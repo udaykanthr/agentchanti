@@ -115,7 +115,7 @@ class CLIDisplay:
             prefix = " → " if i == self.current_step else "   "
 
             if i == self.current_step:
-                lines.append(f"{prefix}{icon} Step {i+1}: {step['text']}")
+                lines.append(f"{prefix}{icon} Task {i+1}: {step['text']}")
                 if type_tag:
                     lines.append(f"        Type: {type_tag}")
                 if "info" in step and step["info"]:
@@ -133,7 +133,7 @@ class CLIDisplay:
                 elif step["status"] == "skipped":
                     status_label = " – skipped"
 
-                line = f"{prefix}{icon} Step {i+1}: {step['text'][:55]}"
+                line = f"{prefix}{icon} Task {i+1}: {step['text'][:55]}"
                 if type_tag:
                     line += f" {type_tag}"
                 line += status_label
