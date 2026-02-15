@@ -146,8 +146,7 @@ class CLIDisplay:
         h = self.term_height
 
         # Clear screen
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        os.system('cls' if os.name == 'nt' else 'clear')
 
         # ── TOP: Big wild-west title in orange ──
         ORANGE = "\033[38;5;208m"
