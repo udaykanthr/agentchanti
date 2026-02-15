@@ -12,6 +12,39 @@ from .executor import Executor
 MAX_STEP_RETRIES = 3
 
 
+class FileMemory:
+    """Tracks every file's path and current contents across all steps."""
+
+    def __init__(self):
+        self._files: dict[str, str] = {}   # filepath -> contents
+
+    def update(self, files: dict[str, str]):
+        """Store or overwrite file contents."""
+        self._files.update(files)
+
+    def get(self, filepath: str) -> str | None:
+        return self._files.get(filepath)
+
+    def all_files(self) -> dict[str, str]:
+        return dict(self._files)
+
+    def related_context(self, step_text: str) -> str:
+        """Build a compact context string with contents of files
+        whose name appears in the step description."""
+        parts = []
+        for fpath, content in self._files.items():
+            basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+            if basename in step_text or fpath in step_text:
+                parts.append(f"#### [FILE]: {fpath}\n```\n{content}\n```")
+        return "\n\n".join(parts)
+
+    def summary(self) -> str:
+        """One-line-per-file overview (name only, no contents)."""
+        if not self._files:
+            return "(no files yet)"
+        return ", ".join(self._files.keys())
+
+
 def _classify_step(step_text: str, llm_client) -> str:
     """
     Send a single step description to the LLM to classify it.
@@ -24,7 +57,7 @@ def _classify_step(step_text: str, llm_client) -> str:
         "  CODE   = create or modify source code files\n"
         "  TEST   = write or run unit tests\n"
         "  IGNORE = not actionable by a program (e.g. open a text editor,\n"
-        "           open an IDE, save a file , review code visually,\n"
+        "           open an IDE, save a file, review code visually,\n"
         "           set up environment , navigate directories)\n\n"
         f"Step: {step_text}\n\n"
         "Category:"
@@ -56,12 +89,18 @@ def _handle_cmd_step(step_text: str, executor: Executor) -> bool:
 
 
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
-                      executor: Executor, task: str, accumulated_code: dict) -> bool:
+                      executor: Executor, task: str, memory: FileMemory) -> bool:
     """Send a single step to the coder, write files, and review."""
     feedback = ""
 
     for attempt in range(1, MAX_STEP_RETRIES + 1):
         context = f"Task: {task}"
+        # Attach current contents of any file mentioned in this step
+        related = memory.related_context(step_text)
+        if related:
+            context += f"\nExisting files (overwrite as needed):\n{related}"
+        if memory.summary() != "(no files yet)":
+            context += f"\nAll project files: {memory.summary()}"
         if feedback:
             context += f"\nFeedback: {feedback}"
 
@@ -75,7 +114,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             continue
 
         executor.write_files(files)
-        accumulated_code.update(files)
+        memory.update(files)
 
         # Review
         print(f"  Reviewing...")
@@ -96,43 +135,75 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
 
 def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
-                      executor: Executor, task: str, accumulated_code: dict) -> bool:
-    """Generate tests, run them, retry code on failure."""
+                      reviewer: ReviewerAgent, executor: Executor,
+                      task: str, memory: FileMemory) -> bool:
+    """Generate tests, review them, run them, retry on failure."""
+    # Build concise code context from memory (with full paths)
     code_summary = ""
-    for fname, content in accumulated_code.items():
+    for fname, content in memory.all_files().items():
         code_summary += f"#### [FILE]: {fname}\n```python\n{content}\n```\n\n"
 
-    print(f"  Generating tests...")
-    test_response = tester.process(step_text, context=f"Code:\n{code_summary}")
-    test_files = executor.parse_code_blocks(test_response)
+    feedback = ""
 
-    if not test_files:
-        print(f"  No test files generated.")
+    for gen_attempt in range(1, MAX_STEP_RETRIES + 1):
+        print(f"  Generating tests (attempt {gen_attempt})...")
+        gen_context = f"Code:\n{code_summary}"
+        if feedback:
+            gen_context += f"\nFeedback: {feedback}"
+        test_response = tester.process(step_text, context=gen_context)
+        test_files = executor.parse_code_blocks(test_response)
+
+        if not test_files:
+            print(f"  No test files generated.")
+            feedback = "No test files found. Use #### [FILE]: format."
+            continue
+
+        # Review the tests before writing/running
+        print(f"  Reviewing tests...")
+        review = reviewer.process(
+            f"Review these tests for correctness, especially import paths:\n{test_response}",
+            context=f"Project files: {memory.summary()}\n{code_summary}"
+        )
+        print(f"  Review: {review[:200]}...")
+
+        if "code looks good" not in review.lower():
+            feedback = review
+            print(f"  Test review found issues, regenerating...")
+            continue
+
+        # Tests passed review — write and run them
+        executor.write_files(test_files)
+        memory.update(test_files)
+
+        for run_attempt in range(1, MAX_STEP_RETRIES + 1):
+            print(f"  Running tests (attempt {run_attempt})...")
+            success, output = executor.run_tests()
+            if output:
+                print(f"  {output[:300]}")
+
+            if success:
+                print(f"  Tests passed!")
+                return True
+
+            print(f"  Tests failed. Asking coder to fix...")
+            fix_context = (
+                f"Test errors:\n{output[:500]}\n"
+                f"Project files:\n{code_summary}"
+            )
+            fix_response = coder.process("Fix the code so tests pass.", context=fix_context)
+            fix_files = executor.parse_code_blocks(fix_response)
+            if fix_files:
+                executor.write_files(fix_files)
+                memory.update(fix_files)
+                # Refresh code_summary after fix
+                code_summary = ""
+                for fname, content in memory.all_files().items():
+                    code_summary += f"#### [FILE]: {fname}\n```python\n{content}\n```\n\n"
+
+        print(f"  [FAIL] Tests still failing after {MAX_STEP_RETRIES} fix attempts.")
         return False
 
-    executor.write_files(test_files)
-
-    for attempt in range(1, MAX_STEP_RETRIES + 1):
-        print(f"  Running tests (attempt {attempt})...")
-        success, output = executor.run_tests()
-        if output:
-            print(f"  {output[:300]}")
-
-        if success:
-            print(f"  Tests passed!")
-            return True
-
-        print(f"  Tests failed. Asking coder to fix...")
-        fix_response = coder.process(
-            "Fix the code so tests pass.",
-            context=f"Test errors:\n{output[:500]}"
-        )
-        fix_files = executor.parse_code_blocks(fix_response)
-        if fix_files:
-            executor.write_files(fix_files)
-            accumulated_code.update(fix_files)
-
-    print(f"  [FAIL] Tests still failing after {MAX_STEP_RETRIES} fix attempts.")
+    print(f"  [FAIL] Could not generate valid tests after {MAX_STEP_RETRIES} attempts.")
     return False
 
 
@@ -181,10 +252,11 @@ def main():
     print(f"Parsed {len(steps)} steps.\n")
 
     # --- Step 3: Process each step one by one ---
-    accumulated_code: dict = {}
+    memory = FileMemory()
 
     for i, step_text in enumerate(steps, 1):
-        print(f"\n--- Step {i}: {step_text} ---\n")
+        print(f"\n--- Step {i}: {step_text} ---")
+        print(f"  Memory: {memory.summary()}")
 
         # Classify this step by sending it to the LLM
         step_type = _classify_step(step_text, llm_client)
@@ -198,11 +270,11 @@ def main():
 
         elif step_type == "CODE":
             _handle_code_step(step_text, coder, reviewer, executor,
-                              args.task, accumulated_code)
+                              args.task, memory)
 
         elif step_type == "TEST":
-            _handle_test_step(step_text, tester, coder, executor,
-                              args.task, accumulated_code)
+            _handle_test_step(step_text, tester, coder, reviewer, executor,
+                              args.task, memory)
         else:
             print(f"  Unknown type '{step_type}', skipping.")
 
