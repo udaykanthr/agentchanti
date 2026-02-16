@@ -88,13 +88,18 @@ def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: in
     display.step_info(step_idx, "Classifying step...")
     prompt = (
         "Classify the following task step into exactly one category.\n"
-        "Reply with ONLY one word: CMD, CODE, TEST, or IGNORE\n"
-        "  CMD    = run a specific shell command (must contain an actual command)\n"
-        "  CODE   = create or modify source code files, make sure path and filename are correct and meaningful\n"
-        "  TEST   = write or run unit tests, make sure path and filename are correct and meaningful\n"
-        "  IGNORE = not actionable by a program (e.g. open a text editor,\n"
-        "           open an IDE, save a file, review code visually,\n"
-        "           set up environment , navigate directories)\n\n"
+        "Reply with ONLY one word: CMD, CODE, TEST, or IGNORE\n\n"
+        "  CMD    = anything that can be done by running shell commands, including:\n"
+        "           - scanning or listing files/directories (ls, tree, find, dir)\n"
+        "           - reading or inspecting file contents (cat, type, head)\n"
+        "           - checking project structure or dependencies\n"
+        "           - installing packages (pip install, npm install)\n"
+        "           - running scripts, builds, or any CLI tool\n"
+        "           - navigating or exploring a codebase\n\n"
+        "  CODE   = create or modify source code files (writing new code or editing existing files)\n\n"
+        "  TEST   = write or run unit/integration tests\n\n"
+        "  IGNORE = not actionable by a program (e.g. open an IDE, review code visually,\n"
+        "           think about architecture, make a decision)\n\n"
         f"Step: {step_text}\n\n"
         "Category:"
     )
@@ -114,25 +119,64 @@ def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: in
 
 
 def _handle_cmd_step(step_text: str, executor: Executor,
+                     llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int) -> bool:
-    """Extract and run a shell command from the step description."""
+    """Extract or generate a shell command, run it, and store output."""
+    # 1. Try to find a command in backticks from the step text
     match = re.search(r"`([^`]+)`", step_text)
-    if not match:
-        display.step_info(step_idx, "No command in backticks, skipping.")
-        log.info(f"Step {step_idx+1}: No backtick command found, skipping.")
-        return True
 
-    cmd = match.group(1)
+    if match:
+        cmd = match.group(1)
+    else:
+        # 2. Ask the LLM to generate the right command
+        display.step_info(step_idx, "Generating command...")
+        gen_prompt = (
+            "You are a shell command generator. Given a task step, output "
+            "ONLY the shell command to accomplish it. No explanations, no "
+            "markdown, no backticks — just the raw command.\n"
+            "Use commands that work on Windows (PowerShell). "
+            "For listing files use: Get-ChildItem -Recurse | Select-Object FullName\n"
+            "For reading a file use: Get-Content <path>\n\n"
+            f"Step: {step_text}\n\n"
+            "Command:"
+        )
+        sent_before = token_tracker.total_prompt_tokens
+        recv_before = token_tracker.total_completion_tokens
+
+        cmd = llm_client.generate_response(gen_prompt).strip()
+
+        sent_delta = token_tracker.total_prompt_tokens - sent_before
+        recv_delta = token_tracker.total_completion_tokens - recv_before
+        display.step_tokens(step_idx, sent_delta, recv_delta)
+
+        # Clean up: strip backticks or markdown the LLM may add anyway
+        cmd = cmd.strip('`').strip()
+        if cmd.startswith('```'):
+            cmd = cmd.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
+
+        if not cmd:
+            display.step_info(step_idx, "Could not generate command, skipping.")
+            log.warning(f"Step {step_idx+1}: LLM returned empty command.")
+            return True
+
     display.step_info(step_idx, f"Running: {cmd}")
     log.info(f"Step {step_idx+1}: Running command: {cmd}")
 
     success, output = executor.run_command(cmd)
     log.info(f"Step {step_idx+1}: Command output:\n{output}")
 
+    # 3. Store command output in memory so later steps have context
+    if output:
+        # Truncate very long output to avoid blowing up context
+        truncated = output[:4000] if len(output) > 4000 else output
+        memory.update({
+            f"_cmd_output/step_{step_idx+1}.txt": f"$ {cmd}\n\n{truncated}"
+        })
+
     if success:
-        display.step_info(step_idx, f"Command succeeded.")
+        display.step_info(step_idx, "Command succeeded.")
     else:
-        display.step_info(step_idx, f"Command failed. See log.")
+        display.step_info(step_idx, "Command failed. See log.")
         log.warning(f"Step {step_idx+1}: Command failed.")
     return success
 
@@ -384,7 +428,8 @@ def main():
             display.complete_step(i, "skipped")
 
         elif step_type == "CMD":
-            success = _handle_cmd_step(step_text, executor, display, i)
+            success = _handle_cmd_step(step_text, executor, llm_client,
+                                       memory, display, i)
             display.complete_step(i, "done" if success else "failed")
 
         elif step_type == "CODE":
