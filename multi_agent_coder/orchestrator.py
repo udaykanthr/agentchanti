@@ -203,24 +203,48 @@ def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: in
 # Step handlers — now accept ``language``
 # ───────────────────────────────────────────────────────────────
 
+def _build_prior_steps_context(memory: FileMemory, step_idx: int) -> str:
+    """Collect outputs of prior steps from memory for context."""
+    parts: list[str] = []
+    all_files = memory.all_files()
+    for i in range(step_idx):
+        key = f"_cmd_output/step_{i+1}.txt"
+        if key in all_files:
+            parts.append(f"Step {i+1} output:\n{all_files[key]}")
+    if not parts:
+        return ""
+    return "Previously executed steps:\n" + "\n\n".join(parts) + "\n\n"
+
+
 def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
                      language: str | None = None) -> tuple[bool, str]:
-    match = re.search(r"`([^`]+)`", step_text)
+    cmd = _extract_command_from_step(step_text)
 
-    if match:
-        cmd = match.group(1)
+    if cmd:
+        pass  # use extracted command
     else:
         display.step_info(step_idx, "Generating command...")
+
+        prior_context = _build_prior_steps_context(memory, step_idx)
+        file_summary = memory.summary()
+
         gen_prompt = (
             "You are a shell command generator. Given a task step, output "
             "ONLY the shell command to accomplish it. No explanations, no "
             "markdown, no backticks — just the raw command.\n"
             f"{_shell_instructions()}\n"
-            f"Step: {step_text}\n\n"
-            "Command:"
         )
+        if prior_context:
+            gen_prompt += (
+                f"{prior_context}"
+                "IMPORTANT: Use the exact names, paths, and values from the "
+                "previous steps above. Do NOT guess or use defaults.\n\n"
+            )
+        if file_summary != "(no files yet)":
+            gen_prompt += f"Project files: {file_summary}\n\n"
+        gen_prompt += f"Step: {step_text}\n\nCommand:"
         sent_before = token_tracker.total_prompt_tokens
         recv_before = token_tracker.total_completion_tokens
 
@@ -260,6 +284,38 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         return False, f"Command `{cmd}` failed.\nOutput:\n{output}"
 
 
+# File extensions and names that don't need code review
+_NON_CODE_EXTENSIONS = {
+    '.md', '.txt', '.rst', '.log', '.csv',
+    '.yml', '.yaml', '.toml', '.ini', '.cfg',
+    '.json', '.xml',
+    '.html', '.css',
+    '.env', '.env.example', '.gitignore', '.dockerignore',
+    '.editorconfig',
+}
+_NON_CODE_FILENAMES = {
+    'README', 'README.md', 'README.rst', 'README.txt',
+    'LICENSE', 'LICENSE.md', 'LICENSE.txt',
+    'CHANGELOG', 'CHANGELOG.md',
+    'CONTRIBUTING', 'CONTRIBUTING.md',
+    'Makefile', 'Dockerfile', 'Procfile',
+    '.gitignore', '.dockerignore', '.editorconfig',
+    'requirements.txt', 'setup.cfg',
+}
+
+
+def _all_non_code_files(filenames: list[str]) -> bool:
+    """Return True if every file in the list is non-functional (docs, config, etc.)."""
+    if not filenames:
+        return False
+    for f in filenames:
+        basename = f.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        _, ext = os.path.splitext(basename)
+        if basename not in _NON_CODE_FILENAMES and ext.lower() not in _NON_CODE_EXTENSIONS:
+            return False
+    return True
+
+
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
                       executor: Executor, task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
@@ -297,6 +353,12 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         written = executor.write_files(files)
         memory.update(files)
         display.step_info(step_idx, f"Written: {', '.join(written)}")
+
+        # Skip review for non-code files (README, LICENSE, configs, etc.)
+        if _all_non_code_files(list(files.keys())):
+            display.step_info(step_idx, "Non-code files, skipping review ✔")
+            log.info(f"Step {step_idx+1}: Skipped review (non-code files: {list(files.keys())})")
+            return True, ""
 
         # Review
         display.step_info(step_idx, "Reviewing code...")
@@ -443,6 +505,8 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 
     context_files = memory.related_context(step_text)
 
+    prior_context = _build_prior_steps_context(memory, step_idx)
+
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
         "Analyze the failure and provide a concrete fix.\n\n"
@@ -450,15 +514,29 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
     )
+    if prior_context:
+        prompt += f"{prior_context}\n"
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
-    prompt += (
-        f"All project files: {memory.summary()}\n\n"
-        "Respond with:\n"
-        "1. ROOT CAUSE: one-line explanation of what went wrong\n"
-        "2. FIX: provide corrected code using #### [FILE]: path/file.py markers "
-        "with fenced code blocks, OR a shell command in backticks to fix the issue.\n"
-    )
+    prompt += f"All project files: {memory.summary()}\n\n"
+
+    # Step-type-specific fix instructions
+    if step_type == "CMD":
+        prompt += (
+            "This is a COMMAND step. Do NOT generate code files.\n"
+            "Use the exact names, paths, and values from previous steps.\n"
+            "Respond with:\n"
+            "1. ROOT CAUSE: one-line explanation of what went wrong\n"
+            "2. FIX: provide the corrected shell command in backticks.\n"
+            f"{_shell_instructions()}"
+        )
+    else:
+        prompt += (
+            "Respond with:\n"
+            "1. ROOT CAUSE: one-line explanation of what went wrong\n"
+            "2. FIX: provide corrected code using #### [FILE]: path/file.py markers "
+            "with fenced code blocks, OR a shell command in backticks to fix the issue.\n"
+        )
 
     sent_before = token_tracker.total_prompt_tokens
     recv_before = token_tracker.total_completion_tokens
@@ -474,39 +552,115 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 
 
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
-               display: CLIDisplay, step_idx: int) -> bool:
+               display: CLIDisplay, step_idx: int,
+               step_type: str = "CODE") -> bool:
     applied = False
 
-    files = executor.parse_code_blocks(diagnosis)
-    if files:
-        written = executor.write_files(files)
-        memory.update(files)
-        display.step_info(step_idx, f"Fixed files: {', '.join(written)}")
-        log.info(f"Step {step_idx+1}: Applied code fixes to: {', '.join(written)}")
-        applied = True
-
-    cmd_matches = re.findall(r"`([^`]+)`", diagnosis)
-    cmd_indicators = (
-        'pip ', 'npm ', 'mkdir ', 'python ', 'install',
-        'apt ', 'brew ', 'choco ', 'set ', 'export ',
-        'curl ', 'wget ', 'git ', 'New-Item', 'Set-', 'Get-',
-    )
-    for cmd in cmd_matches:
-        cmd = cmd.strip()
-        if not cmd or '\n' in cmd or cmd.startswith('#'):
-            continue
-        if any(ind in cmd for ind in cmd_indicators):
-            display.step_info(step_idx, f"Running fix: {cmd}")
-            log.info(f"Step {step_idx+1}: Running fix command: {cmd}")
-            success, output = executor.run_command(cmd)
-            if output:
-                truncated = output[:4000] if len(output) > 4000 else output
-                memory.update({
-                    f"_fix_output/step_{step_idx+1}.txt": f"$ {cmd}\n\n{truncated}"
-                })
+    # Only write code files for CODE / TEST steps, never for CMD
+    if step_type != "CMD":
+        files = executor.parse_code_blocks(diagnosis)
+        if files:
+            written = executor.write_files(files)
+            memory.update(files)
+            display.step_info(step_idx, f"Fixed files: {', '.join(written)}")
+            log.info(f"Step {step_idx+1}: Applied code fixes to: {', '.join(written)}")
             applied = True
 
+    # Extract and run fix commands (from triple-backtick blocks + inline backticks)
+    fix_commands = _extract_commands_from_text(diagnosis)
+    for cmd in fix_commands:
+        display.step_info(step_idx, f"Running fix: {cmd}")
+        log.info(f"Step {step_idx+1}: Running fix command: {cmd}")
+        success, output = executor.run_command(cmd)
+        if output:
+            truncated = output[:4000] if len(output) > 4000 else output
+            memory.update({
+                f"_fix_output/step_{step_idx+1}.txt": f"$ {cmd}\n\n{truncated}"
+            })
+        applied = True
+
     return applied
+
+
+def _is_file_path(text: str) -> bool:
+    """Return True if *text* looks like a bare file/directory path, not a command."""
+    text = text.strip()
+    # No spaces usually means it's a path, not a command with arguments
+    # Exception: single-word commands like "pytest" are handled by _looks_like_command
+    if ' ' in text:
+        return False
+    # Looks like a file path: contains slashes and/or has a file extension
+    has_sep = '/' in text or '\\' in text
+    has_ext = bool(re.search(r'\.\w{1,5}$', text))
+    return has_sep or has_ext
+
+
+def _looks_like_command(text: str) -> bool:
+    """Return True if *text* looks like an executable shell command."""
+    text = text.strip()
+    if not text:
+        return False
+    # Reject bare file paths
+    if _is_file_path(text):
+        return False
+    # Known command prefixes (the first word)
+    first_word = text.split()[0].lower().rstrip('.exe')
+    known_commands = {
+        'pip', 'pip3', 'python', 'python3', 'py',
+        'npm', 'npx', 'node', 'yarn', 'pnpm',
+        'go', 'cargo', 'rustc', 'mvn', 'gradle', 'javac', 'java',
+        'ruby', 'bundle', 'gem', 'rspec',
+        'git', 'docker', 'make', 'cmake',
+        'mkdir', 'rmdir', 'del', 'copy', 'move', 'ren', 'type', 'dir',
+        'ls', 'cat', 'cp', 'mv', 'rm', 'find', 'grep', 'chmod', 'chown',
+        'cd', 'echo', 'set', 'export', 'source',
+        'curl', 'wget', 'ssh', 'scp',
+        'apt', 'apt-get', 'brew', 'choco', 'yum', 'dnf', 'pacman',
+        'powershell', 'pwsh', 'cmd',
+        'pytest', 'jest', 'tox', 'mypy', 'flake8', 'black', 'ruff',
+    }
+    return first_word in known_commands
+
+
+def _extract_commands_from_text(text: str) -> list[str]:
+    """Extract shell commands from *text*, handling both triple- and single-backtick blocks.
+
+    Prefers triple-backtick code blocks (```cmd, ```bash, ```shell, ```)
+    over single-backtick inline code.  Filters out file paths and non-commands.
+    """
+    commands: list[str] = []
+    seen: set[str] = set()
+
+    # 1. Triple-backtick code blocks (```lang\n...\n```)
+    for m in re.finditer(r"```(?:\w*)\n(.*?)```", text, re.DOTALL):
+        block = m.group(1).strip()
+        for line in block.splitlines():
+            line = line.strip()
+            if line and _looks_like_command(line) and line not in seen:
+                commands.append(line)
+                seen.add(line)
+
+    # 2. Single-backtick inline commands (`...`)
+    for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", text):
+        cmd = m.group(1).strip()
+        if cmd and _looks_like_command(cmd) and cmd not in seen:
+            commands.append(cmd)
+            seen.add(cmd)
+
+    return commands
+
+
+def _extract_command_from_step(step_text: str) -> str | None:
+    """Extract an inline command from a step description.
+
+    Only matches backtick content that looks like a real command,
+    skipping bare file paths like ``tests/test_main.py``.
+    """
+    for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", step_text):
+        candidate = m.group(1).strip()
+        if _looks_like_command(candidate):
+            return candidate
+    return None
 
 
 # ───────────────────────────────────────────────────────────────
@@ -609,6 +763,9 @@ def main():
                         help="Force resume from checkpoint")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore checkpoint and start fresh")
+    parser.add_argument("--auto", action="store_true",
+                        help="Non-interactive mode: auto-approve plan, "
+                             "skip all prompts (for backend/service use)")
     args = parser.parse_args()
 
     # ── 1. Detect language ──
@@ -678,8 +835,9 @@ def main():
     if not args.fresh:
         checkpoint_state = load_checkpoint(checkpoint_file)
         if checkpoint_state:
-            if args.resume:
+            if args.resume or args.auto:
                 resuming = True
+                log.info("Auto-resuming from checkpoint" if args.auto else "Resuming (--resume)")
             else:
                 resuming = CLIDisplay.prompt_resume(checkpoint_state)
 
@@ -732,7 +890,9 @@ def main():
         steps, dependencies = executor.parse_step_dependencies(raw_steps)
 
         # ── 11. Plan approval loop ──
-        while True:
+        if args.auto:
+            log.info(f"Auto-approved {len(steps)} steps (--auto mode)")
+        while not args.auto:
             action, removed = CLIDisplay.prompt_plan_approval(steps)
             if action == "approve":
                 break
@@ -870,7 +1030,11 @@ def main():
 
         # Git: offer commit
         if use_git and git_utils.has_changes():
-            git_choice = CLIDisplay.prompt_git_action("complete")
+            if args.auto:
+                git_choice = "commit"
+                log.info("Auto-committing changes (--auto mode)")
+            else:
+                git_choice = CLIDisplay.prompt_git_action("complete")
             if git_choice == "commit":
                 ok, msg = git_utils.commit_changes(
                     f"AgentChanti: {args.task[:60]}")
@@ -883,7 +1047,11 @@ def main():
 
         # Git: offer rollback
         if use_git and checkpoint_branch:
-            git_choice = CLIDisplay.prompt_git_action("failed")
+            if args.auto:
+                git_choice = "skip"
+                log.info("Auto-skipping git rollback (--auto mode)")
+            else:
+                git_choice = CLIDisplay.prompt_git_action("failed")
             if git_choice == "rollback":
                 ok, msg = git_utils.rollback_to_branch(checkpoint_branch)
                 print(f"  {'Rolled back!' if ok else 'Rollback failed: ' + msg}")
@@ -909,7 +1077,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             step_text, step_type, error_info,
             memory, llm_client, display, step_idx)
 
-        fix_applied = _apply_fix(diagnosis, executor, memory, display, step_idx)
+        fix_applied = _apply_fix(diagnosis, executor, memory, display, step_idx,
+                                 step_type=step_type)
 
         if not fix_applied:
             display.step_info(step_idx, "No actionable fix found in diagnosis.")
