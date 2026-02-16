@@ -463,6 +463,23 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx, "Tests passed ✔")
                 return True, ""
 
+            # Auto-install missing packages before asking coder to fix
+            missing_pkgs = executor.detect_missing_packages(output)
+            if missing_pkgs:
+                display.step_info(step_idx, f"Installing missing packages: {', '.join(missing_pkgs)}")
+                log.info(f"Step {step_idx+1}: Auto-installing: {missing_pkgs}")
+                install_ok, install_out = executor.install_packages(missing_pkgs)
+                if install_ok:
+                    display.step_info(step_idx, "Packages installed, re-running tests...")
+                    success, output = executor.run_tests(test_cmd)
+                    log.info(f"Step {step_idx+1}: Test re-run after install:\n{output}")
+                    last_test_output = output
+                    if success:
+                        display.step_info(step_idx, "Tests passed after package install ✔")
+                        return True, ""
+                else:
+                    log.warning(f"Step {step_idx+1}: Package install failed: {install_out}")
+
             display.step_info(step_idx, "Tests failed, asking coder to fix...")
             fix_context = (
                 f"Test errors:\n{output[:500]}\n"
@@ -534,8 +551,22 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += (
             "Respond with:\n"
             "1. ROOT CAUSE: one-line explanation of what went wrong\n"
-            "2. FIX: provide corrected code using #### [FILE]: path/file.py markers "
-            "with fenced code blocks, OR a shell command in backticks to fix the issue.\n"
+            "2. FIX: provide the COMPLETE corrected file(s). Do NOT use diffs or patches.\n"
+            "   Write the ENTIRE file content, not just the changed parts.\n\n"
+            "CRITICAL FORMAT — the #### [FILE]: marker must be OUTSIDE and BEFORE the code block:\n\n"
+            "#### [FILE]: path/to/file.py\n"
+            "```python\n"
+            "# entire file contents here\n"
+            "```\n\n"
+            "WRONG (do NOT do this):\n"
+            "```python\n"
+            "#### [FILE]: path/to/file.py   <-- WRONG! marker inside code block\n"
+            "```\n\n"
+            "WRONG (do NOT do this):\n"
+            "```diff\n"
+            "-old line   <-- WRONG! do not use diff format\n"
+            "+new line\n"
+            "```\n"
         )
 
     sent_before = token_tracker.total_prompt_tokens
@@ -559,6 +590,15 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     # Only write code files for CODE / TEST steps, never for CMD
     if step_type != "CMD":
         files = executor.parse_code_blocks(diagnosis)
+
+        # Fallback: try fuzzy parsing (handles diff blocks, inline file
+        # comments, and other common LLM diagnosis formats)
+        if not files:
+            files = executor.parse_code_blocks_fuzzy(diagnosis)
+            if files:
+                log.info(f"Step {step_idx+1}: Standard parser found nothing, "
+                         f"fuzzy parser extracted: {list(files.keys())}")
+
         if files:
             written = executor.write_files(files)
             memory.update(files)
@@ -697,45 +737,56 @@ def _execute_step(step_idx: int, step_text: str, *,
                   llm_client, executor, coder, reviewer, tester,
                   task: str, memory: FileMemory, display: CLIDisplay,
                   language: str | None) -> tuple[int, bool, str]:
-    """Execute a single step. Returns ``(step_idx, success, error_info)``."""
-    log.info(f"\n{'='*60}\nTask {step_idx+1}: {step_text}\n"
-             f"Memory: {memory.summary()}\n{'='*60}")
+    """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
-    display.start_step(step_idx)
-    step_type = _classify_step(step_text, llm_client, display, step_idx)
-    display.steps[step_idx]["type"] = step_type
-    display.render()
-    log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
+    Catches all exceptions so that a crash inside any handler never
+    kills the whole pipeline — the step is marked as failed instead.
+    """
+    try:
+        log.info(f"\n{'='*60}\nTask {step_idx+1}: {step_text}\n"
+                 f"Memory: {memory.summary()}\n{'='*60}")
 
-    success, error_info = True, ""
+        display.start_step(step_idx)
+        step_type = _classify_step(step_text, llm_client, display, step_idx)
+        display.steps[step_idx]["type"] = step_type
+        display.render()
+        log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
 
-    if step_type == "IGNORE":
-        display.step_info(step_idx, "Not actionable, skipping.")
-        display.complete_step(step_idx, "skipped")
+        success, error_info = True, ""
 
-    elif step_type == "CMD":
-        success, error_info = _handle_cmd_step(
-            step_text, executor, llm_client, memory, display, step_idx,
-            language=language)
-        display.complete_step(step_idx, "done" if success else "failed")
+        if step_type == "IGNORE":
+            display.step_info(step_idx, "Not actionable, skipping.")
+            display.complete_step(step_idx, "skipped")
 
-    elif step_type == "CODE":
-        success, error_info = _handle_code_step(
-            step_text, coder, reviewer, executor,
-            task, memory, display, step_idx, language=language)
-        display.complete_step(step_idx, "done" if success else "failed")
+        elif step_type == "CMD":
+            success, error_info = _handle_cmd_step(
+                step_text, executor, llm_client, memory, display, step_idx,
+                language=language)
+            display.complete_step(step_idx, "done" if success else "failed")
 
-    elif step_type == "TEST":
-        success, error_info = _handle_test_step(
-            step_text, tester, coder, reviewer, executor,
-            task, memory, display, step_idx, language=language)
-        display.complete_step(step_idx, "done" if success else "failed")
+        elif step_type == "CODE":
+            success, error_info = _handle_code_step(
+                step_text, coder, reviewer, executor,
+                task, memory, display, step_idx, language=language)
+            display.complete_step(step_idx, "done" if success else "failed")
 
-    else:
-        display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
-        display.complete_step(step_idx, "skipped")
+        elif step_type == "TEST":
+            success, error_info = _handle_test_step(
+                step_text, tester, coder, reviewer, executor,
+                task, memory, display, step_idx, language=language)
+            display.complete_step(step_idx, "done" if success else "failed")
 
-    return step_idx, success, error_info
+        else:
+            display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
+            display.complete_step(step_idx, "skipped")
+
+        return step_idx, success, error_info
+
+    except Exception as exc:
+        log.error(f"Task {step_idx+1}: Unhandled exception: {exc}")
+        display.step_info(step_idx, f"Error: {type(exc).__name__}: {exc}")
+        display.complete_step(step_idx, "failed")
+        return step_idx, False, f"Unhandled exception: {type(exc).__name__}: {exc}"
 
 
 # ───────────────────────────────────────────────────────────────
@@ -1065,41 +1116,53 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         llm_client, executor, coder, reviewer, tester,
                         task: str, memory: FileMemory, display: CLIDisplay,
                         language: str | None) -> bool:
-    """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed."""
+    """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
+
+    All exceptions are caught so that a crash during diagnosis (e.g. an
+    embedding error) never kills the whole pipeline — the step is simply
+    marked as failed and the pipeline halts gracefully.
+    """
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
-        display.step_info(
-            step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")
-        log.info(f"Task {step_idx+1}: Diagnosis attempt "
-                 f"{diag_attempt}/{MAX_DIAGNOSIS_RETRIES}")
+        try:
+            display.step_info(
+                step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")
+            log.info(f"Task {step_idx+1}: Diagnosis attempt "
+                     f"{diag_attempt}/{MAX_DIAGNOSIS_RETRIES}")
 
-        step_type = display.steps[step_idx].get("type", "CODE")
-        diagnosis = _diagnose_failure(
-            step_text, step_type, error_info,
-            memory, llm_client, display, step_idx)
+            step_type = display.steps[step_idx].get("type", "CODE")
+            diagnosis = _diagnose_failure(
+                step_text, step_type, error_info,
+                memory, llm_client, display, step_idx)
 
-        fix_applied = _apply_fix(diagnosis, executor, memory, display, step_idx,
-                                 step_type=step_type)
+            fix_applied = _apply_fix(diagnosis, executor, memory, display, step_idx,
+                                     step_type=step_type)
 
-        if not fix_applied:
-            display.step_info(step_idx, "No actionable fix found in diagnosis.")
-            log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
+            if not fix_applied:
+                display.step_info(step_idx, "No actionable fix found in diagnosis.")
+                log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
+                continue
+
+            # Re-run the step
+            display.step_info(step_idx, "Fix applied — retrying step...")
+            _, success, error_info = _execute_step(
+                step_idx, step_text,
+                llm_client=llm_client, executor=executor,
+                coder=coder, reviewer=reviewer, tester=tester,
+                task=task, memory=memory, display=display,
+                language=language,
+            )
+
+            if success:
+                return True
+            else:
+                log.warning(f"Task {step_idx+1}: Still failing after "
+                            f"diagnosis attempt {diag_attempt}")
+
+        except Exception as exc:
+            log.error(f"Task {step_idx+1}: Exception during diagnosis "
+                      f"attempt {diag_attempt}: {exc}")
+            display.step_info(step_idx, f"Diagnosis error: {type(exc).__name__}")
             continue
-
-        # Re-run the step
-        display.step_info(step_idx, "Fix applied — retrying step...")
-        _, success, error_info = _execute_step(
-            step_idx, step_text,
-            llm_client=llm_client, executor=executor,
-            coder=coder, reviewer=reviewer, tester=tester,
-            task=task, memory=memory, display=display,
-            language=language,
-        )
-
-        if success:
-            return True
-        else:
-            log.warning(f"Task {step_idx+1}: Still failing after "
-                        f"diagnosis attempt {diag_attempt}")
 
     display.step_info(
         step_idx, "Step failed after all fix attempts. Halting pipeline.")

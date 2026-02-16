@@ -19,12 +19,15 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     """Compute cosine similarity between two vectors without numpy."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0.0 or norm_b == 0.0:
+    try:
+        dot = sum(x * y for x, y in zip(a, b) if x is not None and y is not None)
+        norm_a = math.sqrt(sum(x * x for x in a if x is not None))
+        norm_b = math.sqrt(sum(x * x for x in b if x is not None))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+    except (TypeError, ValueError):
         return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _chunk_text(text: str, chunk_size: int = _CHARS_PER_CHUNK,
@@ -69,7 +72,7 @@ class EmbeddingStore:
         chunk_vectors: List[Tuple[int, List[float]]] = []
         for idx, chunk in enumerate(chunks):
             vec = self.llm_client.generate_embedding(chunk, model=self.embed_model)
-            if vec:
+            if vec and all(v is not None for v in vec):
                 chunk_vectors.append((idx, vec))
                 stored_any = True
         if stored_any:
@@ -86,7 +89,7 @@ class EmbeddingStore:
         Returns list of (key, score) tuples, descending by score.
         """
         query_vec = self.llm_client.generate_embedding(query, model=self.embed_model)
-        if not query_vec:
+        if not query_vec or any(v is None for v in query_vec):
             log.warning("[EmbeddingStore] Could not embed query, returning empty results")
             return []
 

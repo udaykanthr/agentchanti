@@ -67,6 +67,114 @@ class Executor:
         return files
 
     @staticmethod
+    def parse_code_blocks_fuzzy(text: str) -> Dict[str, str]:
+        """Fallback parser for LLM responses that don't follow the strict format.
+
+        Handles common patterns:
+        1. ``#### [FILE]:`` on the first line inside ANY code block (python, diff, etc.)
+        2. Diff blocks with ``+`` prefixed ``#### [FILE]:`` lines
+        3. Code blocks preceded by a line mentioning a file path
+        4. Code blocks whose first line is a ``# filepath`` comment
+        """
+        files: Dict[str, str] = {}
+
+        # ── Pattern 1: #### [FILE]: as first line inside any code block ──
+        # The LLM sometimes wraps everything in ```python ... ``` but puts
+        # the marker inside.  The content may be plain code or diff-style.
+        for m in re.finditer(r"```(?:\w*)\n(.*?)```", text, re.DOTALL):
+            block = m.group(1)
+            first_line = block.split("\n", 1)[0].strip()
+            fmatch = re.match(r"^(?:\+\s*)?####\s*\[FILE\]:\s*(.+)", first_line)
+            if not fmatch:
+                continue
+            raw = fmatch.group(1).strip()
+            filename = Executor._sanitize_filename(raw)
+            if not filename or ('/' not in filename and '.' not in filename):
+                continue
+            rest = block.split("\n", 1)[1] if "\n" in block else ""
+            # Check if the content uses diff markers (+/-/@@)
+            has_diff = any(
+                l.startswith(('+', '-', '@@'))
+                for l in rest.splitlines()[:10] if l.strip()
+            )
+            if has_diff:
+                content_lines = []
+                for line in rest.splitlines():
+                    if line.startswith('@@'):
+                        continue
+                    elif line.startswith('-'):
+                        continue
+                    elif line.startswith('+'):
+                        content_lines.append(line[1:])
+                    else:
+                        content_lines.append(line)
+                if content_lines:
+                    files[filename] = "\n".join(content_lines)
+            else:
+                files[filename] = rest.rstrip("\n")
+
+        if files:
+            return files
+
+        # ── Pattern 2: diff blocks with +#### [FILE]: or +# filepath ──
+        for m in re.finditer(r"```diff\n(.*?)```", text, re.DOTALL):
+            block = m.group(1)
+            fname_match = (
+                re.search(r"^\+\s*####\s*\[FILE\]:\s*(.+)", block, re.MULTILINE)
+                or re.search(r"^\+\s*#\s*(\S+\.\w{1,5})\s*$", block, re.MULTILINE)
+            )
+            if not fname_match:
+                continue
+            raw = fname_match.group(1).strip()
+            filename = Executor._sanitize_filename(raw)
+            if not filename or ('/' not in filename and '.' not in filename):
+                continue
+            content_lines = []
+            past_header = False
+            for line in block.splitlines():
+                if not past_header:
+                    if fname_match.group(0).strip() in line:
+                        past_header = True
+                    continue
+                if line.startswith('+'):
+                    content_lines.append(line[1:])
+                elif not line.startswith('-') and not line.startswith('@@'):
+                    content_lines.append(line)
+            if content_lines:
+                files[filename] = "\n".join(content_lines)
+
+        if files:
+            return files
+
+        # ── Pattern 3: text before code block mentions a file path ──
+        for m in re.finditer(
+            r"(?:^|\n)[^\n]*?(?:`([^`\n]+\.\w{1,5})`|(\b\S+\.\w{1,5}))\s*:?\s*\n"
+            r"```(?:\w+)?\n(.*?)```",
+            text, re.DOTALL,
+        ):
+            raw = (m.group(1) or m.group(2) or "").strip()
+            filename = Executor._sanitize_filename(raw)
+            if not filename or ('/' not in filename and '.' not in filename):
+                continue
+            files[filename] = m.group(3).rstrip("\n")
+
+        if files:
+            return files
+
+        # ── Pattern 4: first line of code block is a # filepath comment ──
+        for m in re.finditer(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL):
+            block = m.group(1)
+            first_line = block.split("\n", 1)[0].strip()
+            fname_match = re.match(r"^#\s*(\S+\.\w{1,5})\s*$", first_line)
+            if fname_match:
+                filename = Executor._sanitize_filename(fname_match.group(1))
+                if filename and ('/' in filename or '.' in filename):
+                    rest = block.split("\n", 1)[1] if "\n" in block else ""
+                    files[filename] = rest.rstrip("\n")
+
+        return files
+
+    @staticmethod
     def write_files(files: Dict[str, str], base_dir: str = ".") -> List[str]:
         """
         Writes files to disk. Returns list of written file paths.
@@ -158,6 +266,82 @@ class Executor:
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = cwd + (os.pathsep + existing if existing else "")
         return Executor.run_command(test_command, env=env)
+
+    # ── Missing-package auto-install ──
+
+    # Well-known module → pip-package mappings where the names differ
+    _MODULE_TO_PACKAGE = {
+        "cv2": "opencv-python",
+        "PIL": "Pillow",
+        "sklearn": "scikit-learn",
+        "yaml": "pyyaml",
+        "bs4": "beautifulsoup4",
+        "dotenv": "python-dotenv",
+        "gi": "PyGObject",
+        "serial": "pyserial",
+        "usb": "pyusb",
+        "attr": "attrs",
+        "dateutil": "python-dateutil",
+        "jose": "python-jose",
+        "jwt": "PyJWT",
+        "magic": "python-magic",
+        "lxml": "lxml",
+    }
+
+    # pytest fixtures that come from well-known plugins
+    _FIXTURE_TO_PACKAGE = {
+        "benchmark": "pytest-benchmark",
+        "httpserver": "pytest-localserver",
+        "mocker": "pytest-mock",
+        "faker": "faker",
+        "freezer": "pytest-freezegun",
+        "celery_app": "pytest-celery",
+        "async_client": "httpx",
+        "anyio_backend": "anyio",
+        "respx_mock": "respx",
+    }
+
+    @staticmethod
+    def detect_missing_packages(test_output: str) -> List[str]:
+        """Parse test output and return a list of pip packages to install.
+
+        Detects:
+        - ``ModuleNotFoundError: No module named 'xyz'``
+        - ``ImportError: No module named 'xyz'``
+        - ``fixture 'xyz' not found`` (pytest plugin fixtures)
+        """
+        packages: list[str] = []
+        seen: set[str] = set()
+
+        # Missing modules
+        for m in re.finditer(
+            r"(?:ModuleNotFoundError|ImportError):\s*No module named ['\"]([^'\"]+)['\"]",
+            test_output,
+        ):
+            module = m.group(1).split(".")[0]  # top-level package
+            pkg = Executor._MODULE_TO_PACKAGE.get(module, module)
+            if pkg not in seen:
+                packages.append(pkg)
+                seen.add(pkg)
+
+        # Missing pytest fixtures (plugin packages)
+        for m in re.finditer(r"fixture ['\"](\w+)['\"] not found", test_output):
+            fixture = m.group(1)
+            pkg = Executor._FIXTURE_TO_PACKAGE.get(fixture)
+            if pkg and pkg not in seen:
+                packages.append(pkg)
+                seen.add(pkg)
+
+        return packages
+
+    @staticmethod
+    def install_packages(packages: List[str]) -> Tuple[bool, str]:
+        """Install packages via pip. Returns (all_succeeded, combined_output)."""
+        if not packages:
+            return True, ""
+        cmd = f"pip install {' '.join(packages)}"
+        log.info(f"[Executor] Auto-installing: {cmd}")
+        return Executor.run_command(cmd)
 
     @staticmethod
     def parse_step_dependencies(steps: List[str]) -> Tuple[List[str], Dict[int, set]]:
