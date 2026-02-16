@@ -101,3 +101,44 @@ class Executor:
     def run_tests(test_command: str = "pytest") -> Tuple[bool, str]:
         """Shortcut to run tests."""
         return Executor.run_command(test_command)
+
+    @staticmethod
+    def parse_step_dependencies(steps: List[str]) -> Tuple[List[str], Dict[int, set]]:
+        """Parse ``(depends: N, M)`` markers from step text.
+
+        Returns ``(cleaned_steps, dependencies)`` where *cleaned_steps*
+        has dependency markers removed and *dependencies* maps each
+        step index to a set of dependency indices (0-based).
+
+        If **no** dependency markers are found at all, falls back to
+        strict sequential ordering (each step depends on the previous)
+        so that steps never run out of order.
+        """
+        cleaned: List[str] = []
+        deps: Dict[int, set] = {}
+        dep_pattern = re.compile(r"\s*\(depends?:\s*([\d,\s]+)\)\s*$", re.IGNORECASE)
+        found_any_marker = False
+
+        for idx, step in enumerate(steps):
+            match = dep_pattern.search(step)
+            if match:
+                found_any_marker = True
+                raw = match.group(1)
+                # Parse comma-separated step numbers (1-based → 0-based)
+                dep_indices = set()
+                for num_str in raw.split(","):
+                    num_str = num_str.strip()
+                    if num_str.isdigit():
+                        dep_indices.add(int(num_str) - 1)  # 1-based → 0-based
+                deps[idx] = dep_indices
+                cleaned.append(step[:match.start()].rstrip())
+            else:
+                cleaned.append(step)
+                deps[idx] = set()
+
+        # No markers at all → sequential: each step depends on its predecessor
+        if not found_any_marker:
+            for idx in range(1, len(cleaned)):
+                deps[idx] = {idx - 1}
+
+        return cleaned, deps
