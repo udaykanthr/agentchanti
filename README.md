@@ -22,13 +22,7 @@
   <img src="https://img.shields.io/badge/API%20keys-none%20required-brightgreen" alt="No API Keys">
 </p>
 
----
 
-## Disclaimer
-
-> **This is a personal project by [Uday Kanth](https://github.com/udaykanth-rapeti).** It is not affiliated with, endorsed by, sponsored by, or in any way officially connected with my current or past employer(s), or any of their subsidiaries, clients, or affiliates. All opinions, code, and design decisions in this project are my own and do not represent the views or intellectual property of any organization I am or have been associated with. This project was built entirely on my own time using my own resources.
-
----
 
 ## What is AgentChanti?
 
@@ -515,6 +509,10 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 ---
 
-<p align="center">
-  Built with coffee and local LLMs by <a href="https://github.com/udaykanth-rapeti">Uday Kanth</a>
-</p>
+---
+
+## Disclaimer
+
+> **This is a personal project by [Uday Kanth](https://github.com/udaykanth-rapeti).** It is not affiliated with, endorsed by, sponsored by, or in any way officially connected with my current or past employer(s), or any of their subsidiaries, clients, or affiliates. All opinions, code, and design decisions in this project are my own and do not represent the views or intellectual property of any organization I am or have been associated with. This project was built entirely on my own time using my own resources.
+
+---
