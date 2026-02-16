@@ -1,5 +1,6 @@
 import requests
 import json
+from typing import List, Optional
 from .base import LLMClient
 from ..cli_display import token_tracker, log
 
@@ -48,3 +49,23 @@ class LMStudioClient(LLMClient):
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             log.error(f"[LM Studio] Parse error: {e}")
             return ""
+
+    def generate_embedding(self, text: str, model: Optional[str] = None) -> List[float]:
+        embed_model = model or self.model
+        url = f"{self.base_url}/embeddings"
+        payload = {"model": embed_model, "input": text}
+        headers = {"Content-Type": "application/json"}
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("data", [])
+            if items:
+                return items[0].get("embedding", [])
+            return []
+        except requests.exceptions.RequestException as e:
+            log.error(f"[LM Studio] Embedding error: {e}")
+            return []
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            log.error(f"[LM Studio] Embedding parse error: {e}")
+            return []

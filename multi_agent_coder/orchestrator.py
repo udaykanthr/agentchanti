@@ -8,20 +8,31 @@ from .agents.coder import CoderAgent
 from .agents.reviewer import ReviewerAgent
 from .agents.tester import TesterAgent
 from .executor import Executor
+from .embedding_store import EmbeddingStore
 from .cli_display import CLIDisplay, token_tracker, log
 
 MAX_STEP_RETRIES = 3
 
 
 class FileMemory:
-    """Tracks every file's path and current contents across all steps."""
+    """Tracks every file's path and current contents across all steps.
 
-    def __init__(self):
+    When an EmbeddingStore is provided, context retrieval uses semantic
+    similarity instead of simple filename matching.
+    """
+
+    def __init__(self, embedding_store: EmbeddingStore | None = None,
+                 top_k: int = 5):
         self._files: dict[str, str] = {}   # filepath -> contents
+        self._store = embedding_store
+        self._top_k = top_k
 
     def update(self, files: dict[str, str]):
-        """Store or overwrite file contents."""
+        """Store or overwrite file contents and update embeddings."""
         self._files.update(files)
+        if self._store:
+            for fpath, content in files.items():
+                self._store.add(fpath, content)
 
     def get(self, filepath: str) -> str | None:
         return self._files.get(filepath)
@@ -30,8 +41,31 @@ class FileMemory:
         return dict(self._files)
 
     def related_context(self, step_text: str) -> str:
-        """Build a compact context string with contents of files
-        whose name appears in the step description."""
+        """Build a compact context string with the most relevant files.
+
+        Uses semantic search when embeddings are available, otherwise
+        falls back to filename substring matching.
+        """
+        if self._store and self._store.size > 0:
+            return self._semantic_context(step_text)
+        return self._substring_context(step_text)
+
+    def _semantic_context(self, step_text: str) -> str:
+        """Retrieve context using embedding similarity."""
+        results = self._store.search(step_text, top_k=self._top_k)
+        parts = []
+        for fpath, score in results:
+            content = self._files.get(fpath, "")
+            if content:
+                parts.append(
+                    f"#### [FILE]: {fpath} (relevance: {score:.2f})\n"
+                    f"```\n{content}\n```"
+                )
+        log.debug(f"[FileMemory] Semantic search returned {len(results)} files")
+        return "\n\n".join(parts)
+
+    def _substring_context(self, step_text: str) -> str:
+        """Fallback: match files whose basename appears in the step text."""
         parts = []
         for fpath, content in self._files.items():
             basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
@@ -272,6 +306,10 @@ def main():
                         default="lm_studio", help="The LLM provider to use")
     parser.add_argument("--model", default=Config.DEFAULT_MODEL,
                         help="The model name to use")
+    parser.add_argument("--embed-model", default=Config.EMBEDDING_MODEL,
+                        help="Embedding model name (default: %(default)s)")
+    parser.add_argument("--no-embeddings", action="store_true",
+                        help="Disable semantic embeddings")
     args = parser.parse_args()
 
     # Init LLM
@@ -279,6 +317,14 @@ def main():
         llm_client = OllamaClient(base_url=Config.OLLAMA_BASE_URL, model=args.model)
     else:
         llm_client = LMStudioClient(base_url=Config.LM_STUDIO_BASE_URL, model=args.model)
+
+    # Init embedding store
+    embed_store = None
+    if not args.no_embeddings:
+        embed_store = EmbeddingStore(llm_client, embed_model=args.embed_model)
+        log.info(f"Embeddings enabled (model: {args.embed_model})")
+    else:
+        log.info("Embeddings disabled")
 
     # Init agents
     planner = PlannerAgent("Planner", "Senior Software Architect",
@@ -318,18 +364,18 @@ def main():
     log.info(f"Parsed {len(steps)} steps.")
 
     # --- Step 3: Process each step ---
-    memory = FileMemory()
+    memory = FileMemory(embedding_store=embed_store, top_k=Config.EMBEDDING_TOP_K)
     any_failed = False
 
     for i, step_text in enumerate(steps):
-        log.info(f"\n{'='*60}\nStep {i+1}: {step_text}\nMemory: {memory.summary()}\n{'='*60}")
+        log.info(f"\n{'='*60}\nTask {i+1}: {step_text}\nMemory: {memory.summary()}\n{'='*60}")
 
         # Classify
         display.start_step(i)
         step_type = _classify_step(step_text, llm_client, display, i)
         display.steps[i]["type"] = step_type
         display.render()
-        log.info(f"Step {i+1}: Classified as [{step_type}]")
+        log.info(f"Task {i+1}: Classified as [{step_type}]")
 
         success = True
 

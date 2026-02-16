@@ -5,3 +5,5 @@ class Config:
     LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
     DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek-coder-v2-lite-instruct")
     Context_Window = 1024
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+    EMBEDDING_TOP_K = int(os.getenv("EMBEDDING_TOP_K", "5"))
