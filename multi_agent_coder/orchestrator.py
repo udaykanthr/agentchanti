@@ -377,13 +377,41 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         log.info(f"Step {step_idx+1}: Review:\n{review}")
 
-        if "code looks good" in review.lower():
+        review_lower = review.lower()
+        # Accept if the reviewer explicitly approves
+        approved = any(phrase in review_lower for phrase in (
+            "code looks good",
+            "looks good",
+            "no issues",
+            "no critical issues",
+            "no bugs found",
+            "code is correct",
+            "functionally correct",
+            "lgtm",
+        ))
+
+        if approved:
             display.step_info(step_idx, "Review passed ✔")
             return True, ""
-        else:
-            feedback = review
-            display.step_info(step_idx, "Review found issues, retrying...")
-            log.warning(f"Step {step_idx+1}: Review issues: {review[:200]}")
+
+        # On the last attempt, accept the code if the review only has
+        # minor/style suggestions (no keywords indicating actual bugs)
+        if attempt == MAX_STEP_RETRIES:
+            has_critical = any(kw in review_lower for kw in (
+                "error", "bug", "crash", "undefined", "missing import",
+                "will fail", "won't work", "does not work", "broken",
+                "incorrect", "wrong", "typeerror", "nameerror",
+                "syntaxerror", "attributeerror", "keyerror",
+            ))
+            if not has_critical:
+                display.step_info(step_idx, "Review has only minor suggestions, accepting ✔")
+                log.info(f"Step {step_idx+1}: Accepted on last attempt "
+                         f"(review had no critical keywords)")
+                return True, ""
+
+        feedback = review
+        display.step_info(step_idx, "Review found issues, retrying...")
+        log.warning(f"Step {step_idx+1}: Review issues: {review[:200]}")
 
     log.error(f"Step {step_idx+1}: Failed after {MAX_STEP_RETRIES} attempts.")
     return False, f"Code step failed after {MAX_STEP_RETRIES} attempts.\nLast review feedback:\n{feedback}"
@@ -442,7 +470,24 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
         log.info(f"Step {step_idx+1}: Test review:\n{review}")
 
-        if "code looks good" not in review.lower():
+        review_lower = review.lower()
+        test_approved = any(phrase in review_lower for phrase in (
+            "code looks good", "looks good", "no issues",
+            "no critical issues", "no bugs found", "code is correct",
+            "functionally correct", "lgtm", "tests look good",
+        ))
+
+        # On last attempt, accept if no critical issues found
+        if not test_approved and gen_attempt == MAX_STEP_RETRIES:
+            has_critical = any(kw in review_lower for kw in (
+                "error", "bug", "crash", "undefined", "missing import",
+                "will fail", "won't work", "incorrect", "wrong import",
+            ))
+            if not has_critical:
+                test_approved = True
+                log.info(f"Step {step_idx+1}: Test accepted on last attempt (minor issues only)")
+
+        if not test_approved:
             feedback = review
             display.step_info(step_idx, "Test review found issues, regenerating...")
             continue
@@ -643,8 +688,15 @@ def _looks_like_command(text: str) -> bool:
     # Reject bare file paths
     if _is_file_path(text):
         return False
-    # Known command prefixes (the first word)
-    first_word = text.split()[0].lower().rstrip('.exe')
+    # Extract the first token, splitting on whitespace AND shell operators
+    # so that "echo.>file" splits to "echo." and "type nul > file" splits to "type"
+    first_token = re.split(r'[\s>|&;<]', text)[0].lower()
+    # Strip trailing .exe suffix (not rstrip which eats individual chars)
+    if first_token.endswith('.exe'):
+        first_token = first_token[:-4]
+    # Strip trailing dots (CMD echo. syntax)
+    first_token = first_token.rstrip('.')
+
     known_commands = {
         'pip', 'pip3', 'python', 'python3', 'py',
         'npm', 'npx', 'node', 'yarn', 'pnpm',
@@ -653,13 +705,13 @@ def _looks_like_command(text: str) -> bool:
         'git', 'docker', 'make', 'cmake',
         'mkdir', 'rmdir', 'del', 'copy', 'move', 'ren', 'type', 'dir',
         'ls', 'cat', 'cp', 'mv', 'rm', 'find', 'grep', 'chmod', 'chown',
-        'cd', 'echo', 'set', 'export', 'source',
+        'cd', 'echo', 'set', 'export', 'source', 'touch',
         'curl', 'wget', 'ssh', 'scp',
         'apt', 'apt-get', 'brew', 'choco', 'yum', 'dnf', 'pacman',
         'powershell', 'pwsh', 'cmd',
         'pytest', 'jest', 'tox', 'mypy', 'flake8', 'black', 'ruff',
     }
-    return first_word in known_commands
+    return first_token in known_commands
 
 
 def _extract_commands_from_text(text: str) -> list[str]:

@@ -60,6 +60,8 @@ class EmbeddingStore:
         self.embed_model = embed_model
         # key -> list of (chunk_index, embedding_vector)
         self._vectors: dict[str, List[Tuple[int, List[float]]]] = {}
+        # Track keys that have already failed to avoid spamming warnings
+        self._failed_keys: set[str] = set()
 
     def add(self, key: str, text: str) -> bool:
         """
@@ -77,9 +79,15 @@ class EmbeddingStore:
                 stored_any = True
         if stored_any:
             self._vectors[key] = chunk_vectors
+            self._failed_keys.discard(key)
             log.debug(f"[EmbeddingStore] Stored {len(chunk_vectors)} chunk(s) for '{key}'")
         else:
-            log.warning(f"[EmbeddingStore] Failed to embed '{key}'")
+            if key not in self._failed_keys:
+                log.warning(f"[EmbeddingStore] Failed to embed '{key}' "
+                            f"(falling back to substring matching)")
+                self._failed_keys.add(key)
+            else:
+                log.debug(f"[EmbeddingStore] Still failing to embed '{key}'")
         return stored_any
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
@@ -90,7 +98,7 @@ class EmbeddingStore:
         """
         query_vec = self.llm_client.generate_embedding(query, model=self.embed_model)
         if not query_vec or any(v is None for v in query_vec):
-            log.warning("[EmbeddingStore] Could not embed query, returning empty results")
+            log.debug("[EmbeddingStore] Could not embed query, falling back to substring match")
             return []
 
         scores: dict[str, float] = {}

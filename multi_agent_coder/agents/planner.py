@@ -17,10 +17,18 @@ class PlannerAgent(Agent):
 
 Provide a step-by-step plan as a numbered list.
 Keep each step short and actionable. Do NOT include code in this plan.
+
+IMPORTANT RULES:
+- Base your plan ONLY on what actually exists in the project (see context above).
+- Do NOT assume files exist unless they are listed in the project context.
+- Do NOT include steps to install from requirements.txt or package.json unless those files are confirmed to exist.
+- Do NOT add unnecessary setup steps. Focus on what the task actually needs.
+- Each step should produce a concrete, verifiable result.
+
 For steps that involve running shell commands (scanning files, listing directories,
 installing packages, etc.), include the exact command in backticks, e.g.:
 {_shell_example()}
-  2. Install dependencies with `pip install -r requirements.txt`
+  2. Install a specific package with `pip install pytest`
 
 For each step, if it depends on a previous step being completed first, add (depends: N) or (depends: N, M) at the end of the step.
 Steps with no dependencies can run in parallel.
