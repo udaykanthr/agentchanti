@@ -270,6 +270,7 @@ class Executor:
             # output UTF-8.  This mismatch causes empty/garbled output.
             proc = subprocess.Popen(
                 cmd, shell=True,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=run_env,

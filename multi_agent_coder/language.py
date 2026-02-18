@@ -46,14 +46,14 @@ TEST_FRAMEWORKS = {
         "prefix": "test_",
     },
     "javascript": {
-        "command": "npx jest",
+        "command": "npx jest --forceExit --watchAll=false",
         "dir": "__tests__",
         "ext": ".js",
         "prefix": "",
         "suffix": ".test",
     },
     "typescript": {
-        "command": "npx jest",
+        "command": "npx jest --forceExit --watchAll=false",
         "dir": "__tests__",
         "ext": ".ts",
         "prefix": "",
