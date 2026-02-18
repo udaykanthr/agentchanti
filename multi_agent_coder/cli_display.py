@@ -350,8 +350,9 @@ class CLIDisplay:
                         # TUI unavailable or cancelled — fall through
                         print("  TUI editor not available or cancelled. "
                               "Falling back to text editor.")
-                    except Exception:
-                        print("  TUI editor failed. Using text editor.")
+                    except Exception as e:
+                        print(f"  TUI editor failed ({e}). Using text editor.")
+                        log.warning(f"TUI editor exception: {e}")
                 # Fall back to text editor
                 edited = CLIDisplay._edit_plan_in_editor(steps)
                 if edited:

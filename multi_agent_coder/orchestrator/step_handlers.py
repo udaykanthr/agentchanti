@@ -16,6 +16,8 @@ from ..language import get_code_block_lang, get_test_framework
 from .memory import FileMemory
 from .classification import _extract_command_from_step
 
+from ..diff_display import show_diffs
+
 
 MAX_STEP_RETRIES = 3
 
@@ -228,6 +230,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.warning(f"Step {step_idx+1}: No files parsed from coder response.")
             continue
 
+        # Show diffs before writing
+        show_diffs(files)
+
         written = executor.write_files(files)
         memory.update(files)
         display.step_info(step_idx, f"Written: {', '.join(written)}")
@@ -386,7 +391,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             display.step_info(step_idx, "Test review found issues, regenerating...")
             continue
 
-        # Write and run
+        # Show diffs before writing test files
+        show_diffs(test_files)
+
         written = executor.write_files(test_files)
         memory.update(test_files)
         display.step_info(step_idx, f"Tests written: {', '.join(written)}")
@@ -469,6 +476,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
             fix_files = executor.parse_code_blocks(fix_response)
             if fix_files:
+                show_diffs(fix_files, log_only=True)
                 executor.write_files(fix_files)
                 memory.update(fix_files)
                 code_summary = ""

@@ -2,10 +2,13 @@
 TUI Plan Editor — curses-based interactive plan editing.
 
 Provides arrow-key navigation, inline editing, reordering, and
-step deletion. Falls back to the text editor if curses is unavailable.
+step deletion. Falls back to a lightweight ANSI-based editor
+if curses is unavailable (common on Windows).
 """
 
 from __future__ import annotations
+import sys
+import os
 
 
 def launch_tui_editor(steps: list[str]) -> list[str] | None:
@@ -13,15 +16,143 @@ def launch_tui_editor(steps: list[str]) -> list[str] | None:
 
     Returns the edited steps list, or None if:
     - The user cancelled (pressed 'q')
-    - curses is not available (caller should fall back to text editor)
+    - Both curses and ANSI editors fail
     """
+    # Try curses first (works on Linux/macOS)
     try:
         import curses
         editor = PlanEditorTUI(steps)
         return curses.wrapper(editor._main_loop)
-    except (ImportError, Exception):
-        return None  # fallback to text editor
+    except ImportError:
+        pass  # curses not available (Windows)
+    except Exception as e:
+        _log_warning(f"Curses TUI failed: {e}")
 
+    # Fallback: ANSI-based editor (works everywhere)
+    try:
+        return _ansi_plan_editor(steps)
+    except Exception as e:
+        _log_warning(f"ANSI editor failed: {e}")
+        return None
+
+
+def _log_warning(msg: str):
+    """Try to log; don't fail if logger isn't available."""
+    try:
+        from .cli_display import log
+        log.warning(f"[TUI] {msg}")
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ANSI Plan Editor — no curses required, works on Windows + WSL
+# ══════════════════════════════════════════════════════════════════
+
+def _clear_screen():
+    """Clear terminal screen cross-platform."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def _ansi_plan_editor(steps: list[str]) -> list[str] | None:
+    """Lightweight plan editor using plain print + input.
+
+    Supports: view, edit, add, delete, reorder, approve, cancel.
+    """
+    edited = list(steps)
+
+    while True:
+        _clear_screen()
+        # Header
+        print("\033[1;36m" + "═" * 60 + "\033[0m")
+        print("\033[1;36m  AgentChanti — Plan Editor\033[0m")
+        print("\033[1;36m" + "═" * 60 + "\033[0m")
+        print()
+
+        # Steps
+        for i, step in enumerate(edited):
+            num = f"  \033[33m{i+1:2d}.\033[0m "
+            print(f"{num}{step}")
+        print()
+        print(f"\033[90m  {len(edited)} steps\033[0m")
+        print()
+
+        # Menu
+        print("\033[7m Commands: \033[0m")
+        print("  \033[1ma\033[0m  Add step      "
+              "\033[1me\033[0m  Edit step     "
+              "\033[1md\033[0m  Delete step")
+        print("  \033[1mu\033[0m  Move up       "
+              "\033[1mn\033[0m  Move down     "
+              "\033[1mq\033[0m  Cancel")
+        print("  \033[1;32mEnter\033[0m  Approve plan")
+        print()
+
+        try:
+            choice = input("  \033[1m>\033[0m ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if choice == "" or choice == "approve":
+            return edited if edited else None
+
+        elif choice == "q" or choice == "cancel":
+            return None
+
+        elif choice == "a":
+            try:
+                after = input("  Add after step # (0 for beginning): ").strip()
+                pos = int(after)
+                text = input("  Step text: ").strip()
+                if text:
+                    edited.insert(pos, text)
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+
+        elif choice == "e":
+            try:
+                num = input(f"  Edit step # (1-{len(edited)}): ").strip()
+                idx = int(num) - 1
+                if 0 <= idx < len(edited):
+                    print(f"  Current: {edited[idx]}")
+                    new_text = input("  New text (Enter to keep): ").strip()
+                    if new_text:
+                        edited[idx] = new_text
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+
+        elif choice == "d":
+            try:
+                num = input(f"  Delete step # (1-{len(edited)}): ").strip()
+                idx = int(num) - 1
+                if 0 <= idx < len(edited):
+                    removed = edited.pop(idx)
+                    print(f"  \033[31mRemoved:\033[0m {removed}")
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+
+        elif choice == "u":
+            try:
+                num = input(f"  Move step # up (1-{len(edited)}): ").strip()
+                idx = int(num) - 1
+                if 0 < idx < len(edited):
+                    edited[idx], edited[idx-1] = edited[idx-1], edited[idx]
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+
+        elif choice == "n":
+            try:
+                num = input(f"  Move step # down (1-{len(edited)}): ").strip()
+                idx = int(num) - 1
+                if 0 <= idx < len(edited) - 1:
+                    edited[idx], edited[idx+1] = edited[idx+1], edited[idx]
+            except (ValueError, EOFError, KeyboardInterrupt):
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Curses Plan Editor — full TUI experience on Linux/macOS
+# ══════════════════════════════════════════════════════════════════
 
 class PlanEditorTUI:
     """Curses-based interactive plan editor.

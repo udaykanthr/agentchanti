@@ -4,6 +4,7 @@ Diagnosis and fix helpers — analyze step failures and apply fixes.
 
 from ..executor import Executor
 from ..cli_display import CLIDisplay, token_tracker, log
+from ..diff_display import show_diffs
 
 from .memory import FileMemory
 from .step_handlers import _shell_instructions
@@ -102,6 +103,7 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                          f"fuzzy parser extracted: {list(files.keys())}")
 
         if files:
+            show_diffs(files, log_only=True)
             written = executor.write_files(files)
             memory.update(files)
             display.step_info(step_idx, f"Fixed files: {', '.join(written)}")
