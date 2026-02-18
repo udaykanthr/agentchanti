@@ -6,6 +6,8 @@ from .cli_display import log
 
 
 class Executor:
+    def __init__(self):
+        self._background_processes: List[subprocess.Popen] = []
 
     @staticmethod
     def parse_plan_steps(plan_text: str) -> List[str]:
@@ -241,20 +243,18 @@ class Executor:
                 return True
         return False
 
-    @staticmethod
-    def run_command(cmd: str, env: dict | None = None,
-                    timeout: int = 120) -> Tuple[bool, str]:
+    def run_command(self, cmd: str, env: dict | None = None,
+                    timeout: int = 120, background: bool = False) -> Tuple[bool, str]:
         """
         Runs an arbitrary shell command. Returns (success, output).
         On Windows, auto-wraps PowerShell cmdlets so they don't fail
         in the default cmd.exe shell.
 
-        stdout and stderr are merged into a single stream so that
-        output from test runners (which often write to stderr) is
-        never lost.
+        If *background* is True, the process is started and tracked. The 
+        method waits briefly (3s) to see if it crashes; if not, it returns success.
         """
         try:
-            log.info(f"[Executor] Running command: {cmd}")
+            log.info(f"[Executor] Running {'background ' if background else ''}command: {cmd}")
             if os.name == 'nt' and Executor._needs_powershell(cmd):
                 # Escape double quotes inside the command for PowerShell
                 escaped = cmd.replace('"', '\\"')
@@ -274,6 +274,18 @@ class Executor:
                 stderr=subprocess.STDOUT,
                 env=run_env,
             )
+
+            if background:
+                self._background_processes.append(proc)
+                # Wait briefly to see if it dies instantly (e.g. port already in use)
+                try:
+                    stdout_bytes, _ = proc.communicate(timeout=3)
+                    output = Executor._decode_output(stdout_bytes)
+                    return proc.returncode == 0, output.strip()
+                except subprocess.TimeoutExpired:
+                    # Still running after 3s — assume background success for now
+                    return True, "[Background process started]"
+
             stdout_bytes, _ = proc.communicate(timeout=timeout)
             output = Executor._decode_output(stdout_bytes)
             log.info(f"[Executor] Exit code: {proc.returncode}, "
@@ -301,6 +313,28 @@ class Executor:
         except Exception as e:
             log.error(f"[Executor] Exception running command: {e}")
             return False, str(e)
+
+    def cleanup(self):
+        """Terminate all background processes."""
+        if not self._background_processes:
+            return
+        log.info(f"[Executor] Cleaning up {len(self._background_processes)} background processes")
+        for proc in self._background_processes:
+            try:
+                if proc.poll() is None:  # still running
+                    # On Windows, taskkill is often more reliable for tree cleanup
+                    if os.name == 'nt':
+                         subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                                        capture_output=True)
+                    else:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+            except Exception as e:
+                log.warning(f"[Executor] Failed to cleanup process {proc.pid}: {e}")
+        self._background_processes.clear()
 
     @staticmethod
     def _decode_output(raw: bytes | None) -> str:

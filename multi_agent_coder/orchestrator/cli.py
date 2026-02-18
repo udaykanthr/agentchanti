@@ -532,6 +532,7 @@ def main():
                     "sent": token_tracker.total_prompt_tokens,
                     "recv": token_tracker.total_completion_tokens,
                     "total": token_tracker.total_tokens,
+                    "cost": token_tracker.total_cost,
                 }
                 report_path = generate_html_report(
                     args.task, step_reports, token_usage,
@@ -555,6 +556,9 @@ def main():
                 ok, msg = git_utils.commit_changes(
                     f"AgentChanti (partial): {args.task[:50]}")
                 print(f"  {'Committed!' if ok else 'Commit failed: ' + msg}")
+
+    # ── 15. Cleanup ──
+    executor.cleanup()
 
 
 if __name__ == "__main__":

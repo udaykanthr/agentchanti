@@ -162,10 +162,19 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             log.warning(f"Step {step_idx+1}: LLM returned empty command.")
             return True, ""
 
-    display.step_info(step_idx, f"Running: {cmd}")
-    log.info(f"Step {step_idx+1}: Running command: {cmd}")
+    # Detect if this should be a background command (e.g. starting a server)
+    background_keywords = ("server", "start", "run", "listen", "execute", "watch")
+    is_background = any(kw in step_text.lower() for kw in background_keywords) or \
+                    any(kw in cmd.lower() for kw in ("node", "npm", "python", "flask", "django", "server.py"))
+    
+    if is_background:
+        display.step_info(step_idx, f"Running background: {cmd}")
+        log.info(f"Step {step_idx+1}: Running background command: {cmd}")
+    else:
+        display.step_info(step_idx, f"Running: {cmd}")
+        log.info(f"Step {step_idx+1}: Running command: {cmd}")
 
-    success, output = executor.run_command(cmd)
+    success, output = executor.run_command(cmd, background=is_background)
     log.info(f"Step {step_idx+1}: Command output:\n{output}")
 
     if output:
