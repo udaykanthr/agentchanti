@@ -174,10 +174,26 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             log.warning(f"Step {step_idx+1}: LLM returned empty command.")
             return True, ""
 
-    # Detect if this should be a background command (e.g. starting a server)
-    background_keywords = ("server", "start", "run", "listen", "execute", "watch")
-    is_background = any(kw in step_text.lower() for kw in background_keywords) or \
-                    any(kw in cmd.lower() for kw in ("node", "npm", "python", "flask", "django", "server.py"))
+    # Detect if this should be a background command (e.g. starting a server).
+    # Must be specific — broad keywords like "npm" or "run" cause false
+    # positives that make install/build commands return before completing.
+    import re as _re
+    _bg_cmd_patterns = (
+        r'\bnpm\s+start\b',               # npm start
+        r'\bnpm\s+run\s+(dev|serve|start)\b',  # npm run dev/serve/start
+        r'\bnpx\s+(next|vite|nuxt)\s+dev\b',   # npx next dev, npx vite dev
+        r'\bnode\s+\S*server\S*',          # node server.js, node src/server.ts
+        r'\bpython\s+\S*server\S*',        # python server.py
+        r'\bpython\s+-m\s+(http\.server|flask)\b',
+        r'\bflask\s+run\b',
+        r'\brunserver\b',                   # manage.py runserver (Django)
+        r'\buvicorn\b',
+        r'\bgunicorn\b',
+        r'\bng\s+serve\b',                 # Angular dev server
+        r'\byarn\s+(start|dev)\b',
+        r'\bpnpm\s+(start|dev)\b',
+    )
+    is_background = any(_re.search(p, cmd, _re.IGNORECASE) for p in _bg_cmd_patterns)
     
     if is_background:
         display.step_info(step_idx, f"Running background: {cmd}")
