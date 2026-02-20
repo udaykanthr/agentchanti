@@ -73,8 +73,8 @@ The agents collaborate in a pipeline with built-in retry loops, automatic failur
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/udaykanth-rapeti/myagent.git
-cd myagent
+git clone git@github.com:udaykanthr/agentchanti.git
+cd agentchanti
 
 # 2. Install
 pip install -e .

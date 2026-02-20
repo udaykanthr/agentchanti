@@ -261,6 +261,7 @@ def main():
                 resuming = True
                 log.info("Auto-resuming from checkpoint" if args.auto else "Resuming (--resume)")
             else:
+                display.stop_spinner()
                 resuming = CLIDisplay.prompt_resume(checkpoint_state)
 
     # ── 8. Restore state or create git checkpoint ──
@@ -305,16 +306,38 @@ def main():
                 planner_context += f"\n\n{kb_context}"
                 log.info(f"Injected {knowledge_base.size} knowledge entries into planner")
 
-        plan = planner.process(args.task, context=planner_context)
-        log.info(f"Plan:\n{plan}")
+        MAX_PLAN_RETRIES = 3
+        plan = None
+        raw_steps = None
 
-        # ── 10. Parse steps + dependencies ──
-        display.show_status("Parsing steps...")
-        raw_steps = executor.parse_plan_steps(plan)
-        if not raw_steps:
-            log.error("Could not parse any steps from the plan.")
-            print("\n  [ERROR] Could not parse any steps. Check the log file.\n")
-            return
+        for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
+            display.show_status(
+                f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
+            )
+            plan = planner.process(args.task, context=planner_context)
+            log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
+
+            # ── 10. Parse steps + dependencies ──
+            raw_steps = executor.parse_plan_steps(plan)
+            if not raw_steps:
+                log.warning(f"Plan attempt {plan_attempt}: no steps parsed")
+                if plan_attempt < MAX_PLAN_RETRIES:
+                    continue
+                log.error("Could not parse any steps from the plan.")
+                print("\n  [ERROR] Could not parse any steps. Check the log file.\n")
+                return
+
+            # Validate plan quality
+            is_valid, reason = Executor.validate_plan_quality(raw_steps)
+            if is_valid:
+                break
+
+            log.warning(f"Plan attempt {plan_attempt} rejected: {reason}")
+            if plan_attempt < MAX_PLAN_RETRIES:
+                display.show_status(f"Plan too vague ({reason}), retrying...")
+            else:
+                log.warning(f"Proceeding with low-quality plan after {MAX_PLAN_RETRIES} attempts")
+                print(f"\n  [WARN] Plan quality is low ({reason}). You may want to replan or edit.\n")
 
         steps, dependencies = executor.parse_step_dependencies(raw_steps)
 
@@ -322,6 +345,7 @@ def main():
         if args.auto:
             log.info(f"Auto-approved {len(steps)} steps (--auto mode)")
         while not args.auto:
+            display.stop_spinner()
             # Try TUI editor first, fall back to text-based approval
             action, removed, edited_steps = CLIDisplay.prompt_plan_approval(
                 steps, use_tui=True)
@@ -524,6 +548,7 @@ def main():
                 git_choice = "commit"
                 log.info("Auto-committing changes (--auto mode)")
             else:
+                display.stop_spinner()
                 git_choice = CLIDisplay.prompt_git_action("complete")
             if git_choice == "commit":
                 ok, msg = git_utils.commit_changes(
@@ -558,6 +583,7 @@ def main():
                 git_choice = "skip"
                 log.info("Auto-skipping git rollback (--auto mode)")
             else:
+                display.stop_spinner()
                 git_choice = CLIDisplay.prompt_git_action("failed")
             if git_choice == "rollback":
                 ok, msg = git_utils.rollback_to_branch(checkpoint_branch)

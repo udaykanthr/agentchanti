@@ -86,6 +86,15 @@ class CLIDisplay:
         "skipped":  "–",
     }
 
+    # Spinner frames for waiting animation (ASCII-safe for Windows cp1252)
+    _SPINNER_FRAMES = ["|", "/", "-", "\\"]
+    _WAITING_PHRASES = [
+        "Waiting for response",
+        "Still thinking",
+        "Processing",
+        "Working on it",
+    ]
+
     def __init__(self, task_description: str):
         self.task = task_description
         self.steps: list[dict] = []
@@ -94,6 +103,10 @@ class CLIDisplay:
         self._refresh_size()
         self._render_lock = threading.Lock()
         self._last_stream_render: float = 0.0
+        # Spinner state
+        self._spinner_thread: threading.Thread | None = None
+        self._spinner_stop = threading.Event()
+        self._spinner_message: str = ""
 
     def _refresh_size(self):
         size = shutil.get_terminal_size((80, 24))
@@ -109,62 +122,227 @@ class CLIDisplay:
         sys.stdout.write(f"\033[{row};1H")
 
     def set_steps(self, step_texts: list[str]):
+        self._stop_spinner()
         self.steps = [
             {"text": t, "status": "pending", "type": "?"}
             for t in step_texts
         ]
 
-    def _progress_bar(self) -> str:
+    # ── Color palette ──
+    C_ORANGE = "\033[38;5;208m"
+    C_CYAN   = "\033[38;5;81m"
+    C_GREEN  = "\033[38;5;114m"
+    C_RED    = "\033[38;5;203m"
+    C_YELLOW = "\033[38;5;221m"
+    C_DIM    = "\033[38;5;243m"
+    C_WHITE  = "\033[38;5;255m"
+    C_BOLD   = "\033[1m"
+    C_RESET  = "\033[0m"
+
+    def _ansi_center(self, text: str) -> str:
+        """Center text that contains ANSI codes within terminal width."""
+        vis_len = len(re.sub(r'\033\[[0-9;]*m', '', text))
+        pad = self.term_width - vis_len
+        if pad <= 0:
+            return text
+        lpad = pad // 2
+        return " " * lpad + text
+
+    # ── Spinner animation ──
+
+    def _start_spinner(self, message: str = ""):
+        """Start a background spinner animation for the current waiting state."""
+        self._stop_spinner()  # stop any existing one
+        self._spinner_stop.clear()
+        self._spinner_message = message
+        self._spinner_thread = threading.Thread(
+            target=self._spinner_loop, daemon=True)
+        self._spinner_thread.start()
+
+    def _stop_spinner(self):
+        """Stop the background spinner if running."""
+        if self._spinner_thread and self._spinner_thread.is_alive():
+            self._spinner_stop.set()
+            self._spinner_thread.join(timeout=1.0)
+        self._spinner_thread = None
+
+    def stop_spinner(self):
+        """Public: stop the spinner before interactive prompts."""
+        self._stop_spinner()
+
+    def _spinner_loop(self):
+        """Background loop that animates a spinner on the display."""
+        C = self.C_CYAN; D = self.C_DIM; Y = self.C_YELLOW; R = self.C_RESET
+        frame_idx = 0
+        start_time = _time.monotonic()
+
+        while not self._spinner_stop.is_set():
+            elapsed = _time.monotonic() - start_time
+            mins, secs = divmod(int(elapsed), 60)
+            time_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+
+            # Rotate phrase every 8 seconds
+            phrase_idx = int(elapsed // 8) % len(self._WAITING_PHRASES)
+            phrase = self._WAITING_PHRASES[phrase_idx]
+
+            spinner = self._SPINNER_FRAMES[frame_idx % len(self._SPINNER_FRAMES)]
+            dots = "." * ((frame_idx % 3) + 1)
+            base_msg = self._spinner_message or phrase
+            base_clean = base_msg.rstrip(". ")
+
+            anim_text = f"        {Y}{spinner}{R} {C}{base_clean}{dots:<3}{R} {D}({time_str}){R}"
+
+            try:
+                with self._render_lock:
+                    self._refresh_size()
+                    w = self.term_width
+                    banner_rows = 11
+                    sep_row = self.term_height - 2
+
+                    if self.steps and 0 <= self.current_step < len(self.steps):
+                        # Rebuild to get _spinner_line_idx
+                        step_lines = self._build_step_lines()
+                        avail = sep_row - banner_rows - 1
+                        top_pad = max(0, (avail - len(step_lines)) // 2)
+                        start_row = banner_rows + 1 + top_pad
+
+                        max_vis = max(
+                            (self._vis_len(sl) for sl in step_lines), default=0)
+                        center_pad = max(0, (w - max_vis) // 2)
+
+                        if self._spinner_line_idx >= 0:
+                            # Overwrite the last info line of the active step
+                            target_row = start_row + self._spinner_line_idx
+                        else:
+                            # No info lines yet — put it right after the step header
+                            # Find the active step's first line index
+                            active_line = 0
+                            for idx, step in enumerate(self.steps):
+                                if idx == self.current_step:
+                                    break
+                                active_line += 1
+                            target_row = start_row + active_line + 1
+
+                        if target_row < sep_row:
+                            self._move_to(target_row)
+                            sys.stdout.write("\033[2K")
+                            sys.stdout.write(
+                                " " * center_pad + anim_text)
+                            sys.stdout.flush()
+
+                    elif self.status_message:
+                        avail_height = sep_row - banner_rows
+                        mid_row = banner_rows + max(avail_height // 2 - 1, 1)
+                        spinner_row = mid_row + 1
+                        if spinner_row < sep_row:
+                            self._move_to(spinner_row)
+                            sys.stdout.write("\033[2K")
+                            sys.stdout.write(self._ansi_center(anim_text))
+                            sys.stdout.flush()
+            except (OSError, ValueError):
+                break
+
+            frame_idx += 1
+            self._spinner_stop.wait(0.15)  # ~7 fps
+
+    def _progress_bar_compact(self) -> str:
+        """Short progress bar for status line."""
         total = len(self.steps)
         done = sum(1 for s in self.steps if s["status"] in ("done", "skipped"))
         pct = int((done / total) * 100) if total else 0
-        bar_len = 30
+        bar_len = 15
         filled = int(bar_len * done / total) if total else 0
-        bar = "█" * filled + "░" * (bar_len - filled)
-        return f"[{bar}] {pct}% ({done}/{total})"
+        G = self.C_GREEN; D = self.C_DIM; R = self.C_RESET
+        bar = f"{G}{'█' * filled}{R}{D}{'░' * (bar_len - filled)}{R}"
+        return f"{bar} {pct}% ({done}/{total})"
 
-    def _token_summary(self) -> str:
+    def _vis_len(self, text: str) -> int:
+        """Visible length of text after stripping ANSI codes."""
+        return len(re.sub(r'\033\[[0-9;]*m', '', text))
+
+    def _render_status_bar(self):
+        """Render a status bar: progress centered, tokens+cost right-aligned."""
+        w = self.term_width
         t = token_tracker
-        summary = (
-            f"Tokens  ↑ sent: {t.total_prompt_tokens}  "
-            f"↓ recv: {t.total_completion_tokens}  "
-            f"Σ total: {t.total_tokens}  "
-            f"({t.call_count} calls)"
-        )
+        D = self.C_DIM; W = self.C_WHITE; C = self.C_CYAN
+        G = self.C_GREEN; R = self.C_RESET
+        BG = "\033[48;5;236m"
+
+        # Build the two parts
+        progress = self._progress_bar_compact()
+
+        right = (f"{D}↑{R}{W}{t.total_prompt_tokens:,}{R} "
+                 f"{D}↓{R}{W}{t.total_completion_tokens:,}{R} "
+                 f"{D}Σ{R}{C}{t.total_tokens:,}{R} "
+                 f"{D}{t.call_count} calls{R}")
         if t.total_cost > 0:
-            summary += f"  💰 Cost: ${t.total_cost:.4f}"
-        return summary
+            right += f"  {G}${t.total_cost:.4f}{R}"
+
+        prog_vis = self._vis_len(progress)
+        right_vis = self._vis_len(right)
+
+        # Center the progress bar
+        prog_lpad = max(0, (w - prog_vis) // 2)
+        # Right-align token details (1 char margin)
+        right_start = max(prog_lpad + prog_vis + 1, w - right_vis - 1)
+        gap = max(1, right_start - prog_lpad - prog_vis)
+
+        line = " " * prog_lpad + progress + " " * gap + right
+        line_vis = self._vis_len(line)
+        # Pad to fill full width for background
+        line += " " * max(0, w - line_vis)
+
+        print(f"{BG}{line}{R}", end="")
 
     def _build_step_lines(self) -> list[str]:
-        """Build the step list lines for bottom section."""
+        """Build the step list lines for bottom section.
+
+        Also sets ``self._spinner_line_idx`` to the index within the
+        returned list where the spinner should overwrite (the last info
+        line of the active step), or ``-1`` if there's no suitable line.
+        """
         lines = []
+        self._spinner_line_idx = -1
+        D = self.C_DIM; W = self.C_WHITE; C = self.C_CYAN
+        G = self.C_GREEN; RED = self.C_RED; Y = self.C_YELLOW
+        B = self.C_BOLD; R = self.C_RESET
+
         for i, step in enumerate(self.steps):
-            icon = self.ICONS.get(step["status"], "?")
+            icon_raw = self.ICONS.get(step["status"], "?")
             type_tag = f"[{step['type']}]" if step["type"] != "?" else ""
-            prefix = " → " if i == self.current_step else "   "
+
+            # Color the icon by status
+            icon_color = {"pending": D, "active": Y, "done": G,
+                          "failed": RED, "skipped": D}.get(step["status"], D)
+            icon = f"{icon_color}{icon_raw}{R}"
 
             if i == self.current_step:
-                lines.append(f"{prefix}{icon} Task {i+1}: {step['text']}")
+                prefix = f" {Y}▸{R} "
+                lines.append(f"{prefix}{icon} {B}{W}Step {i+1}:{R} {W}{step['text']}{R}")
                 if type_tag:
-                    lines.append(f"        Type: {type_tag}")
+                    lines.append(f"        {D}Type: {type_tag}{R}")
                 if "info" in step and step["info"]:
                     for info_line in step["info"]:
-                        lines.append(f"        {info_line}")
+                        lines.append(f"        {C}{info_line}{R}")
+                    # Last info line is the spinner target
+                    self._spinner_line_idx = len(lines) - 1
                 if "tokens" in step:
                     t = step["tokens"]
-                    lines.append(f"        Tokens: ↑{t['sent']} ↓{t['recv']}")
+                    lines.append(f"        {D}Tokens: ↑{t['sent']:,} ↓{t['recv']:,}{R}")
             else:
+                prefix = "   "
                 status_label = ""
                 if step["status"] == "done":
-                    status_label = " ✔ done"
+                    status_label = f" {G}done{R}"
                 elif step["status"] == "failed":
-                    status_label = " ✘ failed"
+                    status_label = f" {RED}failed{R}"
                 elif step["status"] == "skipped":
-                    status_label = " – skipped"
+                    status_label = f" {D}skipped{R}"
 
-                line = f"{prefix}{icon} Task {i+1}: {step['text'][:55]}"
+                name_color = D if step["status"] == "pending" else W
+                line = f"{prefix}{icon} {name_color}Step {i+1}:{R} {name_color}{step['text'][:55]}{R}"
                 if type_tag:
-                    line += f" {type_tag}"
+                    line += f" {D}{type_tag}{R}"
                 line += status_label
                 lines.append(line)
         return lines
@@ -179,13 +357,16 @@ class CLIDisplay:
         self._refresh_size()
         w = self.term_width
         h = self.term_height
+        O = self.C_ORANGE
+        D = self.C_DIM
+        W = self.C_WHITE
+        Y = self.C_YELLOW
+        R = self.C_RESET
 
         # Clear screen
         os.system('cls' if os.name == 'nt' else 'clear')
 
-        # ── TOP: Big wild-west title in orange ──
-        ORANGE = "\033[38;5;208m"
-        RESET = "\033[0m"
+        # ── TOP: Banner ──
         banner = [
             r"     _                    _      ____ _                 _   _ ",
             r"    / \   __ _  ___ _ __ | |_   / ___| |__   __ _ _ __ | |_(_)",
@@ -196,47 +377,46 @@ class CLIDisplay:
             r"                    ━━  L o c a l   C o d e r  ━━              ",
         ]
         self._move_to(1)
-        print(f"{ORANGE}{'═' * w}{RESET}")
+        print(f"{O}{'═' * w}{R}")
         for line in banner:
-            print(f"{ORANGE}{self._center(line)}{RESET}")
-        print(f"{ORANGE}{'═' * w}{RESET}")
-        print(self._center(f"Task: {self.task}"))
+            print(f"{O}{self._center(line)}{R}")
+        print(f"{O}{'═' * w}{R}")
+        print(self._ansi_center(f"{D}Task:{R} {W}{self.task}{R}"))
 
-        # ── MIDDLE: Progress + Tokens centered ──
-        step_lines = self._build_step_lines()
-        steps_height = len(step_lines) + 2  # +2 for separator + padding
+        header_end = len(banner) + 4  # banner lines + 2 borders + task line
 
-        # Middle zone: between header and steps section
-        middle_start = len(banner) + 4
-        bottom_start = max(h - steps_height, middle_start + 6)
-        mid_row = (middle_start + bottom_start) // 2 - 2
-
-        self._move_to(mid_row)
+        # Reserve bottom: 1 line status bar + 1 separator
+        status_row = h - 1
+        sep_row = h - 2
 
         if not self.steps and self.status_message:
-            # No steps yet — show planning status
-            YELLOW = "\033[33m"
-            print(self._center(f"{YELLOW}⏳  {self.status_message}{RESET}"))
+            # No steps yet — show planning status centered on screen
+            avail = sep_row - header_end
+            mid_row = header_end + max(avail // 2 - 1, 1)
+            self._move_to(mid_row)
+            #print(self._ansi_center(f"{Y}⏳  {self.status_message}{R}"))
         else:
-            progress_text = f"Progress: {self._progress_bar()}"
-            print(self._center(progress_text))
-            print()
-            print(self._center(self._token_summary()))
+            # ── CENTER: Steps list ──
+            step_lines = self._build_step_lines()
+            avail = sep_row - header_end - 1  # usable rows between header and separator
 
-            # Step-level tokens for active step
-            if 0 <= self.current_step < len(self.steps):
-                step = self.steps[self.current_step]
-                if "tokens" in step:
-                    t = step["tokens"]
-                    step_tok = f"Step {self.current_step+1} tokens: ↑{t['sent']}  ↓{t['recv']}"
-                    print()
-                    print(self._center(step_tok))
+            # Vertically center the step block
+            top_pad = max(0, (avail - len(step_lines)) // 2)
+            start_row = header_end + 1 + top_pad
+            self._move_to(start_row)
 
-        # ── BOTTOM: Steps list ──
-        self._move_to(bottom_start)
-        print("─" * w)
-        for line in step_lines:
-            print(line)
+            # Horizontally center the step block
+            max_vis = max((self._vis_len(sl) for sl in step_lines), default=0)
+            center_pad = max(0, (w - max_vis) // 2)
+
+            for sl in step_lines:
+                print(" " * center_pad + sl)
+
+        # ── BOTTOM: Status bar (pinned) ──
+        self._move_to(sep_row)
+        print(f"{D}{'─' * w}{R}", end="")
+        self._move_to(status_row)
+        self._render_status_bar()
 
         sys.stdout.flush()
 
@@ -244,6 +424,7 @@ class CLIDisplay:
         """Show a status message in the center (before steps are loaded)."""
         self.status_message = message
         self.render()
+        self._start_spinner(message)
 
     def start_step(self, index: int, step_type: str = "?"):
         self.current_step = index
@@ -255,6 +436,7 @@ class CLIDisplay:
 
     def step_info(self, index: int, message: str):
         """Add a log line to the current step's display."""
+        self._stop_spinner()
         if 0 <= index < len(self.steps):
             info_list = self.steps[index].get("info", [])
             if len(info_list) >= 5:
@@ -262,6 +444,13 @@ class CLIDisplay:
             info_list.append(message)
             self.steps[index]["info"] = info_list
         self.render()
+        # Restart spinner for messages that indicate waiting
+        if any(kw in message.lower() for kw in (
+            "generating", "coding", "classifying", "reviewing",
+            "analyzing", "requesting", "running", "installing",
+            "re-planning", "retrying",
+        )):
+            self._start_spinner(message)
 
     def step_tokens(self, index: int, sent: int, recv: int):
         """Update token counts for the active step."""
@@ -274,29 +463,31 @@ class CLIDisplay:
 
     def complete_step(self, index: int, status: str = "done"):
         """Mark step as done/failed/skipped."""
+        self._stop_spinner()
         self.steps[index]["status"] = status
         self.render()
 
     def finish(self, success: bool = True):
-        self._move_to(self.term_height - 1)
+        self._stop_spinner()
+        G = self.C_GREEN; RED = self.C_RED; D = self.C_DIM; R = self.C_RESET
+        self._move_to(self.term_height - 3)
         if success:
-            msg = "✔  All steps processed successfully!"
+            msg = f"{G}✔  All steps processed successfully!{R}"
             if token_tracker.total_cost > 0:
-                msg += f" (Total Cost: ${token_tracker.total_cost:.4f})"
-            print(self._center(msg))
+                msg += f"  {D}(Total Cost: ${token_tracker.total_cost:.4f}){R}"
+            print(self._ansi_center(msg))
         else:
-            print(self._center("✘  Some steps failed. Check logs for details."))
+            print(self._ansi_center(f"{RED}✘  Some steps failed. Check logs for details.{R}"))
         print()
 
     def budget_check(self, limit: float) -> bool:
         """Check if total cost exceeds limit. Returns True if over budget."""
         if limit > 0 and token_tracker.total_cost >= limit:
             with self._render_lock:
-                self._move_to(self.term_height - 2)
-                RED = "\033[31m"
-                RESET = "\033[0m"
-                msg = f"⚠  BUDGET EXCEEDED ($ {token_tracker.total_cost:.4f} >= ${limit:.2f})  ⚠"
-                print(f"{RED}{self._center(msg)}{RESET}")
+                self._move_to(self.term_height - 3)
+                RED = self.C_RED; R = self.C_RESET
+                msg = f"{RED}⚠  BUDGET EXCEEDED (${token_tracker.total_cost:.4f} >= ${limit:.2f})  ⚠{R}"
+                print(self._ansi_center(msg))
             return True
         return False
 

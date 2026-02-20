@@ -9,6 +9,53 @@ class Executor:
     def __init__(self):
         self._background_processes: List[subprocess.Popen] = []
 
+    # Phrases that indicate the model is producing generic filler instead
+    # of an actual plan.  Matched case-insensitively against each step.
+    _VAGUE_STEP_PATTERNS = [
+        r"^implement\b.*\b(core|main|basic|provided|the)\b.*\b(functionality|solution|feature|logic)\b",
+        r"^(begin|start)\b.*\b(simple|basic|clear)\b.*\b(abstraction|understanding|overview)\b",
+        r"^(review|analyze|understand|study)\b.*\b(problem|statement|requirements?|codebase)\b",
+        r"^(set up|setup|configure)\b.*\b(environment|workspace|tooling)\b",
+        r"^(ensure|verify|validate)\b.*\b(everything|all|code)\b.*\b(works?|correct|proper)\b",
+        r"^(finalize|complete|finish)\b.*\b(implementation|solution|project)\b",
+        r"^(test|debug)\b.*\b(thoroughly|completely|everything)\b",
+        r"^(deploy|deliver|submit)\b.*\b(final|completed?|finished)\b",
+        r"^(read|gather|collect)\b.*\b(information|data|input)\b",
+        r"^(write|create)\b.*\b(documentation|docs|readme)\b.*\b(for|about)\b",
+    ]
+
+    @classmethod
+    def validate_plan_quality(cls, steps: List[str]) -> tuple[bool, str]:
+        """Check if parsed plan steps are actionable or generic filler.
+
+        Returns ``(is_valid, reason)``.  A plan is invalid when:
+        - Too few steps (< 1) or too many (> 25)
+        - Majority of steps match vague/generic patterns
+        - Steps are extremely short (avg < 8 chars) suggesting fragments
+        """
+        if not steps:
+            return False, "no steps parsed"
+        if len(steps) > 25:
+            return False, f"too many steps ({len(steps)})"
+
+        avg_len = sum(len(s) for s in steps) / len(steps)
+        if avg_len < 8:
+            return False, "steps are too short / fragmented"
+
+        vague_count = 0
+        for step in steps:
+            for pat in cls._VAGUE_STEP_PATTERNS:
+                if re.search(pat, step, re.IGNORECASE):
+                    vague_count += 1
+                    break
+
+        if len(steps) <= 3 and vague_count >= len(steps):
+            return False, "all steps are generic filler"
+        if vague_count > len(steps) * 0.5:
+            return False, f"{vague_count}/{len(steps)} steps are vague/generic"
+
+        return True, ""
+
     @staticmethod
     def parse_plan_steps(plan_text: str) -> List[str]:
         """
@@ -31,14 +78,23 @@ class Executor:
                     steps.append(step_text)
         return steps
 
+    # Generic placeholder path segments that local models hallucinate
+    _PLACEHOLDER_SEGMENTS = {
+        'path', 'to', 'your', 'my', 'the', 'project', 'folder',
+        'directory', 'example', 'sample', 'some', 'filename',
+        'yourproject', 'myproject', 'your_project', 'my_project',
+    }
+
     @staticmethod
     def _sanitize_filename(raw: str) -> str:
         """Clean up LLM-generated filenames that may contain junk.
 
         Also blocks path traversal (``../``) so that LLM output can
         never write files outside the project directory.
+        Returns empty string for clearly invalid/placeholder paths.
         """
-        name = raw.strip()
+        # Reject anything with newlines (multi-line capture mistake)
+        name = raw.split('\n')[0].strip()
         # Strip trailing parenthetical descriptions: "file.py (main file)"
         name = re.sub(r'\s*\(.*?\)\s*$', '', name)
         # Strip trailing comments: "file.py # main module"
@@ -56,7 +112,50 @@ class Executor:
         name = '/'.join(parts)
         # Remove leading slashes (absolute paths → relative)
         name = name.lstrip('/')
-        return name.strip()
+        name = name.strip()
+
+        # Reject if too long (real filenames rarely exceed 200 chars)
+        if len(name) > 200:
+            return ""
+        # Reject if it contains spaces (almost never valid in code paths)
+        if ' ' in name:
+            return ""
+        # Reject placeholder paths like "path/to/file.py", "your/project/app.js"
+        if parts:
+            dir_parts = {p.lower() for p in parts[:-1]}  # all except filename
+            if dir_parts & Executor._PLACEHOLDER_SEGMENTS:
+                return ""
+
+        return name
+
+    @staticmethod
+    def _looks_like_code(content: str) -> bool:
+        """Return True if *content* looks like actual code rather than prose.
+
+        Local models sometimes return natural-language paragraphs instead of
+        code.  This heuristic catches the most obvious cases so we don't
+        write garbage files to disk.
+        """
+        lines = content.strip().splitlines()
+        if not lines:
+            return False
+        # Prose indicator: average line length > 120 chars (code is usually shorter)
+        avg_len = sum(len(l) for l in lines) / len(lines)
+        if avg_len > 120:
+            return False
+        # Prose indicator: majority of lines start with uppercase letter
+        # (sentences) rather than code-like characters (import, def, {, <, etc.)
+        if len(lines) >= 3:
+            prose_starts = sum(
+                1 for l in lines
+                if l.strip() and l.strip()[0].isupper()
+                and not l.strip().startswith(('I', 'If', 'In'))  # allow some keywords
+                or l.strip().startswith(('The ', 'This ', 'It ', 'Please ', 'Here ',
+                                         'A ', 'An ', 'I am ', 'I can '))
+            )
+            if prose_starts > len(lines) * 0.5:
+                return False
+        return True
 
     @staticmethod
     def parse_code_blocks(text: str) -> Dict[str, str]:
@@ -74,8 +173,20 @@ class Executor:
             # Skip if filename still looks invalid
             if not filename or '/' not in filename and '.' not in filename:
                 continue
+            # Skip if content looks like prose rather than code
+            if not Executor._looks_like_code(content):
+                log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
+                continue
             files[filename] = content
         return files
+
+    @staticmethod
+    def _try_add_file(files: Dict[str, str], filename: str, content: str):
+        """Add file to *files* dict only if the content looks like real code."""
+        if not Executor._looks_like_code(content):
+            log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
+            return
+        files[filename] = content
 
     @staticmethod
     def parse_code_blocks_fuzzy(text: str) -> Dict[str, str]:
@@ -120,9 +231,9 @@ class Executor:
                     else:
                         content_lines.append(line)
                 if content_lines:
-                    files[filename] = "\n".join(content_lines)
+                    Executor._try_add_file(files, filename, "\n".join(content_lines))
             else:
-                files[filename] = rest.rstrip("\n")
+                Executor._try_add_file(files, filename, rest.rstrip("\n"))
 
         if files:
             return files
@@ -152,7 +263,7 @@ class Executor:
                 elif not line.startswith('-') and not line.startswith('@@'):
                     content_lines.append(line)
             if content_lines:
-                files[filename] = "\n".join(content_lines)
+                Executor._try_add_file(files, filename, "\n".join(content_lines))
 
         if files:
             return files
@@ -167,7 +278,7 @@ class Executor:
             filename = Executor._sanitize_filename(raw)
             if not filename or ('/' not in filename and '.' not in filename):
                 continue
-            files[filename] = m.group(3).rstrip("\n")
+            Executor._try_add_file(files, filename, m.group(3).rstrip("\n"))
 
         if files:
             return files
@@ -181,7 +292,7 @@ class Executor:
                 filename = Executor._sanitize_filename(fname_match.group(1))
                 if filename and ('/' in filename or '.' in filename):
                     rest = block.split("\n", 1)[1] if "\n" in block else ""
-                    files[filename] = rest.rstrip("\n")
+                    Executor._try_add_file(files, filename, rest.rstrip("\n"))
 
         return files
 
