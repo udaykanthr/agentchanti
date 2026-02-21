@@ -92,8 +92,6 @@ def _shell_examples() -> str:
 _NON_CODE_EXTENSIONS = {
     '.md', '.txt', '.rst', '.log', '.csv',
     '.yml', '.yaml', '.toml', '.ini', '.cfg',
-    '.json', '.xml',
-    '.html', '.css',
     '.env', '.env.example', '.gitignore', '.dockerignore',
     '.editorconfig',
 }
