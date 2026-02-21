@@ -132,7 +132,7 @@ class GeminiClient(LLMClient):
     def generate_embedding(self, text: str, model: Optional[str] = None) -> List[float]:
         # Ignore local-only model names that aren't valid on the Gemini API
         if model and (model in self._LOCAL_ONLY_EMBED_MODELS
-                      or not model.startswith(("text-embedding", "embedding-", "models/"))):
+                      or not model.startswith(("text-embedding", "embedding-", "models/", "gemini-embedding"))):
             log.warning(f"[Gemini] Embedding model '{model}' is not a valid "
                         f"Gemini API model, using 'text-embedding-004' instead")
             model = None
