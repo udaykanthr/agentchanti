@@ -163,12 +163,16 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         sent_before = token_tracker.total_prompt_tokens
         recv_before = token_tracker.total_completion_tokens
 
-        cmd = llm_client.generate_response(gen_prompt).strip()
+        cmd_response = llm_client.generate_response(gen_prompt).strip()
 
         sent_delta = token_tracker.total_prompt_tokens - sent_before
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
+        if cmd_response:
+            display.add_llm_log(cmd_response, source="Coder")
+
+        cmd = cmd_response
         cmd = cmd.strip('`').strip()
         if cmd.startswith('```'):
             cmd = cmd.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
@@ -287,6 +291,10 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
+        explanation = CLIDisplay.extract_explanation(fix_response)
+        if explanation:
+            display.add_llm_log(explanation, source="Coder")
+
         fix_files = executor.parse_code_blocks(fix_response)
         if not fix_files:
             fix_files = executor.parse_code_blocks_fuzzy(fix_response)
@@ -338,6 +346,10 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
+        explanation = CLIDisplay.extract_explanation(response)
+        if explanation:
+            display.add_llm_log(explanation, source="Coder")
+
         files = executor.parse_code_blocks(response)
         if not files:
             feedback = "No file markers found. Use #### [FILE]: path/to/file.py format."
@@ -381,6 +393,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         sent_delta = token_tracker.total_prompt_tokens - sent_before
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
+
+        if review:
+            display.add_llm_log(review, source="Reviewer")
 
         log.info(f"Step {step_idx+1}: Review:\n{review}")
 
@@ -478,6 +493,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
+        explanation = CLIDisplay.extract_explanation(test_response)
+        if explanation:
+            display.add_llm_log(explanation, source="Tester")
+
         test_files = executor.parse_code_blocks(test_response)
         if not test_files:
             feedback = "No test files found. Use #### [FILE]: format."
@@ -498,6 +517,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         sent_delta = token_tracker.total_prompt_tokens - sent_before
         recv_delta = token_tracker.total_completion_tokens - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
+
+        if review:
+            display.add_llm_log(review, source="Reviewer")
 
         log.info(f"Step {step_idx+1}: Test review:\n{review}")
 
@@ -629,6 +651,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             sent_delta = token_tracker.total_prompt_tokens - sent_before
             recv_delta = token_tracker.total_completion_tokens - recv_before
             display.step_tokens(step_idx, sent_delta, recv_delta)
+
+            explanation = CLIDisplay.extract_explanation(fix_response)
+            if explanation:
+                display.add_llm_log(explanation, source="Coder")
 
             fix_files = executor.parse_code_blocks(fix_response)
             if fix_files:

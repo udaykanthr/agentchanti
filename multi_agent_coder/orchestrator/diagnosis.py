@@ -89,6 +89,10 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     recv_delta = token_tracker.total_completion_tokens - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
+    explanation = CLIDisplay.extract_explanation(diagnosis)
+    if explanation:
+        display.add_llm_log(explanation, source="Diagnosis")
+
     log.info(f"Step {step_idx+1}: Diagnosis:\n{diagnosis}")
     return diagnosis
 

@@ -103,6 +103,9 @@ class CLIDisplay:
         self._refresh_size()
         self._render_lock = threading.Lock()
         self._last_stream_render: float = 0.0
+        self._header_end = 4  # compact header rows
+        self._left_pane_width = 24
+        self._llm_log: list[str] = []
         # Spinner state
         self._spinner_thread: threading.Thread | None = None
         self._spinner_stop = threading.Event()
@@ -116,6 +119,137 @@ class CLIDisplay:
     def _center(self, text: str) -> str:
         """Center text within terminal width."""
         return text.center(self.term_width)
+
+    def _wrap_task(self, text: str, width: int, max_lines: int = 2) -> list[str]:
+        """Wrap and truncate task description to fit within given width."""
+        if width <= 0 or not text:
+            return []
+        text = text.strip()
+        if not text:
+            return []
+        lines = []
+        remaining = text
+        for i in range(max_lines):
+            if not remaining:
+                break
+            if len(remaining) <= width:
+                lines.append(remaining)
+                break
+            if i == max_lines - 1:
+                lines.append(remaining[:max(0, width - 3)] + "...")
+            else:
+                cut = remaining.rfind(' ', 0, width)
+                if cut <= 0:
+                    cut = width
+                lines.append(remaining[:cut])
+                remaining = remaining[cut:].lstrip()
+        return lines
+
+    # Regex to strip LLM special tokens: <|...|>, <|...|, <<...>>, [|...|] etc.
+    _GIBBERISH_RE = re.compile(
+        r'<\|[^|>]*\|?>|'       # <|token|> or <|token
+        r'<<[^>]*>>|'            # <<token>>
+        r'\[\|[^|\]]*\|?\]|'    # [|token|] or [|token]
+        r'<\/?s>|'               # <s> </s> (sentence tokens)
+        r'\[INST\]|\[\/INST\]|'  # [INST] [/INST] (Llama chat tokens)
+        r'\[UNUSED_TOKEN_\d+\]'  # [UNUSED_TOKEN_145] etc.
+    )
+    # Characters that count as "readable" for the gibberish ratio check
+    _READABLE_RE = re.compile(r'[a-zA-Z0-9\s]')
+
+    @classmethod
+    def _sanitize_line(cls, text: str) -> str:
+        """Strip LLM special tokens and gibberish from a single line."""
+        if not text:
+            return ""
+        original_len = len(text)
+        # Remove known special token patterns
+        cleaned = cls._GIBBERISH_RE.sub('', text).strip()
+        if not cleaned:
+            return ""
+        # If most of the original was special tokens, the leftover is likely junk
+        if original_len > 10 and len(cleaned) / original_len < 0.4:
+            return ""
+        # Strip orphaned quotes/brackets left after token removal
+        cleaned = cleaned.strip("'\"[](){}<>,;:|`")
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return ""
+        # Reject lines that are mostly non-readable characters
+        readable = len(cls._READABLE_RE.findall(cleaned))
+        if len(cleaned) > 3 and readable / len(cleaned) < 0.4:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def extract_explanation(response: str) -> str:
+        """Extract non-code explanation text from an LLM response."""
+        lines = response.splitlines()
+        result = []
+        in_code = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            if stripped.startswith("#### [FILE]:"):
+                continue
+            cleaned = CLIDisplay._sanitize_line(stripped)
+            if cleaned:
+                result.append(cleaned)
+        return "\n".join(result)
+
+    def add_llm_log(self, text: str, source: str = ""):
+        """Add LLM thinking text to the log pane.
+
+        *source*: agent label e.g. 'Coder', 'Reviewer', 'Tester', 'Diagnosis'
+        """
+        added = False
+        if source:
+            self._llm_log.append(f"[{source}]")
+        for line in text.splitlines():
+            cleaned = self._sanitize_line(line.strip())
+            if cleaned:
+                self._llm_log.append(f"  {cleaned}" if source else cleaned)
+                added = True
+        if added:
+            self._llm_log.append("")  # blank separator
+            self.render()
+
+    def _build_log_lines(self, width: int, max_lines: int) -> list[str]:
+        """Build wrapped log lines for the right pane (auto-scroll to latest)."""
+        if width <= 0 or not self._llm_log:
+            return []
+        C = self.C_CYAN; G = self.C_GREEN; Y = self.C_YELLOW
+        RED = self.C_RED; O = self.C_ORANGE; D = self.C_DIM; R = self.C_RESET
+        _SRC_COLORS = {
+            "Coder": C, "Reviewer": G, "Tester": Y, "Diagnosis": RED,
+        }
+        wrapped: list[str] = []
+        for entry in self._llm_log:
+            if not entry:
+                wrapped.append("")
+                continue
+            # Color source header lines like "[Coder]"
+            if entry.startswith("[") and "]" in entry:
+                tag = entry[1:entry.index("]")]
+                color = _SRC_COLORS.get(tag, O)
+                wrapped.append(f"{color}▸ {entry}{R}")
+                continue
+            # Word-wrap regular lines
+            remaining = entry
+            while remaining and len(remaining) > width:
+                cut = remaining.rfind(' ', 0, width)
+                if cut <= 0:
+                    cut = width
+                wrapped.append(f"{D}{remaining[:cut]}{R}")
+                remaining = remaining[cut:].lstrip()
+            if remaining:
+                wrapped.append(f"{D}{remaining}{R}")
+        # Auto-scroll: show the last N lines
+        return wrapped[-max_lines:] if len(wrapped) > max_lines else wrapped
 
     def _move_to(self, row: int):
         """Move cursor to a specific row (1-indexed)."""
@@ -181,7 +315,6 @@ class CLIDisplay:
             mins, secs = divmod(int(elapsed), 60)
             time_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
 
-            # Rotate phrase every 8 seconds
             phrase_idx = int(elapsed // 8) % len(self._WAITING_PHRASES)
             phrase = self._WAITING_PHRASES[phrase_idx]
 
@@ -190,60 +323,43 @@ class CLIDisplay:
             base_msg = self._spinner_message or phrase
             base_clean = base_msg.rstrip(". ")
 
-            anim_text = f"        {Y}{spinner}{R} {C}{base_clean}{dots:<3}{R} {D}({time_str}){R}"
+            anim_text = f"{Y}{spinner}{R} {C}{base_clean}{dots:<3}{R} {D}({time_str}){R}"
 
             try:
                 with self._render_lock:
                     self._refresh_size()
-                    w = self.term_width
-                    banner_rows = 11
+                    header_end = self._header_end
                     sep_row = self.term_height - 2
 
-                    if self.steps and 0 <= self.current_step < len(self.steps):
-                        # Rebuild to get _spinner_line_idx
-                        step_lines = self._build_step_lines()
-                        avail = sep_row - banner_rows - 1
-                        top_pad = max(0, (avail - len(step_lines)) // 2)
-                        start_row = banner_rows + 1 + top_pad
+                    if self.steps:
+                        # Two-pane mode: show spinner in right pane
+                        left_w = self._left_pane_width
+                        right_col = left_w + 3
+                        content_start = header_end + 3
+                        content_height = max(0, sep_row - content_start)
+                        spinner_row = content_start + content_height - 1
 
-                        max_vis = max(
-                            (self._vis_len(sl) for sl in step_lines), default=0)
-                        center_pad = max(0, (w - max_vis) // 2)
-
-                        if self._spinner_line_idx >= 0:
-                            # Overwrite the last info line of the active step
-                            target_row = start_row + self._spinner_line_idx
-                        else:
-                            # No info lines yet — put it right after the step header
-                            # Find the active step's first line index
-                            active_line = 0
-                            for idx, step in enumerate(self.steps):
-                                if idx == self.current_step:
-                                    break
-                                active_line += 1
-                            target_row = start_row + active_line + 1
-
-                        if target_row < sep_row:
-                            self._move_to(target_row)
-                            sys.stdout.write("\033[2K")
+                        if content_start < spinner_row < sep_row:
                             sys.stdout.write(
-                                " " * center_pad + anim_text)
+                                f"\033[{spinner_row};{right_col}H\033[K"
+                                f"{anim_text}")
                             sys.stdout.flush()
 
                     elif self.status_message:
-                        avail_height = sep_row - banner_rows
-                        mid_row = banner_rows + max(avail_height // 2 - 1, 1)
+                        avail_height = sep_row - header_end
+                        mid_row = header_end + max(avail_height // 2 - 1, 1)
                         spinner_row = mid_row + 1
                         if spinner_row < sep_row:
                             self._move_to(spinner_row)
                             sys.stdout.write("\033[2K")
-                            sys.stdout.write(self._ansi_center(anim_text))
+                            sys.stdout.write(self._ansi_center(
+                                f"        {anim_text}"))
                             sys.stdout.flush()
             except (OSError, ValueError):
                 break
 
             frame_idx += 1
-            self._spinner_stop.wait(0.15)  # ~7 fps
+            self._spinner_stop.wait(0.15)
 
     def _progress_bar_compact(self) -> str:
         """Short progress bar for status line."""
@@ -295,56 +411,35 @@ class CLIDisplay:
         print(f"{BG}{line}{R}", end="")
 
     def _build_step_lines(self) -> list[str]:
-        """Build the step list lines for bottom section.
-
-        Also sets ``self._spinner_line_idx`` to the index within the
-        returned list where the spinner should overwrite (the last info
-        line of the active step), or ``-1`` if there's no suitable line.
-        """
+        """Build compact step list: icon Task N  status."""
         lines = []
-        self._spinner_line_idx = -1
-        D = self.C_DIM; W = self.C_WHITE; C = self.C_CYAN
+        D = self.C_DIM; W = self.C_WHITE
         G = self.C_GREEN; RED = self.C_RED; Y = self.C_YELLOW
         B = self.C_BOLD; R = self.C_RESET
 
         for i, step in enumerate(self.steps):
             icon_raw = self.ICONS.get(step["status"], "?")
-            type_tag = f"[{step['type']}]" if step["type"] != "?" else ""
-
-            # Color the icon by status
             icon_color = {"pending": D, "active": Y, "done": G,
                           "failed": RED, "skipped": D}.get(step["status"], D)
             icon = f"{icon_color}{icon_raw}{R}"
 
             if i == self.current_step:
-                prefix = f" {Y}▸{R} "
-                lines.append(f"{prefix}{icon} {B}{W}Step {i+1}:{R} {W}{step['text']}{R}")
-                if type_tag:
-                    lines.append(f"        {D}Type: {type_tag}{R}")
-                if "info" in step and step["info"]:
-                    for info_line in step["info"]:
-                        lines.append(f"        {C}{info_line}{R}")
-                    # Last info line is the spinner target
-                    self._spinner_line_idx = len(lines) - 1
-                if "tokens" in step:
-                    t = step["tokens"]
-                    lines.append(f"        {D}Tokens: ↑{t['sent']:,} ↓{t['recv']:,}{R}")
+                prefix = f" {Y}▸{R}"
             else:
-                prefix = "   "
-                status_label = ""
-                if step["status"] == "done":
-                    status_label = f" {G}done{R}"
-                elif step["status"] == "failed":
-                    status_label = f" {RED}failed{R}"
-                elif step["status"] == "skipped":
-                    status_label = f" {D}skipped{R}"
+                prefix = "  "
 
-                name_color = D if step["status"] == "pending" else W
-                line = f"{prefix}{icon} {name_color}Step {i+1}:{R} {name_color}{step['text'][:55]}{R}"
-                if type_tag:
-                    line += f" {D}{type_tag}{R}"
-                line += status_label
-                lines.append(line)
+            label = f"Task {i + 1}"
+            status = step["status"]
+            name_color = W if status != "pending" else D
+
+            if status == "pending":
+                status_text = ""
+            else:
+                sc = {"active": Y, "done": G, "failed": RED,
+                      "skipped": D}.get(status, D)
+                status_text = f" {sc}{status}{R}"
+
+            lines.append(f"{prefix} {icon} {name_color}{label}{R}{status_text}")
         return lines
 
     def render(self):
@@ -366,51 +461,91 @@ class CLIDisplay:
         # Clear screen
         os.system('cls' if os.name == 'nt' else 'clear')
 
-        # ── TOP: Banner ──
-        banner = [
-            r"     _                    _      ____ _                 _   _ ",
-            r"    / \   __ _  ___ _ __ | |_   / ___| |__   __ _ _ __ | |_(_)",
-            r"   / _ \ / _` |/ _ \ '_ \| __| | |   | '_ \ / _` | '_ \| __| |",
-            r"  / ___ \ (_| |  __/ | | | |_  | |___| | | | (_| | | | | |_| |",
-            r" /_/   \_\__, |\___|_| |_|\__|  \____|_| |_|\__,_|_| |_|\__|_|",
-            r"         |___/                                                 ",
-            r"                    ━━  L o c a l   C o d e r  ━━              ",
-        ]
+        # ── TOP: Compact left-aligned brand + task description ──
+        brand_text = "Agent Chanti"
+        sub_text = "\u2501\u2501 Local Coder \u2501\u2501"
+        brand_col = max(len(brand_text), len(sub_text)) + 4
+
+        task_start = brand_col + 3
+        task_width = max(0, w - task_start - 1)
+        task_lines = self._wrap_task(self.task, task_width, max_lines=2)
+        t1 = task_lines[0] if len(task_lines) > 0 else ""
+        t2 = task_lines[1] if len(task_lines) > 1 else ""
+
         self._move_to(1)
         print(f"{O}{'═' * w}{R}")
-        for line in banner:
-            print(f"{O}{self._center(line)}{R}")
+        gap1 = " " * max(1, brand_col - len(brand_text) - 2)
+        print(f"  {O}{self.C_BOLD}{brand_text}{R}{gap1}{D}\u2502{R} {W}{t1}{R}")
+        gap2 = " " * max(1, brand_col - len(sub_text) - 2)
+        print(f"  {D}{sub_text}{R}{gap2}{D}\u2502{R} {D}{t2}{R}")
         print(f"{O}{'═' * w}{R}")
-        print(self._ansi_center(f"{D}Task:{R} {W}{self.task}{R}"))
 
-        header_end = len(banner) + 4  # banner lines + 2 borders + task line
+        header_end = 4
+        self._header_end = header_end
 
         # Reserve bottom: 1 line status bar + 1 separator
         status_row = h - 1
         sep_row = h - 2
 
+        left_w = self._left_pane_width
+        right_w = max(0, w - left_w - 3)  # 3 for " │ "
+
         if not self.steps and self.status_message:
-            # No steps yet — show planning status centered on screen
+            # No steps yet — show planning status centered
             avail = sep_row - header_end
             mid_row = header_end + max(avail // 2 - 1, 1)
             self._move_to(mid_row)
-            #print(self._ansi_center(f"{Y}⏳  {self.status_message}{R}"))
         else:
-            # ── CENTER: Steps list ──
+            # ── CENTER: Two-pane layout ──
+            B = self.C_BOLD
+            pane_row = header_end + 1
+            self._move_to(pane_row)
+
+            # Pane headers
+            lh = f"  {B}{W}Steps{R}"
+            rh = f"{B}{W}LLM Thinking{R}"
+            lh_pad = " " * max(0, left_w - 7)  # 7 = len("  Steps")
+            print(f"{lh}{lh_pad}{D}\u2502{R} {rh}")
+
+            # Pane separator line
+            hl = "\u2500"  # ─
+            print(f"{D}{hl * left_w}\u253c{hl * (w - left_w - 1)}{R}")
+
+            content_start = pane_row + 2
+            content_height = max(0, sep_row - content_start)
+
             step_lines = self._build_step_lines()
-            avail = sep_row - header_end - 1  # usable rows between header and separator
+            log_lines = self._build_log_lines(right_w, content_height)
 
-            # Vertically center the step block
-            top_pad = max(0, (avail - len(step_lines)) // 2)
-            start_row = header_end + 1 + top_pad
-            self._move_to(start_row)
+            # Show scroll indicator if log overflows
+            has_more = len(self._llm_log) > 0 and len(log_lines) == content_height
 
-            # Horizontally center the step block
-            max_vis = max((self._vis_len(sl) for sl in step_lines), default=0)
-            center_pad = max(0, (w - max_vis) // 2)
+            for row_i in range(content_height):
+                self._move_to(content_start + row_i)
 
-            for sl in step_lines:
-                print(" " * center_pad + sl)
+                # Left pane
+                if row_i < len(step_lines):
+                    left = step_lines[row_i]
+                else:
+                    left = ""
+                lv = self._vis_len(left)
+                lpad = " " * max(0, left_w - lv)
+
+                # Right pane
+                if row_i < len(log_lines):
+                    right = log_lines[row_i]
+                else:
+                    right = ""
+
+                sys.stdout.write(f"{left}{lpad}{D}\u2502{R} {right}\033[K\n")
+
+            # Scroll indicator at bottom of right pane
+            if has_more:
+                ind_row = sep_row - 1
+                if ind_row > content_start:
+                    ind_text = f"{D}\u2500\u2500\u25bc\u2500\u2500{R}"
+                    ind_col = left_w + 3 + max(0, (right_w - 5) // 2)
+                    sys.stdout.write(f"\033[{ind_row};{ind_col}H{ind_text}")
 
         # ── BOTTOM: Status bar (pinned) ──
         self._move_to(sep_row)
