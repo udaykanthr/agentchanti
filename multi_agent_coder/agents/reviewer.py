@@ -56,11 +56,19 @@ KNOWN PROJECT FILES:
    - Tests that test nothing (empty test bodies, no assertions).
    - Tests that will always pass regardless of implementation.
 
+──────── SCOPE RESTRICTION (CRITICAL) ────────
+You MUST restrict your review ONLY to the code changes relevant to the
+current step.  Do NOT review, comment on, or suggest changes to code that
+was NOT modified by this step.  If unrelated code has pre-existing issues,
+IGNORE them — they are out of scope.
+
 ──────── DO NOT FLAG ────────
 - Code style, naming conventions, or missing docstrings
 - Minor refactoring opportunities
 - Performance suggestions (unless it causes a bug)
 - Missing edge-case tests (focus on whether EXISTING tests are correct)
+- Pre-existing issues in code NOT touched by this step
+- Formatting, whitespace, or comment style in unmodified code
 
 ──────── OUTPUT FORMAT ────────
 If ALL mandatory checks pass and the code will work correctly:

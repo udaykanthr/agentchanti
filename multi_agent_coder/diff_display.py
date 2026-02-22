@@ -147,6 +147,23 @@ def _detect_hazards(filepath: str, old_content: str, new_content: str) -> list[t
              # We will flag a WARNING for ANY edit to package.json to be safe, asking user to confirm.
              hazards.append((HAZARD_WARN, "Verify this is not a manual dependency edit (use `npm install` instead)."))
 
+    # 4. Unicode corruption (mojibake) detection
+    # Check if the new content introduces common UTF-8→Latin-1 corruption
+    # patterns that weren't present in the old content.
+    import re
+    _MOJIBAKE_PATTERNS = [
+        r'â\x80[\x93\x94\x98\x99\x9c\x9d\x9e\xa2\xa6]',  # em/en dash, quotes, bullet, ellipsis
+        r'Ã[©¨¼¶¤±§]',  # accented chars corrupted
+    ]
+    for pat in _MOJIBAKE_PATTERNS:
+        old_matches = len(re.findall(pat, old_content))
+        new_matches = len(re.findall(pat, new_content))
+        if new_matches > old_matches:
+            hazards.append((HAZARD_WARN,
+                            f"Possible Unicode corruption (mojibake) detected — "
+                            f"special characters may have been corrupted."))
+            break  # one warning is enough
+
     return hazards
 
 

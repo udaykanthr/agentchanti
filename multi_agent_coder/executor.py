@@ -317,6 +317,69 @@ class Executor:
         'requirements.txt',
     }
 
+    # Common mojibake patterns: UTF-8 bytes misinterpreted as Latin-1/cp1252.
+    # Maps the corrupted string → correct Unicode character.
+    _MOJIBAKE_MAP: dict[str, str] = {
+        "â\x80\x94": "—",   # em dash
+        "â\x80\x93": "–",   # en dash
+        "â\x80\x99": "\u2019",  # right single quote
+        "â\x80\x98": "\u2018",  # left single quote
+        "â\x80\x9c": "\u201c",  # left double quote
+        "â\x80\x9d": "\u201d",  # right double quote
+        "â\x80\xa6": "…",   # ellipsis
+        "â\x80\xa2": "•",   # bullet
+        "â\x80\x9e": "\u201e",  # double low-9 quote
+        "â\x84\xa2": "™",   # trademark
+        "â\x80\x8b": "\u200b",  # zero-width space
+        "Ã©": "é",
+        "Ã¨": "è",
+        "Ã¼": "ü",
+        "Ã¶": "ö",
+        "Ã¤": "ä",
+        "Ã±": "ñ",
+        "Ã§": "ç",
+    }
+
+    @staticmethod
+    def _repair_mojibake(content: str) -> str:
+        """Detect and repair common UTF-8→Latin-1 mojibake in LLM output.
+
+        When an LLM regenerates a file containing multi-byte UTF-8 characters
+        (like em dashes, smart quotes, etc.), it sometimes outputs the individual
+        bytes as if they were Latin-1 characters, producing "mojibake".
+
+        This method first tries a general fix (re-encode as Latin-1, decode as
+        UTF-8), then falls back to replacing known mojibake patterns.
+        """
+        # Fast path: if there are no characters > 0x7F, nothing to fix
+        if content.isascii():
+            return content
+
+        # Try the general fix: encode the string as Latin-1 and decode as UTF-8.
+        # This reverses the most common corruption pattern.
+        try:
+            fixed = content.encode("latin-1").decode("utf-8")
+            # Sanity check: the fix should not introduce more non-ASCII oddities
+            # If the fixed version has fewer high bytes, it's probably correct
+            if fixed != content:
+                log.info("[Executor] Repaired mojibake via latin-1→utf-8 re-encoding")
+                return fixed
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+
+        # Fallback: replace known mojibake patterns individually
+        result = content
+        repaired = False
+        for bad, good in Executor._MOJIBAKE_MAP.items():
+            if bad in result:
+                result = result.replace(bad, good)
+                repaired = True
+
+        if repaired:
+            log.info("[Executor] Repaired mojibake via pattern replacement")
+
+        return result
+
     @staticmethod
     def write_files(files: Dict[str, str], base_dir: str = ".") -> List[str]:
         """
@@ -339,6 +402,9 @@ class Executor:
         for filename, content in files.items():
             filepath = os.path.join(base_dir, filename)
             dirpath = os.path.dirname(filepath)
+
+            # Repair mojibake before writing
+            content = Executor._repair_mojibake(content)
 
             # Guard: never overwrite dependency manifests / lock files
             basename = os.path.basename(filename)

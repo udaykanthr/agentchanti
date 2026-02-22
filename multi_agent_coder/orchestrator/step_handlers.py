@@ -325,6 +325,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     feedback = ""
     context_window = cfg.CONTEXT_WINDOW if cfg else 8192
     ctx_budget = int(context_window * 0.8)
+    prev_files: dict[str, str] = {}  # Track files from previous attempt
 
     for attempt in range(1, MAX_STEP_RETRIES + 1):
         context = f"Task: {task}"
@@ -335,6 +336,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             context += f"\nAll project files: {memory.summary()}"
         if feedback:
             context += f"\nFeedback: {feedback}"
+            # On retry, tell the coder to ONLY fix the flagged issues
+            context += (
+                "\n\nCRITICAL: Only fix the specific issues mentioned in the "
+                "feedback above. Do NOT modify any code that is unrelated to "
+                "the feedback. Preserve ALL existing content, formatting, and "
+                "special characters exactly as they are. Only output the "
+                "file(s) that need changes."
+            )
 
         display.step_info(step_idx, f"Coding (attempt {attempt}/{MAX_STEP_RETRIES})...")
         sent_before = token_tracker.total_prompt_tokens
@@ -357,6 +366,13 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.warning(f"Step {step_idx+1}: No files parsed from coder response.")
             continue
 
+        # On retry, merge: keep previously approved files that weren't
+        # re-generated, so the coder doesn't need to regenerate everything
+        if attempt > 1 and prev_files:
+            merged = dict(prev_files)
+            merged.update(files)  # new files override previous
+            files = merged
+
         # Auto-fix hazardous diffs before showing to user
         files = _auto_fix_hazards(files, coder, executor, display, step_idx,
                                   step_text, language=language)
@@ -369,6 +385,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: User rejected diff, retrying.")
             continue
 
+        prev_files = dict(files)  # Save for potential merge on retry
         written = executor.write_files(files)
         memory.update(files)
         display.step_info(step_idx, f"Written: {', '.join(written)}")
@@ -379,14 +396,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: Skipped review (non-code files: {list(files.keys())})")
             return True, ""
 
-        # Review
+        # Review — pass step description so reviewer scopes to this step
         display.step_info(step_idx, "Reviewing code...")
         sent_before = token_tracker.total_prompt_tokens
         recv_before = token_tracker.total_completion_tokens
 
         review = reviewer.process(
-            f"Review this code:\n{response}",
-            context=f"Step: {step_text}",
+            f"Review this code for the step: {step_text}\n\n{response}",
+            context=f"Step: {step_text}\nOnly review changes relevant to this step.",
             language=language,
         )
 
@@ -437,6 +454,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
     log.error(f"Step {step_idx+1}: Failed after {MAX_STEP_RETRIES} attempts.")
     return False, f"Code step failed after {MAX_STEP_RETRIES} attempts.\nLast review feedback:\n{feedback}"
+
 
 
 def _normalize_fix_paths(fix_files: dict[str, str],
@@ -686,15 +704,45 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx, "Tests passed ✔")
                 return True, ""
 
-            # Detect stuck loop: same error output repeating means code
-            # fixes aren't helping (likely an infra/tool issue, not code)
-            if prev_output and output == prev_output and run_attempt > 1:
-                display.step_info(step_idx,
-                                  "Same error repeating — not a code issue, stopping retry loop.")
-                log.warning(f"Step {step_idx+1}: Identical test output on attempt "
-                            f"{run_attempt}, breaking retry loop.")
-                break
+            # Extract error classes for smarter deduplication
+            import re as _re
+            _error_classes = set(_re.findall(
+                r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+                r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
+                r'AssertionError|KeyError|ValueError)',
+                output or ""
+            ))
+
+            # Detect stuck loop: compare error classes, not just exact output
+            if prev_output and run_attempt > 1:
+                prev_error_classes = set(_re.findall(
+                    r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+                    r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
+                    r'AssertionError|KeyError|ValueError)',
+                    prev_output or ""
+                ))
+                if _error_classes and _error_classes == prev_error_classes:
+                    display.step_info(step_idx,
+                                      "Same error types repeating — fix not working, stopping.")
+                    log.warning(f"Step {step_idx+1}: Same error classes on attempt "
+                                f"{run_attempt}: {_error_classes}, breaking retry loop.")
+                    break
+                if output == prev_output:
+                    display.step_info(step_idx,
+                                      "Same error repeating — not a code issue, stopping retry loop.")
+                    log.warning(f"Step {step_idx+1}: Identical test output on attempt "
+                                f"{run_attempt}, breaking retry loop.")
+                    break
             prev_output = output
+
+            # Early exit for unfixable error types
+            _unfixable = _error_classes & {'SyntaxError', 'IndentationError'}
+            if _unfixable and run_attempt > 1:
+                display.step_info(step_idx,
+                                  f"Persistent {', '.join(_unfixable)} — likely unfixable, stopping.")
+                log.warning(f"Step {step_idx+1}: Unfixable errors after "
+                            f"{run_attempt} attempts: {_unfixable}")
+                break
 
             # Detect system-level / environment failures early — these
             # can't be fixed by editing code (e.g. missing Gemfile,
@@ -750,18 +798,26 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 else:
                     log.warning(f"Step {step_idx+1}: Package install failed: {install_out}")
 
-            # Early exit: if the same error repeats across gen attempts,
+            # Early exit: if the same error type repeats across gen attempts,
             # the fix isn't working — break to avoid wasting LLM calls
-            if prev_gen_error and output == prev_gen_error:
-                display.step_info(step_idx,
-                                  "Same test error repeating across attempts — stopping.")
-                log.warning(f"Step {step_idx+1}: Identical test error across gen "
-                            f"attempts, breaking retry loop.")
-                break
+            if prev_gen_error:
+                prev_gen_classes = set(_re.findall(
+                    r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+                    r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
+                    r'AssertionError|KeyError|ValueError)',
+                    prev_gen_error or ""
+                ))
+                if (output == prev_gen_error or
+                        (_error_classes and _error_classes == prev_gen_classes)):
+                    display.step_info(step_idx,
+                                      "Same test error repeating across attempts — stopping.")
+                    log.warning(f"Step {step_idx+1}: Same error types across gen "
+                                f"attempts: {_error_classes}, breaking retry loop.")
+                    break
             prev_gen_error = output
 
             display.step_info(step_idx, "Tests failed, asking coder to fix...")
-            error_detail = output[:500] if output else f"(command `{test_cmd}` produced no output — it may have crashed or the test framework may not be installed)"
+            error_detail = output[:1000] if output else f"(command `{test_cmd}` produced no output — it may have crashed or the test framework may not be installed)"
 
             # Build a more specific fix prompt that restricts changes to test files
             test_file_list = ", ".join(test_files.keys())
