@@ -121,10 +121,19 @@ class CLIDisplay:
         return text.center(self.term_width)
 
     def _wrap_task(self, text: str, width: int, max_lines: int = 2) -> list[str]:
-        """Wrap and truncate task description to fit within given width."""
+        """Wrap and truncate task description to fit within given width.
+
+        Large prompts are pre-truncated so only the first ``max_lines``
+        worth of characters are processed.
+        """
         if width <= 0 or not text:
             return []
-        text = text.strip()
+        # Collapse to a single line and pre-truncate to avoid processing
+        # extremely long prompt text (e.g. loaded from a file).
+        text = " ".join(text.split())
+        max_chars = max_lines * width + 20  # small slack for word-break
+        if len(text) > max_chars:
+            text = text[:max_chars]
         if not text:
             return []
         lines = []
@@ -503,7 +512,24 @@ class CLIDisplay:
 
             # Pane headers
             lh = f"  {B}{W}Steps{R}"
-            rh = f"{B}{W}LLM Thinking{R}"
+            # Show active task description beside LLM Thinking header
+            active_desc = ""
+            if 0 <= self.current_step < len(self.steps):
+                active_desc = self.steps[self.current_step].get("text", "")
+            rh_label = "LLM Thinking"
+            if active_desc:
+                # Truncate to 1 line: reserve space for label + separator
+                sep = " \u2500 "
+                max_desc = right_w - len(rh_label) - len(sep)
+                if max_desc > 10:
+                    desc = " ".join(active_desc.split())
+                    if len(desc) > max_desc:
+                        desc = desc[:max(0, max_desc - 3)] + "..."
+                    rh = f"{B}{W}{rh_label}{R}{D}{sep}{Y}{desc}{R}"
+                else:
+                    rh = f"{B}{W}{rh_label}{R}"
+            else:
+                rh = f"{B}{W}{rh_label}{R}"
             lh_pad = " " * max(0, left_w - 7)  # 7 = len("  Steps")
             print(f"{lh}{lh_pad}{D}\u2502{R} {rh}")
 
