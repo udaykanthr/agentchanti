@@ -681,7 +681,7 @@ class CLIDisplay:
         # ── Centre the block vertically in the remaining space ──
         avail = h - header_end - 2  # leave 2 rows margin at bottom
         block_height = len(report_lines)
-        start_row = header_end + max((avail - block_height) // 2, 1)
+        start_row = header_end #+ max((avail - block_height) // 2, 1)
 
         for i, line in enumerate(report_lines):
             self._move_to(start_row + i)
