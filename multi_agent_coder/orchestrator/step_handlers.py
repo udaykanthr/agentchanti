@@ -778,7 +778,19 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       display: CLIDisplay, step_idx: int,
                       language: str | None = None,
                       cfg: Config | None = None,
-                      auto: bool = False) -> tuple[bool, str]:
+                      auto: bool = False,
+                      code_graph=None) -> tuple[bool, str]:
+    # --- Diff-aware editing path ---
+    if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
+        diff_result = _try_diff_edit(
+            step_text=step_text, coder=coder, task=task,
+            memory=memory, display=display, step_idx=step_idx,
+            language=language, cfg=cfg, code_graph=code_graph,
+        )
+        if diff_result is not None:
+            return diff_result
+        # diff_result is None → fallback to full-file flow below
+
     feedback = ""
     context_window = cfg.CONTEXT_WINDOW if cfg else 8192
     ctx_budget = int(context_window * 0.8)
@@ -1417,3 +1429,269 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
     log.error(f"Step {step_idx+1}: Could not generate valid tests after {MAX_TEST_GEN_RETRIES} attempts.")
     return False, f"Could not generate valid tests after {MAX_TEST_GEN_RETRIES} attempts.\nLast feedback:\n{feedback}"
+
+
+# ---------------------------------------------------------------------------
+# Diff-aware editing (Phase 5)
+# ---------------------------------------------------------------------------
+
+def _try_diff_edit(
+    *,
+    step_text: str,
+    coder: CoderAgent,
+    task: str,
+    memory: FileMemory,
+    display: CLIDisplay,
+    step_idx: int,
+    language: str | None,
+    cfg: Config,
+    code_graph,
+) -> tuple[bool, str] | None:
+    """Attempt a diff-aware edit.  Returns ``(success, error_info)`` on
+    success, or ``None`` to signal the caller should fall back to the
+    full-file flow.
+    """
+    import re as _re
+
+    try:
+        from ..editing.scope_resolver import ScopeResolver
+        from ..editing.context_slicer import ContextSlicer
+        from ..editing.diff_parser import DiffParser
+        from ..editing.patch_applier import PatchApplier
+        from ..editing.metrics import log_edit_metric
+    except ImportError as exc:
+        log.debug("[DiffEdit] editing module not available: %s", exc)
+        return None
+
+    # Identify target file from step text or memory
+    target_file = _detect_target_file(step_text, memory)
+    if not target_file:
+        log.debug("[DiffEdit] No target file identified from step text")
+        return None
+
+    # Check the file actually exists on disk
+    if not os.path.isfile(target_file):
+        log.debug("[DiffEdit] Target file does not exist: %s", target_file)
+        return None
+
+    display.step_info(step_idx, f"[DiffEdit] Resolving scope for {os.path.basename(target_file)}...")
+
+    # 1. Resolve scope
+    resolver = ScopeResolver(code_graph)
+    scope = resolver.resolve(step_text, target_file, code_graph)
+
+    min_conf = getattr(cfg, "EDITING_MIN_CONFIDENCE", 0.60)
+    if scope.confidence < min_conf:
+        log.warning(
+            "[DiffEdit] Confidence %.2f < %.2f for %s, falling back",
+            scope.confidence, min_conf, target_file,
+        )
+        _log_fallback_metric(cfg, target_file, step_text, scope, "low_confidence")
+        return None
+
+    # 2. Slice files
+    ctx_lines = getattr(cfg, "EDITING_CONTEXT_LINES", 5)
+    slicer = ContextSlicer()
+
+    scopes_map: dict = {}
+    for af in scope.affected_files:
+        scopes_map[af] = scope
+
+    slices = slicer.slice_files(scopes_map)
+    formatted = slicer.format_for_prompt(slices)
+
+    # Compute token stats
+    full_file_lines = 0
+    sliced_lines = 0
+    for fslice in slices.values():
+        full_file_lines += fslice.total_lines
+        sliced_lines += sum(b.line_end - b.line_start + 1 for b in fslice.slices)
+        if fslice.imports_block:
+            sliced_lines += fslice.imports_block.count("\n") + 1
+
+    display.step_info(step_idx, f"[DiffEdit] Sending {sliced_lines}/{full_file_lines} lines to LLM...")
+
+    # 3. Build diff prompt and call LLM
+    diff_prompt = _build_diff_prompt(step_text, formatted)
+    sent_before = token_tracker.total_prompt_tokens
+    recv_before = token_tracker.total_completion_tokens
+
+    llm_response = coder.llm_client.generate_response(diff_prompt)
+
+    sent_delta = token_tracker.total_prompt_tokens - sent_before
+    recv_delta = token_tracker.total_completion_tokens - recv_before
+    display.step_tokens(step_idx, sent_delta, recv_delta)
+
+    # 4. Parse diff
+    parser = DiffParser()
+    parsed = parser.parse(llm_response)
+
+    if parsed is None:
+        log.warning("[DiffEdit] LLM did not return valid diff format, falling back")
+        _log_fallback_metric(cfg, target_file, step_text, scope, "parse_failed")
+        return None
+
+    # Validate hunks against actual file content
+    file_contents: dict[str, list[str]] = {}
+    for patch in parsed.file_patches:
+        try:
+            with open(patch.file_path, "r", encoding="utf-8", errors="replace") as f:
+                file_contents[patch.file_path] = f.readlines()
+        except OSError:
+            pass
+
+    parsed = parser.validate(parsed, file_contents)
+    if parsed is None or not parsed.parse_successful:
+        log.warning("[DiffEdit] >50%% hunks invalid, falling back")
+        _log_fallback_metric(cfg, target_file, step_text, scope, "validation_failed")
+        return None
+
+    # 5. Apply patches
+    fuzzy_window = getattr(cfg, "EDITING_FUZZY_MATCH_WINDOW", 3)
+    validate_syntax = getattr(cfg, "EDITING_VALIDATE_SYNTAX", True)
+    fallback_syntax = getattr(cfg, "EDITING_FALLBACK_ON_SYNTAX_ERROR", True)
+
+    applier = PatchApplier(
+        fuzzy_match_window=fuzzy_window,
+        validate_syntax=validate_syntax,
+        fallback_on_syntax_error=fallback_syntax,
+    )
+    result = applier.apply(parsed)
+
+    if not result.success:
+        log.warning("[DiffEdit] Patch apply failed: %s", result.error)
+        _log_fallback_metric(cfg, target_file, step_text, scope, f"apply_failed: {result.error}")
+        return None
+
+    # Update memory with modified files
+    for fpath in result.files_modified:
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                memory.update({fpath: f.read()})
+        except OSError:
+            pass
+
+    display.step_info(
+        step_idx,
+        f"[DiffEdit] Applied {result.hunks_applied} hunk(s) to "
+        f"{len(result.files_modified)} file(s)"
+    )
+
+    # Log metrics
+    if getattr(cfg, "EDITING_TRACK_METRICS", True):
+        reduction = (
+            round((1 - sliced_lines / full_file_lines) * 100, 1)
+            if full_file_lines > 0 else 0
+        )
+        log_edit_metric({
+            "file": target_file,
+            "task_length_chars": len(step_text),
+            "resolution_method": scope.resolution_method,
+            "confidence": round(scope.confidence, 2),
+            "full_file_lines": full_file_lines,
+            "sliced_lines_sent": sliced_lines,
+            "token_reduction_pct": reduction,
+            "hunks_applied": result.hunks_applied,
+            "hunks_failed": result.hunks_failed,
+            "fallback_used": False,
+            "syntax_valid": result.syntax_valid,
+            "affected_files_count": len(scope.affected_files),
+        })
+
+    return True, ""
+
+
+def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
+    """Try to identify the target file for editing from the step text."""
+    import re as _re
+
+    # Look for explicit file path mentions in the step text
+    known_files = list(memory.all_files().keys())
+
+    # Direct mention of a known file path
+    for fpath in known_files:
+        if fpath in step_text:
+            return fpath
+
+    # Check for basename mention
+    for fpath in known_files:
+        basename = os.path.basename(fpath)
+        if basename and basename in step_text and basename.count(".") > 0:
+            return fpath
+
+    # Look for file-path-like patterns in the step text
+    path_pattern = _re.compile(r'[\w/\\]+\.\w{1,5}')
+    for m in path_pattern.finditer(step_text):
+        candidate = m.group().replace("\\", "/")
+        for fpath in known_files:
+            if fpath.endswith(candidate) or candidate.endswith(fpath):
+                return fpath
+
+    # If only one file in memory, use it
+    if len(known_files) == 1:
+        return known_files[0]
+
+    return None
+
+
+def _build_diff_prompt(task_description: str, formatted_slices: str) -> str:
+    """Build the LLM prompt requesting a structured diff response."""
+    return f"""You are editing existing code. You will receive minimal file slices, not full files.
+You MUST respond with ONLY a diff in the exact format specified.
+NEVER rewrite the full file. NEVER include unchanged lines in your response.
+ALWAYS use the exact line numbers shown in the slice annotations.
+
+Task: {task_description}
+
+{formatted_slices}
+
+Respond with ONLY a diff in this exact format — nothing else:
+
+@@DIFF_START@@
+FILE: {{file_path}}
+<<<<<<< ORIGINAL (line {{n}})
+{{exact original lines}}
+=======
+{{replacement lines}}
+>>>>>>> UPDATED
+@@DIFF_END@@
+
+Rules:
+- Use line numbers from the slice annotations
+- Only include blocks that actually change
+- Preserve indentation exactly
+- If no changes needed for a file, omit it entirely
+- ORIGINAL block must match the slice content exactly
+- For multiple changes in the same file, include multiple ORIGINAL/UPDATED blocks under the same FILE header
+- For changes across multiple files, include multiple FILE sections"""
+
+
+def _log_fallback_metric(
+    cfg: Config,
+    target_file: str,
+    step_text: str,
+    scope,
+    reason: str,
+) -> None:
+    """Log a fallback metric entry."""
+    if not getattr(cfg, "EDITING_TRACK_METRICS", True):
+        return
+    try:
+        from ..editing.metrics import log_edit_metric
+        log_edit_metric({
+            "file": target_file,
+            "task_length_chars": len(step_text),
+            "resolution_method": scope.resolution_method,
+            "confidence": round(scope.confidence, 2),
+            "full_file_lines": 0,
+            "sliced_lines_sent": 0,
+            "token_reduction_pct": 0,
+            "hunks_applied": 0,
+            "hunks_failed": 0,
+            "fallback_used": True,
+            "fallback_reason": reason,
+            "syntax_valid": True,
+            "affected_files_count": len(scope.affected_files),
+        })
+    except Exception:
+        pass

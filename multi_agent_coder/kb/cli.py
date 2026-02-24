@@ -551,6 +551,39 @@ def _cmd_global_search(args: argparse.Namespace) -> None:
     print(f"\n  Search time: {elapsed_ms:.1f}ms")
 
 
+def _cmd_edit_stats(args: argparse.Namespace) -> None:
+    """Show rolling DiffEdit statistics."""
+    from ..editing.metrics import read_edit_stats
+
+    project_root = _project_root()
+    last_n = getattr(args, "last_n", 50)
+    stats = read_edit_stats(last_n=last_n, project_root=project_root)
+
+    if stats["total_edits"] == 0:
+        print("No DiffEdit metrics found yet.")
+        print("Metrics are recorded when diff-aware editing is used during task execution.")
+        return
+
+    print(f"\n┌─────────────────────────────────────┐")
+    print(f"│ DiffEdit Stats (last {last_n} edits){' ' * max(0, 8 - len(str(last_n)))}│")
+    print(f"├─────────────────────────────────────┤")
+    print(f"│ Total edits:          {stats['total_edits']:<13}│")
+    print(f"│ Avg token reduction:  {stats['avg_token_reduction']:<6.0f}%{' ' * 6}│")
+    print(f"│ Success rate:         {stats['success_rate']:<6.0f}%{' ' * 6}│")
+    print(f"│ Fallback rate:        {stats['fallback_rate']:<6.0f}%{' ' * 6}│")
+    print(f"│ Avg confidence:       {stats['avg_confidence']:<13.2f}│")
+
+    methods = stats.get("resolution_methods", {})
+    if methods:
+        print(f"│ Resolution methods:{' ' * 18}│")
+        for method, pct in methods.items():
+            label = f"  {method}:"
+            print(f"│ {label:<22}{pct:<6.0f}%{' ' * 6}│")
+
+    print(f"└─────────────────────────────────────┘")
+    print()
+
+
 def _cmd_health(args: argparse.Namespace) -> None:
     """Show overall KB health report."""
     from .health import check, format_health, to_json
@@ -771,6 +804,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Machine-readable JSON output",
     )
     health_p.set_defaults(func=_cmd_health)
+
+    # =======================================================================
+    # Phase 5 — DiffEdit stats
+    # =======================================================================
+
+    # --- edit-stats ---
+    editstats_p = subparsers.add_parser(
+        "edit-stats", help="Show rolling DiffEdit performance statistics"
+    )
+    editstats_p.add_argument(
+        "--last-n", dest="last_n", type=int, default=50,
+        help="Number of recent edits to include in stats (default: 50)",
+    )
+    editstats_p.set_defaults(func=_cmd_edit_stats)
 
     return parser
 

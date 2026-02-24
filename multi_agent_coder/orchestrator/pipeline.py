@@ -151,7 +151,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                   language: str | None, cfg=None,
                   auto: bool = False,
                   search_agent=None,
-                  kb_context_builder=None) -> tuple[int, bool, str]:
+                  kb_context_builder=None,
+                  code_graph=None) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
     Catches all exceptions so that a crash inside any handler never
@@ -203,10 +204,14 @@ def _execute_step(step_idx: int, step_text: str, *,
             display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "CODE":
+            # Extract code graph from kb_context_builder if available
+            _graph = code_graph
+            if _graph is None and kb_context_builder is not None:
+                _graph = getattr(kb_context_builder, "_graph", None)
             success, error_info = _handle_code_step(
                 step_text, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language, cfg=cfg,
-                auto=auto)
+                auto=auto, code_graph=_graph)
             display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "TEST":

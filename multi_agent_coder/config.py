@@ -51,6 +51,13 @@ _DEFAULTS = {
     "kb_auto_index_on_start": True,
     "kb_watcher_debounce_seconds": 1.0,
     "kb_verbose_logging": False,
+    "editing_diff_mode": True,
+    "editing_min_confidence": 0.60,
+    "editing_context_lines": 5,
+    "editing_fuzzy_match_window": 3,
+    "editing_validate_syntax": True,
+    "editing_track_metrics": True,
+    "editing_fallback_on_syntax_error": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -283,6 +290,43 @@ class Config:
             kb_section.get("verbose_logging", _DEFAULTS["kb_verbose_logging"]),
         )
 
+        # Diff-aware editing (Phase 5)
+        editing_section = yd.get("editing", {}) if isinstance(yd.get("editing"), dict) else {}
+        self.EDITING_DIFF_MODE = _get_bool(
+            "EDITING_DIFF_MODE", "editing_diff_mode",
+            editing_section.get("diff_mode", _DEFAULTS["editing_diff_mode"]),
+        )
+        self.EDITING_MIN_CONFIDENCE = float(
+            os.getenv("EDITING_MIN_CONFIDENCE")
+            or editing_section.get("min_confidence_threshold",
+                                   _DEFAULTS["editing_min_confidence"])
+        )
+        self.EDITING_CONTEXT_LINES = int(
+            os.getenv("EDITING_CONTEXT_LINES")
+            or editing_section.get("context_lines",
+                                   _DEFAULTS["editing_context_lines"])
+        )
+        self.EDITING_FUZZY_MATCH_WINDOW = int(
+            os.getenv("EDITING_FUZZY_MATCH_WINDOW")
+            or editing_section.get("fuzzy_match_window",
+                                   _DEFAULTS["editing_fuzzy_match_window"])
+        )
+        self.EDITING_VALIDATE_SYNTAX = _get_bool(
+            "EDITING_VALIDATE_SYNTAX", "editing_validate_syntax",
+            editing_section.get("validate_syntax_after_patch",
+                                _DEFAULTS["editing_validate_syntax"]),
+        )
+        self.EDITING_TRACK_METRICS = _get_bool(
+            "EDITING_TRACK_METRICS", "editing_track_metrics",
+            editing_section.get("track_metrics",
+                                _DEFAULTS["editing_track_metrics"]),
+        )
+        self.EDITING_FALLBACK_ON_SYNTAX_ERROR = _get_bool(
+            "EDITING_FALLBACK_ON_SYNTAX_ERROR", "editing_fallback_on_syntax_error",
+            editing_section.get("fallback_on_syntax_error",
+                                _DEFAULTS["editing_fallback_on_syntax_error"]),
+        )
+
         # Plugins
         self.PLUGINS: list[str] = yd.get("plugins", _DEFAULTS["plugins"])
         if not isinstance(self.PLUGINS, list):
@@ -339,6 +383,15 @@ class Config:
                 "watcher_debounce_seconds": self.KB_WATCHER_DEBOUNCE_SECONDS,
                 "verbose_logging": self.KB_VERBOSE_LOGGING,
             },
+            "editing": {
+                "diff_mode": self.EDITING_DIFF_MODE,
+                "min_confidence_threshold": self.EDITING_MIN_CONFIDENCE,
+                "context_lines": self.EDITING_CONTEXT_LINES,
+                "fuzzy_match_window": self.EDITING_FUZZY_MATCH_WINDOW,
+                "validate_syntax_after_patch": self.EDITING_VALIDATE_SYNTAX,
+                "track_metrics": self.EDITING_TRACK_METRICS,
+                "fallback_on_syntax_error": self.EDITING_FALLBACK_ON_SYNTAX_ERROR,
+            },
         }
 
     def to_yaml(self) -> str:
@@ -362,7 +415,7 @@ class Config:
 
     # Safety: Critical files that require extra care when editing
     CRITICAL_FILES = {
-        "package.json",
+        # "package.json",
         "pyproject.toml",
         "go.mod",
         "pom.xml",

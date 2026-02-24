@@ -254,8 +254,12 @@ def main():
     if cfg.KB_ENABLED and not args.no_kb:
         try:
             import os as _os
+            from ..kb.startup import KBStartupManager
             from ..kb.context_builder import ContextBuilder
             from ..kb.runtime_watcher import RuntimeWatcher
+
+            # Smart startup check — handles Qdrant, global KB, local KB
+            KBStartupManager().run(project_root=_os.getcwd())
 
             kb_context_builder = ContextBuilder(project_root=_os.getcwd())
             kb_runtime_watcher = RuntimeWatcher(
