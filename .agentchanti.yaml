@@ -13,7 +13,7 @@ openai:
   api_key: ''
   base_url: https://api.openai.com/v1
 gemini:
-  api_key: 'AIzaSyDB1DYoxMfq-sJO7ZI5nNxW59HF_m583vo'
+  api_key: ''
   base_url: https://generativelanguage.googleapis.com/v1beta
 anthropic:
   api_key: ''
