@@ -14,7 +14,10 @@ from ..agents.reviewer import ReviewerAgent
 from ..agents.tester import TesterAgent
 from ..executor import Executor
 from ..cli_display import CLIDisplay, token_tracker, log
-from ..language import get_code_block_lang, get_test_framework
+from ..language import (
+    get_code_block_lang, get_test_framework, detect_test_runner,
+    detect_language_from_files,
+)
 
 from .memory import FileMemory
 from .classification import _extract_command_from_step
@@ -56,6 +59,10 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         has_jest_globals: bool — True if @jest/globals is installed
         has_jest_config: bool — True if jest.config.* exists
         module_type: str    — "module" or "commonjs"
+        test_runner: str    — "vitest", "jest", or "jest" (default)
+        has_vitest: bool    — True if vitest in devDependencies
+        has_vitest_config: bool — True if vitest.config.* exists
+        has_tsx: bool       — True if .tsx files exist in project
     """
     env = {
         "is_esm": False,
@@ -63,6 +70,10 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         "has_jest_globals": False,
         "has_jest_config": False,
         "module_type": "commonjs",
+        "test_runner": "jest",
+        "has_vitest": False,
+        "has_vitest_config": False,
+        "has_tsx": False,
     }
 
     # Read package.json
@@ -79,12 +90,21 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
             env["is_esm"] = True
             env["module_type"] = "module"
 
-        # Jest in dependencies
+        # Dependency detection
         all_deps = {}
         all_deps.update(pkg.get("dependencies", {}))
         all_deps.update(pkg.get("devDependencies", {}))
         env["has_jest"] = "jest" in all_deps
         env["has_jest_globals"] = "@jest/globals" in all_deps
+        env["has_vitest"] = "vitest" in all_deps
+
+    # Vitest config detection
+    for config_name in ("vitest.config.ts", "vitest.config.js",
+                        "vitest.config.mts", "vitest.config.mjs"):
+        cfg_path = os.path.join(cwd, config_name) if cwd else config_name
+        if os.path.isfile(cfg_path):
+            env["has_vitest_config"] = True
+            break
 
     # Jest config detection
     for config_name in ("jest.config.js", "jest.config.ts", "jest.config.mjs",
@@ -93,6 +113,20 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         if os.path.isfile(cfg_path):
             env["has_jest_config"] = True
             break
+
+    # Determine test runner: prefer Vitest if detected
+    if env["has_vitest_config"] or env["has_vitest"]:
+        env["test_runner"] = "vitest"
+    elif env["has_jest_config"] or env["has_jest"]:
+        env["test_runner"] = "jest"
+
+    # Check for .tsx files (useful for React testing guidance)
+    scan_dir = cwd or "."
+    if os.path.isdir(os.path.join(scan_dir, "src")):
+        for root, _dirs, files in os.walk(os.path.join(scan_dir, "src")):
+            if any(f.endswith(".tsx") for f in files):
+                env["has_tsx"] = True
+                break
 
     return env
 
@@ -1057,11 +1091,30 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       language: str | None = None,
                       auto: bool = False,
                       search_agent=None) -> tuple[bool, str]:
-    lang_tag = get_code_block_lang(language) if language else "python"
-    test_cmd = get_test_framework(language)["command"] if language else "pytest"
-
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
+
+    # Infer language from memory file paths when not explicitly provided
+    if language is None:
+        mem_files = list(memory.all_files().keys())
+        if mem_files:
+            language = detect_language_from_files(mem_files)
+            if language:
+                log.info(f"Step {step_idx+1}: Inferred language '{language}' "
+                         f"from memory files")
+
+    # Detect JS/TS project environment for ESM-aware test generation
+    js_env: dict | None = None
+    test_runner: str | None = None
+    if language in ("javascript", "typescript"):
+        js_env = _read_js_project_env(subproject_cwd)
+        test_runner = js_env.get("test_runner")
+        log.info(f"Step {step_idx+1}: JS project env: {js_env}")
+
+    # Use language-aware defaults (fall back to Python only as last resort)
+    lang_tag = get_code_block_lang(language) if language else "python"
+    fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")
+    test_cmd = fw["command"]
 
     # Ensure the test runner binary is installed before attempting to run tests
     parts = test_cmd.split()
@@ -1086,12 +1139,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             log.warning(f"Step {step_idx+1}: Failed to install "
                         f"{actual_tool}: {out[:200]}")
 
-    # Detect JS/TS project environment for ESM-aware test generation
-    js_env: dict | None = None
-    if language in ("javascript", "typescript"):
-        js_env = _read_js_project_env(subproject_cwd)
-        log.info(f"Step {step_idx+1}: JS project env: {js_env}")
-
+    # Auto-setup for Jest-based JS/TS projects (skip when Vitest is the runner)
+    if js_env and test_runner != "vitest":
         # Auto-setup for ESM projects: install @jest/globals if needed
         if js_env.get("is_esm") and not js_env.get("has_jest_globals"):
             display.step_info(step_idx, "ESM project detected, installing @jest/globals...")
@@ -1137,7 +1186,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # Add JS/TS environment info to context
         if js_env:
             env_note = f"\nProject environment: {js_env}"
-            if js_env.get('is_esm'):
+            if js_env.get('is_esm') and test_runner != "vitest":
                 env_note += (
                     "\nCRITICAL: This is an ES Module project. "
                     "Tests MUST import from '@jest/globals'.\n"
@@ -1667,11 +1716,7 @@ Respond with ONLY a diff in this exact format — nothing else:
 
 @@DIFF_START@@
 FILE: {{file_path}}
-<<<<<<< ORIGINAL (line {{n}})
-{{exact original lines}}
-=======
 {{replacement lines}}
->>>>>>> UPDATED
 @@DIFF_END@@
 
 Rules:
