@@ -30,6 +30,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+.agentchanti.yaml
+.agentchanti/
+
 # AgentChanti runtime artifacts
 .agentchanti/kb/local/graph.pkl
 .agentchanti/kb/local/index.db
