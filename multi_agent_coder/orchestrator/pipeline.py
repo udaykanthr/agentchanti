@@ -152,14 +152,33 @@ def _execute_step(step_idx: int, step_text: str, *,
                   auto: bool = False,
                   search_agent=None,
                   kb_context_builder=None,
-                  code_graph=None) -> tuple[int, bool, str]:
+                  code_graph=None,
+                  project_profile=None) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
     Catches all exceptions so that a crash inside any handler never
     kills the whole pipeline — the step is marked as failed instead.
     """
     try:
-        # --- KB Context Injection (Phase 4) ---
+        # --- Project Orientation + KB Context Injection (Phase 4+) ---
+        #
+        # Project grounding ALWAYS comes first — before KB symbols,
+        # before task description, before everything.  It is the LLM's
+        # "north star" for the entire session.
+
+        context_parts: list[str] = []
+
+        # 1. Project orientation grounding (always first)
+        if project_profile is not None:
+            try:
+                context_parts.append(project_profile.format_for_prompt())
+            except Exception as orient_exc:
+                _logger.warning(
+                    "[KB] Project orientation formatting failed: %s",
+                    orient_exc,
+                )
+
+        # 2. KB context (Phase 4 — symbols, error fixes, patterns)
         if kb_context_builder is not None:
             try:
                 from ..kb.context_builder import ContextBuilder
@@ -171,8 +190,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                 if kb_ctx.kb_available or kb_ctx.behavioral_instructions:
                     kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
                     if kb_text:
-                        # Inject into coder's context via memory's kb_context
-                        memory._kb_context = kb_text
+                        context_parts.append(kb_text)
                 _logger.debug(
                     "[KB] Injected context: %d tokens, sources: %s, "
                     "symbols: %d, errors: %d",
@@ -181,6 +199,10 @@ def _execute_step(step_idx: int, step_text: str, *,
                 )
             except Exception as kb_exc:
                 _logger.warning("[KB] Context injection failed: %s", kb_exc)
+
+        # Combine and store in memory for downstream handlers
+        if context_parts:
+            memory._kb_context = "\n\n".join(context_parts)
 
         log.info(f"\n{'='*60}\nTask {step_idx+1}: {step_text}\n"
                  f"Memory: {memory.summary()}\n{'='*60}")
@@ -211,7 +233,8 @@ def _execute_step(step_idx: int, step_text: str, *,
             success, error_info = _handle_code_step(
                 step_text, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language, cfg=cfg,
-                auto=auto, code_graph=_graph)
+                auto=auto, code_graph=_graph,
+                project_profile=project_profile)
             display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "TEST":
@@ -240,7 +263,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         language: str | None, cfg=None,
                         auto: bool = False,
                         search_agent=None,
-                        kb_context_builder=None) -> bool:
+                        kb_context_builder=None,
+                        project_profile=None) -> bool:
     """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
 
     All exceptions are caught so that a crash during diagnosis (e.g. an
@@ -318,6 +342,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 language=language, cfg=cfg, auto=auto,
                 search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
+                project_profile=project_profile,
             )
 
             if success:

@@ -779,13 +779,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       language: str | None = None,
                       cfg: Config | None = None,
                       auto: bool = False,
-                      code_graph=None) -> tuple[bool, str]:
+                      code_graph=None,
+                      project_profile=None) -> tuple[bool, str]:
     # --- Diff-aware editing path ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
             step_text=step_text, coder=coder, task=task,
             memory=memory, display=display, step_idx=step_idx,
             language=language, cfg=cfg, code_graph=code_graph,
+            project_profile=project_profile,
         )
         if diff_result is not None:
             return diff_result
@@ -797,7 +799,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     prev_files: dict[str, str] = {}  # Track files from previous attempt
 
     for attempt in range(1, MAX_STEP_RETRIES + 1):
-        context = f"Task: {task}"
+        # Prepend project orientation grounding to context
+        context_prefix = ""
+        if project_profile is not None:
+            try:
+                context_prefix = project_profile.format_for_prompt() + "\n\n"
+            except Exception:
+                pass
+
+        context = context_prefix + f"Task: {task}"
         related = memory.related_context(step_text, max_tokens=ctx_budget)
         if related:
             context += f"\nExisting files (overwrite as needed):\n{related}"
@@ -1446,6 +1456,7 @@ def _try_diff_edit(
     language: str | None,
     cfg: Config,
     code_graph,
+    project_profile=None,
 ) -> tuple[bool, str] | None:
     """Attempt a diff-aware edit.  Returns ``(success, error_info)`` on
     success, or ``None`` to signal the caller should fall back to the
@@ -1499,6 +1510,13 @@ def _try_diff_edit(
 
     slices = slicer.slice_files(scopes_map)
     formatted = slicer.format_for_prompt(slices)
+
+    # Prepend project orientation grounding to sliced context
+    if project_profile is not None:
+        try:
+            formatted = project_profile.format_for_prompt() + "\n\n" + formatted
+        except Exception:
+            pass
 
     # Compute token stats
     full_file_lines = 0

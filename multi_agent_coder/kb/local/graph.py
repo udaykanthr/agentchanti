@@ -502,6 +502,20 @@ class CodeGraph:
                         queue.append(pred)
         return sorted(affected)
 
+    def get_all_file_nodes(self) -> list[dict]:
+        """Return all FILE nodes in the graph.
+
+        Returns
+        -------
+        list[dict]
+            Each item contains: id, path, language, hash, and node_type.
+        """
+        return [
+            {"id": nid, "path": attrs.get("path", ""), **attrs}
+            for nid, attrs in self._g.nodes(data=True)
+            if attrs.get("node_type") == NodeType.FILE
+        ]
+
     def find_symbol(
         self,
         name: str,

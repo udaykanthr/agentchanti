@@ -224,6 +224,32 @@ def _run_task_impl(
             kb_context_builder = None
             kb_runtime_watcher = None
 
+    # Project orientation — detect project DNA for LLM grounding
+    project_profile = None
+    try:
+        from .kb.project_orientation import ProjectOrientation
+
+        kb_graph = None
+        if kb_context_builder is not None:
+            kb_graph = getattr(kb_context_builder, "_graph", None)
+
+        orientation = ProjectOrientation(
+            graph=kb_graph,
+            project_root=os.getcwd(),
+        )
+        project_profile = orientation.get_profile()
+        _logger.info(
+            "[KB] Project detected: %s / %s | source: %s | tests: %s",
+            project_profile.language,
+            project_profile.framework or "no framework",
+            project_profile.source_root,
+            ", ".join(project_profile.test_frameworks) or "unknown",
+        )
+    except Exception as orient_exc:
+        _logger.warning(
+            "[KB] Project orientation failed (non-fatal): %s", orient_exc,
+        )
+
     # Pre-load existing source files into memory
     if source_files:
         memory.update(source_files)
@@ -254,6 +280,7 @@ def _run_task_impl(
                 task=task, memory=memory, display=display,
                 language=language, auto=auto,
                 kb_context_builder=kb_context_builder,
+                project_profile=project_profile,
             )
 
             if success:
@@ -269,6 +296,7 @@ def _run_task_impl(
                     language=language,
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
+                    project_profile=project_profile,
                 )
                 if fixed:
                     step_results[idx] = "done"
