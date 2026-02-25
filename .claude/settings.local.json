@@ -9,7 +9,8 @@
       "Bash(pip index:*)",
       "Bash(pip install:*)",
       "Bash(python -m py_compile:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cd:*)"
     ]
   }
 }
