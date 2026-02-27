@@ -44,6 +44,7 @@ class KBFileHandler:
         project_root: str,
         debounce_seconds: float = 0.5,
         vector_store=None,
+        api_client=None,
     ) -> None:
         self._indexer = indexer
         self._project_root = os.path.abspath(project_root)
@@ -51,6 +52,7 @@ class KBFileHandler:
         self._last_event: dict[str, float] = {}
         self._lock = threading.Lock()
         self._vector_store = vector_store
+        self._api_client = api_client
 
     # ------------------------------------------------------------------
     # Watchdog event dispatch
@@ -188,6 +190,7 @@ class KBFileHandler:
                     manifest=manifest,
                     vector_store=self._vector_store,
                     project_root=self._project_root,
+                    api_client=self._api_client,
                 )
             except Exception as exc:
                 logger.warning(
@@ -221,11 +224,11 @@ class KBWatcher:
         each incremental graph update (Phase 2 integration).
     """
 
-    def __init__(self, indexer, project_root: str, vector_store=None) -> None:
+    def __init__(self, indexer, project_root: str, vector_store=None, api_client=None) -> None:
         self._indexer = indexer
         self._project_root = os.path.abspath(project_root)
         self._observer: Optional[object] = None
-        self._handler = KBFileHandler(indexer, project_root, vector_store=vector_store)
+        self._handler = KBFileHandler(indexer, project_root, vector_store=vector_store, api_client=api_client)
 
     def start(self) -> None:
         """

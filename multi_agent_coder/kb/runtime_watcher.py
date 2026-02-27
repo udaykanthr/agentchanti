@@ -39,7 +39,7 @@ class RuntimeWatcher:
         self._running = False
         self._stop_event = threading.Event()
 
-    def start(self, project_root: str) -> None:
+    def start(self, project_root: str, api_client=None) -> None:
         """
         Start the runtime file watcher in a background daemon thread.
 
@@ -47,8 +47,11 @@ class RuntimeWatcher:
         ----------
         project_root:
             Absolute path to the project root directory.
+        api_client:
+            Optional LLM Client for embedding operations.
         """
         self._project_root = os.path.abspath(project_root)
+        self._api_client = api_client
 
         has_index = self._has_local_index()
 
@@ -106,9 +109,16 @@ class RuntimeWatcher:
             try:
                 from .local.indexer import Indexer
                 from .local.watcher import KBWatcher
+                from .local.vector_store import QdrantStore, is_qdrant_running
 
                 indexer = Indexer(self._project_root)
-                watcher = KBWatcher(indexer, self._project_root)
+                vector_store = QdrantStore(self._project_root) if is_qdrant_running() else None
+                watcher = KBWatcher(
+                    indexer, 
+                    self._project_root, 
+                    vector_store=vector_store,
+                    api_client=self._api_client,
+                )
                 self._observer = watcher._observer  # will be set after start
                 self._running = True
 
@@ -148,6 +158,7 @@ class RuntimeWatcher:
                 debounce_seconds=self._debounce,
                 on_first_index_done=self._switch_to_incremental,
                 stop_event=self._stop_event,
+                api_client=self._api_client,
             )
 
             observer = Observer()
@@ -204,11 +215,13 @@ class _FirstFileHandler:
         debounce_seconds: float,
         on_first_index_done,
         stop_event: threading.Event,
+        api_client=None,
     ) -> None:
         self._project_root = project_root
         self._debounce = debounce_seconds
         self._on_done = on_first_index_done
         self._stop_event = stop_event
+        self._api_client = api_client
         self._triggered = False
         self._lock = threading.Lock()
         self._pending_events: list[str] = []
@@ -305,6 +318,7 @@ class _FirstFileHandler:
                         manifest=manifest,
                         vector_store=vector_store,
                         project_root=self._project_root,
+                        api_client=self._api_client,
                     )
                     logger.info("[KB] Auto-embed complete.")
             except Exception as exc:

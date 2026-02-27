@@ -252,21 +252,25 @@ def _read_lines(abs_path: str, line_start: int, line_end: int) -> list[str]:
 # OpenAI embedding helpers
 # ---------------------------------------------------------------------------
 
-def _get_openai_client():
-    """Return an openai.OpenAI client, raising ImportError if not installed."""
-    try:
-        import openai  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "openai package is required for embedding. "
-            "Install it with: pip install 'multi_agent_coder[semantic]'"
-        ) from exc
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise EnvironmentError(
-            "OPENAI_API_KEY environment variable is not set."
-        )
-    return openai.OpenAI(api_key=api_key)
+def _embed_single(client, text: str) -> list[float]:
+    """Embed a single text string with retries."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            vec = client.generate_embedding(text)
+            if vec:
+                return vec
+            logger.warning("Embedding attempt %d returned empty vector", attempt)
+        except Exception as exc:
+            if attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Embedding API error (attempt %d/%d): %s — retrying in %ds",
+                    attempt, MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error("Embedding API failed after %d attempts: %s", MAX_RETRIES, exc)
+    return []
 
 
 def _embed_batch(client, texts: list[str]) -> list[list[float]]:
@@ -323,6 +327,7 @@ def embed_project(
     manifest: "Manifest",
     vector_store,
     project_root: str,
+    api_client,
     incremental: bool = False,
 ) -> dict:
     """
@@ -338,6 +343,8 @@ def embed_project(
         A :class:`~agentchanti.kb.local.vector_store.QdrantStore` instance.
     project_root:
         Absolute path to the project root.
+    api_client:
+        The LLM client instance to use for embedding.
     incremental:
         If True, skip files whose hash matches their last_embedded_hash.
 
@@ -352,7 +359,6 @@ def embed_project(
     except ImportError:
         _tqdm = None  # type: ignore
 
-    client = _get_openai_client()
     all_chunks = extract_symbol_chunks(graph, project_root)
 
     # For incremental mode, collect hashes of already-embedded files.
@@ -394,7 +400,7 @@ def embed_project(
         texts = [c.text for c in batch]
 
         try:
-            vectors = _embed_batch(client, texts)
+            vectors = _embed_batch(api_client, texts)
         except RuntimeError as exc:
             logger.warning("Skipping batch starting at %d: %s", batch_start, exc)
             error_count += len(batch)
@@ -461,6 +467,7 @@ def embed_file_symbols(
     manifest: "Manifest",
     vector_store,
     project_root: str,
+    api_client,
 ) -> None:
     """
     Re-embed only the symbols belonging to *file_path*.
@@ -479,8 +486,9 @@ def embed_file_symbols(
         Qdrant store instance.
     project_root:
         Absolute path to the project root.
+    api_client:
+        The LLM client instance to use for embedding.
     """
-    client = _get_openai_client()
     all_chunks = extract_symbol_chunks(graph, project_root)
     file_chunks = [c for c in all_chunks if c.file_path == file_path]
 
@@ -490,7 +498,7 @@ def embed_file_symbols(
 
     texts = [c.text for c in file_chunks]
     try:
-        vectors = _embed_batch(client, texts)
+        vectors = _embed_batch(api_client, texts)
     except RuntimeError as exc:
         logger.warning("Embedding failed for file %s: %s", file_path, exc)
         return

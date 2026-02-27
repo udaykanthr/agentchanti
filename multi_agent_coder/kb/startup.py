@@ -86,7 +86,7 @@ class KBStartupManager:
     ──────────────────────────────────────────────────────────────
     """
 
-    def run(self, project_root: str) -> KBStartupReport:
+    def run(self, project_root: str, api_client=None) -> KBStartupReport:
         """
         Execute the startup check sequence.
 
@@ -94,6 +94,8 @@ class KBStartupManager:
         ----------
         project_root:
             Absolute path to the project root directory.
+        api_client:
+            Optional LLM Client for embedding operations.
 
         Returns
         -------
@@ -120,7 +122,7 @@ class KBStartupManager:
 
         # 3. CHECK LOCAL KB (index + embed)
         try:
-            self._check_local_kb(project_root, report)
+            self._check_local_kb(project_root, report, api_client)
         except Exception as exc:
             logger.debug("[KB] Local KB check failed: %s", exc)
 
@@ -176,7 +178,7 @@ class KBStartupManager:
     # Local KB: the main decision logic
     # ------------------------------------------------------------------
 
-    def _check_local_kb(self, project_root: str, report: KBStartupReport) -> None:
+    def _check_local_kb(self, project_root: str, report: KBStartupReport, api_client=None) -> None:
         """Apply the local KB decision table."""
         meta = self._read_graph_meta(project_root)
 
@@ -198,7 +200,7 @@ class KBStartupManager:
                 logger.info(
                     "[KB] New project detected, indexing in background..."
                 )
-                self._run_background(self._full_index_and_embed, project_root)
+                self._run_background(self._full_index_and_embed, project_root, api_client)
                 report.local_index_triggered = True
                 report.background = True
             else:
@@ -240,7 +242,7 @@ class KBStartupManager:
                 changed_files,
                 age_minutes,
             )
-            self._run_background(self._full_index_and_embed, project_root)
+            self._run_background(self._full_index_and_embed, project_root, api_client)
             report.local_index_triggered = True
             report.background = True
             return
@@ -344,7 +346,7 @@ class KBStartupManager:
     # Index / embed operations
     # ------------------------------------------------------------------
 
-    def _full_index_and_embed(self, project_root: str) -> None:
+    def _full_index_and_embed(self, project_root: str, api_client=None) -> None:
         """Run a full index, then embed if Qdrant is running."""
         from .local.indexer import Indexer, _manifest_path
 
@@ -371,6 +373,7 @@ class KBStartupManager:
                     manifest=manifest,
                     vector_store=vector_store,
                     project_root=project_root,
+                    api_client=api_client,
                 )
                 logger.info("[KB] Background embed complete.")
         except Exception as exc:
