@@ -73,7 +73,7 @@ class KBStartupManager:
     ──────────────────────────────────────────────────────────────
     Condition                            Action
     ──────────────────────────────────────────────────────────────
-    Qdrant not running                 → Auto-start Docker (blocking, fast)
+    vector_backend=qdrant + not running→ Auto-start Docker (blocking, fast)
     global_kb collection missing       → seed_all() (blocking, one-time)
     global_kb exists                   → Nothing
     No local index + blank project     → Nothing (RuntimeWatcher handles)
@@ -84,7 +84,15 @@ class KBStartupManager:
     11-50 files changed                → Incremental update in background
     > 50 files changed OR > 60m stale  → Full re-index in background
     ──────────────────────────────────────────────────────────────
+
+    Parameters
+    ----------
+    vector_backend:
+        ``"local"`` (default) or ``"qdrant"``.
     """
+
+    def __init__(self, vector_backend: str = "local") -> None:
+        self._vector_backend = vector_backend
 
     def run(self, project_root: str, api_client=None) -> KBStartupReport:
         """
@@ -103,13 +111,14 @@ class KBStartupManager:
         """
         report = KBStartupReport()
 
-        # 1. CHECK QDRANT
-        try:
-            if not self._qdrant_running():
-                self._start_qdrant(project_root)
-                report.qdrant_started = True
-        except Exception as exc:
-            logger.debug("[KB] Qdrant auto-start failed: %s", exc)
+        # 1. CHECK QDRANT (only when using qdrant backend)
+        if self._vector_backend == "qdrant":
+            try:
+                if not self._qdrant_running():
+                    self._start_qdrant(project_root)
+                    report.qdrant_started = True
+            except Exception as exc:
+                logger.debug("[KB] Qdrant auto-start failed: %s", exc)
 
         # 2. CHECK GLOBAL KB (seed)
         try:
@@ -347,7 +356,7 @@ class KBStartupManager:
     # ------------------------------------------------------------------
 
     def _full_index_and_embed(self, project_root: str, api_client=None) -> None:
-        """Run a full index, then embed if Qdrant is running."""
+        """Run a full index, then embed using the configured vector store."""
         from .local.indexer import Indexer, _manifest_path
 
         indexer = Indexer(project_root)
@@ -358,24 +367,25 @@ class KBStartupManager:
             summary.get("symbol_count", 0),
         )
 
-        # Embed if Qdrant is available
+        # Embed using the configured vector store
         try:
-            if self._qdrant_running():
-                from .local.embedder import embed_project
-                from .local.manifest import Manifest
-                from .local.vector_store import QdrantStore
+            from .local.embedder import embed_project
+            from .local.manifest import Manifest
+            from .local.sqlite_vector_store import create_vector_store
 
-                graph = indexer.load_graph()
-                manifest = Manifest(_manifest_path(project_root))
-                vector_store = QdrantStore(project_root)
-                embed_project(
-                    graph=graph,
-                    manifest=manifest,
-                    vector_store=vector_store,
-                    project_root=project_root,
-                    api_client=api_client,
-                )
-                logger.info("[KB] Background embed complete.")
+            graph = indexer.load_graph()
+            manifest = Manifest(_manifest_path(project_root))
+            vector_store = create_vector_store(
+                project_root, backend=self._vector_backend
+            )
+            embed_project(
+                graph=graph,
+                manifest=manifest,
+                vector_store=vector_store,
+                project_root=project_root,
+                api_client=api_client,
+            )
+            logger.info("[KB] Background embed complete.")
         except Exception as exc:
             logger.debug("[KB] Background embed skipped: %s", exc)
 

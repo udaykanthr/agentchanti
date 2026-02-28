@@ -251,24 +251,20 @@ def _cmd_query(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_embed(args: argparse.Namespace) -> None:
-    """Embed project symbols into Qdrant."""
+    """Embed project symbols into the vector store."""
     project_root = _project_root()
     _require_index(project_root)
 
     from .local.indexer import Indexer, _manifest_path
     from .local.manifest import Manifest
-    from .local.vector_store import QdrantStore, is_qdrant_running
+    from .local.sqlite_vector_store import create_vector_store
     from .local.embedder import embed_project
     from ..config import Config
     from ..llm.ollama import OllamaClient
     from ..llm.lm_studio import LMStudioClient
 
-    if not is_qdrant_running():
-        print(
-            "Qdrant is not running. Start it with:\n"
-            "  agentchanti kb qdrant start"
-        )
-        sys.exit(1)
+    cfg = Config.load()
+    backend = cfg.KB_VECTOR_BACKEND
 
     indexer = Indexer(project_root)
     try:
@@ -278,7 +274,7 @@ def _cmd_embed(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     manifest = Manifest(_manifest_path(project_root))
-    vector_store = QdrantStore(project_root)
+    vector_store = create_vector_store(project_root, backend=backend)
 
     incremental = getattr(args, "incremental", False)
     mode = "incremental" if incremental else "full"
@@ -372,8 +368,12 @@ def _cmd_search(args: argparse.Namespace) -> None:
 
     from .local.indexer import Indexer, _manifest_path
     from .local.manifest import Manifest
-    from .local.vector_store import QdrantStore
+    from .local.sqlite_vector_store import create_vector_store
     from .local.searcher import Searcher
+    from ..config import Config
+
+    cfg = Config.load()
+    backend = cfg.KB_VECTOR_BACKEND
 
     indexer = Indexer(project_root)
     try:
@@ -383,7 +383,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     manifest = Manifest(_manifest_path(project_root))
-    vector_store = QdrantStore(project_root)
+    vector_store = create_vector_store(project_root, backend=backend)
     searcher = Searcher(
         graph=graph,
         manifest=manifest,

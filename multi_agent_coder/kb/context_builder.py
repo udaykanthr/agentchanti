@@ -77,8 +77,13 @@ class ContextBuilder:
         Absolute path to the project root.  Defaults to ``os.getcwd()``.
     """
 
-    def __init__(self, project_root: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        project_root: Optional[str] = None,
+        vector_backend: str = "local",
+    ) -> None:
         self._project_root = os.path.abspath(project_root or os.getcwd())
+        self._vector_backend = vector_backend
         self._searcher = None
         self._graph = None
         self._global_store = None
@@ -111,10 +116,12 @@ class ContextBuilder:
             self._graph = indexer.load_graph()
 
             from .local.manifest import Manifest
-            from .local.vector_store import QdrantStore
+            from .local.sqlite_vector_store import create_vector_store
 
             manifest = Manifest(_manifest_path(self._project_root))
-            vector_store = QdrantStore(self._project_root)
+            vector_store = create_vector_store(
+                self._project_root, backend=self._vector_backend
+            )
 
             from .local.searcher import Searcher
             self._searcher = Searcher(
@@ -453,3 +460,106 @@ class ContextBuilder:
 
         parts.append("=== END KNOWLEDGE BASE CONTEXT ===")
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Option A: Relevant file selection
+    # ------------------------------------------------------------------
+
+    def get_relevant_files(
+        self,
+        task_description: str,
+        changed_files: list[str] | None = None,
+        max_files: int = 15,
+    ) -> list[str]:
+        """
+        Return file paths most relevant to the task.
+
+        Uses KB search results and graph impact analysis to identify a
+        minimal set of files the coder should work with.
+
+        Parameters
+        ----------
+        task_description:
+            Natural-language description of the current task/step.
+        changed_files:
+            Files already modified/created in this session.
+        max_files:
+            Maximum number of file paths to return.
+
+        Returns
+        -------
+        list[str]
+            Ranked list of relative file paths.
+        """
+        relevant: dict[str, float] = {}  # path → relevance score
+
+        # 1. Semantic search → extract file paths
+        try:
+            local_available = self._ensure_local()
+        except Exception:
+            local_available = False
+
+        if local_available and self._searcher is not None:
+            try:
+                results = self._searcher.search(
+                    query=task_description, top_k=10,
+                )
+                for result in results:
+                    file_path = getattr(result, "file", "")
+                    score = getattr(result, "score", 0.5)
+                    if file_path:
+                        relevant[file_path] = max(
+                            relevant.get(file_path, 0), score
+                        )
+            except Exception as exc:
+                logger.debug("[KB] get_relevant_files search failed: %s", exc)
+
+        # 2. Graph impact analysis on changed files
+        if self._graph is not None and changed_files:
+            try:
+                for cf in changed_files[:10]:
+                    # Find dependents of this file using impact_analysis
+                    impacted = self._graph.impact_analysis(cf, depth=2)
+                    for item in impacted:
+                        file_path = item.get("file_path", "")
+                        if file_path and file_path not in relevant:
+                            # Lower score than direct search hits
+                            relevant[file_path] = 0.3
+            except Exception as exc:
+                logger.debug("[KB] get_relevant_files impact failed: %s", exc)
+
+        # 3. Graph expansion — neighbours of top search results
+        if self._graph is not None and relevant:
+            try:
+                top_files = sorted(
+                    relevant.items(), key=lambda x: x[1], reverse=True
+                )[:5]
+                for file_path, _ in top_files:
+                    related = self._graph.get_related_symbols(
+                        file_path, depth=1
+                    )
+                    for r in related:
+                        r_file = r.get("file_path", "")
+                        if r_file and r_file not in relevant:
+                            relevant[r_file] = 0.2
+            except Exception:
+                pass
+
+        # 4. Always include changed files
+        if changed_files:
+            for cf in changed_files:
+                if cf not in relevant:
+                    relevant[cf] = 0.9
+
+        # 5. Sort by score, return top max_files
+        sorted_files = sorted(
+            relevant.items(), key=lambda x: x[1], reverse=True
+        )
+        result = [f for f, _ in sorted_files[:max_files]]
+
+        logger.info(
+            "[KB] Relevant files: %d identified (from %d candidates)",
+            len(result), len(relevant),
+        )
+        return result
+

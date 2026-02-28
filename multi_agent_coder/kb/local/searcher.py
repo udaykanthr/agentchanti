@@ -1,12 +1,12 @@
 """
 Semantic search over the Local Knowledge Base — Phase 2.
 
-Combines Qdrant vector search with Phase 1 graph look-ups to return
-ranked :class:`SearchResult` objects enriched with source code snippets
-and related-symbol information.
+Combines vector search (local SQLite or Qdrant) with Phase 1 graph
+look-ups to return ranked :class:`SearchResult` objects enriched
+with source code snippets and related-symbol information.
 
-Graceful degradation: if Qdrant is not running, falls back to a
-keyword search over the Phase 1 graph manifest.
+Graceful degradation: if the vector store is unavailable or empty,
+falls back to keyword search over the Phase 1 graph manifest.
 """
 
 from __future__ import annotations
@@ -15,14 +15,18 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
-from .vector_store import is_qdrant_running  # noqa: F401 — imported for patching in tests
+# Keep this import for backward compatibility — existing tests patch it
+try:
+    from .vector_store import is_qdrant_running  # noqa: F401
+except ImportError:
+    def is_qdrant_running() -> bool:  # type: ignore[misc]
+        return False
 
 if TYPE_CHECKING:
     from .graph import CodeGraph
     from .manifest import Manifest
-    from .vector_store import QdrantStore
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +257,7 @@ def _graph_keyword_search(
 
 class Searcher:
     """
-    Combines Qdrant vector search with Phase 1 graph look-ups.
+    Combines vector search with Phase 1 graph look-ups.
 
     Parameters
     ----------
@@ -262,7 +266,8 @@ class Searcher:
     manifest:
         Loaded :class:`~agentchanti.kb.local.manifest.Manifest`.
     vector_store:
-        A :class:`~agentchanti.kb.local.vector_store.QdrantStore` instance.
+        Any vector store with a ``.search()`` method — either
+        :class:`QdrantStore` or :class:`SQLiteVectorStore`.
     project_root:
         Absolute path to the project root.
     """
@@ -271,8 +276,8 @@ class Searcher:
         self,
         graph: "CodeGraph",
         manifest: "Manifest",
-        vector_store: "QdrantStore",
-        project_root: str,
+        vector_store: Any = None,
+        project_root: str = "",
     ) -> None:
         self._graph = graph
         self._manifest = manifest
@@ -307,15 +312,9 @@ class Searcher:
         """
         t0 = time.perf_counter()
 
-        if not is_qdrant_running():
-            logger.warning(
-                "Qdrant is not running — falling back to graph-only keyword search. "
-                "Start Qdrant with: agentchanti kb qdrant start"
-            )
-            print(
-                "Warning: Qdrant is not running. Falling back to keyword search.\n"
-                "Start Qdrant with: agentchanti kb qdrant start"
-            )
+        # No vector store available — use keyword fallback
+        if self._vector_store is None:
+            logger.debug("No vector store available — using keyword fallback")
             results = _graph_keyword_search(
                 query, self._graph, self._manifest,
                 self._project_root, top_k, filters
@@ -323,6 +322,18 @@ class Searcher:
             elapsed = (time.perf_counter() - t0) * 1000
             logger.info("Keyword fallback search returned %d results in %.1fms", len(results), elapsed)
             return results
+
+        # Check if vector store has any data
+        try:
+            info = self._vector_store.collection_info()
+            if info is None or info.get("points_count", 0) == 0:
+                logger.debug("Vector store is empty — using keyword fallback")
+                return _graph_keyword_search(
+                    query, self._graph, self._manifest,
+                    self._project_root, top_k, filters
+                )
+        except Exception:
+            pass  # proceed to try search anyway
 
         # ------------------------------------------------------------------
         # Semantic search path
@@ -336,25 +347,24 @@ class Searcher:
                 self._project_root, top_k, filters
             )
 
-        # Build Qdrant filters (convert "file" partial match to contains check)
-        qdrant_filters: Optional[dict] = None
+        # Build store filters (works for both Qdrant and SQLite stores)
+        store_filters: Optional[dict] = None
         if filters:
-            qdrant_filters = {}
+            store_filters = {}
             if "language" in filters:
-                qdrant_filters["language"] = filters["language"]
+                store_filters["language"] = filters["language"]
             if "symbol_type" in filters:
-                qdrant_filters["symbol_type"] = filters["symbol_type"]
-            # "file" partial match is handled post-retrieval for flexibility
-            # (Qdrant MatchValue is exact; we'll filter after)
+                store_filters["symbol_type"] = filters["symbol_type"]
+            # "file" partial match is handled post-retrieval
 
         try:
             raw_results = self._vector_store.search(
                 query_vector=query_vector,
                 top_k=top_k * 2,  # over-fetch to allow post-filtering
-                filters=qdrant_filters,
+                filters=store_filters,
             )
         except Exception as exc:
-            logger.warning("Qdrant search failed: %s — falling back to keyword search", exc)
+            logger.warning("Vector store search failed: %s — falling back to keyword search", exc)
             return _graph_keyword_search(
                 query, self._graph, self._manifest,
                 self._project_root, top_k, filters

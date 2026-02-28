@@ -47,6 +47,7 @@ _DEFAULTS = {
     "kb_registry_repo": "agentchanti-kb-registry",
     "kb_registry_auto_update": True,
     "kb_enabled": True,
+    "kb_vector_backend": "local",
     "kb_max_context_tokens": 4000,
     "kb_auto_index_on_start": True,
     "kb_watcher_debounce_seconds": 1.0,
@@ -293,6 +294,9 @@ class Config:
             "kb_verbose_logging",
             kb_section.get("verbose_logging", _DEFAULTS["kb_verbose_logging"]),
         )
+        self.KB_VECTOR_BACKEND = _get(
+            "KB_VECTOR_BACKEND", "kb_vector_backend",
+            kb_section.get("vector_backend", _DEFAULTS["kb_vector_backend"]))
 
         # Diff-aware editing (Phase 5)
         editing_section = yd.get("editing", {}) if isinstance(yd.get("editing"), dict) else {}
@@ -402,6 +406,7 @@ class Config:
             "kb_registry_auto_update": self.KB_REGISTRY_AUTO_UPDATE,
             "kb": {
                 "enabled": self.KB_ENABLED,
+                "vector_backend": self.KB_VECTOR_BACKEND,
                 "max_context_tokens": self.KB_MAX_CONTEXT_TOKENS,
                 "auto_index_on_start": self.KB_AUTO_INDEX_ON_START,
                 "watcher_debounce_seconds": self.KB_WATCHER_DEBOUNCE_SECONDS,

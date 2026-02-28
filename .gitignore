@@ -46,3 +46,6 @@ multi_agent_coder/kb/global_kb/core/errors.db
 
 .claude/
 *.pyc
+multi_agent_coder/llm/__pycache__/base.cpython-312.pyc
+multi_agent_coder/llm/__pycache__/lm_studio.cpython-312.pyc
+multi_agent_coder/llm/__pycache__/ollama.cpython-312.pyc

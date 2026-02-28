@@ -280,3 +280,67 @@ class FileMemory:
             if not self._files:
                 return "(no files yet)"
             return ", ".join(self._files.keys())
+
+    def scoped_context(
+        self,
+        step_text: str,
+        relevant_files: list[str],
+        max_tokens: int | None = None,
+    ) -> str:
+        """Build context using ONLY the files in *relevant_files*.
+
+        This is the KB-guided alternative to :meth:`related_context`.
+        When the Knowledge Base identifies a focused set of relevant files,
+        this method ensures only those files are included in the context —
+        dramatically reducing context window usage on large codebases.
+
+        Falls back to :meth:`related_context` if *relevant_files* is empty.
+
+        Parameters
+        ----------
+        step_text:
+            The current step description.
+        relevant_files:
+            File paths identified as relevant by the KB.
+        max_tokens:
+            Optional token budget.
+
+        Returns
+        -------
+        str
+            Formatted context string.
+        """
+        if not relevant_files:
+            return self.related_context(step_text, max_tokens)
+
+        with self._lock:
+            parts: list[str] = []
+            budget = max_tokens or float("inf")
+            used = 0
+
+            for fpath in relevant_files:
+                content = self._files.get(fpath, "")
+                if not content:
+                    # Try looking up by basename
+                    for stored_path, stored_content in self._files.items():
+                        if stored_path.endswith(fpath) or fpath.endswith(
+                            os.path.basename(stored_path)
+                        ):
+                            content = stored_content
+                            break
+                if not content:
+                    continue
+
+                entry = f"#### [FILE]: {fpath}\n```\n{content}\n```"
+                entry_tokens = _estimate_tokens(entry)
+                if used + entry_tokens > budget:
+                    break
+                parts.append(entry)
+                used += entry_tokens
+
+            log.debug(
+                f"[FileMemory] Scoped context: {len(parts)}/{len(relevant_files)} "
+                f"files ({used} est. tokens)"
+            )
+            return "\n\n".join(parts)
+

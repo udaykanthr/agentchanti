@@ -109,10 +109,10 @@ class RuntimeWatcher:
             try:
                 from .local.indexer import Indexer
                 from .local.watcher import KBWatcher
-                from .local.vector_store import QdrantStore, is_qdrant_running
+                from .local.sqlite_vector_store import create_vector_store
 
                 indexer = Indexer(self._project_root)
-                vector_store = QdrantStore(self._project_root) if is_qdrant_running() else None
+                vector_store = create_vector_store(self._project_root)
                 watcher = KBWatcher(
                     indexer, 
                     self._project_root, 
@@ -301,26 +301,24 @@ class _FirstFileHandler:
                 summary.get("symbol_count", 0),
             )
 
-            # Try to embed if Qdrant is running
+            # Try to embed using the configured vector store
             try:
-                from .local.vector_store import is_qdrant_running
-                if is_qdrant_running():
-                    from .local.embedder import embed_project
-                    from .local.indexer import _manifest_path
-                    from .local.manifest import Manifest
-                    from .local.vector_store import QdrantStore
+                from .local.sqlite_vector_store import create_vector_store
+                from .local.embedder import embed_project
+                from .local.indexer import _manifest_path
+                from .local.manifest import Manifest
 
-                    graph = indexer.load_graph()
-                    manifest = Manifest(_manifest_path(self._project_root))
-                    vector_store = QdrantStore(self._project_root)
-                    embed_project(
-                        graph=graph,
-                        manifest=manifest,
-                        vector_store=vector_store,
-                        project_root=self._project_root,
-                        api_client=self._api_client,
-                    )
-                    logger.info("[KB] Auto-embed complete.")
+                graph = indexer.load_graph()
+                manifest = Manifest(_manifest_path(self._project_root))
+                vector_store = create_vector_store(self._project_root)
+                embed_project(
+                    graph=graph,
+                    manifest=manifest,
+                    vector_store=vector_store,
+                    project_root=self._project_root,
+                    api_client=self._api_client,
+                )
+                logger.info("[KB] Auto-embed complete.")
             except Exception as exc:
                 logger.debug("[KB] Auto-embed skipped: %s", exc)
 

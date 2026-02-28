@@ -97,7 +97,7 @@ class TestStartupQdrant:
     @patch.object(KBStartupManager, "_qdrant_running", return_value=False)
     def test_qdrant_auto_started(self, mock_qr, mock_start, mock_gk, mock_lk):
         """When Qdrant is not running, it should be auto-started."""
-        report = KBStartupManager().run("/tmp/project")
+        report = KBStartupManager(vector_backend="qdrant").run("/tmp/project")
         assert report.qdrant_started
         mock_start.assert_called_once_with("/tmp/project")
 
@@ -443,7 +443,7 @@ class TestStartupIntegration:
         mock_meta, mock_files, mock_bg, capsys,
     ):
         """Fresh install + small project → start qdrant, seed, index bg."""
-        report = KBStartupManager().run("/tmp/project")
+        report = KBStartupManager(vector_backend="qdrant").run("/tmp/project")
 
         assert report.qdrant_started
         assert report.global_kb_seeded

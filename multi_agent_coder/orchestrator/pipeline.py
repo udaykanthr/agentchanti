@@ -204,6 +204,26 @@ def _execute_step(step_idx: int, step_text: str, *,
         if context_parts:
             memory._kb_context = "\n\n".join(context_parts)
 
+        # --- KB-guided file scoping (Option A) ---
+        # Use KB to identify most relevant files for this step,
+        # so the coder only sees focused context instead of everything.
+        if kb_context_builder is not None:
+            try:
+                changed = list(memory.all_files().keys())[:10]
+                relevant_files = kb_context_builder.get_relevant_files(
+                    task_description=step_text,
+                    changed_files=changed,
+                    max_files=15,
+                )
+                if relevant_files:
+                    memory._kb_relevant_files = relevant_files
+                    _logger.debug(
+                        "[KB] Scoped to %d relevant files for step %d",
+                        len(relevant_files), step_idx + 1,
+                    )
+            except Exception as kb_scope_exc:
+                _logger.debug("[KB] File scoping failed: %s", kb_scope_exc)
+
         log.info(f"\n{'='*60}\nTask {step_idx+1}: {step_text}\n"
                  f"Memory: {memory.summary()}\n{'='*60}")
 
