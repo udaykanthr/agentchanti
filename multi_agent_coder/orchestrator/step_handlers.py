@@ -1444,6 +1444,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             log.info(f"Step {step_idx+1}: User rejected test diff, retrying.")
             continue
 
+        # Prefix test file paths with sub-project root (same as CODE steps)
+        if subproject_cwd:
+            test_files = _prefix_subproject_paths(
+                test_files, subproject_cwd, memory)
+
         written = executor.write_files(test_files)
         memory.update(test_files)
         display.step_info(step_idx, f"Tests written: {', '.join(written)}")
