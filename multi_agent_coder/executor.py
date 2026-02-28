@@ -177,8 +177,11 @@ class Executor:
             filename = Executor._sanitize_filename(raw_filename)
             content = match.group(2)
             # Skip if filename still looks invalid
-            if not filename or '/' not in filename and '.' not in filename:
+            if not filename:
                 continue
+            if '/' not in filename and '.' not in filename:
+                if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
+                    continue
             # Skip if content looks like prose rather than code
             if not Executor._looks_like_code(content):
                 log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
@@ -217,8 +220,11 @@ class Executor:
                 continue
             raw = fmatch.group(1).strip()
             filename = Executor._sanitize_filename(raw)
-            if not filename or ('/' not in filename and '.' not in filename):
+            if not filename:
                 continue
+            if '/' not in filename and '.' not in filename:
+                if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
+                    continue
             rest = block.split("\n", 1)[1] if "\n" in block else ""
             # Check if the content uses diff markers (+/-/@@)
             has_diff = any(
@@ -255,8 +261,11 @@ class Executor:
                 continue
             raw = fname_match.group(1).strip()
             filename = Executor._sanitize_filename(raw)
-            if not filename or ('/' not in filename and '.' not in filename):
+            if not filename:
                 continue
+            if '/' not in filename and '.' not in filename:
+                if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
+                    continue
             content_lines = []
             past_header = False
             for line in block.splitlines():
@@ -282,8 +291,11 @@ class Executor:
         ):
             raw = (m.group(1) or m.group(2) or "").strip()
             filename = Executor._sanitize_filename(raw)
-            if not filename or ('/' not in filename and '.' not in filename):
+            if not filename:
                 continue
+            if '/' not in filename and '.' not in filename:
+                if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
+                    continue
             Executor._try_add_file(files, filename, m.group(3).rstrip("\n"))
 
         if files:

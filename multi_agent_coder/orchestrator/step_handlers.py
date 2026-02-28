@@ -932,6 +932,11 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: User rejected diff, retrying.")
             continue
 
+        # Build review context before updating memory/disk so diffs are captured correctly
+        use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
+        if use_diff_review:
+            review_ctx = _build_review_context(files, memory, step_text)
+
         prev_files = dict(files)  # Save for potential merge on retry
         written = executor.write_files(files)
         memory.update(files)
@@ -948,9 +953,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         sent_before = token_tracker.total_prompt_tokens
         recv_before = token_tracker.total_completion_tokens
 
-        use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
         if use_diff_review:
-            review_ctx = _build_review_context(files, memory, step_text)
             review = reviewer.process(
                 f"Review this code change for the step: {step_text}\n\n{review_ctx}",
                 context=f"Step: {step_text}\nReview ONLY the changes shown.",
@@ -1957,6 +1960,7 @@ def _try_chunk_edit(
         edits_by_file.setdefault(edit.file_path, []).append(edit)
 
     result_files: dict[str, str] = {}
+    original_files: dict[str, str | None] = {}
     for fpath, file_edits in edits_by_file.items():
         original = memory.get(fpath)
         if original is None:
@@ -1964,17 +1968,22 @@ def _try_chunk_edit(
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     original = f.read()
             except OSError:
-                log.warning("[ChunkEdit] Cannot read original file: %s", fpath)
-                continue
+                log.info("[ChunkEdit] Treating %s as a new file", fpath)
+                original = None
+
+        original_files[fpath] = original
 
         try:
-            result_files[fpath] = chunk_editor.apply_chunk_edits(original, file_edits)
+            result_files[fpath] = chunk_editor.apply_chunk_edits(original or "", file_edits)
         except Exception as exc:
             log.warning("[ChunkEdit] Failed to apply edits to %s: %s", fpath, exc)
             return None
 
     if not result_files:
         return None
+
+    # Build review context before updating memory/disk so diffs are captured correctly
+    review_ctx = _build_review_context(result_files, memory, step_text)
 
     approved = prompt_diff_approval(result_files, auto=auto)
     if not approved:
@@ -1989,7 +1998,6 @@ def _try_chunk_edit(
         display.step_info(step_idx, "Non-code files, skipping review")
         return True, ""
 
-    review_ctx = _build_review_context(result_files, memory, step_text)
     reviewer_mode = "diff" if getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True) else "full"
 
     display.step_info(step_idx, "Reviewing changes...")
@@ -2020,7 +2028,26 @@ def _try_chunk_edit(
         display.step_info(step_idx, "Review passed")
         return True, ""
 
-    log.info("[ChunkEdit] Review found issues, falling back to full-file for retry")
+    log.info("[ChunkEdit] Review found issues, reverting and falling back to full-file for retry")
+    
+    # Revert memory and disk since the review failed
+    for fpath, orig_content in original_files.items():
+        if orig_content is not None:
+            memory.update({fpath: orig_content})
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(orig_content)
+            except OSError:
+                pass
+        else:
+            # It was a new file, remove it
+            try:
+                if fpath in memory.all_files():
+                    del memory.all_files()[fpath]  # Depending on FileMemory implementation
+                os.remove(fpath)
+            except Exception:
+                pass
+
     return None
 
 

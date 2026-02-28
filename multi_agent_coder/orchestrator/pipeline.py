@@ -300,6 +300,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
         display.complete_step(step_idx, "failed")
         return False
 
+    last_diagnosis_content = None
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
             display.step_info(
@@ -311,13 +313,15 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             diagnosis = _diagnose_failure(
                 step_text, step_type, error_info,
                 memory, llm_client, display, step_idx,
-                search_agent=search_agent, language=language)
+                search_agent=search_agent, language=language,
+                previous_diagnosis=last_diagnosis_content)
 
             fix_applied, cmds_succeeded = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type)
 
             if not fix_applied:
+                last_diagnosis_content = diagnosis
                 display.step_info(step_idx, "No actionable fix found in diagnosis.")
                 log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
                 continue

@@ -17,7 +17,8 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       memory: FileMemory, llm_client, display: CLIDisplay,
                       step_idx: int,
                       search_agent=None,
-                      language: str | None = None) -> str:
+                      language: str | None = None,
+                      previous_diagnosis: str | None = None) -> str:
     display.step_info(step_idx, "Analyzing failure root cause...")
 
     # ── Optional: search the web for error documentation ────
@@ -71,6 +72,15 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
     prompt += f"All project files: {memory.summary()}\n\n"
+
+    if previous_diagnosis:
+        prompt += (
+            "IMPORTANT FEEDBACK ON YOUR PREVIOUS ATTEMPT:\n"
+            "Your previous diagnosis failed because it did not produce an actionable fix in the correct format. "
+            "You MUST use the exact `#### [FILE]:` marker for code fixes, or exact shell commands for CMD fixes.\n\n"
+            "Your previous output was:\n"
+            f"{previous_diagnosis}\n\n"
+        )
 
     # Step-type-specific fix instructions
     if step_type == "CMD":
