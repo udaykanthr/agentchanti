@@ -1974,7 +1974,12 @@ def _try_chunk_edit(
         original_files[fpath] = original
 
         try:
-            result_files[fpath] = chunk_editor.apply_chunk_edits(original or "", file_edits)
+            # Filter chunks for this file so the editor can resolve
+            # mismatched line numbers from the LLM.
+            file_chunks = [c for c in all_chunks if c.file_path == fpath]
+            result_files[fpath] = chunk_editor.apply_chunk_edits(
+                original or "", file_edits, known_chunks=file_chunks,
+            )
         except Exception as exc:
             log.warning("[ChunkEdit] Failed to apply edits to %s: %s", fpath, exc)
             return None

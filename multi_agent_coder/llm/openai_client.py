@@ -67,6 +67,7 @@ class OpenAIClient(LLMClient):
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[OpenAI] Streaming ~{est_tokens} est. tokens")
 
+        log.debug(f"[OpenAI] Prompt:\n{prompt}")
         payload = {
             "model": self.model,
             "messages": [

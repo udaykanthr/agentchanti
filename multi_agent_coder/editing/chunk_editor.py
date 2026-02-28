@@ -57,6 +57,19 @@ _RUST_PATTERNS = [
     re.compile(r"^((?:pub\s+)?impl\s+)", re.MULTILINE),
 ]
 
+_C_PATTERNS = [
+    # C/C++ function definitions at column 0:
+    # return_type [*] function_name(
+    re.compile(
+        r"^((?:static\s+|inline\s+|extern\s+)*"
+        r"\w+(?:\s*\*+)?\s+\w+\s*\()",
+        re.MULTILINE,
+    ),
+    # struct / enum / union / typedef at column 0
+    re.compile(r"^(typedef\s+(?:struct|enum|union)\b)", re.MULTILINE),
+    re.compile(r"^((?:struct|enum|union)\s+\w+\s*\{)", re.MULTILINE),
+]
+
 _LANG_PATTERNS: dict[str, list[re.Pattern]] = {
     "python": _PY_PATTERNS,
     "javascript": _JS_PATTERNS,
@@ -64,6 +77,8 @@ _LANG_PATTERNS: dict[str, list[re.Pattern]] = {
     "go": _GO_PATTERNS,
     "java": _JAVA_PATTERNS,
     "rust": _RUST_PATTERNS,
+    "c": _C_PATTERNS,
+    "cpp": _C_PATTERNS,
 }
 
 _EXT_TO_LANG = {
@@ -124,6 +139,29 @@ class ChunkEditResponse:
     new_content: str
     is_new: bool = False       # True for [NEW] insertions
     insert_after: int = 0      # line number to insert after (for new chunks)
+
+
+def _chunk_id_matches(chunk_id: str, edit_id: str) -> bool:
+    """Check if a chunk_id matches an edit's chunk_id.
+
+    The LLM may return just the function/class name (e.g. ``setup``)
+    while the canonical chunk_id is ``function:setup``.
+    """
+    if not edit_id:
+        return False
+    # Exact match
+    if chunk_id == edit_id:
+        return True
+    # chunk_id ends with the edit_id after the colon
+    # e.g. chunk_id="function:setup" matches edit_id="setup"
+    if ":" in chunk_id:
+        _, name_part = chunk_id.rsplit(":", 1)
+        if name_part == edit_id:
+            return True
+        # Handle dotted names: "method:UserService.authenticate" vs "authenticate"
+        if "." in name_part and name_part.rsplit(".", 1)[-1] == edit_id:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -411,17 +449,31 @@ class ChunkEditor:
         self,
         original_content: str,
         edits: list[ChunkEditResponse],
+        known_chunks: list[FileChunk] | None = None,
     ) -> str:
         """Splice edited chunks back into the original file content.
 
         Applies edits in reverse line order to preserve line numbering.
+
+        When *known_chunks* is provided, each edit's line range is resolved
+        against the known chunks first.  This corrects hallucinated line
+        numbers from the LLM that would otherwise corrupt the file.
         """
         lines = original_content.splitlines(True)
+        total_lines = len(lines)
 
-        # Sort edits by line_start descending (apply from bottom up)
-        sorted_edits = sorted(edits, key=lambda e: e.line_start, reverse=True)
+        # Resolve line ranges before sorting
+        resolved_edits: list[tuple[int, int, ChunkEditResponse]] = []
+        for edit in edits:
+            start, end = self._resolve_edit_lines(
+                edit, known_chunks, total_lines, lines,
+            )
+            resolved_edits.append((start, end, edit))
 
-        for edit in sorted_edits:
+        # Sort by resolved line_start descending (apply from bottom up)
+        resolved_edits.sort(key=lambda t: t[0], reverse=True)
+
+        for start, end, edit in resolved_edits:
             new_lines = edit.new_content.splitlines(True)
             # Ensure last line has newline
             if new_lines and not new_lines[-1].endswith("\n"):
@@ -433,11 +485,153 @@ class ChunkEditor:
                 lines[insert_pos:insert_pos] = new_lines
             else:
                 # Replace line range (1-indexed to 0-indexed)
-                start = max(0, edit.line_start - 1)
-                end = min(len(lines), edit.line_end)
-                lines[start:end] = new_lines
+                s = max(0, start - 1)
+                e = min(len(lines), end)
+                lines[s:e] = new_lines
 
         return "".join(lines)
+
+    @staticmethod
+    def _resolve_edit_lines(
+        edit: ChunkEditResponse,
+        known_chunks: list[FileChunk] | None,
+        total_lines: int,
+        original_lines: list[str] | None = None,
+    ) -> tuple[int, int]:
+        """Resolve correct line range for an edit using known chunks.
+
+        Returns ``(line_start, line_end)`` — possibly corrected.
+
+        Handles two scenarios:
+        1. **Full chunk replacement** — the LLM replaced the whole chunk
+           but used wrong absolute line numbers.  Fix: use the chunk's
+           actual line range.
+        2. **Partial chunk edit** — the LLM only edited a sub-range
+           within the chunk (e.g. one block inside a large function).
+           Fix: use content-based alignment to find the correct
+           sub-range within the chunk, preserving the rest.
+        """
+        if not known_chunks or edit.is_new:
+            return edit.line_start, edit.line_end
+
+        # Try matching by chunk_id
+        for chunk in known_chunks:
+            if (chunk.file_path == edit.file_path
+                    and _chunk_id_matches(chunk.chunk_id, edit.chunk_id)):
+
+                edit_span = edit.line_end - edit.line_start + 1
+                chunk_span = chunk.line_end - chunk.line_start + 1
+
+                # --- Full chunk replacement ---
+                # If the edit covers most of the chunk, use the chunk range.
+                if edit_span >= chunk_span * 0.7:
+                    if (edit.line_start != chunk.line_start
+                            or edit.line_end != chunk.line_end):
+                        logger.info(
+                            "[ChunkEditor] Corrected line range for %s:%s: "
+                            "%d-%d → %d-%d (matched chunk %s)",
+                            edit.file_path, edit.chunk_id,
+                            edit.line_start, edit.line_end,
+                            chunk.line_start, chunk.line_end,
+                            chunk.chunk_id,
+                        )
+                    return chunk.line_start, chunk.line_end
+
+                # --- Partial chunk edit ---
+                # The LLM edited a sub-range within the chunk.
+                # Try content-based alignment: find the first non-blank
+                # line of the new content in the original within the chunk.
+                if original_lines is not None:
+                    new_content_lines = edit.new_content.splitlines()
+                    # Find first non-blank line for anchoring
+                    anchor = ""
+                    for ncl in new_content_lines:
+                        stripped = ncl.strip()
+                        if stripped:
+                            anchor = stripped
+                            break
+
+                    if anchor:
+                        search_start = chunk.line_start - 1  # 0-indexed
+                        search_end = min(chunk.line_end, len(original_lines))
+                        for i in range(search_start, search_end):
+                            if original_lines[i].strip() == anchor:
+                                resolved_start = i + 1  # back to 1-indexed
+                                resolved_end = resolved_start + edit_span - 1
+                                # Clamp to chunk boundary
+                                resolved_end = min(resolved_end, chunk.line_end)
+                                logger.info(
+                                    "[ChunkEditor] Content-aligned partial "
+                                    "edit for %s:%s: %d-%d → %d-%d "
+                                    "(anchor: %.40s)",
+                                    edit.file_path, edit.chunk_id,
+                                    edit.line_start, edit.line_end,
+                                    resolved_start, resolved_end,
+                                    anchor,
+                                )
+                                return resolved_start, resolved_end
+
+                # Fallback: keep the LLM's span size but shift it to
+                # be within the chunk's range using proportional offset.
+                if chunk_span > edit_span:
+                    # Clamp: place the edit proportionally within chunk
+                    max_offset = chunk_span - edit_span
+                    llm_offset = edit.line_start - 1  # rough offset
+                    offset = min(max(0, llm_offset), max_offset)
+                    resolved_start = chunk.line_start + offset
+                    resolved_end = resolved_start + edit_span - 1
+                    logger.info(
+                        "[ChunkEditor] Offset-adjusted partial edit "
+                        "for %s:%s: %d-%d → %d-%d",
+                        edit.file_path, edit.chunk_id,
+                        edit.line_start, edit.line_end,
+                        resolved_start, resolved_end,
+                    )
+                    return resolved_start, resolved_end
+
+                # Last resort: use chunk range
+                return chunk.line_start, chunk.line_end
+
+        # No chunk_id match — try content-based alignment against the
+        # entire file.  This handles cases where the file is chunked as
+        # a single top_level block (e.g. C files without language patterns).
+        if original_lines is not None:
+            new_content_lines = edit.new_content.splitlines()
+            anchor = ""
+            for ncl in new_content_lines:
+                stripped = ncl.strip()
+                if stripped:
+                    anchor = stripped
+                    break
+
+            if anchor:
+                edit_span = edit.line_end - edit.line_start + 1
+                for i in range(len(original_lines)):
+                    if original_lines[i].strip() == anchor:
+                        resolved_start = i + 1  # 1-indexed
+                        resolved_end = resolved_start + edit_span - 1
+                        resolved_end = min(resolved_end, total_lines)
+                        logger.info(
+                            "[ChunkEditor] Content-aligned edit (no chunk "
+                            "match) for %s:%s: %d-%d → %d-%d "
+                            "(anchor: %.40s)",
+                            edit.file_path, edit.chunk_id,
+                            edit.line_start, edit.line_end,
+                            resolved_start, resolved_end,
+                            anchor,
+                        )
+                        return resolved_start, resolved_end
+
+        # Sanity check: warn if line numbers exceed file length
+        if edit.line_start > total_lines or edit.line_end > total_lines:
+            logger.warning(
+                "[ChunkEditor] Edit line range %d-%d exceeds file "
+                "length %d for %s:%s",
+                edit.line_start, edit.line_end, total_lines,
+                edit.file_path, edit.chunk_id,
+            )
+
+        return edit.line_start, edit.line_end
 
     # ------------------------------------------------------------------
     # Internal helpers
