@@ -381,11 +381,56 @@ def _cmd_search(args: argparse.Namespace) -> None:
 
     manifest = Manifest(_manifest_path(project_root))
     vector_store = create_vector_store(project_root, backend=backend)
+
+    # Initialize LLM Client
+    llm_kwargs = dict(
+        max_retries=cfg.LLM_MAX_RETRIES,
+        retry_delay=cfg.LLM_RETRY_DELAY,
+        stream=False,
+    )
+    provider = cfg.PROVIDER
+    model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+    api_client = None
+
+    if provider == "ollama":
+        from ..llm.ollama import OllamaClient
+        api_client = OllamaClient(
+            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
+    elif provider == "openai":
+        from ..llm.openai_client import OpenAIClient
+        if not cfg.OPENAI_API_KEY:
+             print("OPENAI_API_KEY is required for OpenAI provider in .agentchanti.yaml", file=sys.stderr)
+             sys.exit(1)
+        api_client = OpenAIClient(
+            base_url=cfg.OPENAI_BASE_URL, model=model,
+            api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
+    elif provider == "gemini":
+        from ..llm.gemini_client import GeminiClient
+        if not cfg.GEMINI_API_KEY:
+             print("GEMINI_API_KEY is required for Gemini provider in .agentchanti.yaml", file=sys.stderr)
+             sys.exit(1)
+        api_client = GeminiClient(
+            base_url=cfg.GEMINI_BASE_URL, model=model,
+            api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
+    elif provider == "anthropic":
+        from ..llm.anthropic_client import AnthropicClient
+        if not cfg.ANTHROPIC_API_KEY:
+             print("ANTHROPIC_API_KEY is required for Anthropic provider in .agentchanti.yaml", file=sys.stderr)
+             sys.exit(1)
+        api_client = AnthropicClient(
+            base_url=cfg.ANTHROPIC_BASE_URL, model=model,
+            api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
+    else:
+        from ..llm.lm_studio import LMStudioClient
+        api_client = LMStudioClient(
+            base_url=cfg.LM_STUDIO_BASE_URL, model=model, **llm_kwargs)
+
     searcher = Searcher(
         graph=graph,
         manifest=manifest,
         vector_store=vector_store,
         project_root=project_root,
+        api_client=api_client,
     )
 
     import time as _time

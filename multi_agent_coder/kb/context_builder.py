@@ -81,9 +81,11 @@ class ContextBuilder:
         self,
         project_root: Optional[str] = None,
         vector_backend: str = "local",
+        api_client: Any = None,
     ) -> None:
         self._project_root = os.path.abspath(project_root or os.getcwd())
         self._vector_backend = vector_backend
+        self._api_client = api_client
         self._searcher = None
         self._graph = None
         self._global_store = None
@@ -129,6 +131,7 @@ class ContextBuilder:
                 manifest=manifest,
                 vector_store=vector_store,
                 project_root=self._project_root,
+                api_client=self._api_client,
             )
             return True
         except Exception as exc:
@@ -284,6 +287,7 @@ class ContextBuilder:
                         task_description,
                         categories=["pattern", "adr"],
                         top_k=3,
+                        api_client=self._api_client,
                     )
                     ctx.global_patterns = patterns
                     if patterns:
@@ -297,6 +301,7 @@ class ContextBuilder:
             try:
                 behavioral = self._global_store.get_behavioral_instructions(
                     task_description,
+                    api_client=self._api_client,
                 )
                 ctx.behavioral_instructions = behavioral
             except Exception as exc:

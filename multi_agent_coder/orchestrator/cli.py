@@ -265,7 +265,7 @@ def main():
             # Smart startup check — handles global KB, local KB
             KBStartupManager().run(project_root=_os.getcwd(), api_client=llm_client)
 
-            kb_context_builder = ContextBuilder(project_root=_os.getcwd())
+            kb_context_builder = ContextBuilder(project_root=_os.getcwd(), api_client=llm_client)
             kb_runtime_watcher = RuntimeWatcher(
                 debounce_seconds=cfg.KB_WATCHER_DEBOUNCE_SECONDS,
             )

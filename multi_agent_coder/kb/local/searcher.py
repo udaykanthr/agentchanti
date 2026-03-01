@@ -65,7 +65,7 @@ class SearchResult:
 # Embedding helper (reuses OpenAI client logic from embedder)
 # ---------------------------------------------------------------------------
 
-def _embed_query(query: str) -> list[float]:
+def _embed_query(query: str, api_client: Any = None) -> list[float]:
     """
     Embed *query* using the same model as the indexed symbols.
 
@@ -73,12 +73,25 @@ def _embed_query(query: str) -> list[float]:
     ----------
     query:
         Natural-language search string.
+    api_client:
+        Optional LLM client instance to use for embedding.
 
     Returns
     -------
     list[float]
         1536-dimensional embedding vector.
     """
+    if api_client is not None:
+        from ...config import Config
+        cfg = Config.load()
+        embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+        try:
+            vec = api_client.generate_embedding(query, model=embed_model, dimensions=1536)
+            if vec:
+                return vec
+        except Exception as exc:
+            logger.warning("api_client embedding failed: %s", exc)
+
     import os as _os
     try:
         import openai  # type: ignore
@@ -95,8 +108,10 @@ def _embed_query(query: str) -> list[float]:
         )
 
     client = openai.OpenAI(api_key=api_key)
-    from .embedder import EMBED_MODEL
-    response = client.embeddings.create(model=EMBED_MODEL, input=[query])
+    from ...config import Config
+    cfg = Config.load()
+    embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+    response = client.embeddings.create(model=embed_model, input=[query])
     return response.data[0].embedding
 
 
@@ -268,11 +283,13 @@ class Searcher:
         manifest: "Manifest",
         vector_store: Any = None,
         project_root: str = "",
+        api_client: Any = None,
     ) -> None:
         self._graph = graph
         self._manifest = manifest
         self._vector_store = vector_store
         self._project_root = os.path.abspath(project_root)
+        self._api_client = api_client
 
     def search(
         self,
@@ -329,7 +346,7 @@ class Searcher:
         # Semantic search path
         # ------------------------------------------------------------------
         try:
-            query_vector = _embed_query(query)
+            query_vector = _embed_query(query, api_client=self._api_client)
         except Exception as exc:
             logger.warning("Failed to embed query: %s — falling back to keyword search", exc)
             return _graph_keyword_search(
