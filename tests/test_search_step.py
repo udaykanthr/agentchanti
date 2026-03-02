@@ -18,8 +18,7 @@ class TestClassifySearchStep:
     @patch("multi_agent_coder.orchestrator.classification.token_tracker")
     def test_classify_returns_search(self, mock_tracker):
         """When the LLM responds with SEARCH, _classify_step should return it."""
-        mock_tracker.total_prompt_tokens = 0
-        mock_tracker.total_completion_tokens = 0
+        mock_tracker.snapshot.return_value = (0, 0)
 
         mock_llm = MagicMock()
         mock_llm.generate_response.return_value = "SEARCH"
@@ -36,8 +35,7 @@ class TestClassifySearchStep:
     @patch("multi_agent_coder.orchestrator.classification.token_tracker")
     def test_classify_prompt_mentions_search(self, mock_tracker):
         """The classification prompt should mention SEARCH as a valid option."""
-        mock_tracker.total_prompt_tokens = 0
-        mock_tracker.total_completion_tokens = 0
+        mock_tracker.snapshot.return_value = (0, 0)
 
         mock_llm = MagicMock()
         mock_llm.generate_response.return_value = "CODE"

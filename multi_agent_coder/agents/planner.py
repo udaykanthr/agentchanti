@@ -1,4 +1,5 @@
 import os
+import platform
 import re
 import logging
 
@@ -12,6 +13,31 @@ def _shell_example() -> str:
     if os.name == 'nt':
         return "  1. List all project files with `dir /s /b`"
     return "  1. List all project files with `find . -type f`"
+
+
+def _os_context_for_prompt() -> str:
+    """Return OS/shell context string for LLM prompts."""
+    if os.name == 'nt':
+        return (
+            f"HOST OS: Windows ({platform.version()})\n"
+            "SHELL: cmd.exe (NOT bash, NOT PowerShell)\n"
+            "All shell commands in backticks MUST use Windows cmd.exe syntax.\n"
+            "  - Use `mkdir` instead of `mkdir -p`\n"
+            "  - Use `call venv\\Scripts\\activate` instead of `source venv/bin/activate`\n"
+            "  - Use `set VAR=value` instead of `export VAR=value`\n"
+            "  - Use `del` instead of `rm`, `copy` instead of `cp`\n"
+            "  - Use `dir /s /b` instead of `find . -type f` or `ls`\n"
+            "  - Use `type <file>` instead of `cat <file>`\n"
+            "  - Do NOT use PowerShell cmdlets (Get-ChildItem, etc.)\n"
+        )
+    sysname = platform.system()
+    os_label = "macOS" if sysname == "Darwin" else sysname
+    shell = os.environ.get('SHELL', '/bin/bash').rsplit('/', 1)[-1]
+    return (
+        f"HOST OS: {os_label} ({platform.release()})\n"
+        f"SHELL: {shell}\n"
+        "All shell commands in backticks should use standard Unix shell syntax.\n"
+    )
 
 
 # ── Task intent classification (regex-based, no LLM) ────────────
@@ -218,6 +244,8 @@ TESTER (generates and runs unit tests), or a SEARCHER (searches the web for
 documentation and latest info). Your plan MUST be precise enough for
 these agents to succeed on the first attempt.
 
+═══════ HOST ENVIRONMENT ═══════
+""" + _os_context_for_prompt() + """
 ═══════ STEP FORMAT ═══════
 Write a numbered list. Each step MUST be a single, concrete action:
 

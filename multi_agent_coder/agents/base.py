@@ -18,10 +18,18 @@ class Agent(ABC):
         pass
 
     def _build_prompt(self, task: str, context: str, language: str | None = None) -> str:
+        import os as _os
         prompt = f"Role: {self.role}\nGoal: {self.goal}\n\n"
         if language:
             from ..language import get_language_name
             prompt += f"Language: {get_language_name(language)}\n\n"
+        if _os.name == 'nt':
+            prompt += "Platform: Windows (use cmd.exe-compatible commands)\n\n"
+        else:
+            import platform as _platform
+            _sysname = _platform.system()
+            _os_label = "macOS" if _sysname == "Darwin" else _sysname
+            prompt += f"Platform: {_os_label}\n\n"
         if self.prompt_suffix:
             prompt += f"Instructions: {self.prompt_suffix}\n\n"
         if context:

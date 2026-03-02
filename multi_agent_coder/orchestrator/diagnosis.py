@@ -120,13 +120,13 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             "```\n"
         )
 
-    sent_before = token_tracker.total_prompt_tokens
-    recv_before = token_tracker.total_completion_tokens
+    sent_before, recv_before = token_tracker.snapshot()
 
     diagnosis = llm_client.generate_response(prompt)
 
-    sent_delta = token_tracker.total_prompt_tokens - sent_before
-    recv_delta = token_tracker.total_completion_tokens - recv_before
+    sent_after, recv_after = token_tracker.snapshot()
+    sent_delta = sent_after - sent_before
+    recv_delta = recv_after - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
     explanation = CLIDisplay.extract_explanation(diagnosis)

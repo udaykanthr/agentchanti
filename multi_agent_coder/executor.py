@@ -708,6 +708,28 @@ class Executor:
         if m:
             return f'where "{m.group(1)}" 2>nul'
 
+        # source path → call path (with venv bin→Scripts translation)
+        # Also handles `. path` (dot-space shorthand for source)
+        m = re.match(r'^(?:source|\.)\s+(.+)', cmd)
+        if m:
+            path = m.group(1).strip()
+            path = re.sub(r'(\S+)/bin/activate', r'\1/Scripts/activate', path)
+            path = path.replace('/', '\\')
+            return f'call {path}'
+
+        # ls [args] → dir [args]
+        m = re.match(r'^ls(\s|$)(.*)', cmd)
+        if m:
+            args = m.group(2).strip()
+            if not args or args.startswith('-'):
+                return 'dir'
+            return f'dir {args}'
+
+        # cat file → type file (single file, not heredocs)
+        m = re.match(r'^cat\s+(\S+)$', cmd)
+        if m and '<<' not in cmd:
+            return f'type {m.group(1)}'
+
         return cmd
 
     def run_command(self, cmd: str, env: dict | None = None,

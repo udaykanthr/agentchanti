@@ -432,15 +432,20 @@ def _shell_instructions() -> str:
             "For reading a file use: type <path>\n"
             "For creating a directory use: mkdir <path>\n"
             "For installing Python packages use: pip install <package>\n"
+            "For activating a virtual environment use: call venv\\Scripts\\activate\n"
+            "Do NOT use Unix commands: source, mkdir -p, touch, rm -rf, cat, ls, chmod, export.\n"
             "Do NOT use PowerShell cmdlets like Get-ChildItem, Select-Object, etc.\n"
         )
     else:
+        _sysname = platform.system()
+        _os_label = "macOS" if _sysname == "Darwin" else _sysname
         base = (
-            f"Use standard shell commands for {platform.system()}.\n"
+            f"Use standard shell commands for {_os_label}.\n"
             "For listing files use: find . -type f\n"
             "For reading a file use: cat <path>\n"
             "For creating a directory use: mkdir -p <path>\n"
             "For installing Python packages use: pip install <package>\n"
+            "For activating a virtual environment use: source venv/bin/activate\n"
         )
     base += (
         "\nCRITICAL: Commands run non-interactively (no terminal input available).\n"
@@ -787,13 +792,13 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         if file_summary != "(no files yet)":
             gen_prompt += f"Project files: {file_summary}\n\n"
         gen_prompt += f"Step: {step_text}\n\nCommand:"
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         cmd_response = llm_client.generate_response(gen_prompt).strip()
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         if cmd_response:
@@ -946,13 +951,13 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
             f"```"
         )
 
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         fix_response = coder.process(fix_prompt, context="", language=language)
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         explanation = CLIDisplay.extract_explanation(fix_response)
@@ -1089,13 +1094,13 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             )
 
         display.step_info(step_idx, f"Coding (attempt {attempt}/{MAX_STEP_RETRIES})...")
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         response = coder.process(step_text, context=context, language=language)
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         explanation = CLIDisplay.extract_explanation(response)
@@ -1162,8 +1167,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         # Review — pass step description so reviewer scopes to this step
         display.step_info(step_idx, "Reviewing code...")
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         lint_errors = _quick_offline_lint(files)
         lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
@@ -1183,8 +1187,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 language=language,
             )
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         if review:
@@ -1450,15 +1455,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 )
             gen_context += env_note
 
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         test_response = tester.process(
             step_text, context=gen_context, language=language,
             env_info=js_env)
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         explanation = CLIDisplay.extract_explanation(test_response)
@@ -1488,8 +1493,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
         # Review tests
         display.step_info(step_idx, "Reviewing tests...")
-        sent_before = token_tracker.total_prompt_tokens
-        recv_before = token_tracker.total_completion_tokens
+        sent_before, recv_before = token_tracker.snapshot()
 
         lint_errors = _quick_offline_lint(test_files)
         lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
@@ -1500,8 +1504,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             language=language,
         )
 
-        sent_delta = token_tracker.total_prompt_tokens - sent_before
-        recv_delta = token_tracker.total_completion_tokens - recv_before
+        sent_after, recv_after = token_tracker.snapshot()
+        sent_delta = sent_after - sent_before
+        recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
 
         if review:
@@ -1713,14 +1718,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 "Only output the corrected test file(s) using #### [FILE]: format."
             )
 
-            sent_before = token_tracker.total_prompt_tokens
-            recv_before = token_tracker.total_completion_tokens
+            sent_before, recv_before = token_tracker.snapshot()
 
             fix_response = coder.process(
                 fix_prompt, context=fix_context, language=language)
 
-            sent_delta = token_tracker.total_prompt_tokens - sent_before
-            recv_delta = token_tracker.total_completion_tokens - recv_before
+            sent_after, recv_after = token_tracker.snapshot()
+            sent_delta = sent_after - sent_before
+            recv_delta = recv_after - recv_before
             display.step_tokens(step_idx, sent_delta, recv_delta)
 
             explanation = CLIDisplay.extract_explanation(fix_response)
@@ -1851,13 +1856,13 @@ def _try_diff_edit(
 
     # 3. Build diff prompt and call LLM
     diff_prompt = _build_diff_prompt(step_text, formatted)
-    sent_before = token_tracker.total_prompt_tokens
-    recv_before = token_tracker.total_completion_tokens
+    sent_before, recv_before = token_tracker.snapshot()
 
     llm_response = coder.llm_client.generate_response(diff_prompt)
 
-    sent_delta = token_tracker.total_prompt_tokens - sent_before
-    recv_delta = token_tracker.total_completion_tokens - recv_before
+    sent_after, recv_after = token_tracker.snapshot()
+    sent_delta = sent_after - sent_before
+    recv_delta = recv_after - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
     # 4. Parse diff
@@ -2178,13 +2183,13 @@ def _try_chunk_edit(
     )
 
     display.step_info(step_idx, f"[ChunkEdit] Sending {len(all_target_ids)} target chunks...")
-    sent_before = token_tracker.total_prompt_tokens
-    recv_before = token_tracker.total_completion_tokens
+    sent_before, recv_before = token_tracker.snapshot()
 
     llm_response = coder.llm_client.generate_response(chunk_prompt)
 
-    sent_delta = token_tracker.total_prompt_tokens - sent_before
-    recv_delta = token_tracker.total_completion_tokens - recv_before
+    sent_after, recv_after = token_tracker.snapshot()
+    sent_delta = sent_after - sent_before
+    recv_delta = recv_after - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
     edits = chunk_editor.parse_chunk_response(llm_response)
@@ -2243,8 +2248,7 @@ def _try_chunk_edit(
     reviewer_mode = "diff" if getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True) else "full"
 
     display.step_info(step_idx, "Reviewing changes...")
-    sent_before = token_tracker.total_prompt_tokens
-    recv_before = token_tracker.total_completion_tokens
+    sent_before, recv_before = token_tracker.snapshot()
 
     lint_errors = _quick_offline_lint(result_files)
     lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
@@ -2255,8 +2259,9 @@ def _try_chunk_edit(
         review_mode=reviewer_mode,
     )
 
-    sent_delta = token_tracker.total_prompt_tokens - sent_before
-    recv_delta = token_tracker.total_completion_tokens - recv_before
+    sent_after, recv_after = token_tracker.snapshot()
+    sent_delta = sent_after - sent_before
+    recv_delta = recv_after - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
     if review:

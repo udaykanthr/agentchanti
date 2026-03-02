@@ -40,6 +40,7 @@ class OllamaClient(LLMClient):
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
+            model_name=self.model,
         )
         log.debug(f"[Ollama] Usage: prompt={prompt_tokens} completion={completion_tokens}")
         log.debug(f"[Ollama] Response:\n{result}")
@@ -88,6 +89,7 @@ class OllamaClient(LLMClient):
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             tokens_generated,
+            model_name=self.model,
         )
         log.debug(f"[Ollama] Streamed {tokens_generated} tokens")
         log.debug(f"[Ollama] Response:\n{result}")

@@ -23,7 +23,11 @@ class StepReport:
 def _format_duration(seconds: float) -> str:
     if seconds <= 0:
         return ""
-    mins, secs = divmod(int(seconds), 60)
+    total_secs = int(seconds)
+    hours, remainder = divmod(total_secs, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {mins}m {secs}s"
     return f"{mins}m {secs}s" if mins else f"{secs}s"
 
 
@@ -189,6 +193,10 @@ def generate_html_report(
       <div class="stat-value" style="color: var(--failure);">{failed}</div>
       <div class="stat-label">Failed</div>
     </div>
+    {f'''<div class="stat">
+      <div class="stat-value" style="color: var(--muted);">{skipped}</div>
+      <div class="stat-label">Skipped</div>
+    </div>''' if skipped > 0 else ""}
     <div class="stat">
       <div class="stat-value">{total_sent + total_recv:,}</div>
       <div class="stat-label">Total Tokens</div>

@@ -20,15 +20,22 @@ class TokenTracker:
         self.call_count = 0
         self.pricing = pricing or {}
         self.current_context_size = 0
+        self._lock = threading.Lock()
 
     def record(self, prompt_tokens: int, completion_tokens: int, model_name: str | None = None):
-        self.total_prompt_tokens += prompt_tokens
-        self.total_completion_tokens += completion_tokens
-        self.call_count += 1
-        self.current_context_size = prompt_tokens
-        
+        with self._lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.call_count += 1
+            self.current_context_size = prompt_tokens
+
         if model_name:
             self._calculate_cost(model_name, prompt_tokens, completion_tokens)
+
+    def snapshot(self) -> tuple[int, int]:
+        """Return a thread-safe snapshot of (total_prompt_tokens, total_completion_tokens)."""
+        with self._lock:
+            return self.total_prompt_tokens, self.total_completion_tokens
 
     def _calculate_cost(self, model_name: str, prompt: int, completion: int):
         # Simple match or regex match for pricing
@@ -37,12 +44,13 @@ class TokenTracker:
             if pattern in model_name.lower():
                 price_entry = prices
                 break
-        
+
         if price_entry:
             # Pricing is per 1M tokens
             cost = (prompt * price_entry["input"] / 1_000_000) + \
                    (completion * price_entry["output"] / 1_000_000)
-            self.total_cost += cost
+            with self._lock:
+                self.total_cost += cost
 
     @property
     def total_tokens(self):
@@ -324,8 +332,7 @@ class CLIDisplay:
 
         while not self._spinner_stop.is_set():
             elapsed = _time.monotonic() - start_time
-            mins, secs = divmod(int(elapsed), 60)
-            time_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+            time_str = self._format_elapsed(elapsed)
 
             phrase_idx = int(elapsed // 8) % len(self._WAITING_PHRASES)
             phrase = self._WAITING_PHRASES[phrase_idx]
@@ -388,6 +395,16 @@ class CLIDisplay:
         """Visible length of text after stripping ANSI codes."""
         return len(re.sub(r'\033\[[0-9;]*m', '', text))
 
+    @staticmethod
+    def _format_elapsed(elapsed: float) -> str:
+        """Format elapsed seconds as a compact time string with hour support."""
+        total = int(elapsed)
+        hours, remainder = divmod(total, 3600)
+        mins, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{mins:02d}:{secs:02d}"
+        return f"{mins}:{secs:02d}" if mins else f"{secs}s"
+
     def _render_status_bar(self):
         """Render a status bar: progress centered, tokens+cost right-aligned."""
         w = self.term_width
@@ -403,8 +420,7 @@ class CLIDisplay:
         ctx_str = f"{ctx/1000:.1f}K".replace(".0K", "K") if ctx >= 1000 else str(ctx)
         
         elapsed = _time.monotonic() - self.start_time
-        mins, secs = divmod(int(elapsed), 60)
-        time_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+        time_str = self._format_elapsed(elapsed)
 
         right = (f"{D}⏱ {R}{W}{time_str}{R} "
                  f"{D}Ctx:{R}{W}{ctx_str}{R} "
@@ -461,9 +477,7 @@ class CLIDisplay:
                 status_text = f" {sc}{status}{R}"
 
                 if status in ("done", "failed") and "duration" in step:
-                    dur = step["duration"]
-                    m, s = divmod(int(dur), 60)
-                    dur_str = f" {m}:{s:02d}" if m else f" {int(s)}s"
+                    dur_str = f" {self._format_elapsed(step['duration'])}"
                     status_text += f"{D}{dur_str}{R}"
 
             lines.append(f"{prefix} {icon} {name_color}{label}{R}{status_text}")
@@ -610,8 +624,11 @@ class CLIDisplay:
         self.steps[index]["status"] = "active"
         self.steps[index]["type"] = step_type
         self.steps[index]["info"] = []
-        self.steps[index]["tokens"] = {"sent": 0, "recv": 0}
-        self.steps[index]["start_time"] = _time.monotonic()
+        # Preserve original start_time and accumulated tokens on retries
+        if "start_time" not in self.steps[index]:
+            self.steps[index]["start_time"] = _time.monotonic()
+        if "tokens" not in self.steps[index]:
+            self.steps[index]["tokens"] = {"sent": 0, "recv": 0}
         self.render()
 
     def step_info(self, index: int, message: str):

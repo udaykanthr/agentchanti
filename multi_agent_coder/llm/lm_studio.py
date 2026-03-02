@@ -42,6 +42,7 @@ class LMStudioClient(LLMClient):
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
+            model_name=self.model,
         )
         log.debug(f"[LM Studio] Usage: prompt={prompt_tokens} completion={completion_tokens}")
 
@@ -63,12 +64,14 @@ class LMStudioClient(LLMClient):
             ],
             "temperature": 0.7,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         headers = {"Content-Type": "application/json"}
         url = f"{self.base_url}/chat/completions"
 
         content_parts: list[str] = []
         tokens_generated = 0
+        prompt_tokens = est_tokens
 
         # timeout: (connect, read-per-chunk); generous read timeout for slow models
         response = requests.post(url, headers=headers, json=payload,
@@ -91,11 +94,21 @@ class LMStudioClient(LLMClient):
                         tokens_generated += 1
                         if self._stream_callback and tokens_generated % 10 == 0:
                             self._stream_callback(tokens_generated)
+                    # Extract actual usage from the final chunk if available
+                    usage = chunk.get("usage")
+                    if usage:
+                        pt = usage.get("prompt_tokens")
+                        ct = usage.get("completion_tokens")
+                        if isinstance(pt, int):
+                            prompt_tokens = pt
+                        if isinstance(ct, int):
+                            tokens_generated = ct
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
         result = "".join(content_parts)
-        token_tracker.record(est_tokens, tokens_generated)
+        token_tracker.record(prompt_tokens, tokens_generated,
+                             model_name=self.model)
         log.debug(f"[LM Studio] Streamed {tokens_generated} tokens")
         log.debug(f"[LM Studio] Response:\n{result}")
 

@@ -445,8 +445,7 @@ class TestDiagnosisWithSearch:
     @patch("multi_agent_coder.orchestrator.diagnosis.token_tracker")
     def test_diagnosis_includes_search_context(self, mock_tracker):
         """When search_agent is provided, its results should appear in the LLM prompt."""
-        mock_tracker.total_prompt_tokens = 0
-        mock_tracker.total_completion_tokens = 0
+        mock_tracker.snapshot.return_value = (0, 0)
 
         mock_llm = MagicMock()
         mock_llm.generate_response.return_value = "ROOT CAUSE: test\nFIX: none"
@@ -482,8 +481,7 @@ class TestDiagnosisWithSearch:
     @patch("multi_agent_coder.orchestrator.diagnosis.token_tracker")
     def test_diagnosis_works_without_search(self, mock_tracker):
         """Without search_agent, diagnosis should work normally (backward compat)."""
-        mock_tracker.total_prompt_tokens = 0
-        mock_tracker.total_completion_tokens = 0
+        mock_tracker.snapshot.return_value = (0, 0)
 
         mock_llm = MagicMock()
         mock_llm.generate_response.return_value = "ROOT CAUSE: test\nFIX: none"
@@ -512,8 +510,7 @@ class TestDiagnosisWithSearch:
     @patch("multi_agent_coder.orchestrator.diagnosis.token_tracker")
     def test_diagnosis_handles_search_exception(self, mock_tracker):
         """If search_agent.search_for_error raises, diagnosis should still work."""
-        mock_tracker.total_prompt_tokens = 0
-        mock_tracker.total_completion_tokens = 0
+        mock_tracker.snapshot.return_value = (0, 0)
 
         mock_llm = MagicMock()
         mock_llm.generate_response.return_value = "ROOT CAUSE: test\nFIX: none"
