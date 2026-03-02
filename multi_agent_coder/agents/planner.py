@@ -332,13 +332,19 @@ Write a numbered list. Each step MUST be a single, concrete action:
     - `npm init -y`
     - `ng new myapp --defaults`
 
-12. **Sub-project paths**: When a step creates a new project in a subdirectory
-    (e.g. `npx create-react-app my-app`, `npx create-next-app my-app --yes`),
-    ALL subsequent steps MUST reference files with the subdirectory prefix.
+12. **Sub-project paths and naming**: When a step creates a new project in a
+    subdirectory, you MUST derive the project folder name from the user's task
+    description. Do NOT invent a creative name — use what the user asked for.
+    If the task says "create a SPA" or "build a React app" without a specific
+    name, use a simple descriptive slug (e.g. `spa-app` or `react-app`).
+    CRITICAL: Use the EXACT SAME folder name in ALL steps. Never change it.
+    - If step 1 creates `my-app/`, ALL subsequent steps use `my-app/`.
     - CORRECT: "Create dashboard page in `my-app/src/pages/Dashboard.js`"
     - WRONG: "Create dashboard page in `src/pages/Dashboard.js`"
     - CMD steps that operate on the sub-project must include `cd my-app &&`
       before the command (e.g. `cd my-app && npm install axios`)
+    - If KB documentation uses placeholder names like `<project-name>`,
+      replace them with the consistent project name you chose above.
 
 13. **SKIP already-installed packages**: If the project knowledge above lists
     packages as already installed, do NOT add install steps for them.

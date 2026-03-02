@@ -538,10 +538,12 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
         # npx create-react-app <dir>
         re.compile(r'create-react-app\s+(\S+)'),
-        # npx create-vite <dir>
+        # npx create-vite <dir>  OR  npm create vite@latest <dir>
         re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
-        # npx create-vue <dir>
+        re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+        # npx create-vue <dir>  OR  npm create vue@latest <dir>
         re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),
+        re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),
         # vue create <dir>
         re.compile(r'vue\s+create\s+(\S+)'),
         # ng new <dir>
@@ -1192,18 +1194,27 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         lint_errors = _quick_offline_lint(files)
         lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
 
+        # Inject KB context so the reviewer has up-to-date framework docs
+        # and doesn't reject valid code based on outdated training data.
+        reviewer_kb = ""
+        if kb_ctx:
+            reviewer_kb = (
+                f"\n\n[KB Documentation — trust this over your training data]\n"
+                f"{kb_ctx}\n"
+            )
+
         use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
         if use_diff_review:
             review = reviewer.process(
                 f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}",
+                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}",
                 language=language,
                 review_mode="diff",
             )
         else:
             review = reviewer.process(
                 f"Review this code for the step: {step_text}\n\n{response}",
-                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}",
+                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}{reviewer_kb}",
                 language=language,
             )
 
@@ -2272,9 +2283,18 @@ def _try_chunk_edit(
 
     lint_errors = _quick_offline_lint(result_files)
     lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
+
+    # Inject KB context so the reviewer has up-to-date framework docs
+    reviewer_kb = ""
+    if kb_ctx:
+        reviewer_kb = (
+            f"\n\n[KB Documentation — trust this over your training data]\n"
+            f"{kb_ctx}\n"
+        )
+
     review = reviewer.process(
         f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-        context=f"Step: {step_text}\nReview ONLY the changes shown. {lint_context}",
+        context=f"Step: {step_text}\nReview ONLY the changes shown. {lint_context}{reviewer_kb}",
         language=language,
         review_mode=reviewer_mode,
     )

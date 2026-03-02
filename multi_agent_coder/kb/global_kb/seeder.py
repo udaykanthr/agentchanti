@@ -432,10 +432,11 @@ _ERROR_SEEDS: list[ErrorFix] = [
         cause="Tailwind CSS v4 removed the 'tailwindcss init' command and tailwind.config.js. "
               "The old PostCSS-based setup is no longer supported.",
         fix_template="Use the new Tailwind CSS v4 installation:\n"
-                     "1. Install: npm install tailwindcss @tailwindcss/cli\n"
-                     "2. Create CSS file with: @import \"tailwindcss\";\n"
-                     "3. Build: npx @tailwindcss/cli -i ./src/input.css -o ./src/output.css\n"
-                     "4. For Vite projects: npm install tailwindcss @tailwindcss/vite and add plugin to vite.config.ts\n"
+                     "1. Create Vite project: npm create vite@latest <project-name> -- --template react --no-interactive\n"
+                     "   IMPORTANT: Replace <project-name> with the EXACT name from the user's task.\n"
+                     "2. Install Tailwind: cd <project-name> && npm install tailwindcss @tailwindcss/vite\n"
+                     "3. Add Tailwind plugin to vite.config.ts (import tailwindcss from '@tailwindcss/vite')\n"
+                     "4. Add @import \"tailwindcss\"; to main CSS file\n"
                      "5. Configuration is now done via CSS @theme directive, NOT tailwind.config.js",
         severity="error",
         tags="tailwindcss,tailwind,init,config,postcss,css,deprecated,v4",
@@ -888,23 +889,30 @@ The `tailwind.config.js` / `tailwind.config.ts` configuration file is also
 
 ## Correct Installation (Tailwind CSS v4)
 
+IMPORTANT: In ALL commands below, replace `<project-name>` with the EXACT
+project name derived from the user's task description. Use the SAME name
+consistently in every step — do NOT invent a different name.
+
 ### Step 1: Install packages, Install Tailwind CSS
 
 ```bash
-npm install tailwindcss @tailwindcss/postcss postcss
+npm create vite@latest <project-name> -- --template react --no-interactive
+cd <project-name>
+npm install tailwindcss @tailwindcss/vite
 ```
 
-### Step 2: Add Tailwind to your PostCSS configuration
+### Step 2: Configure the Vite plugin
+Add the @tailwindcss/vite plugin to your Vite configuration.
 
-Add @tailwindcss/postcss to your postcss.config.mjs file, 
-or wherever PostCSS is configured in your project.
+```vite.config.ts
+import { defineConfig } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
 
-```mjs
-export default {
-  plugins: {
-    "@tailwindcss/postcss": {},
-  }
-}
+export default defineConfig({
+  plugins: [
+    tailwindcss(),
+  ],
+})
 ```
 
 ### Step 3: Import Tailwind in your CSS
@@ -921,89 +929,15 @@ Run your build process with npm run dev or whatever command is configured in you
 npm run dev
 ```
 
-### Step 4: Start using Tailwind in your HTML
-Make sure your compiled CSS is included in the <head> (your framework might handle this for you), 
-then start using Tailwind’s utility classes to style your content.
-
-```html
-<!doctype html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="/dist/styles.css" rel="stylesheet">
-</head>
-<body>
-  <h1 class="text-3xl font-bold underline">
-    Hello world!
-  </h1>
-</body>
-</html>
-```
-
-## Framework Integrations
-
-### Vite (React, Vue, Svelte)
-
-```bash
-npm install tailwindcss @tailwindcss/vite
-```
-
-Then add the plugin to `vite.config.ts`:
-
-```typescript
-import tailwindcss from "@tailwindcss/vite";
-import { defineConfig } from "vite";
-
-export default defineConfig({
-  plugins: [tailwindcss()],
-});
-```
-
-And import in your CSS:
-
-```css
-@import "tailwindcss";
-```
-
-### PostCSS
-
-```bash
-npm install tailwindcss @tailwindcss/postcss postcss
-```
-
-Create `postcss.config.mjs`:
-
-```javascript
-export default {
-  plugins: {
-    "@tailwindcss/postcss": {},
-  },
-};
-```
-
-## Configuration in v4
-
-All customization in Tailwind CSS v4 is done via CSS using `@theme`:
-
-```css
-@import "tailwindcss";
-
-@theme {
-  --color-primary: #3b82f6;
-  --font-display: "Inter", sans-serif;
-}
-```
-
 There is **no** `tailwind.config.js` file in v4.
 
 ## Key Differences from v3
 
 | Feature | v3 (old) | v4 (current) |
 |---------|----------|--------------|
-| Install | `npm install tailwindcss postcss autoprefixer` |
+| Install | `npm install tailwindcss postcss autoprefixer` | `npm create vite@latest <project-name>` then `npm install tailwindcss @tailwindcss/vite` |
 | Init | `npx tailwindcss init -p` | Not needed |
-| Config | `tailwind.config.js` | CSS `@theme` directive |
+| Config | `tailwind.config.js` | vite.config.ts |
 | CSS import | `@tailwind base/components/utilities` | `@import "tailwindcss"` |
 | Build | `npx tailwindcss -i input -o output` | `npm run dev` |
 """,
