@@ -23,7 +23,16 @@ Complete reference for the AgentChanti multi-agent AI coding system.
    - [Google Gemini](#google-gemini)
    - [Anthropic Claude](#anthropic-claude)
    - [Embedding Models](#embedding-models)
-5. [Key Features](#key-features)
+5. [RAG Architecture](#rag-architecture)
+   - [Overview](#overview)
+   - [Phase 1: Code Graph](#phase-1-code-graph)
+   - [Phase 2: Local Semantic KB](#phase-2-local-semantic-kb)
+   - [Phase 3: Global KB](#phase-3-global-kb)
+   - [Phase 4: Context Assembly](#phase-4-context-assembly)
+   - [Project Orientation](#project-orientation)
+   - [Startup & Runtime Lifecycle](#startup--runtime-lifecycle)
+   - [Data Flow](#data-flow)
+6. [Key Features](#key-features)
    - [TUI Plan Editor](#tui-plan-editor)
    - [Diff-Aware Editing](#diff-aware-editing)
    - [Knowledge Base (KB)](#knowledge-base-kb)
@@ -36,10 +45,10 @@ Complete reference for the AgentChanti multi-agent AI coding system.
    - [Git Integration](#git-integration)
    - [HTML Reports](#html-reports)
    - [Protected Files](#protected-files)
-6. [Library API](#library-api)
-7. [Plugin System](#plugin-system)
-8. [Supported Languages](#supported-languages)
-9. [Troubleshooting](#troubleshooting)
+7. [Library API](#library-api)
+8. [Plugin System](#plugin-system)
+9. [Supported Languages](#supported-languages)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -536,6 +545,353 @@ ollama pull nomic-embed-text
 # Disable:
 agentchanti "task" --no-embeddings
 ```
+
+---
+
+## RAG Architecture
+
+AgentChanti implements a **4-phase Retrieval-Augmented Generation (RAG)** system that dynamically injects relevant context into every LLM prompt. This allows agents to understand your codebase, recall error fixes, and follow project-specific conventions without you manually providing context.
+
+### Overview
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Your Coding Task                         │
+└──────────────────┬───────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Phase 1: Code Graph        Tree-sitter AST parsing          │
+│  ───────────────────        Classes, functions, imports,      │
+│                             call edges → NetworkX graph       │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 2: Semantic KB       Embed symbols → SQLite vectors   │
+│  ────────────────────       Cosine similarity search          │
+│                             Graph-enriched results            │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 3: Global KB         Error-fix dictionary (regex)     │
+│  ──────────────────         Coding patterns, ADRs             │
+│                             Behavioral instructions           │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 4: Context Builder   Intent detection (error/review)  │
+│  ────────────────────────   Retrieve → rank → budget (4000t) │
+│                             Inject into agent prompt          │
+└──────────────────┬───────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────┐
+│              Planner / Coder / Reviewer / Tester             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Phase 1: Code Graph
+
+**Files:** `kb/local/graph.py`, `kb/local/parser.py`, `kb/local/indexer.py`, `kb/local/manifest.py`
+
+Tree-sitter parses your source files into an AST and extracts structured symbols:
+
+| Extracted | Details |
+|-----------|---------|
+| **Classes** | Name, line range, docstring, base classes |
+| **Functions/Methods** | Name, parameters, return type, docstring, parent class |
+| **Variables** | Name, type hint, scope (module/class/function) |
+| **Imports** | Module names and aliases |
+| **Function Calls** | Call sites within functions |
+
+**Supported languages:** Python, JavaScript, TypeScript, Java, C, C++, Go, Rust, Ruby, PHP, C#.
+
+These symbols are assembled into a **NetworkX directed multi-graph** with five node types (`FILE`, `MODULE`, `CLASS`, `FUNCTION`, `VARIABLE`) and six edge types (`CONTAINS`, `CALLS`, `INHERITS`, `IMPORTS`, `REFERENCES`, `OVERRIDES`).
+
+**Key graph operations:**
+
+| Method | What It Does |
+|--------|-------------|
+| `get_related_symbols(name, depth)` | Returns 1-hop neighbors of a symbol |
+| `impact_analysis(file_path)` | Finds all downstream dependents of a file |
+| `add_parsed_file(parsed)` | Idempotent: adds/updates a file's symbols in the graph |
+
+**Indexing pipeline:**
+- **Full index** (`Indexer.full_index()`): Walks the project (respecting `.gitignore`), parses every supported file, builds the graph, persists to `graph.pkl` + `index.db` + `graph_meta.json`.
+- **Incremental index** (`Indexer.update_file(path)`): Hash-based change detection. Only re-parses files whose content hash differs from the stored hash.
+
+**Storage location:** `.agentchanti/kb/local/`
+
+```
+.agentchanti/kb/local/
+├── graph.pkl           # Pickled NetworkX DiGraph
+├── index.db            # SQLite manifest (files, symbols, hashes)
+├── graph_meta.json     # Metadata (last_indexed, file_count, symbol_count)
+└── vectors.db          # Phase 2: SQLite vector store
+```
+
+### Phase 2: Local Semantic KB
+
+**Files:** `kb/local/embedder.py`, `kb/local/sqlite_vector_store.py`, `kb/local/searcher.py`
+
+Converts code symbols into vector embeddings for natural-language search.
+
+**Symbol chunking:** Each function and class from the Phase 1 graph becomes a `SymbolChunk` — a formatted text block containing the symbol's language, file path, signature, docstring, and body code. Each chunk receives a deterministic UUID5 ID (`{file_path}:{symbol_name}:{line_start}`) for idempotent upserts.
+
+**Embedding generation:**
+- Processed in batches of 100
+- Concurrency is throttled for local LLMs (max_workers=1 for Ollama/LM Studio to avoid KV cache thrashing; max_workers=5 for cloud APIs)
+- Up to 3 retries with exponential backoff on API errors
+
+**Vector storage:** Zero-config SQLite backend (`sqlite_vector_store.py`):
+
+```sql
+CREATE TABLE vectors (
+    point_id TEXT PRIMARY KEY,
+    vector   BLOB NOT NULL,
+    payload  TEXT NOT NULL DEFAULT '{}'
+);
+```
+
+Payload contains: `file`, `language`, `symbol_type`, `symbol_name`, `parent_class`, `line_start`, `line_end`, `last_modified`, `loc`.
+
+**Search:** Cosine similarity computed with NumPy (fallback: pure Python). Supports payload-based filtering on language, symbol type, and file path.
+
+**Semantic search pipeline** (`Searcher.search(query, filters, top_k)`):
+
+1. Embed the natural-language query using the same model/provider as stored vectors
+2. Fetch `top_k * 2` candidates from vector store with cosine similarity
+3. Apply payload filters (language, symbol_type, file path)
+4. Deduplicate by `(file, symbol_name, line_start)`
+5. **Graph enrichment**: For each result, call `graph.get_related_symbols(name, depth=1)` to add 1-hop neighbors from Phase 1
+6. **Fallback**: If the vector store is unavailable or empty, falls back to keyword-based graph search
+
+**Search result:**
+
+```python
+@dataclass
+class SearchResult:
+    symbol_name: str
+    symbol_type: str       # "function" | "method" | "class"
+    file: str
+    line_start: int
+    line_end: int
+    code_snippet: str      # Actual source lines
+    score: float           # Cosine similarity (0-1)
+    related_symbols: list  # 1-hop graph neighbors
+```
+
+### Phase 3: Global KB
+
+**Files:** `kb/global_kb/store.py`, `kb/global_kb/error_dict.py`, `kb/global_kb/seeder.py`
+
+A pre-bundled knowledge base of error patterns, coding best practices, and behavioral instructions.
+
+**Error dictionary** (`error_dict.py`):
+
+```sql
+CREATE TABLE errors (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    error_type    TEXT NOT NULL,
+    language      TEXT NOT NULL,
+    pattern       TEXT NOT NULL,      -- Regex pattern
+    cause         TEXT,
+    fix_template  TEXT NOT NULL,
+    severity      TEXT DEFAULT 'error',
+    tags          TEXT,               -- Comma-separated
+    source        TEXT DEFAULT 'core'
+);
+```
+
+Lookup strategy (in priority order):
+1. **Exact match** on `error_type`
+2. **Regex pattern match** on the error message
+3. **Fuzzy tag match** on error components
+
+Pre-seeded with common errors for Python, JavaScript, TypeScript, Java, Go, Rust, and C#.
+
+**Global vector store** (`store.py`): Stores and searches over four categories of knowledge:
+- **Patterns** — Best practices, design patterns, architectural guidance
+- **ADRs** — Architecture Decision Records
+- **Docs** — General documentation
+- **Behavioral** — Agent instructions injected into every step
+
+**Storage:** `.agentchanti/kb/global_kb/core/global_kb.db` (SQLite)
+
+**Seeding:** Automatically populated on first run via `KBStartupManager`. Markdown documents (with frontmatter: title, category, language, tags) are chunked, embedded, and stored in the global vector store.
+
+**Registry updates:** The global KB can be updated from a GitHub registry (`agentchanti-kb-registry`) via `agentchanti kb update`.
+
+### Phase 4: Context Assembly
+
+**Files:** `kb/context_builder.py`
+
+The `ContextBuilder` is the single entry point that orchestrates all retrieval and produces the final context block injected into LLM prompts.
+
+**Intent detection:** The step description is scanned for keywords to determine which KB layers to activate:
+
+| Intent | Trigger Keywords | KB Layers Activated |
+|--------|-----------------|-------------------|
+| **Error** | error, exception, failed, traceback, bug, fix, debug, crash | Error dictionary (Phase 3) |
+| **Review** | review, refactor, improve, clean, optimize, pattern, quality | Global patterns (Phase 3) |
+| **Default** | (always) | Local semantic search (Phase 2), graph expansion (Phase 1), behavioral instructions (Phase 3) |
+
+**Assembly pipeline** (`ContextBuilder.build_context(task, current_file, max_tokens)`):
+
+1. Detect intent from task description
+2. **Semantic search** (Phase 2): Query vector store with the task description (top_k=8)
+3. **Graph expansion** (Phase 1): For top 3 results, extract 1-hop related symbols
+4. **Error lookup** (Phase 3): If error intent detected, query error dictionary
+5. **Global patterns** (Phase 3): If review intent detected, semantic search over global KB (top_k=3)
+6. **Behavioral instructions** (Phase 3): Always included
+
+**Token budget management** (default: 4000 tokens): Results are trimmed by priority (highest = last to trim):
+
+1. Behavioral instructions (highest priority)
+2. Error fixes
+3. Local symbols (top 3)
+4. Global patterns
+5. Related symbols
+6. Local symbols (remaining)
+
+**Formatted output injected into prompts:**
+
+```
+=== KNOWLEDGE BASE CONTEXT ===
+
+[BEHAVIORAL INSTRUCTIONS]
+... (behavioral docs)
+
+[RELEVANT CODE FROM THIS PROJECT]
+File: path/to/file.py (lines 10-30)
+... (code snippet)
+Related: symbol1, symbol2, ...
+
+[ERROR FIX PATTERNS]
+Error: AttributeError
+Cause: ...
+Fix: ...
+
+[CODING PATTERNS]
+Title: ...
+Content: ...
+
+=== END KNOWLEDGE BASE CONTEXT ===
+```
+
+**Relevant file selection** (`ContextBuilder.get_relevant_files()`): Used by the Coder agent to identify which files to focus on. Combines semantic search results, graph impact analysis on changed files, and graph expansion — then sorts by score and returns top-k.
+
+### Project Orientation
+
+**File:** `kb/project_orientation.py`
+
+Detects the project "DNA" once per session and caches the result as a `ProjectProfile`:
+
+| Detected Property | Sources |
+|------------------|---------|
+| Language | Config files (`package.json`, `pyproject.toml`, `go.mod`, etc.), Phase 1 graph distribution, filesystem patterns |
+| Framework | React, Next.js, Vue, Flask, Django, FastAPI, Spring, etc. |
+| Source/Test roots | Directory structure analysis |
+| Test framework | Jest, Vitest, pytest, unittest, etc. |
+| Entry points | `main.py`, `index.ts`, `App.tsx`, etc. |
+
+The profile is formatted as a **mandatory grounding block** prepended to every LLM prompt:
+
+```
+=== PROJECT CONTEXT (read carefully before acting) ===
+
+Project: my-app v1.0.0
+Language: typescript
+Framework: nextjs
+
+DIRECTORY STRUCTURE (CRITICAL — always use these paths):
+  Project root:  /path/to/project
+  Source files:   /path/to/project/src
+  Test files:    /path/to/project/__tests__
+  Entry points:  src/index.tsx
+
+COMMANDS:
+  Run tests:  npm run test
+
+TEST FRAMEWORK: jest, vitest
+
+STRICT RULES — you MUST follow these:
+  1. NEVER create files outside /path/to/project/src unless explicitly told to.
+  2. ALL new source files must use .ts or .tsx extension.
+  3. ALL test files must use the project's test framework: jest, vitest.
+  4. NEVER use a different language. This is a typescript project.
+
+=== END PROJECT CONTEXT ===
+```
+
+### Startup & Runtime Lifecycle
+
+**Startup** (`kb/startup.py`): The `KBStartupManager` runs at CLI launch and makes smart decisions to minimize startup time:
+
+| Condition | Action | Latency Target |
+|-----------|--------|---------------|
+| Global KB missing | Seed all (one-time) | Blocking |
+| No local index + blank project | Skip (RuntimeWatcher handles) | < 10ms |
+| No local index + files exist | Full index + embed | Blocking |
+| 0 files changed | Nothing | < 10ms |
+| 1-50 files changed | Incremental update | Background |
+| > 50 files or > 60min stale | Full re-index | Background |
+
+**Runtime Watcher** (`kb/runtime_watcher.py`): A daemon thread that monitors file changes during agent execution:
+
+- **Incremental mode** (existing project): Watches for file changes via `watchdog`, triggers `Indexer.update_file()` + re-embed for each changed file
+- **Creation mode** (blank/new project): Watches for the first file creation, then triggers a full index and switches to incremental mode
+- **Debouncing**: 1-second default debounce to avoid rapid re-indexing on editor auto-saves
+
+### Data Flow
+
+End-to-end flow showing how RAG integrates into the agent pipeline:
+
+```
+1. CLI Start
+   └─→ KBStartupManager.run()
+       ├─→ Seed global KB (if first run)
+       ├─→ Full/incremental local index (if needed)
+       └─→ Start RuntimeWatcher (background daemon)
+
+2. Pipeline Initialization
+   └─→ ContextBuilder created with project_root + llm_client
+       └─→ Lazy-loads Phase 1 graph + Phase 2 searcher
+
+3. Project Orientation
+   └─→ ProjectOrientation.get_profile()
+       └─→ Detect language, framework, test runner, directories
+       └─→ Cache ProjectProfile for session
+
+4. Per-Step Execution
+   └─→ For each step in the plan:
+       ├─→ Prepend ProjectProfile grounding block
+       ├─→ ContextBuilder.build_context(step_text)
+       │   ├─→ Phase 2: Semantic search over local vectors
+       │   ├─→ Phase 1: Graph expansion (1-hop neighbors)
+       │   ├─→ Phase 3: Error lookup (if error intent)
+       │   ├─→ Phase 3: Global patterns (if review intent)
+       │   ├─→ Phase 3: Behavioral instructions (always)
+       │   └─→ Token budget trimming (4000 tokens)
+       ├─→ Inject formatted context into agent prompt
+       └─→ Call Planner / Coder / Reviewer / Tester
+
+5. Runtime Updates
+   └─→ RuntimeWatcher detects file changes
+       └─→ Incremental re-index + re-embed (background)
+       └─→ Next step sees updated context
+```
+
+**Key files reference:**
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| AST Parser | `kb/local/parser.py` | Tree-sitter extraction (11 languages) |
+| Code Graph | `kb/local/graph.py` | NetworkX directed multi-graph |
+| Indexer | `kb/local/indexer.py` | Full & incremental indexing |
+| Manifest | `kb/local/manifest.py` | SQLite file/symbol tracking |
+| Embedder | `kb/local/embedder.py` | Symbol embedding orchestrator |
+| Vector Store | `kb/local/sqlite_vector_store.py` | SQLite cosine similarity search |
+| Searcher | `kb/local/searcher.py` | Semantic search + keyword fallback |
+| Error Dict | `kb/global_kb/error_dict.py` | Error-fix pattern lookup |
+| Global Store | `kb/global_kb/store.py` | Global KB query interface |
+| Seeder | `kb/global_kb/seeder.py` | Sample data population |
+| Context Builder | `kb/context_builder.py` | Context assembly pipeline |
+| Orientation | `kb/project_orientation.py` | Project profile detection |
+| Startup | `kb/startup.py` | Smart initialization manager |
+| Watcher | `kb/runtime_watcher.py` | File change monitoring |
 
 ---
 

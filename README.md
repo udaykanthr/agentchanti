@@ -37,6 +37,54 @@ Supports local LLMs ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.
 
 ---
 
+## RAG Architecture
+
+AgentChanti uses a **4-phase Retrieval-Augmented Generation (RAG)** system to give every agent deep awareness of your codebase. Before any code is written, the system automatically indexes your project and injects the most relevant context into each LLM prompt.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Your Coding Task                         │
+└──────────────────┬───────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Phase 1: Code Graph        Tree-sitter AST parsing          │
+│  ───────────────────        Classes, functions, imports,      │
+│                             call edges → NetworkX graph       │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 2: Semantic KB       Embed symbols → SQLite vectors   │
+│  ────────────────────       Cosine similarity search          │
+│                             Graph-enriched results            │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 3: Global KB         Error-fix dictionary (regex)     │
+│  ──────────────────         Coding patterns, ADRs             │
+│                             Behavioral instructions           │
+├──────────────────────────────────────────────────────────────┤
+│  Phase 4: Context Builder   Intent detection (error/review)  │
+│  ────────────────────────   Retrieve → rank → budget (4000t) │
+│                             Inject into agent prompt          │
+└──────────────────┬───────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────┐
+│              Planner / Coder / Reviewer / Tester             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+| Phase | What It Does | Storage |
+|-------|-------------|---------|
+| **Code Graph** | Parses AST with tree-sitter (11 languages), builds a directed graph of symbols and call edges | `graph.pkl` + `index.db` |
+| **Semantic KB** | Embeds functions/classes into vectors, enables natural-language search over your code | `vectors.db` (SQLite) |
+| **Global KB** | Maps error patterns to fixes, stores coding best practices and behavioral rules | `global_kb.db` (SQLite) |
+| **Context Builder** | Assembles retrieved context per-step with token budgeting and priority ranking | In-memory |
+
+Additional capabilities:
+- **Project Orientation** -- auto-detects language, framework, test runner, and directory structure; injects as a grounding block in every prompt
+- **Runtime Watcher** -- monitors file changes during execution and triggers incremental re-indexing in the background
+- **Smart Startup** -- < 10ms for unchanged projects; incremental or full re-index only when needed
+
+All storage is local SQLite -- no external vector database required. See [documentation.md](documentation.md#rag-architecture) for the full technical deep-dive.
+
+---
+
 ## Getting Started
 
 ### Prerequisites

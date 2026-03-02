@@ -2,7 +2,30 @@
 
 ## What AgentChanti Excels At Today
 
-AgentChanti is a **one-shot, multi-agent AI coding CLI** — you give it a task in plain English, and it autonomously Plans → Codes → Reviews → Tests → Delivers. Its superpower is the **pipeline architecture** combined with a **plugin system** that makes it extensible beyond just coding.
+AgentChanti is a **one-shot, multi-agent AI coding CLI** — you give it a task in plain English, and it autonomously Plans → Codes → Reviews → Tests → Delivers. Its superpower is the **pipeline architecture** combined with a **4-phase RAG system** and a **plugin system** that makes it extensible beyond just coding.
+
+---
+
+## 🧠 RAG-Powered Codebase Understanding
+
+A key differentiator of AgentChanti is its **4-phase RAG (Retrieval-Augmented Generation)** system. Every agent prompt is augmented with context retrieved from multiple knowledge layers, so agents don't operate blindly — they understand your project before writing a single line of code.
+
+| Phase | What It Does | Why It Matters |
+|-------|-------------|----------------|
+| **Code Graph** | Tree-sitter AST parsing → NetworkX graph of symbols, calls, imports | Agents know your code structure, can trace callers/callees, and run impact analysis |
+| **Semantic KB** | Vector embeddings of functions/classes → cosine similarity search | Natural-language queries like "how does auth work?" retrieve the most relevant code |
+| **Global KB** | Error-fix dictionary + coding patterns + behavioral instructions | Bug diagnosis finds known fixes instantly; agents follow best practices per language |
+| **Context Builder** | Intent-aware retrieval → token-budgeted prompt injection | Each step gets only the context it needs (error fixes for bugs, patterns for refactors) |
+
+**How it improves every use case:**
+
+- **Feature addition**: Semantic search retrieves related code so the Coder understands existing conventions and APIs
+- **Bug fixing**: Error dictionary pattern-matches against known fixes; graph expansion reveals impacted files
+- **Refactoring**: Graph impact analysis shows downstream dependents; related symbols are included in context
+- **Code review**: Global KB injects coding patterns and best practices relevant to the detected language/framework
+- **Test generation**: Project Orientation detects the test framework and directory structure, preventing wrong-language tests
+
+All retrieval is local (SQLite-backed vector store) — no external vector database required. The RuntimeWatcher keeps the index fresh during execution, so even files created mid-run are immediately searchable.
 
 ---
 
@@ -13,9 +36,9 @@ AgentChanti is a **one-shot, multi-agent AI coding CLI** — you give it a task 
 | Use Case | Why It's a Great Fit |
 |---|---|
 | **Scaffold entire projects** | `agentchanti "Create a FastAPI app with auth, CRUD, and Docker"` — the Planner breaks it into ordered waves, Coder builds each piece, Tester verifies |
-| **Add features to existing code** | KB indexes your project, so it understands your codebase and writes code that fits in |
+| **Add features to existing code** | The RAG system indexes your project (AST graph + vector embeddings), so agents understand your codebase structure and write code that fits in |
 | **Generate comprehensive tests** | The Tester agent is purpose-built for this; it runs tests and retries on failure |
-| **Fix bugs with diagnosis loop** | Give it a bug description → it diagnoses, patches, verifies, auto-retries up to 3× |
+| **Fix bugs with diagnosis loop** | Give it a bug description → the RAG system retrieves error-fix patterns from the Global KB + related code from the semantic KB → it diagnoses, patches, verifies, auto-retries up to 3x |
 | **Code migration / refactoring** | E.g. "Convert all callbacks to async/await" — the Review agent catches regressions |
 | **CI/CD one-shot tasks** | `agentchanti "..." --auto --no-git --no-report` — fully headless for automation pipelines |
 
@@ -170,7 +193,7 @@ graph TB
 
 ### Most Unique & Differentiating Use Case
 
-> **Self-Improving Codebase Agent**: Point AgentChanti at its OWN codebase with the KB enabled. It indexes itself, understands its own architecture, and you can ask it to improve itself:
+> **Self-Improving Codebase Agent**: Point AgentChanti at its OWN codebase with the RAG system enabled. It indexes itself (AST graph + semantic embeddings), understands its own architecture through retrieval, and you can ask it to improve itself:
 > ```bash
 > agentchanti "Add a new DEPLOY plugin that pushes to Docker Hub after tests pass"
 > ```
