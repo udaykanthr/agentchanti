@@ -423,6 +423,23 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="task,canceled,async,timeout,cancellation,csharp",
     ),
+
+    # ── Tooling / Framework (all languages) ──────────────────────────────
+    ErrorFix(
+        error_type="TailwindCSSDeprecatedInit",
+        language="all",
+        pattern=r"(tailwindcss\s+init|npx\s+tailwindcss\s+init|tailwind\.config\.(js|ts|cjs|mjs))",
+        cause="Tailwind CSS v4 removed the 'tailwindcss init' command and tailwind.config.js. "
+              "The old PostCSS-based setup is no longer supported.",
+        fix_template="Use the new Tailwind CSS v4 installation:\n"
+                     "1. Install: npm install tailwindcss @tailwindcss/cli\n"
+                     "2. Create CSS file with: @import \"tailwindcss\";\n"
+                     "3. Build: npx @tailwindcss/cli -i ./src/input.css -o ./src/output.css\n"
+                     "4. For Vite projects: npm install tailwindcss @tailwindcss/vite and add plugin to vite.config.ts\n"
+                     "5. Configuration is now done via CSS @theme directive, NOT tailwind.config.js",
+        severity="error",
+        tags="tailwindcss,tailwind,init,config,postcss,css,deprecated,v4",
+    ),
 ]
 
 
@@ -843,6 +860,152 @@ Ensure you've run indexing first: `agentchanti kb index && agentchanti kb embed`
 
 ### Slow Search
 Install NumPy for optimized vector operations: `pip install numpy`
+""",
+    },
+    "tailwindcss-v4-setup-guide.md": {
+        "title": "Tailwind CSS v4 Setup Guide",
+        "tags": "tailwindcss, tailwind, css, frontend, setup, install, init, postcss, cli",
+        "content": """## Overview
+
+**IMPORTANT**: As of Tailwind CSS v4 (released 2025), the old `npx tailwindcss init`
+command and `tailwind.config.js` configuration file are **no longer supported**.
+Tailwind CSS v4 uses a completely new installation and configuration approach.
+
+## DEPRECATED — Do NOT Use
+
+The following commands are **obsolete** and will fail with Tailwind CSS v4:
+
+```bash
+# WRONG — these no longer work:
+npx tailwindcss init
+npx tailwindcss init -p
+npx tailwindcss init -p --yes
+npx tailwindcss init --full
+```
+
+The `tailwind.config.js` / `tailwind.config.ts` configuration file is also
+**no longer used** in Tailwind CSS v4. Configuration is now done via CSS.
+
+## Correct Installation (Tailwind CSS v4)
+
+### Step 1: Install packages, Install Tailwind CSS
+
+```bash
+npm install tailwindcss @tailwindcss/postcss postcss
+```
+
+### Step 2: Add Tailwind to your PostCSS configuration
+
+Add @tailwindcss/postcss to your postcss.config.mjs file, 
+or wherever PostCSS is configured in your project.
+
+```mjs
+export default {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  }
+}
+```
+
+### Step 3: Import Tailwind in your CSS
+Add an @import to your CSS file that imports Tailwind CSS.
+
+```css
+@import "tailwindcss";
+```
+
+Start your build process
+Run your build process with npm run dev or whatever command is configured in your package.json file.
+
+```bash
+npm run dev
+```
+
+### Step 4: Start using Tailwind in your HTML
+Make sure your compiled CSS is included in the <head> (your framework might handle this for you), 
+then start using Tailwind’s utility classes to style your content.
+
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link href="/dist/styles.css" rel="stylesheet">
+</head>
+<body>
+  <h1 class="text-3xl font-bold underline">
+    Hello world!
+  </h1>
+</body>
+</html>
+```
+
+## Framework Integrations
+
+### Vite (React, Vue, Svelte)
+
+```bash
+npm install tailwindcss @tailwindcss/vite
+```
+
+Then add the plugin to `vite.config.ts`:
+
+```typescript
+import tailwindcss from "@tailwindcss/vite";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+});
+```
+
+And import in your CSS:
+
+```css
+@import "tailwindcss";
+```
+
+### PostCSS
+
+```bash
+npm install tailwindcss @tailwindcss/postcss postcss
+```
+
+Create `postcss.config.mjs`:
+
+```javascript
+export default {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  },
+};
+```
+
+## Configuration in v4
+
+All customization in Tailwind CSS v4 is done via CSS using `@theme`:
+
+```css
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #3b82f6;
+  --font-display: "Inter", sans-serif;
+}
+```
+
+There is **no** `tailwind.config.js` file in v4.
+
+## Key Differences from v3
+
+| Feature | v3 (old) | v4 (current) |
+|---------|----------|--------------|
+| Install | `npm install tailwindcss postcss autoprefixer` |
+| Init | `npx tailwindcss init -p` | Not needed |
+| Config | `tailwind.config.js` | CSS `@theme` directive |
+| CSS import | `@tailwind base/components/utilities` | `@import "tailwindcss"` |
+| Build | `npx tailwindcss -i input -o output` | `npm run dev` |
 """,
     },
 }

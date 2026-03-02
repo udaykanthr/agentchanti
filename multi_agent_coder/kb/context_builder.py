@@ -295,6 +295,23 @@ class ContextBuilder:
                 except Exception as exc:
                     logger.debug("[KB] Global pattern search failed: %s", exc)
 
+        # 5b. Global docs (Phase 3) — always search for relevant documentation
+        self._ensure_global()
+        if self._global_store is not None:
+            try:
+                docs = self._global_store.search(
+                    task_description,
+                    categories=["doc"],
+                    top_k=2,
+                    api_client=self._api_client,
+                )
+                if docs:
+                    ctx.global_patterns.extend(docs)
+                    if "global_kb" not in ctx.sources_used:
+                        ctx.sources_used.append("global_kb")
+            except Exception as exc:
+                logger.debug("[KB] Global doc search failed: %s", exc)
+
         # 6. Behavioral instructions (Phase 3) — always
         self._ensure_global()
         if self._global_store is not None:

@@ -620,9 +620,21 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         subproject = first_components.pop()
         # Sanity check: directory must exist on disk and not be a common
         # source directory name (which would be a false positive)
-        if os.path.isdir(subproject) and subproject not in _NON_SUBPROJECT_DIRS:
-            log.info(f"[SubProject] Detected sub-project root: {subproject}/")
-            return subproject
+        if os.path.isdir(subproject):
+            # Even if the name is in _NON_SUBPROJECT_DIRS (e.g. "app"),
+            # treat it as a real sub-project if it contains a manifest
+            is_blocked_name = subproject in _NON_SUBPROJECT_DIRS
+            if not is_blocked_name:
+                log.info(f"[SubProject] Detected sub-project root: {subproject}/")
+                return subproject
+            # Override the blocklist when a project manifest exists
+            for manifest in ('package.json', 'Cargo.toml', 'go.mod',
+                             'requirements.txt', 'Gemfile', 'pyproject.toml',
+                             'composer.json', 'manage.py'):
+                if os.path.isfile(os.path.join(subproject, manifest)):
+                    log.info(f"[SubProject] Detected sub-project root "
+                             f"(manifest override, {manifest}): {subproject}/")
+                    return subproject
 
     # Fallback 1: if memory contains files from multiple top-level directories
     # (e.g. search provider added files), look for a known project manifest
@@ -780,6 +792,14 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             "markdown, no backticks — just the raw command.\n"
             f"{_shell_instructions()}\n"
         )
+        # Tell the LLM about the sub-project directory so it runs commands there
+        _subproject_for_prompt = _detect_subproject_root(memory)
+        if _subproject_for_prompt:
+            gen_prompt += (
+                f"IMPORTANT: This project lives in the '{_subproject_for_prompt}/' subdirectory. "
+                f"All npm/npx/yarn/pnpm/node commands MUST be prefixed with "
+                f"'cd {_subproject_for_prompt} && ' to run in the correct directory.\n"
+            )
         kb_ctx = getattr(memory, '_kb_context', '')
         if kb_ctx:
             gen_prompt += f"{kb_ctx}\n"

@@ -228,11 +228,29 @@ class GlobalKBStore:
             if categories and len(categories) > 1 and cat not in categories:
                 continue
 
+            # Load content from the markdown file on disk
+            content = ""
+            rel_file = payload.get("file", "")
+            if rel_file:
+                abs_path = os.path.join(_GLOBAL_DIR, rel_file)
+                if os.path.isfile(abs_path):
+                    try:
+                        with open(abs_path, encoding="utf-8") as fh:
+                            raw = fh.read()
+                        # Strip YAML frontmatter
+                        if raw.startswith("---"):
+                            end = raw.find("---", 3)
+                            if end != -1:
+                                raw = raw[end + 3:].strip()
+                        content = raw[:1500]
+                    except OSError:
+                        pass
+
             results.append(GlobalKBResult(
                 title=payload.get("title", ""),
                 category=cat,
-                content="",  # Content stored in files, not vector payload
-                file=payload.get("file", ""),
+                content=content,
+                file=rel_file,
                 score=hit.get("score", 0.0),
                 tags=payload.get("tags", []),
                 language=payload.get("language", "all"),

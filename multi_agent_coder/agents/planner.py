@@ -231,6 +231,31 @@ class PlannerAgent(Agent):
             except Exception as e:
                 _logger.debug(f"[PreAnalysis] Knowledge context failed: {e}")
 
+        # 4. Global KB documentation (framework guides, installation docs)
+        if kb_context_builder is not None:
+            try:
+                kb_context_builder._ensure_global()
+                if kb_context_builder._global_store is not None:
+                    docs = kb_context_builder._global_store.search(
+                        query=task,
+                        categories=["doc", "pattern"],
+                        top_k=3,
+                        api_client=kb_context_builder._api_client,
+                    )
+                    if docs:
+                        doc_hints: list[str] = []
+                        for doc in docs:
+                            content = doc.content or doc.title
+                            if content:
+                                doc_hints.append(f"### {doc.title}\n{content}")
+                        if doc_hints:
+                            parts.append("\n[Framework/Library Documentation]")
+                            parts.append(
+                                "IMPORTANT: Follow these guides when generating steps:")
+                            parts.extend(doc_hints)
+            except Exception as e:
+                _logger.debug(f"[PreAnalysis] Global KB doc search failed: {e}")
+
         return "\n".join(parts) if parts else ""
 
     def process(self, task: str, context: str = "") -> str:

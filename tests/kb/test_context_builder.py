@@ -176,8 +176,8 @@ class TestBuildContext:
         builder._global_store.get_behavioral_instructions.return_value = []
 
         ctx = builder.build_context("review the auth module for patterns")
-        # search should be called with pattern/adr categories
-        assert len(ctx.global_patterns) == 1
+        # search is called for pattern/adr categories AND doc category
+        assert len(ctx.global_patterns) >= 1
         assert ctx.global_patterns[0].title == "SOLID Principles"
 
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
