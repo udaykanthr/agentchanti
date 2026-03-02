@@ -154,7 +154,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                   search_agent=None,
                   kb_context_builder=None,
                   code_graph=None,
-                  project_profile=None) -> tuple[int, bool, str]:
+                  project_profile=None,
+                  knowledge_base=None) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
     Catches all exceptions so that a crash inside any handler never
@@ -179,7 +180,18 @@ def _execute_step(step_idx: int, step_text: str, *,
                     orient_exc,
                 )
 
-        # 2. KB context (Phase 4 — symbols, error fixes, patterns)
+        # 2. Project knowledge (installed packages, file purposes, tech stack)
+        if knowledge_base is not None:
+            try:
+                kb_agent_ctx = knowledge_base.format_for_agents()
+                if kb_agent_ctx:
+                    context_parts.append(kb_agent_ctx)
+            except Exception as kb_fmt_exc:
+                _logger.warning(
+                    "[KB] format_for_agents failed: %s", kb_fmt_exc,
+                )
+
+        # 3. KB context (Phase 4 — symbols, error fixes, patterns)
         if kb_context_builder is not None:
             try:
                 from ..kb.context_builder import ContextBuilder
@@ -275,6 +287,17 @@ def _execute_step(step_idx: int, step_text: str, *,
             display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
             display.complete_step(step_idx, "skipped")
 
+        # Per-step knowledge upsert (lightweight, no LLM calls)
+        # Runs on both success and failure — CMD packages only on success,
+        # but CODE/TEST file purposes are recorded regardless.
+        if knowledge_base is not None:
+            try:
+                knowledge_base.record_step_completion(
+                    step_type, step_text, step_idx, memory.as_dict(),
+                    success=success)
+            except Exception as kb_exc:
+                _logger.warning("[KB] Per-step upsert failed: %s", kb_exc)
+
         return step_idx, success, error_info
 
     except Exception as exc:
@@ -291,7 +314,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         auto: bool = False,
                         search_agent=None,
                         kb_context_builder=None,
-                        project_profile=None) -> bool:
+                        project_profile=None,
+                        knowledge_base=None) -> bool:
     """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
 
     All exceptions are caught so that a crash during diagnosis (e.g. an
@@ -374,6 +398,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
                 project_profile=project_profile,
+                knowledge_base=knowledge_base,
             )
 
             if success:

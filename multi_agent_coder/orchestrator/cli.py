@@ -549,6 +549,7 @@ def main():
                 language=language, cfg=cfg, auto=args.auto,
                 search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
+                knowledge_base=knowledge_base,
             )
 
             if success:
@@ -573,6 +574,7 @@ def main():
                     language=language, cfg=cfg, auto=args.auto,
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
+                    knowledge_base=knowledge_base,
                 )
                 if fixed:
                     step_results[idx] = "done"
@@ -605,6 +607,7 @@ def main():
                         language=language, cfg=cfg, auto=args.auto,
                         search_agent=search_agent,
                         kb_context_builder=kb_context_builder,
+                        knowledge_base=knowledge_base,
                     )
                     futures[f] = idx
 
@@ -641,6 +644,7 @@ def main():
                     language=language, cfg=cfg, auto=args.auto,
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
+                    knowledge_base=knowledge_base,
                 )
                 if fixed:
                     step_results[idx] = "done"
@@ -648,7 +652,7 @@ def main():
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
                                     memory.as_dict(), step_results, language,
                                     display_state=ds)
-                    
+
                     # Budget check after fix
                     if display.budget_check(cfg.BUDGET_LIMIT):
                         log.error(f"Budget exceeded (${token_tracker.total_cost:.4f}). Halting.")
@@ -672,21 +676,23 @@ def main():
             sr.tokens_recv = tokens.get("recv", 0)
             sr.duration = ds.get("duration", 0.0)
 
-    # ── 15. Finish ──
+    # ── 15. Extract knowledge (runs on both success and failure) ──
+    # Patterns/fixes from completed steps are valuable regardless of
+    # overall pipeline outcome — especially fixes learned from failures.
+    if knowledge_base:
+        try:
+            knowledge_base.extract_from_run(
+                args.task, steps, memory.as_dict(), llm_client)
+        except Exception as e:
+            log.warning(f"Knowledge extraction failed: {e}")
+
+    # ── 16. Finish ──
     if pipeline_success:
         display.finish(success=True)
         clear_checkpoint(checkpoint_file)
         log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
                  f"(sent={token_tracker.total_prompt_tokens}, "
                  f"recv={token_tracker.total_completion_tokens})")
-
-        # Extract knowledge from successful run
-        if knowledge_base:
-            try:
-                knowledge_base.extract_from_run(
-                    args.task, steps, memory.as_dict(), llm_client)
-            except Exception as e:
-                log.warning(f"Knowledge extraction failed: {e}")
 
         # Generate HTML report
         if args.report and not args.no_report:

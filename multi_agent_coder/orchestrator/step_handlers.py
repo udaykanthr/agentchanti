@@ -21,7 +21,7 @@ from ..language import (
 )
 
 from .memory import FileMemory
-from .classification import _extract_command_from_step
+from .classification import _extract_command_from_step, _extract_commands_from_text, _looks_like_command
 
 from ..diff_display import show_diffs, prompt_diff_approval, _detect_hazards
 
@@ -775,6 +775,9 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             "markdown, no backticks — just the raw command.\n"
             f"{_shell_instructions()}\n"
         )
+        kb_ctx = getattr(memory, '_kb_context', '')
+        if kb_ctx:
+            gen_prompt += f"{kb_ctx}\n"
         if prior_context:
             gen_prompt += (
                 f"{prior_context}"
@@ -796,8 +799,17 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         if cmd_response:
             display.add_llm_log(cmd_response, source="Coder")
 
-        cmd = cmd_response
-        cmd = cmd.strip('`').strip()
+        extracted = _extract_commands_from_text(cmd_response)
+        if extracted:
+            cmd = extracted[0]
+        else:
+            cmd = cmd_response.strip('`').strip()
+            if not _looks_like_command(cmd):
+                for line in cmd.splitlines():
+                    line = line.strip('`').strip()
+                    if _looks_like_command(line):
+                        cmd = line
+                        break
         if cmd.startswith('```'):
             cmd = cmd.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
 
@@ -1036,13 +1048,16 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     prev_files: dict[str, str] = {}  # Track files from previous attempt
 
     for attempt in range(1, MAX_STEP_RETRIES + 1):
-        # Prepend project orientation grounding to context
+        # Prepend project orientation + knowledge context
         context_prefix = ""
         if project_profile is not None:
             try:
                 context_prefix = project_profile.format_for_prompt() + "\n\n"
             except Exception:
                 pass
+        kb_ctx = getattr(memory, '_kb_context', '')
+        if kb_ctx:
+            context_prefix += kb_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
         # Use slim context for non-target files when enabled
@@ -1418,7 +1433,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
     for gen_attempt in range(1, MAX_TEST_GEN_RETRIES + 1):
         display.step_info(step_idx, f"Generating tests (attempt {gen_attempt}/{MAX_TEST_GEN_RETRIES})...")
-        gen_context = f"Code:\n{code_summary}"
+        kb_ctx = getattr(memory, '_kb_context', '')
+        gen_context = ""
+        if kb_ctx:
+            gen_context += kb_ctx + "\n\n"
+        gen_context += f"Code:\n{code_summary}"
         if feedback:
             gen_context += f"\nFeedback: {feedback}"
         # Add JS/TS environment info to context
@@ -1806,12 +1825,18 @@ def _try_diff_edit(
     slices = slicer.slice_files(scopes_map)
     formatted = slicer.format_for_prompt(slices)
 
-    # Prepend project orientation grounding to sliced context
+    # Prepend project orientation + knowledge context to sliced context
+    prefix_parts = []
     if project_profile is not None:
         try:
-            formatted = project_profile.format_for_prompt() + "\n\n" + formatted
+            prefix_parts.append(project_profile.format_for_prompt())
         except Exception:
             pass
+    kb_ctx = getattr(memory, '_kb_context', '')
+    if kb_ctx:
+        prefix_parts.append(kb_ctx)
+    if prefix_parts:
+        formatted = "\n\n".join(prefix_parts) + "\n\n" + formatted
 
     # Compute token stats
     full_file_lines = 0
@@ -2144,6 +2169,9 @@ def _try_chunk_edit(
             prompt_prefix = project_profile.format_for_prompt() + "\n\n"
         except Exception:
             pass
+    kb_ctx = getattr(memory, '_kb_context', '')
+    if kb_ctx:
+        prompt_prefix += kb_ctx + "\n\n"
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
         step_text, formatted, slim_ctx, language=language,

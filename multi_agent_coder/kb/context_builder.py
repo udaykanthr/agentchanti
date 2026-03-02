@@ -524,9 +524,8 @@ class ContextBuilder:
             try:
                 for cf in changed_files[:10]:
                     # Find dependents of this file using impact_analysis
-                    impacted = self._graph.impact_analysis(cf, depth=2)
-                    for item in impacted:
-                        file_path = item.get("file_path", "")
+                    impacted = self._graph.impact_analysis(cf)
+                    for file_path in impacted:
                         if file_path and file_path not in relevant:
                             # Lower score than direct search hits
                             relevant[file_path] = 0.3

@@ -203,6 +203,61 @@ class KnowledgeBase:
         """Check if a package is recorded as installed."""
         return package_name.strip().lower() in self._knowledge.installed_packages
 
+    # ── Per-step upsert (called after each step completion) ──────
+
+    def record_step_completion(self, step_type: str, step_text: str,
+                               step_idx: int, memory_files: dict[str, str],
+                               success: bool = True):
+        """Lightweight per-step knowledge upsert after step completion.
+
+        Called after every step (success or failure). Records installed
+        packages (CMD steps, only on success) and file purposes
+        (CODE/TEST steps, always) without any LLM calls.
+        """
+        changed = False
+
+        if step_type == "CMD" and success:
+            # Only record packages on success — failed installs shouldn't
+            # be marked as installed.
+            pkgs = _extract_packages_from_step(step_text)
+            for pkg in pkgs:
+                if not self.is_package_installed(pkg):
+                    self.record_install(pkg)
+                    changed = True
+
+            # Also extract from the actual command stored in memory
+            cmd_output = ""
+            for key in memory_files:
+                if key.startswith("_cmd_output") and f"step_{step_idx + 1}" in key:
+                    cmd_output = memory_files[key]
+                    break
+            if cmd_output:
+                # Memory format: "$ pip install flask\n\nSuccessfully installed..."
+                first_line = cmd_output.split("\n", 1)[0]
+                if first_line.startswith("$ "):
+                    raw_cmd = first_line[2:]
+                    pkgs = _extract_packages_from_raw_command(raw_cmd)
+                    for pkg in pkgs:
+                        if not self.is_package_installed(pkg):
+                            self.record_install(pkg)
+                            changed = True
+
+        if step_type in ("CODE", "TEST"):
+            # Record file purposes regardless of success — files are
+            # written to memory before review, so they exist even on failure.
+            for fpath in memory_files:
+                if fpath.startswith("_"):
+                    continue
+                if fpath not in self._knowledge.file_purposes:
+                    purpose = _infer_file_purpose(fpath)
+                    if purpose:
+                        self.record_file_purpose(fpath, purpose)
+                        changed = True
+
+        if changed:
+            self.save()
+            log.info(f"[KnowledgeBase] Updated after step {step_idx + 1} ({step_type})")
+
     # ── Legacy compat: add() still works ─────────────────────────
 
     def add(self, category: str, content: str, source_task: str):
@@ -453,6 +508,15 @@ _INSTALL_PATTERNS = [
     re.compile(r'`(?:go\s+get)\s+(.+?)`', re.IGNORECASE),
 ]
 
+# Raw command patterns (no backtick wrapping) — for per-step upsert
+_RAW_INSTALL_PATTERNS = [
+    re.compile(r'(?:pip3?\s+install(?:\s+-\w+)*)\s+(.+)', re.IGNORECASE),
+    re.compile(r'(?:npm\s+(?:install|i)|yarn\s+add|pnpm\s+add)(?:\s+--[\w-]+)*\s+(.+)', re.IGNORECASE),
+    re.compile(r'(?:gem\s+install)\s+(.+)', re.IGNORECASE),
+    re.compile(r'(?:cargo\s+add)\s+(.+)', re.IGNORECASE),
+    re.compile(r'(?:go\s+get)\s+(.+)', re.IGNORECASE),
+]
+
 
 def _extract_packages_from_step(step_text: str) -> list[str]:
     """Extract package names from an install command step.
@@ -480,6 +544,31 @@ def _extract_packages_from_step(step_text: str) -> list[str]:
                 if pkg and re.match(r'^[a-zA-Z]', pkg):
                     pkg_lower = pkg.lower()
                     # Validate: skip common English words
+                    if pkg_lower not in _NOT_PACKAGES and len(pkg_lower) >= 2:
+                        packages.append(pkg_lower)
+    return packages
+
+
+def _extract_packages_from_raw_command(cmd: str) -> list[str]:
+    """Extract package names from a raw shell command (no backtick wrapping).
+
+    Used by per-step upsert to parse the actual command that was executed.
+    """
+    packages: list[str] = []
+    for pattern in _RAW_INSTALL_PATTERNS:
+        m = pattern.search(cmd)
+        if m:
+            raw = m.group(1)
+            for token in raw.split():
+                token = token.strip()
+                if token.startswith("-"):
+                    continue
+                if token.startswith("@") and "/" in token:
+                    packages.append(token.lower())
+                    continue
+                pkg = re.split(r'[=<>~!@]', token)[0]
+                if pkg and re.match(r'^[a-zA-Z]', pkg):
+                    pkg_lower = pkg.lower()
                     if pkg_lower not in _NOT_PACKAGES and len(pkg_lower) >= 2:
                         packages.append(pkg_lower)
     return packages

@@ -65,54 +65,94 @@ class SearchResult:
 # Embedding helper (reuses OpenAI client logic from embedder)
 # ---------------------------------------------------------------------------
 
+def _make_embed_client():
+    """Create a dedicated embedding client matching the configured provider.
+
+    This ensures the same provider+model is used for query embeddings
+    as was used during ``kb embed``, regardless of what the main
+    generation LLM client happens to be.
+    """
+    from ...config import Config
+    cfg = Config.load()
+    embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+    provider = cfg.PROVIDER
+    llm_kwargs = dict(
+        max_retries=cfg.LLM_MAX_RETRIES,
+        retry_delay=cfg.LLM_RETRY_DELAY,
+        stream=False,
+    )
+
+    if provider == "ollama":
+        from ...llm.ollama import OllamaClient
+        return OllamaClient(
+            base_url=cfg.OLLAMA_BASE_URL, model=embed_model, **llm_kwargs)
+    elif provider == "openai":
+        from ...llm.openai_client import OpenAIClient
+        return OpenAIClient(
+            base_url=cfg.OPENAI_BASE_URL, model=embed_model,
+            api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
+    elif provider == "gemini":
+        from ...llm.gemini_client import GeminiClient
+        return GeminiClient(
+            base_url=cfg.GEMINI_BASE_URL, model=embed_model,
+            api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
+    elif provider == "anthropic":
+        from ...llm.anthropic_client import AnthropicClient
+        return AnthropicClient(
+            base_url=cfg.ANTHROPIC_BASE_URL, model=embed_model,
+            api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
+    else:
+        from ...llm.lm_studio import LMStudioClient
+        return LMStudioClient(
+            base_url=cfg.LM_STUDIO_BASE_URL, model=embed_model, **llm_kwargs)
+
+
 def _embed_query(query: str, api_client: Any = None) -> list[float]:
     """
-    Embed *query* using the same model as the indexed symbols.
+    Embed *query* using the same provider and model as ``kb embed``.
+
+    A dedicated embedding client is created from the config so that the
+    query embedding always matches the stored vectors, even when the
+    main generation LLM uses a different provider or model.
 
     Parameters
     ----------
     query:
         Natural-language search string.
     api_client:
-        Optional LLM client instance to use for embedding.
+        Ignored (kept for backward compatibility).
 
     Returns
     -------
     list[float]
-        1536-dimensional embedding vector.
+        Embedding vector (dimension depends on the model used).
     """
-    if api_client is not None:
-        from ...config import Config
-        cfg = Config.load()
-        embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-        try:
-            vec = api_client.generate_embedding(query, model=embed_model, dimensions=1536)
-            if vec:
-                return vec
-        except Exception as exc:
-            logger.warning("api_client embedding failed: %s", exc)
-
-    import os as _os
-    try:
-        import openai  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "openai package is required for semantic search. "
-            "Install it with: pip install 'multi_agent_coder[semantic]'"
-        ) from exc
-
-    api_key = _os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise EnvironmentError(
-            "OPENAI_API_KEY environment variable is not set."
-        )
-
-    client = openai.OpenAI(api_key=api_key)
     from ...config import Config
     cfg = Config.load()
     embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-    response = client.embeddings.create(model=embed_model, input=[query])
-    return response.data[0].embedding
+
+    # Build a client that matches the provider used during kb embed
+    try:
+        client = _make_embed_client()
+        vec = client.generate_embedding(query, model=embed_model)
+        if vec:
+            return vec
+    except Exception as exc:
+        logger.warning("Embedding client failed: %s", exc)
+
+    # Fallback: try the passed api_client (legacy path)
+    if api_client is not None:
+        try:
+            vec = api_client.generate_embedding(query, model=embed_model)
+            if vec:
+                return vec
+        except Exception as exc:
+            logger.warning("api_client embedding fallback failed: %s", exc)
+
+    raise RuntimeError(
+        f"Could not generate query embedding with provider={cfg.PROVIDER!r}, "
+        f"model={embed_model!r}. Check your .agentchanti.yaml config."
+    )
 
 
 # ---------------------------------------------------------------------------

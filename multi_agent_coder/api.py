@@ -314,6 +314,7 @@ def _run_task_impl(
                 language=language, auto=auto,
                 kb_context_builder=kb_context_builder,
                 project_profile=project_profile,
+                knowledge_base=knowledge_base,
             )
 
             if success:
@@ -332,6 +333,7 @@ def _run_task_impl(
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
                     project_profile=project_profile,
+                    knowledge_base=knowledge_base,
                 )
                 if fixed:
                     step_results[idx] = "done"
@@ -353,15 +355,18 @@ def _run_task_impl(
         except Exception:
             pass
 
+    # Extract knowledge (runs on both success and failure) —
+    # patterns/fixes from completed steps are valuable regardless,
+    # especially fixes learned from failures.
+    if knowledge_base is not None:
+        try:
+            knowledge_base.extract_from_run(
+                task, steps, memory.as_dict(), llm_client)
+        except Exception:
+            pass
+
     if pipeline_success:
         clear_checkpoint(checkpoint_file)
-        # Extract knowledge from successful run
-        if knowledge_base is not None:
-            try:
-                knowledge_base.extract_from_run(
-                    task, steps, memory.as_dict(), llm_client)
-            except Exception:
-                pass
 
     # Collect written files (exclude internal cmd/fix outputs)
     files_written = [f for f in memory.all_files().keys()

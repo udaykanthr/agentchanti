@@ -244,9 +244,17 @@ class SQLiteVectorStore:
         # Compute similarities
         if _HAS_NUMPY:
             query_arr = np.array(query_vector, dtype=np.float32)
-            matrix = np.stack(
-                [np.frombuffer(row[1], dtype=np.float32).copy() for row in filtered]
-            )
+            vecs = [np.frombuffer(row[1], dtype=np.float32).copy() for row in filtered]
+            # Validate dimensions match between query and stored vectors
+            stored_dim = vecs[0].shape[0] if vecs else len(query_vector)
+            query_dim = query_arr.shape[0]
+            if query_dim != stored_dim:
+                raise ValueError(
+                    f"Embedding dimension mismatch: query has {query_dim} dims "
+                    f"but stored vectors have {stored_dim} dims. "
+                    f"Re-embed with the same model: agentchanti kb embed"
+                )
+            matrix = np.stack(vecs)
             scores = _cosine_similarity_batch(query_arr, matrix)
 
             # Get top-k indices

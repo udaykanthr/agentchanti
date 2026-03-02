@@ -255,7 +255,7 @@ def _embed_single(client, text: str, embed_model: str | None) -> list[float]:
     """Embed a single text string with retries."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            vec = client.generate_embedding(text, model=embed_model, dimensions=EMBED_DIMENSIONS)
+            vec = client.generate_embedding(text, model=embed_model)
             if vec:
                 return vec
             logger.warning("Embedding attempt %d returned empty vector", attempt)
