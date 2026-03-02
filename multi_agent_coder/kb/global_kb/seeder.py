@@ -897,8 +897,18 @@ consistently in every step — do NOT invent a different name.
 
 ```bash
 npm create vite@latest <project-name> -- --template react --no-interactive
-cd <project-name>
-npm install tailwindcss @tailwindcss/vite
+```
+
+```bash
+npm install tailwindcss @tailwindcss/vite --save-dev
+```
+
+```bash
+npm install react-router-dom  --save
+```
+
+```bash
+npm install
 ```
 
 ### Step 2: Configure the Vite plugin
@@ -906,21 +916,41 @@ Add the @tailwindcss/vite plugin to your Vite configuration.
 
 ```vite.config.ts
 import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [
+    react(),
     tailwindcss(),
   ],
 })
 ```
 
+```vite.config.js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+})
+```
+
+
 ### Step 3: Import Tailwind in your CSS
-Add an @import to your CSS file that imports Tailwind CSS.
+Add an @import at beginning of index.css , at line #1
 
 ```css
 @import "tailwindcss";
+
+<index.css Content>
 ```
+
+There is **no** `@import "tailwindcss/base.css"` file in v4.
+There is **no** `@import "tailwindcss/components.css"` file in v4.
+There is **no** `@import "tailwindcss/utilities.css"` file in v4.
 
 Start your build process
 Run your build process with npm run dev or whatever command is configured in your package.json file.
@@ -928,8 +958,8 @@ Run your build process with npm run dev or whatever command is configured in you
 ```bash
 npm run dev
 ```
-
 There is **no** `tailwind.config.js` file in v4.
+There is **no** `postcss.config.js` file in v4.
 
 ## Key Differences from v3
 
