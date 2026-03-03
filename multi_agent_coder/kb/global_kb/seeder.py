@@ -893,28 +893,32 @@ IMPORTANT: In ALL commands below, replace `<project-name>` with the EXACT
 project name derived from the user's task description. Use the SAME name
 consistently in every step — do NOT invent a different name.
 
-### Step 1: Install packages, Install Tailwind CSS
+### Step 1: Create a new Vite project with react template
 
 ```bash
 npm create vite@latest <project-name> -- --template react --no-interactive
 ```
 
+### Step 2: Install packages, Install Tailwind CSS
+
 ```bash
 npm install tailwindcss @tailwindcss/vite --save-dev
 ```
+
+### Step 3: Install additional packages
 
 ```bash
 npm install react-router-dom  --save
 ```
 
+### Step 4: Install dependencies
 ```bash
 npm install
 ```
 
-### Step 2: Configure the Vite plugin
-Add the @tailwindcss/vite plugin to your Vite configuration.
+### Step 5: Configure Vite: Add the plugin to your vite.config.ts or vite.config.js
 
-```vite.config.ts
+```
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -927,39 +931,12 @@ export default defineConfig({
 })
 ```
 
-```vite.config.js
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
-
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [react(), tailwindcss()],
-})
-```
-
-
-### Step 3: Import Tailwind in your CSS
-Add an @import at beginning of index.css , at line #1
+### Step 6: Import Tailwind: In your global CSS file (e.g., src/index.css), simply add:
 
 ```css
 @import "tailwindcss";
 
-<index.css Content>
 ```
-
-There is **no** `@import "tailwindcss/base.css"` file in v4.
-There is **no** `@import "tailwindcss/components.css"` file in v4.
-There is **no** `@import "tailwindcss/utilities.css"` file in v4.
-
-Start your build process
-Run your build process with npm run dev or whatever command is configured in your package.json file.
-
-```bash
-npm run dev
-```
-There is **no** `tailwind.config.js` file in v4.
-There is **no** `postcss.config.js` file in v4.
 
 ## Key Differences from v3
 
