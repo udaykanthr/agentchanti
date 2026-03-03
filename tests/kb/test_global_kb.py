@@ -161,6 +161,96 @@ class TestErrorDict(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# ContentFix tests
+# ---------------------------------------------------------------------------
+
+
+class TestContentFix(unittest.TestCase):
+    """Tests for ContentFix CRUD in ErrorDict."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "test_errors.db")
+        from multi_agent_coder.kb.global_kb.error_dict import ErrorDict
+        self.edict = ErrorDict(self.db_path)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_add_and_get(self):
+        """bulk_insert + get round-trips correctly."""
+        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        fix = ContentFix(
+            name="test-fix",
+            file_glob="*.css",
+            content_pattern=r"@old-directive",
+            replacement="@new-directive",
+            description="test rule",
+        )
+        self.edict.bulk_insert_content_fixes([fix])
+        fixes = self.edict.get_content_fixes()
+        self.assertEqual(len(fixes), 1)
+        self.assertEqual(fixes[0].name, "test-fix")
+        self.assertEqual(fixes[0].file_glob, "*.css")
+        self.assertEqual(fixes[0].content_pattern, r"@old-directive")
+        self.assertEqual(fixes[0].replacement, "@new-directive")
+
+    def test_count_and_clear(self):
+        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        fixes = [
+            ContentFix(name=f"fix-{i}", file_glob="*.css",
+                       content_pattern=f"pat{i}", replacement=f"rep{i}")
+            for i in range(5)
+        ]
+        self.edict.bulk_insert_content_fixes(fixes)
+        self.assertEqual(self.edict.count_content_fixes(), 5)
+        self.edict.clear_content_fixes()
+        self.assertEqual(self.edict.count_content_fixes(), 0)
+
+    def test_language_filter(self):
+        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        self.edict.bulk_insert_content_fixes([
+            ContentFix(name="all-fix", file_glob="*.css",
+                       content_pattern="a", replacement="b", language="all"),
+            ContentFix(name="py-fix", file_glob="*.py",
+                       content_pattern="c", replacement="d", language="python"),
+        ])
+        fixes = self.edict.get_content_fixes(language="python")
+        names = {f.name for f in fixes}
+        self.assertIn("all-fix", names)
+        self.assertIn("py-fix", names)
+
+        fixes_js = self.edict.get_content_fixes(language="javascript")
+        names_js = {f.name for f in fixes_js}
+        self.assertIn("all-fix", names_js)
+        self.assertNotIn("py-fix", names_js)
+
+    def test_compiled_flags(self):
+        import re
+        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        fix = ContentFix(
+            name="t", file_glob="*", content_pattern="x",
+            flags="MULTILINE, IGNORECASE",
+        )
+        self.assertEqual(fix.compiled_flags(), re.MULTILINE | re.IGNORECASE)
+
+    def test_upsert_on_duplicate_name(self):
+        """INSERT OR REPLACE updates existing rule by name."""
+        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        self.edict.bulk_insert_content_fixes([
+            ContentFix(name="rule-1", file_glob="*.css",
+                       content_pattern="old", replacement="v1"),
+        ])
+        self.edict.bulk_insert_content_fixes([
+            ContentFix(name="rule-1", file_glob="*.css",
+                       content_pattern="old", replacement="v2"),
+        ])
+        fixes = self.edict.get_content_fixes()
+        self.assertEqual(len(fixes), 1)
+        self.assertEqual(fixes[0].replacement, "v2")
+
+
+# ---------------------------------------------------------------------------
 # Seeder tests
 # ---------------------------------------------------------------------------
 
@@ -175,8 +265,9 @@ class TestSeeder(unittest.TestCase):
 
         summary = seed(embed=False)
 
-        # Check errors.db was populated (36 errors: 5 * 7 languages + 1 tooling)
-        self.assertEqual(summary["errors_seeded"], 36)
+        # Check errors.db was populated (37 errors: 5 * 7 languages + 2 tooling)
+        self.assertEqual(summary["errors_seeded"], 37)
+        self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
         self.assertEqual(summary["docs_seeded"], 10)  # 3+3+2+2
         self.assertEqual(summary["chunks_embedded"], 0)
 

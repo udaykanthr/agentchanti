@@ -18,7 +18,7 @@ import os
 import uuid
 from typing import Optional
 
-from .error_dict import ErrorDict, ErrorFix
+from .error_dict import ErrorDict, ErrorFix, ContentFix
 
 logger = logging.getLogger(__name__)
 
@@ -440,6 +440,50 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "5. Configuration is now done via CSS @theme directive, NOT tailwind.config.js",
         severity="error",
         tags="tailwindcss,tailwind,init,config,postcss,css,deprecated,v4",
+    ),
+    ErrorFix(
+        error_type="TailwindCSSDeprecatedDirectives",
+        language="all",
+        pattern=r"@tailwind\s+(base|components|utilities)",
+        cause="The @tailwind base, @tailwind components, and @tailwind utilities directives "
+              "are REMOVED in Tailwind CSS v4. They no longer exist and will cause build errors. "
+              "This is the #1 most common Tailwind v4 migration mistake.",
+        fix_template="REPLACE the entire CSS file content with ONLY this single line:\n"
+                     "@import \"tailwindcss\";\n\n"
+                     "WRONG (v3 — do NOT use):\n"
+                     "@tailwind base;\n"
+                     "@tailwind components;\n"
+                     "@tailwind utilities;\n\n"
+                     "CORRECT (v4):\n"
+                     "@import \"tailwindcss\";\n\n"
+                     "Do NOT add @tailwind directives alongside @import \"tailwindcss\". "
+                     "The single @import line replaces ALL three @tailwind directives. "
+                     "Any custom CSS (e.g. body styles, @layer) should go AFTER the @import line.",
+        severity="error",
+        tags="tailwindcss,tailwind,css,directive,base,components,utilities,deprecated,v4,import",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Content fix seed data
+# ---------------------------------------------------------------------------
+
+_CONTENT_FIX_SEEDS: list[ContentFix] = [
+    ContentFix(
+        name="tailwind-v4-directives",
+        file_glob="*.css",
+        content_pattern=r"^\s*@tailwind\s+(base|components|utilities)\s*;\s*$",
+        replacement="",
+        ensure_content='@import "tailwindcss";\n',
+        flags="MULTILINE",
+        collapse_blanks=True,
+        language="all",
+        source="core",
+        description=(
+            "Tailwind CSS v4 removed @tailwind base/components/utilities "
+            "directives. Replace with @import \"tailwindcss\"."
+        ),
     ),
 ]
 
@@ -874,6 +918,32 @@ Tailwind CSS v4 uses a completely new installation and configuration approach.
 
 ## DEPRECATED — Do NOT Use
 
+### Deprecated CSS Directives (CRITICAL)
+
+The following CSS directives are **REMOVED** in Tailwind CSS v4 and MUST NOT
+be written to any CSS file. They will cause build failures:
+
+```css
+/* WRONG — NEVER write these: */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+The ONLY correct CSS import for Tailwind CSS v4 is:
+
+```css
+/* CORRECT — use this single line instead: */
+@import "tailwindcss";
+```
+
+Do NOT combine `@tailwind` directives with `@import "tailwindcss"`.
+Do NOT add `@tailwind base;`, `@tailwind components;`, or `@tailwind utilities;`
+anywhere in any CSS file. The single `@import "tailwindcss";` line replaces
+ALL THREE of those old directives.
+
+### Deprecated Commands
+
 The following commands are **obsolete** and will fail with Tailwind CSS v4:
 
 ```bash
@@ -931,12 +1001,17 @@ export default defineConfig({
 })
 ```
 
-### Step 6: Import Tailwind: In your global CSS file (e.g., src/index.css), simply add:
+### Step 6: Import Tailwind in CSS
+
+Replace the ENTIRE contents of src/index.css with ONLY this single line:
 
 ```css
 @import "tailwindcss";
-
 ```
+
+WARNING: Do NOT write `@tailwind base;`, `@tailwind components;`, or
+`@tailwind utilities;` — those directives are REMOVED in v4 and will break
+the build. The single `@import "tailwindcss";` line replaces all of them.
 
 ## Key Differences from v3
 
@@ -1187,15 +1262,27 @@ def seed(
         Summary with keys: errors_seeded, docs_seeded, chunks_embedded.
     """
     project_root = project_root or os.getcwd()
-    summary = {"errors_seeded": 0, "docs_seeded": 0, "chunks_embedded": 0}
+    summary = {
+        "errors_seeded": 0,
+        "content_fixes_seeded": 0,
+        "docs_seeded": 0,
+        "chunks_embedded": 0,
+    }
 
-    # ── 1. Seed errors.db ───────────────────────────────────────────────
+    # ── 1a. Seed errors.db ──────────────────────────────────────────────
     db_path = _errors_db_path()
     edict = ErrorDict(db_path)
     edict.clear()
     edict.bulk_insert(_ERROR_SEEDS)
     summary["errors_seeded"] = edict.count()
     logger.info("Seeded %d errors into %s", summary["errors_seeded"], db_path)
+
+    # ── 1b. Seed content fixes ───────────────────────────────────────────
+    edict.clear_content_fixes()
+    edict.bulk_insert_content_fixes(_CONTENT_FIX_SEEDS)
+    summary["content_fixes_seeded"] = edict.count_content_fixes()
+    logger.info("Seeded %d content fixes into %s",
+                summary["content_fixes_seeded"], db_path)
 
     # ── 2. Write markdown files ─────────────────────────────────────────
     md_files: list[tuple[str, str, str]] = []  # (path, category, title)

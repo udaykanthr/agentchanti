@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .error_dict import ErrorDict, ErrorFix
+from .error_dict import ErrorDict, ErrorFix, ContentFix
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,154 @@ class GlobalKBStore:
             api_client=api_client,
         )
 
+    def get_content_fixes(
+        self,
+        language: Optional[str] = None,
+    ) -> list[ContentFix]:
+        """
+        Return all content-fix rules, optionally filtered by language.
+
+        No embedding needed — deterministic data from ``errors.db``.
+        """
+        edict = self._get_error_dict()
+        return edict.get_content_fixes(language)
+
+    def batch_search(
+        self,
+        query: str,
+        category_limits: dict[str, int],
+        language: Optional[str] = None,
+        api_client=None,
+    ) -> dict[str, list[GlobalKBResult]]:
+        """
+        Single-embedding vector search split by category.
+
+        Performs ONE embedding call and ONE vector scan, then partitions
+        results by category — saving embedding API calls compared to
+        multiple ``search()`` invocations.
+
+        Parameters
+        ----------
+        query:
+            Natural-language search query.
+        category_limits:
+            Mapping of category name to max results for that category.
+            E.g. ``{"pattern": 3, "adr": 3, "doc": 2, "behavioral": 3}``.
+        language:
+            Optional language filter.
+        api_client:
+            LLM client for embedding the query.
+
+        Returns
+        -------
+        dict[str, list[GlobalKBResult]]
+            Results keyed by category.
+        """
+        try:
+            if api_client is None:
+                raise ValueError("api_client required for vector search")
+            return self._vector_batch_search(
+                query, category_limits, language, api_client,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Batch vector search failed, falling back to per-category "
+                "file search: %s", exc,
+            )
+            # Fallback: run individual file-based searches per category
+            result: dict[str, list[GlobalKBResult]] = {}
+            for cat, top_k in category_limits.items():
+                result[cat] = self._fallback_file_search(
+                    query, categories=[cat], language=language, top_k=top_k,
+                )
+            return result
+
+    def _vector_batch_search(
+        self,
+        query: str,
+        category_limits: dict[str, int],
+        language: Optional[str],
+        api_client,
+    ) -> dict[str, list[GlobalKBResult]]:
+        """Single embedding + single scan, split results by category."""
+        from ..local.embedder import _embed_batch
+        from ...config import Config
+
+        cfg = Config.load()
+        embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+
+        # One embedding call for the query
+        vectors = _embed_batch(api_client, [query], embed_model)
+        if not vectors:
+            return {cat: [] for cat in category_limits}
+        query_vector = vectors[0]
+
+        store = self._get_vector_store()
+
+        # Fetch enough results to fill all category buckets
+        total_top_k = sum(category_limits.values()) + 5  # small headroom
+        filters: Optional[dict] = {}
+        if language:
+            filters["language"] = language
+        if not filters:
+            filters = None
+
+        raw_results = store.search(
+            query_vector=query_vector,
+            top_k=total_top_k,
+            filters=filters,
+        )
+
+        # Partition results into category buckets (deduplicated by file)
+        buckets: dict[str, list[GlobalKBResult]] = {
+            cat: [] for cat in category_limits
+        }
+        seen_files: set[str] = set()
+
+        for hit in raw_results:
+            payload = hit.get("payload", {})
+            cat = payload.get("category", "")
+
+            if cat not in category_limits:
+                continue
+            if len(buckets[cat]) >= category_limits[cat]:
+                continue
+
+            # Deduplicate: skip if we already have a result from this file
+            rel_file = payload.get("file", "")
+            if rel_file and rel_file in seen_files:
+                continue
+            if rel_file:
+                seen_files.add(rel_file)
+
+            # Load content from the markdown file on disk
+            content = ""
+            if rel_file:
+                abs_path = os.path.join(_GLOBAL_DIR, rel_file)
+                if os.path.isfile(abs_path):
+                    try:
+                        with open(abs_path, encoding="utf-8") as fh:
+                            raw = fh.read()
+                        if raw.startswith("---"):
+                            end = raw.find("---", 3)
+                            if end != -1:
+                                raw = raw[end + 3:].strip()
+                        content = raw[:4000]
+                    except OSError:
+                        pass
+
+            buckets[cat].append(GlobalKBResult(
+                title=payload.get("title", ""),
+                category=cat,
+                content=content,
+                file=rel_file,
+                score=hit.get("score", 0.0),
+                tags=payload.get("tags", []),
+                language=payload.get("language", "all"),
+            ))
+
+        return buckets
+
     # ------------------------------------------------------------------
     # Vector search
     # ------------------------------------------------------------------
@@ -220,6 +368,7 @@ class GlobalKBStore:
         )
 
         results: list[GlobalKBResult] = []
+        seen_files: set[str] = set()
         for hit in raw_results:
             payload = hit.get("payload", {})
             cat = payload.get("category", "")
@@ -228,9 +377,15 @@ class GlobalKBStore:
             if categories and len(categories) > 1 and cat not in categories:
                 continue
 
+            # Deduplicate: skip if we already have a result from this file
+            rel_file = payload.get("file", "")
+            if rel_file and rel_file in seen_files:
+                continue
+            if rel_file:
+                seen_files.add(rel_file)
+
             # Load content from the markdown file on disk
             content = ""
-            rel_file = payload.get("file", "")
             if rel_file:
                 abs_path = os.path.join(_GLOBAL_DIR, rel_file)
                 if os.path.isfile(abs_path):
@@ -242,7 +397,7 @@ class GlobalKBStore:
                             end = raw.find("---", 3)
                             if end != -1:
                                 raw = raw[end + 3:].strip()
-                        content = raw[:1500]
+                        content = raw[:4000]
                     except OSError:
                         pass
 
@@ -324,7 +479,7 @@ class GlobalKBStore:
                     results.append((score, GlobalKBResult(
                         title=meta.get("title", fname),
                         category=cat,
-                        content=content[:500],
+                        content=content[:4000],
                         file=rel_path,
                         score=score,
                         tags=tags,

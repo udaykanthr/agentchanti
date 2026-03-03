@@ -9,7 +9,7 @@ from ..cli_display import CLIDisplay, token_tracker, log
 from ..diff_display import show_diffs, _detect_hazards
 
 from .memory import FileMemory
-from .step_handlers import _shell_instructions, _strip_protected_files, _detect_subproject_root
+from .step_handlers import _shell_instructions, _strip_protected_files, _apply_content_fixes, _detect_subproject_root
 from .classification import _extract_commands_from_text, _looks_like_command
 
 
@@ -18,8 +18,28 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       step_idx: int,
                       search_agent=None,
                       language: str | None = None,
-                      previous_diagnosis: str | None = None) -> str:
+                      previous_diagnosis: str | None = None,
+                      kb_context_builder=None) -> str:
     display.step_info(step_idx, "Analyzing failure root cause...")
+
+    # ── KB error-fix lookup using actual error output ────
+    # Pass the real error_info into build_context so the ErrorDict
+    # can match against stack traces / error messages, not just the
+    # step description.
+    kb_error_context = ""
+    if kb_context_builder is not None:
+        try:
+            kb_ctx = kb_context_builder.build_context(
+                task_description=step_text,
+                error_output=error_info,
+                max_tokens=2000,
+            )
+            if kb_ctx.error_fixes or kb_ctx.behavioral_instructions:
+                kb_error_context = kb_context_builder.format_context_for_prompt(kb_ctx)
+                log.info(f"Step {step_idx+1}: KB matched {len(kb_ctx.error_fixes)} "
+                         f"error fix patterns for diagnosis")
+        except Exception as exc:
+            log.debug(f"Step {step_idx+1}: KB error lookup during diagnosis failed: {exc}")
 
     # ── Optional: search the web for error documentation ────
     search_context = ""
@@ -54,6 +74,12 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
     )
+    if kb_error_context:
+        prompt += (
+            "The following error-fix patterns from the knowledge base match "
+            "this error. Use them to guide your diagnosis:\n\n"
+            f"{kb_error_context}\n\n"
+        )
     if subproject:
         prompt += (
             f"IMPORTANT: The project source code lives in the '{subproject}/' "
@@ -165,6 +191,9 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         if files:
             # Strip protected manifest files before any further processing
             files = _strip_protected_files(files)
+            # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
+            content_fixes = getattr(memory, '_content_fixes', None)
+            files = _apply_content_fixes(files, content_fixes)
 
         if files:
             # Filter out files with hazardous diffs (e.g. truncation,

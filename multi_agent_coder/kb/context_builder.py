@@ -190,6 +190,7 @@ class ContextBuilder:
         task_description: str,
         current_file: Optional[str] = None,
         max_tokens: int = 4000,
+        error_output: Optional[str] = None,
     ) -> KBContext:
         """
         Build aggregated KB context for a single pipeline step.
@@ -202,6 +203,11 @@ class ContextBuilder:
             Path to the file currently being edited, if known.
         max_tokens:
             Maximum token budget for the injected context.
+        error_output:
+            Actual error/stack-trace text from a failed step.  When
+            provided, this is used for error-fix lookups instead of
+            the step description alone, enabling accurate matching
+            during diagnosis.
 
         Returns
         -------
@@ -211,10 +217,16 @@ class ContextBuilder:
         t0 = time.perf_counter()
         ctx = KBContext()
 
-        # 1. Detect intent
-        is_error = self._detect_error_intent(task_description)
+        # 1. Detect intent — if error_output is provided, force error intent
+        is_error = (
+            bool(error_output)
+            or self._detect_error_intent(task_description)
+        )
         is_review = self._detect_review_intent(task_description)
         language = self._detect_language(current_file)
+
+        # Initialise the global KB store once (used by steps 4, 5, 5b, 6)
+        self._ensure_global()
 
         # 2. Local semantic search (Phase 2)
         try:
@@ -265,12 +277,14 @@ class ContextBuilder:
                 logger.debug("[KB] Graph expansion failed: %s", exc)
 
         # 4. Error lookup (Phase 3) — only if error intent
+        #    Use actual error output for matching when available (during
+        #    diagnosis), falling back to the step description.
         if is_error:
-            self._ensure_global()
             if self._global_store is not None:
                 try:
+                    error_text = error_output or task_description
                     fixes = self._global_store.search_errors(
-                        task_description, language=language,
+                        error_text, language=language,
                     )
                     ctx.error_fixes = fixes
                     if fixes:
@@ -278,51 +292,41 @@ class ContextBuilder:
                 except Exception as exc:
                     logger.debug("[KB] Error lookup failed: %s", exc)
 
-        # 5. Global patterns (Phase 3) — only if review intent
-        if is_review:
-            self._ensure_global()
-            if self._global_store is not None:
-                try:
-                    patterns = self._global_store.search(
-                        task_description,
-                        categories=["pattern", "adr"],
-                        top_k=3,
-                        api_client=self._api_client,
-                    )
-                    ctx.global_patterns = patterns
-                    if patterns:
-                        ctx.sources_used.append("global_kb")
-                except Exception as exc:
-                    logger.debug("[KB] Global pattern search failed: %s", exc)
-
-        # 5b. Global docs (Phase 3) — always search for relevant documentation
-        self._ensure_global()
+        # 5. Batched global KB search (Phase 3)
+        # Single embedding + single vector scan for all categories,
+        # saving 2 embedding API calls compared to separate searches.
         if self._global_store is not None:
             try:
-                docs = self._global_store.search(
+                # Build category limits based on intent
+                category_limits: dict[str, int] = {
+                    "doc": 2,
+                    "behavioral": 3,
+                }
+                if is_review:
+                    category_limits["pattern"] = 3
+                    category_limits["adr"] = 3
+
+                buckets = self._global_store.batch_search(
                     task_description,
-                    categories=["doc"],
-                    top_k=2,
+                    category_limits=category_limits,
                     api_client=self._api_client,
                 )
+
+                # Distribute results into ctx fields
+                patterns = buckets.get("pattern", []) + buckets.get("adr", [])
+                docs = buckets.get("doc", [])
+                behavioral = buckets.get("behavioral", [])
+
+                if is_review and patterns:
+                    ctx.global_patterns = patterns
                 if docs:
                     ctx.global_patterns.extend(docs)
-                    if "global_kb" not in ctx.sources_used:
-                        ctx.sources_used.append("global_kb")
+                if patterns or docs:
+                    ctx.sources_used.append("global_kb")
+                if behavioral:
+                    ctx.behavioral_instructions = behavioral
             except Exception as exc:
-                logger.debug("[KB] Global doc search failed: %s", exc)
-
-        # 6. Behavioral instructions (Phase 3) — always
-        self._ensure_global()
-        if self._global_store is not None:
-            try:
-                behavioral = self._global_store.get_behavioral_instructions(
-                    task_description,
-                    api_client=self._api_client,
-                )
-                ctx.behavioral_instructions = behavioral
-            except Exception as exc:
-                logger.debug("[KB] Behavioral instructions failed: %s", exc)
+                logger.debug("[KB] Batched global KB search failed: %s", exc)
 
         # 7. Token budget management
         ctx = self._apply_token_budget(ctx, max_tokens)

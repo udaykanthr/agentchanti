@@ -112,6 +112,42 @@ class TestPrefixSubprojectPaths:
         assert "my-app/src/index.js" in result
         assert "my-app//src/index.js" not in result
 
+    def test_prefixes_dunder_test_dirs(self):
+        """__tests__/ directories MUST be prefixed (not treated as internal)."""
+        memory = _make_memory({
+            "responsive-spa/src/App.jsx": "A",
+        })
+
+        files = {
+            "__tests__/Header.test.js": "test code",
+            "__mocks__/fileMock.js": "mock",
+        }
+        result = _prefix_subproject_paths(files, "responsive-spa", memory)
+
+        assert "responsive-spa/__tests__/Header.test.js" in result
+        assert "responsive-spa/__mocks__/fileMock.js" in result
+        assert "__tests__/Header.test.js" not in result
+        assert "__mocks__/fileMock.js" not in result
+
+    def test_skips_all_internal_tracking_paths(self):
+        """All known internal paths (_cmd_output, _fix_output, _search_context) are skipped."""
+        memory = _make_memory({
+            "my-app/src/App.js": "A",
+        })
+
+        files = {
+            "_cmd_output/step_1.txt": "output",
+            "_fix_output/step_2.txt": "fix",
+            "_search_context/step_3.txt": "search",
+            "src/NewFile.js": "new code",
+        }
+        result = _prefix_subproject_paths(files, "my-app", memory)
+
+        assert "_cmd_output/step_1.txt" in result
+        assert "_fix_output/step_2.txt" in result
+        assert "_search_context/step_3.txt" in result
+        assert "my-app/src/NewFile.js" in result
+
 
 # ─── CMD-output-based sub-project detection ─────────────────────────
 

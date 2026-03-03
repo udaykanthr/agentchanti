@@ -217,6 +217,21 @@ def _execute_step(step_idx: int, step_text: str, *,
         if context_parts:
             memory._kb_context = "\n\n".join(context_parts)
 
+        # --- Load KB content fixes once per pipeline run ---
+        if not hasattr(memory, '_content_fixes') or memory._content_fixes is None:
+            try:
+                from ..kb.global_kb.store import GlobalKBStore
+                _gkb = GlobalKBStore()
+                memory._content_fixes = _gkb.get_content_fixes(language=language)
+                if memory._content_fixes:
+                    _logger.debug(
+                        "[KB] Loaded %d content-fix rules",
+                        len(memory._content_fixes),
+                    )
+            except Exception as exc:
+                _logger.debug("[KB] Failed to load content fixes: %s", exc)
+                memory._content_fixes = []
+
         # --- KB-guided file scoping (Option A) ---
         # Use KB to identify most relevant files for this step,
         # so the coder only sees focused context instead of everything.
@@ -365,7 +380,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 step_text, step_type, error_info,
                 memory, llm_client, display, step_idx,
                 search_agent=search_agent, language=language,
-                previous_diagnosis=last_diagnosis_content)
+                previous_diagnosis=last_diagnosis_content,
+                kb_context_builder=kb_context_builder)
 
             fix_applied, cmds_succeeded = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,

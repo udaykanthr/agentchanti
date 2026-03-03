@@ -205,12 +205,12 @@ class TestDetectSubprojectRoot:
 
         assert result == "my-app"
 
-    def test_ignores_all_underscore_prefixed_paths(self):
-        """Any path starting with _ should be treated as internal."""
+    def test_ignores_all_internal_tracking_paths(self):
+        """Known internal tracking paths should be excluded from detection."""
         memory = _make_memory({
-            "_internal/tracking.txt": "data",
             "_cmd_output/step_1.txt": "output",
             "_fix_output/step_2.txt": "fix",
+            "_search_context/step_3.txt": "search",
             "dashboard-app/src/App.jsx": "A",
             "dashboard-app/src/index.js": "B",
         })
@@ -219,6 +219,19 @@ class TestDetectSubprojectRoot:
             result = _detect_subproject_root(memory)
 
         assert result == "dashboard-app"
+
+    def test_does_not_exclude_dunder_directories(self):
+        """Directories like __tests__/ and __mocks__/ should NOT be excluded."""
+        memory = _make_memory({
+            "_cmd_output/step_1.txt": "output",
+            "my-app/src/App.jsx": "A",
+            "my-app/__tests__/App.test.jsx": "T",
+        })
+
+        with patch("os.path.isdir", return_value=True):
+            result = _detect_subproject_root(memory)
+
+        assert result == "my-app"
 
     def test_disk_manifest_fallback(self, tmp_path):
         """When package.json is not in memory (protected), detect via disk."""

@@ -37,6 +37,23 @@ CREATE TABLE IF NOT EXISTS errors (
 
 CREATE INDEX IF NOT EXISTS idx_language   ON errors(language);
 CREATE INDEX IF NOT EXISTS idx_error_type ON errors(error_type);
+
+CREATE TABLE IF NOT EXISTS content_fixes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    file_glob       TEXT NOT NULL,
+    content_pattern TEXT NOT NULL,
+    replacement     TEXT NOT NULL DEFAULT '',
+    ensure_content  TEXT DEFAULT '',
+    flags           TEXT DEFAULT 'MULTILINE',
+    collapse_blanks INTEGER DEFAULT 1,
+    language        TEXT DEFAULT 'all',
+    source          TEXT DEFAULT 'core',
+    description     TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_cf_language  ON content_fixes(language);
+CREATE INDEX IF NOT EXISTS idx_cf_file_glob ON content_fixes(file_glob);
 """
 
 
@@ -62,6 +79,45 @@ class ErrorFix:
         if not self.tags:
             return []
         return [t.strip() for t in self.tags.split(",") if t.strip()]
+
+
+@dataclass
+class ContentFix:
+    """A deterministic file-content replacement rule.
+
+    Applied after LLM code generation to fix known patterns that
+    LLMs persistently emit from stale training data (e.g. Tailwind
+    CSS v3 directives in a v4 project).
+
+    Stored in the ``content_fixes`` table of ``errors.db`` and loaded
+    once per pipeline run.  Users add new rules by editing the seeder
+    and re-running ``seed()``.
+    """
+
+    name: str               # unique rule id, e.g. "tailwind-v4-directives"
+    file_glob: str           # fnmatch pattern, e.g. "*.css"
+    content_pattern: str     # regex to search for in file content
+    replacement: str = ""    # replacement string (supports \\1 backrefs)
+    ensure_content: str = "" # if set, prepend when not already present
+    flags: str = "MULTILINE" # comma-separated re flag names
+    collapse_blanks: bool = True
+    language: str = "all"
+    source: str = "core"
+    description: str = ""
+
+    def compiled_flags(self) -> int:
+        """Convert the *flags* string to ``re`` module constants."""
+        flag_map = {
+            "MULTILINE": re.MULTILINE,
+            "IGNORECASE": re.IGNORECASE,
+            "DOTALL": re.DOTALL,
+        }
+        result = 0
+        for f in self.flags.split(","):
+            f = f.strip().upper()
+            if f in flag_map:
+                result |= flag_map[f]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -303,4 +359,78 @@ class ErrorDict:
             severity=row["severity"] or "error",
             tags=row["tags"] or "",
             source=row["source"] or "core",
+        )
+
+    # ------------------------------------------------------------------
+    # Content fixes
+    # ------------------------------------------------------------------
+
+    def bulk_insert_content_fixes(self, fixes: list[ContentFix]) -> None:
+        """Insert multiple content-fix rules in a single transaction."""
+        if not fixes:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO content_fixes
+                    (name, file_glob, content_pattern, replacement,
+                     ensure_content, flags, collapse_blanks, language,
+                     source, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f.name, f.file_glob, f.content_pattern,
+                        f.replacement, f.ensure_content, f.flags,
+                        1 if f.collapse_blanks else 0, f.language,
+                        f.source, f.description,
+                    )
+                    for f in fixes
+                ],
+            )
+
+    def get_content_fixes(
+        self, language: Optional[str] = None,
+    ) -> list[ContentFix]:
+        """Return all content-fix rules, optionally filtered by language."""
+        with self._connect() as conn:
+            if language:
+                rows = conn.execute(
+                    "SELECT * FROM content_fixes "
+                    "WHERE language = ? OR language = 'all'",
+                    (language.lower(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM content_fixes"
+                ).fetchall()
+        return [self._row_to_content_fix(r) for r in rows]
+
+    def clear_content_fixes(self) -> None:
+        """Delete all content-fix records."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM content_fixes")
+
+    def count_content_fixes(self) -> int:
+        """Return total number of content-fix records."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM content_fixes"
+            ).fetchone()
+        return row[0] if row else 0
+
+    @staticmethod
+    def _row_to_content_fix(row: sqlite3.Row) -> ContentFix:
+        """Convert a SQLite Row to a ContentFix dataclass."""
+        return ContentFix(
+            name=row["name"],
+            file_glob=row["file_glob"],
+            content_pattern=row["content_pattern"],
+            replacement=row["replacement"] or "",
+            ensure_content=row["ensure_content"] or "",
+            flags=row["flags"] or "MULTILINE",
+            collapse_blanks=bool(row["collapse_blanks"]),
+            language=row["language"] or "all",
+            source=row["source"] or "core",
+            description=row["description"] or "",
         )

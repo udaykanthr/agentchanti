@@ -135,6 +135,62 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
 import platform
 
 
+# ---------------------------------------------------------------------------
+# KB-driven content fixes
+# ---------------------------------------------------------------------------
+
+
+def _apply_content_fixes(
+    files: dict[str, str],
+    content_fixes: list | None = None,
+) -> dict[str, str]:
+    """Apply KB-driven content-fix rules to generated file content.
+
+    Each rule (a :class:`ContentFix` from the global KB) specifies a
+    ``file_glob``, a ``content_pattern`` regex, a ``replacement``, and
+    optional ``ensure_content`` to prepend when missing.
+
+    Returns *files* unchanged when *content_fixes* is ``None`` or empty.
+    """
+    import fnmatch as _fnmatch
+
+    if not content_fixes:
+        return files
+
+    result = dict(files)
+    for filepath, content in list(result.items()):
+        basename = filepath.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        original = content
+
+        for fix in content_fixes:
+            if not _fnmatch.fnmatch(basename, fix.file_glob):
+                continue
+
+            flags = fix.compiled_flags()
+            pattern = re.compile(fix.content_pattern, flags)
+            if not pattern.search(content):
+                continue
+
+            content = pattern.sub(fix.replacement, content)
+
+            if fix.ensure_content:
+                if fix.ensure_content.strip() not in content:
+                    content = fix.ensure_content + content
+
+            if fix.collapse_blanks:
+                content = re.sub(r"\n{3,}", "\n\n", content).strip() + "\n"
+
+            log.info(
+                "Content fix '%s': applied to %s (%s)",
+                fix.name, filepath, fix.description or "no description",
+            )
+
+        if content != original:
+            result[filepath] = content
+
+    return result
+
+
 def _strip_protected_files(files: dict[str, str]) -> dict[str, str]:
     """Handle protected manifest files from parsed LLM output.
 
@@ -585,10 +641,12 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
 
     # Only consider real source files, not internal tracking paths.
     # Internal paths use underscore-prefixed directories (_cmd_output/,
-    # _fix_output/, etc.) and must be excluded from sub-project detection.
+    # _fix_output/, _search_context/) and must be excluded from sub-project
+    # detection.  Directories like __tests__/ and __mocks__/ are legitimate.
+    _internal = ('_cmd_output/', '_fix_output/', '_search_context/')
     source_paths = [
         p for p in all_files
-        if not p.startswith('_') and '/' in p
+        if not p.startswith(_internal) and '/' in p
     ]
     if not source_paths:
         return None
@@ -711,9 +769,12 @@ def _prefix_subproject_paths(files: dict[str, str],
     known_paths = set(memory.all_files().keys())
     corrected: dict[str, str] = {}
 
+    # Internal tracking directories that should never be prefixed
+    _INTERNAL_PREFIXES = ('_cmd_output/', '_fix_output/', '_search_context/')
+
     for fpath, content in files.items():
-        # Skip internal tracking paths
-        if fpath.startswith('_'):
+        # Skip internal tracking paths (but NOT __tests__, __mocks__, etc.)
+        if fpath.startswith(_INTERNAL_PREFIXES):
             corrected[fpath] = content
             continue
 
@@ -1151,6 +1212,10 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         # Strip protected manifest files (package.json, etc.) to prevent
         # LLM from overwriting them with corrupted versions
         files = _strip_protected_files(files)
+
+        # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
+        content_fixes = getattr(memory, '_content_fixes', None)
+        files = _apply_content_fixes(files, content_fixes)
 
         # On retry, merge: keep previously approved files that weren't
         # re-generated, so the coder doesn't need to regenerate everything

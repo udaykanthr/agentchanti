@@ -153,12 +153,43 @@ class TestBuildContext:
 
         builder._global_store = MagicMock()
         builder._global_store.search_errors.return_value = [fake_fix]
-        builder._global_store.get_behavioral_instructions.return_value = []
+        builder._global_store.batch_search.return_value = {
+            "doc": [], "behavioral": [],
+        }
 
         ctx = builder.build_context("fix the AttributeError exception")
         builder._global_store.search_errors.assert_called_once()
         assert len(ctx.error_fixes) == 1
         assert ctx.error_fixes[0].error_type == "AttributeError"
+
+    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    def test_error_output_used_for_lookup(self, mock_global, mock_local, builder):
+        """When error_output is provided, it should be used for error matching."""
+        mock_local.return_value = False
+
+        fake_fix = MagicMock()
+        fake_fix.error_type = "NullPointerException"
+        fake_fix.cause = "Null dereference"
+        fake_fix.fix_template = "Add null check"
+        fake_fix.tags = ""
+
+        builder._global_store = MagicMock()
+        builder._global_store.search_errors.return_value = [fake_fix]
+        builder._global_store.batch_search.return_value = {
+            "doc": [], "behavioral": [],
+        }
+
+        # Step description has no error keywords, but error_output forces error intent
+        ctx = builder.build_context(
+            "compile the project",
+            error_output="java.lang.NullPointerException at Main.java:42",
+        )
+        builder._global_store.search_errors.assert_called_once()
+        # Should have used the error_output, not the task description
+        call_args = builder._global_store.search_errors.call_args
+        assert "NullPointerException" in call_args[0][0]
+        assert len(ctx.error_fixes) == 1
 
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
@@ -172,18 +203,22 @@ class TestBuildContext:
         fake_pattern.category = "pattern"
 
         builder._global_store = MagicMock()
-        builder._global_store.search.return_value = [fake_pattern]
-        builder._global_store.get_behavioral_instructions.return_value = []
+        builder._global_store.batch_search.return_value = {
+            "pattern": [fake_pattern],
+            "adr": [],
+            "doc": [],
+            "behavioral": [],
+        }
 
         ctx = builder.build_context("review the auth module for patterns")
-        # search is called for pattern/adr categories AND doc category
+        builder._global_store.batch_search.assert_called_once()
         assert len(ctx.global_patterns) >= 1
         assert ctx.global_patterns[0].title == "SOLID Principles"
 
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
     def test_behavioral_always_included(self, mock_global, mock_local, builder):
-        """Behavioral instructions should always be fetched."""
+        """Behavioral instructions should always be fetched via batch_search."""
         mock_local.return_value = False
 
         fake_behavioral = MagicMock()
@@ -191,10 +226,13 @@ class TestBuildContext:
         fake_behavioral.content = "Add type hints to all functions"
 
         builder._global_store = MagicMock()
-        builder._global_store.get_behavioral_instructions.return_value = [fake_behavioral]
+        builder._global_store.batch_search.return_value = {
+            "doc": [],
+            "behavioral": [fake_behavioral],
+        }
 
         ctx = builder.build_context("add a new feature")
-        builder._global_store.get_behavioral_instructions.assert_called_once()
+        builder._global_store.batch_search.assert_called_once()
         assert len(ctx.behavioral_instructions) == 1
 
     @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
