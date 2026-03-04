@@ -383,9 +383,18 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 previous_diagnosis=last_diagnosis_content,
                 kb_context_builder=kb_context_builder)
 
+            # Extract the original failing command from error_info so
+            # _apply_fix can filter it out (prevents re-running the same
+            # broken command extracted from diagnosis inline backticks).
+            import re as _re_diag
+            _orig_cmd_match = _re_diag.search(
+                r"Command `(.+?)` failed\.", error_info or "")
+            _orig_cmd = _orig_cmd_match.group(1) if _orig_cmd_match else None
+
             fix_applied, cmds_succeeded = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
-                step_type=step_type)
+                step_type=step_type,
+                original_error_cmd=_orig_cmd)
 
             if not fix_applied:
                 last_diagnosis_content = diagnosis

@@ -96,11 +96,19 @@ def _looks_like_command(text: str) -> bool:
     return first_token in known_commands
 
 
-def _extract_commands_from_text(text: str) -> list[str]:
+def _extract_commands_from_text(text: str, *, code_blocks_only: bool = False) -> list[str]:
     """Extract shell commands from *text*, handling both triple- and single-backtick blocks.
 
     Prefers triple-backtick code blocks (```cmd, ```bash, ```shell, ```)
     over single-backtick inline code.  Filters out file paths and non-commands.
+
+    Parameters
+    ----------
+    code_blocks_only:
+        If True, only extract from triple-backtick code blocks and skip
+        inline backtick commands.  Useful in diagnosis context where inline
+        backticks often reference the *broken* original command rather than
+        the fix.
     """
     commands: list[str] = []
     seen: set[str] = set()
@@ -121,12 +129,13 @@ def _extract_commands_from_text(text: str) -> list[str]:
                     commands.append(line)
                     seen.add(line)
 
-    # 2. Single-backtick inline commands (`...`)
-    for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", text):
-        cmd = m.group(1).strip()
-        if cmd and _looks_like_command(cmd) and cmd not in seen:
-            commands.append(cmd)
-            seen.add(cmd)
+    # 2. Single-backtick inline commands (`...`) — skip when code_blocks_only
+    if not code_blocks_only:
+        for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", text):
+            cmd = m.group(1).strip()
+            if cmd and _looks_like_command(cmd) and cmd not in seen:
+                commands.append(cmd)
+                seen.add(cmd)
 
     return commands
 

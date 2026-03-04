@@ -38,6 +38,10 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                 kb_error_context = kb_context_builder.format_context_for_prompt(kb_ctx)
                 log.info(f"Step {step_idx+1}: KB matched {len(kb_ctx.error_fixes)} "
                          f"error fix patterns for diagnosis")
+                # Persist error-specific KB context to memory so that if
+                # the step is re-executed, _handle_cmd_step's command
+                # generation prompt includes the error fix patterns.
+                memory._kb_context = kb_error_context
         except Exception as exc:
             log.debug(f"Step {step_idx+1}: KB error lookup during diagnosis failed: {exc}")
 
@@ -172,13 +176,21 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                display: CLIDisplay, step_idx: int,
-               step_type: str = "CODE") -> tuple[bool, bool]:
+               step_type: str = "CODE",
+               original_error_cmd: str | None = None) -> tuple[bool, bool]:
     """Apply fixes from a diagnosis response.
 
     Returns ``(applied, cmds_succeeded)`` where *applied* is True if any
     fix action was taken and *cmds_succeeded* is True if all fix commands
     ran successfully (relevant for CMD steps where the fix command itself
     is the corrected step).
+
+    Parameters
+    ----------
+    original_error_cmd:
+        The original command that failed.  When provided, any extracted
+        fix command that exactly matches the failing command is skipped
+        to avoid re-running the same broken command.
     """
     applied = False
     cmds_succeeded = True
@@ -234,8 +246,21 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                          f"{', '.join(written)}")
                 applied = True
 
-    # Extract and run fix commands (from triple-backtick blocks + inline backticks)
-    fix_commands = _extract_commands_from_text(diagnosis)
+    # Extract and run fix commands.
+    # For CMD steps, only extract from triple-backtick code blocks to avoid
+    # picking up the *broken* original command from inline backtick references
+    # in the diagnosis analysis text (e.g. "The command `npm set-script ...` failed").
+    fix_commands = _extract_commands_from_text(
+        diagnosis, code_blocks_only=(step_type == "CMD"))
+
+    # Filter out commands that exactly match the original failing command
+    if original_error_cmd and fix_commands:
+        _orig = original_error_cmd.strip()
+        before = len(fix_commands)
+        fix_commands = [c for c in fix_commands if c.strip() != _orig]
+        if len(fix_commands) < before:
+            log.info(f"Step {step_idx+1}: Filtered out {before - len(fix_commands)} "
+                     f"command(s) matching the original failing command")
 
     # Fallback: if no commands found, look for raw lines that look like commands
     # (e.g. "npx create-react-app ..." sitting on its own line)
