@@ -442,6 +442,32 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="tailwindcss,tailwind,init,config,postcss,css,deprecated,v4",
     ),
     ErrorFix(
+        error_type="NpmUnknownCommand",
+        language="javascript",
+        pattern=r'Unknown command:?\s*"?(set-script|access|adduser|bin|birthday|bugs|cache|ci|completion|config|dedupe|deprecate|diff|dist-tag|docs|doctor|edit|exec|explain|explore|find-dupes|fund|get|help|hook|init|install|link|ll|login|logout|ls|org|outdated|owner|pack|ping|pkg|prefix|profile|prune|publish|query|rebuild|repo|restart|root|run|search|shrinkwrap|star|stars|start|stop|team|test|token|uninstall|unpublish|unstar|update|version|view|whoami)"?',
+        cause="The npm subcommand is unknown — it may have been removed or renamed in a newer npm version.",
+        fix_template="Common npm command replacements:\n"
+                     "- `npm set-script <name> <cmd>` → removed in npm v7+, use: npm pkg set scripts.<name>=\"<cmd>\"\n"
+                     "- `npm adduser` → `npm login`\n"
+                     "- If no replacement exists, edit package.json directly to achieve the same effect.",
+        severity="error",
+        tags="npm,unknown,command,deprecated,set-script,pkg",
+    ),
+    ErrorFix(
+        error_type="NpmSetScriptDeprecated",
+        language="javascript",
+        pattern=r'(npm\s+set-script|Unknown command:?\s*"?set-script"?)',
+        cause="`npm set-script` was removed in npm v7+. It no longer exists as a subcommand.",
+        fix_template="Replace `npm set-script <name> \"<command>\"` with:\n"
+                     "  npm pkg set scripts.<name>=\"<command>\"\n\n"
+                     "Examples:\n"
+                     "  npm pkg set scripts.start=\"vite\"\n"
+                     "  npm pkg set scripts.build=\"vite build\"\n"
+                     "  npm pkg set scripts.dev=\"vite --open\"",
+        severity="error",
+        tags="npm,set-script,deprecated,pkg,scripts,package-json",
+    ),
+    ErrorFix(
         error_type="TailwindCSSDeprecatedDirectives",
         language="all",
         pattern=r"@tailwind\s+(base|components|utilities)",

@@ -122,6 +122,13 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             "3. SPECIAL CASE: If the command failed because the directory is not empty (e.g. create-react-app .), "
             "the FIX is to create the app in a new subdirectory (e.g. `npx create-react-app my-app ...`) "
             "instead of the current directory.\n"
+            "4. DEPRECATED / UNKNOWN COMMAND: If the error says 'Unknown command' or "
+            "'command not found', the tool may have been removed or renamed in a newer version. "
+            "Provide the modern replacement command. Common examples:\n"
+            "   - `npm set-script` removed in npm v7+ → use `npm pkg set scripts.<name>=\"<value>\"`\n"
+            "   - `npx tailwindcss init` removed in Tailwind v4 → not needed, configure via CSS\n"
+            "   - If no replacement exists, achieve the same goal by editing the config file directly "
+            "(e.g. add a script to package.json via a write/sed command).\n"
             f"{_shell_instructions()}"
         )
     else:

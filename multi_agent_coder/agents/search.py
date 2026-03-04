@@ -246,6 +246,7 @@ class SearchAgent:
             r'Unexpected token\b',
             r'Cannot read propert',       # Cannot read property / properties
             r'command not found\b',
+            r'Unknown command\b',          # npm "Unknown command: set-script"
             r'No such file or directory\b',
             r'Permission denied\b',
         )

@@ -265,8 +265,8 @@ class TestSeeder(unittest.TestCase):
 
         summary = seed(embed=False)
 
-        # Check errors.db was populated (37 errors: 5 * 7 languages + 2 tooling)
-        self.assertEqual(summary["errors_seeded"], 37)
+        # Check errors.db was populated (39 errors: 5 * 7 languages + 4 tooling)
+        self.assertEqual(summary["errors_seeded"], 39)
         self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
         self.assertEqual(summary["docs_seeded"], 10)  # 3+3+2+2
         self.assertEqual(summary["chunks_embedded"], 0)
@@ -275,10 +275,13 @@ class TestSeeder(unittest.TestCase):
         db_path = os.path.join(_GLOBAL_DIR, "core", "errors.db")
         edict = ErrorDict(db_path)
         counts = edict.count_by_language()
-        for lang in ("python", "javascript", "typescript", "java",
-                      "go", "rust", "csharp"):
-            self.assertEqual(counts.get(lang, 0), 5,
-                             f"Expected 5 errors for {lang}")
+        expected_per_lang = {
+            "python": 5, "javascript": 7,  # 5 base + 2 npm
+            "typescript": 5, "java": 5, "go": 5, "rust": 5, "csharp": 5,
+        }
+        for lang, expected in expected_per_lang.items():
+            self.assertEqual(counts.get(lang, 0), expected,
+                             f"Expected {expected} errors for {lang}")
 
     def test_md_files_have_frontmatter(self):
         """All seeded .md files contain valid frontmatter."""
