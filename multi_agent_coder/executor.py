@@ -91,7 +91,7 @@ class Executor:
         pattern = r"^\s*\d+\.\s*(.*)"
         for line in plan_text.splitlines():
             # Check for section boundary — stop parsing numbered items
-            if Executor._PLAN_SECTION_BOUNDARY.match(line):
+            if len(steps) > 0 and Executor._PLAN_SECTION_BOUNDARY.match(line):
                 plan_ended = True
 
             if plan_ended:
