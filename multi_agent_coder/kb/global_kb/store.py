@@ -276,11 +276,12 @@ class GlobalKBStore:
             filters=filters,
         )
 
-        # Partition results into category buckets (deduplicated by file)
+        # Partition results into category buckets (deduplicated by file and title)
         buckets: dict[str, list[GlobalKBResult]] = {
             cat: [] for cat in category_limits
         }
         seen_files: set[str] = set()
+        seen_titles: set[str] = set()
 
         for hit in raw_results:
             payload = hit.get("payload", {})
@@ -291,12 +292,17 @@ class GlobalKBStore:
             if len(buckets[cat]) >= category_limits[cat]:
                 continue
 
-            # Deduplicate: skip if we already have a result from this file
-            rel_file = payload.get("file", "")
+            # Deduplicate by normalized file path and by title
+            rel_file = payload.get("file", "").replace("\\", "/")
+            title = payload.get("title", "")
             if rel_file and rel_file in seen_files:
+                continue
+            if title and title in seen_titles:
                 continue
             if rel_file:
                 seen_files.add(rel_file)
+            if title:
+                seen_titles.add(title)
 
             # Load content from the markdown file on disk
             content = ""
@@ -369,6 +375,7 @@ class GlobalKBStore:
 
         results: list[GlobalKBResult] = []
         seen_files: set[str] = set()
+        seen_titles: set[str] = set()
         for hit in raw_results:
             payload = hit.get("payload", {})
             cat = payload.get("category", "")
@@ -377,12 +384,17 @@ class GlobalKBStore:
             if categories and len(categories) > 1 and cat not in categories:
                 continue
 
-            # Deduplicate: skip if we already have a result from this file
-            rel_file = payload.get("file", "")
+            # Deduplicate by normalized file path and by title
+            rel_file = payload.get("file", "").replace("\\", "/")
+            title = payload.get("title", "")
             if rel_file and rel_file in seen_files:
+                continue
+            if title and title in seen_titles:
                 continue
             if rel_file:
                 seen_files.add(rel_file)
+            if title:
+                seen_titles.add(title)
 
             # Load content from the markdown file on disk
             content = ""
@@ -474,7 +486,7 @@ class GlobalKBStore:
                 if score > 0:
                     tags_str = meta.get("tags", "")
                     tags = [t.strip() for t in tags_str.split(",") if t.strip()]
-                    rel_path = os.path.relpath(filepath, _GLOBAL_DIR)
+                    rel_path = os.path.relpath(filepath, _GLOBAL_DIR).replace("\\", "/")
 
                     results.append((score, GlobalKBResult(
                         title=meta.get("title", fname),

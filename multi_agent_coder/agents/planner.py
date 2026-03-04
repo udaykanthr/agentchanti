@@ -3,7 +3,7 @@ import platform
 import re
 import logging
 
-from .base import Agent
+from .base import Agent, uniquify_context
 
 _logger = logging.getLogger(__name__)
 
@@ -170,6 +170,23 @@ def _find_relevant_files(task: str, source_files: dict[str, str] | None,
 
 class PlannerAgent(Agent):
 
+    def _build_prompt(self, task: str, context: str, language: str | None = None) -> str:
+        """Override base to skip the platform line — the planner's hard-coded
+        template already includes a detailed HOST ENVIRONMENT section via
+        _os_context_for_prompt(), so the base class one-liner is redundant."""
+        prompt = f"Role: {self.role}\nGoal: {self.goal}\n\n"
+        if language:
+            from ..language import get_language_name
+            prompt += f"Language: {get_language_name(language)}\n\n"
+        # NOTE: platform line intentionally omitted — provided later
+        if self.prompt_suffix:
+            prompt += f"Instructions: {self.prompt_suffix}\n\n"
+        if context:
+            context = uniquify_context(context)
+            prompt += f"Context: {context}\n\n"
+        prompt += f"Task: {task}\n\nResponse:"
+        return prompt
+
     def pre_analyze(self, task: str, *,
                     source_files: dict[str, str] | None = None,
                     kb_context_builder=None,
@@ -207,29 +224,10 @@ class PlannerAgent(Agent):
                 elif intent == "feature":
                     parts.append(f"  ^ This file may need modification for the new feature")
 
-        # 3. Knowledge base context (installed packages, tech stack)
-        if knowledge_base is not None:
-            try:
-                k = knowledge_base.knowledge
-                kb_hints: list[str] = []
-
-                if k.installed_packages:
-                    pkgs = ", ".join(k.installed_packages[-20:])
-                    kb_hints.append(
-                        f"Already installed packages (DO NOT re-install): {pkgs}")
-
-                if k.tech_stack.test_framework:
-                    kb_hints.append(
-                        f"Test framework already set up: {k.tech_stack.test_framework}")
-
-                if k.patterns:
-                    kb_hints.append("Project conventions: " + "; ".join(k.patterns[-3:]))
-
-                if kb_hints:
-                    parts.append("\n[Project Knowledge]")
-                    parts.extend(kb_hints)
-            except Exception as e:
-                _logger.debug(f"[PreAnalysis] Knowledge context failed: {e}")
+        # 3. Knowledge base context — SKIPPED here to avoid duplication.
+        # knowledge_base.format_for_planner() is already injected by api.py
+        # into the planner context. Adding it again here would duplicate
+        # installed packages, tech stack, and patterns.
 
         # 4. Global KB documentation (framework guides, installation docs)
         if kb_context_builder is not None:

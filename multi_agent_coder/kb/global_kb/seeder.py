@@ -1392,8 +1392,9 @@ def _embed_md_files(
         language = meta.get("language", "all")
         version = meta.get("version", "1.0.0")
 
-        # Get relative path within registry
-        rel_path = os.path.relpath(filepath, _GLOBAL_DIR)
+        # Get relative path within registry (always use forward slashes
+        # so that UUID5 point_ids are OS-independent and dedup works)
+        rel_path = os.path.relpath(filepath, _GLOBAL_DIR).replace("\\", "/")
 
         chunks = _chunk_markdown(body, title)
         if not chunks:
