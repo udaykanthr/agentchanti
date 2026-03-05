@@ -1949,78 +1949,45 @@ def _cleanup_stale_js_test_files(
 
 def _cleanup_ghost_test_files(
     test_files: dict[str, str],
-    memory: FileMemory,
+    prev_step_test_files: set[str],
     display: CLIDisplay,
     step_idx: int,
     subproject_cwd: str | None,
 ) -> None:
-    """Remove ghost test files in __tests__/ that are NOT in the current batch.
+    """Remove ghost test files left by previous gen attempts of the SAME step.
 
-    Previous generation runs may leave test files at e.g. ``__tests__/Foo.test.js``
-    with stale import paths.  These are picked up by the test runner and cause
-    persistent failures that the fix loop cannot reach (it only knows about
-    files in ``test_files``).  We only remove files that were previously
-    tracked by ``memory`` but are no longer in the current ``test_files`` dict,
-    to avoid deleting user-written tests.
+    When the TesterAgent retries generation (gen_attempt loop), the new attempt
+    may produce a different set of files than the previous attempt.  Files from
+    the old attempt that aren't in the new ``test_files`` become "ghosts" —
+    the test runner picks them up and they fail with stale import paths.
+
+    ``prev_step_test_files`` should contain the set of file paths written by
+    earlier gen attempts **of the same step** (NOT files from other steps).
+    This prevents accidentally deleting test files produced by earlier steps
+    in the pipeline.
     """
-    test_dir_name = "__tests__"
-    base = subproject_cwd or "."
-    tests_dir = os.path.join(base, test_dir_name)
-    if not os.path.isdir(tests_dir):
+    if not prev_step_test_files:
         return
 
-    current_test_basenames = set()
-    for fpath in test_files:
-        # Normalize: could be "__tests__/Foo.test.jsx" or "react-app/__tests__/..."
-        parts = fpath.replace("\\", "/").split("/")
-        if test_dir_name in parts:
-            idx = parts.index(test_dir_name)
-            current_test_basenames.add("/".join(parts[idx:]))
+    current_paths = set(test_files.keys())
+    ghosts = prev_step_test_files - current_paths
+    if not ghosts:
+        return
 
     removed: list[str] = []
-    memory_files = set(memory.all_files().keys())
+    base = subproject_cwd or "."
 
-    for fname in os.listdir(tests_dir):
-        fpath_rel = os.path.join(test_dir_name, fname)
-        abs_path = os.path.join(base, fpath_rel)
-
-        if not os.path.isfile(abs_path):
-            continue
-
-        # Only remove test-like files
-        if not any(fname.endswith(ext) for ext in
-                   ('.test.js', '.test.jsx', '.test.ts', '.test.tsx',
-                    '.spec.js', '.spec.jsx', '.spec.ts', '.spec.tsx')):
-            continue
-
-        # Skip if it's in the current batch
-        if fpath_rel in current_test_basenames:
-            continue
-
-        # Only remove if it was tracked by memory (i.e. we generated it)
-        # Check various path forms that memory might use
-        is_tracked = False
-        for mem_path in memory_files:
-            if mem_path.endswith(fpath_rel) or mem_path == fpath_rel:
-                is_tracked = True
-                break
-            # Also check with subproject prefix
-            if subproject_cwd:
-                full_rel = os.path.join(
-                    os.path.basename(subproject_cwd), fpath_rel)
-                if mem_path.endswith(full_rel) or mem_path == full_rel:
-                    is_tracked = True
-                    break
-
-        if is_tracked:
+    for ghost_path in ghosts:
+        abs_path = os.path.join(base, ghost_path) if not os.path.isabs(ghost_path) else ghost_path
+        if os.path.isfile(abs_path):
             try:
                 os.remove(abs_path)
-                removed.append(fpath_rel)
+                removed.append(ghost_path)
                 log.info(f"Step {step_idx+1}: Removed ghost test file "
-                         f"{fpath_rel}")
+                         f"{ghost_path}")
             except OSError as e:
                 log.warning(f"Step {step_idx+1}: Failed to remove "
-                            f"ghost {fpath_rel}: {e}")
+                            f"ghost {ghost_path}: {e}")
 
     if removed:
         display.step_info(step_idx,
@@ -2121,6 +2088,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     feedback = ""
     last_test_output = ""
     prev_gen_error = None  # Track errors across gen attempts for early exit
+    prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
     for gen_attempt in range(1, MAX_TEST_GEN_RETRIES + 1):
         display.step_info(step_idx, f"Generating tests (attempt {gen_attempt}/{MAX_TEST_GEN_RETRIES})...")
@@ -2212,12 +2180,16 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         _cleanup_stale_js_test_files(test_files, memory, display, step_idx,
                                      subproject_cwd)
 
-        # ── Cleanup ghost test files in __tests__/ at project root ──
-        # Previous generation runs may leave test files that are no longer
-        # in the current test_files dict.  These ghost files get picked up
-        # by the test runner and fail with wrong import paths.
-        _cleanup_ghost_test_files(test_files, memory, display, step_idx,
-                                  subproject_cwd)
+        # ── Cleanup ghost test files from earlier gen attempts of THIS step ──
+        # If this is a retry (gen_attempt > 1), the previous attempt may have
+        # written different files.  Those ghosts get picked up by the runner
+        # and fail with stale imports.  Only cleans files from THIS step's
+        # earlier attempts — never touches files from other pipeline steps.
+        _cleanup_ghost_test_files(test_files, prev_step_test_files,
+                                  display, step_idx, subproject_cwd)
+
+        # Track files from this gen attempt so later attempts can clean them
+        prev_step_test_files = set(test_files.keys())
 
         # Safety check: if generated test files import from 'vitest' but
         # the detected test command is Jest, override to vitest.
