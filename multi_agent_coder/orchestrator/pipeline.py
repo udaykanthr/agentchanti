@@ -21,7 +21,7 @@ from .diagnosis import _diagnose_failure, _apply_fix
 _logger = logging.getLogger(__name__)
 
 
-MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
+MAX_DIAGNOSIS_RETRIES = 1   # outer retries: diagnose failure → fix → re-run step
 
 # ── External service dependency detection ─────────────────────
 # Patterns that indicate the command failed because an external

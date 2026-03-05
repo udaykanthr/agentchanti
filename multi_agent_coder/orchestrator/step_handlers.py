@@ -26,7 +26,7 @@ from .classification import _extract_command_from_step, _extract_commands_from_t
 from ..diff_display import show_diffs, prompt_diff_approval, _detect_hazards
 
 
-MAX_STEP_RETRIES = 3  # Used for code steps and test run/fix attempts
+MAX_STEP_RETRIES = 2  # Used for code steps and test run/fix attempts
 
 # Map test runner binary → install command
 _RUNNER_INSTALL = {
@@ -1243,6 +1243,247 @@ def _extract_test_error(output: str, max_chars: int = 1500) -> str:
     return result if result else output[:max_chars]
 
 
+# ---- Batch error summary for efficient test fixing ----
+
+# Regex to match common error type lines across test runners
+_ERROR_TYPE_RE = re.compile(
+    r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+    r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
+    r'AssertionError|AssertError|KeyError|ValueError|ReferenceError|'
+    r'RangeError|RuntimeError|OSError|IOError|PermissionError|'
+    r'expect\(received\))'
+)
+
+# Test name patterns for pytest, Jest/Vitest, Go, RSpec
+_TEST_NAME_PATTERNS = [
+    # pytest: "FAILED tests/test_foo.py::test_bar - Error..."
+    re.compile(r'FAILED\s+([\w/.]+::\S+)'),
+    # pytest short: "tests/test_foo.py::test_bar FAILED"
+    re.compile(r'([\w/.]+::\S+)\s+FAILED'),
+    # Jest/Vitest: "✕ test name" or "× test name" or "✗ test name"
+    re.compile(r'[×✕✗]\s+(.+)'),
+    # Jest: "FAIL path/to/test.js"
+    re.compile(r'FAIL\s+([\w/.]+\.\w+)'),
+    # Go: "--- FAIL: TestName"
+    re.compile(r'---\s+FAIL:\s+(\S+)'),
+    # RSpec: "rspec ./spec/foo_spec.rb:42"
+    re.compile(r'rspec\s+([\w/.]+:\d+)'),
+]
+
+
+def _count_test_failures(output: str) -> int:
+    """Count the number of individual test failures in test runner output.
+
+    Returns a best-effort count by looking for common failure indicators
+    across pytest, Jest, Vitest, Go test, and RSpec.
+    """
+    if not output:
+        return 0
+
+    clean = _ANSI_RE.sub('', output)
+    count = 0
+
+    # pytest summary: "X failed"
+    m = re.search(r'(\d+)\s+failed', clean)
+    if m:
+        return int(m.group(1))
+
+    # Jest/Vitest summary: "Tests: X failed"
+    m = re.search(r'Tests:\s+(\d+)\s+failed', clean)
+    if m:
+        return int(m.group(1))
+
+    # Go: count "--- FAIL:" lines
+    count = len(re.findall(r'---\s+FAIL:', clean))
+    if count:
+        return count
+
+    # Fallback: count failure marker lines
+    for line in clean.splitlines():
+        stripped = line.strip()
+        if re.match(r'(FAILED\s+|×\s+|✕\s+|✗\s+)', stripped):
+            count += 1
+
+    return max(count, 1) if 'FAIL' in clean.upper() else 0
+
+
+def _build_batch_error_summary(output: str, max_chars: int = 4000) -> str:
+    """Build a structured, compact summary of ALL test failures.
+
+    Groups failures by error type so the LLM can identify shared root causes
+    (e.g. wrong import path affecting 10 tests → one fix). Works across
+    pytest, Jest, Vitest, Go test, and RSpec output formats.
+
+    Returns at most *max_chars* of structured error context.
+    """
+    if not output:
+        return ""
+
+    clean = _ANSI_RE.sub('', output)
+    lines = clean.splitlines()
+
+    # Collect individual failure blocks
+    failures: list[dict] = []       # [{test, error_type, message, file, line}]
+    error_groups: dict[str, list] = {}  # error_type -> [failure indices]
+
+    # Extract test names that failed
+    failed_tests: list[str] = []
+    for line in lines:
+        for pat in _TEST_NAME_PATTERNS:
+            m = pat.search(line)
+            if m:
+                failed_tests.append(m.group(1).strip())
+                break
+
+    # Walk through output to extract error details per failure
+    current_test = None
+    current_error_type = None
+    current_message_lines: list[str] = []
+    current_file = None
+    current_line_no = None
+
+    # Pattern for file:line references
+    _file_line_re = re.compile(
+        r'(?:File\s+["\'](.+?)["\'],\s+line\s+(\d+)'  # Python
+        r'|(\S+\.\w+):(\d+))'                           # JS/Go/general
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # Blank line — flush current failure if we have one
+            if current_error_type and current_message_lines:
+                msg = ' '.join(current_message_lines).strip()
+                if len(msg) > 200:
+                    msg = msg[:200] + '...'
+                failure = {
+                    'test': current_test or '(unknown test)',
+                    'error_type': current_error_type,
+                    'message': msg,
+                    'file': current_file,
+                    'line': current_line_no,
+                }
+                failures.append(failure)
+                error_groups.setdefault(current_error_type, []).append(
+                    len(failures) - 1)
+                current_error_type = None
+                current_message_lines = []
+                current_file = None
+                current_line_no = None
+            continue
+
+        # Detect test name context
+        for pat in _TEST_NAME_PATTERNS:
+            m = pat.search(stripped)
+            if m:
+                current_test = m.group(1).strip()
+                break
+
+        # Detect error type
+        et_match = _ERROR_TYPE_RE.search(stripped)
+        if et_match:
+            # Flush previous if any
+            if current_error_type and current_message_lines:
+                msg = ' '.join(current_message_lines).strip()
+                if len(msg) > 200:
+                    msg = msg[:200] + '...'
+                failure = {
+                    'test': current_test or '(unknown test)',
+                    'error_type': current_error_type,
+                    'message': msg,
+                    'file': current_file,
+                    'line': current_line_no,
+                }
+                failures.append(failure)
+                error_groups.setdefault(current_error_type, []).append(
+                    len(failures) - 1)
+
+            current_error_type = et_match.group(1)
+            # Message is the rest of the line after the error type
+            rest = stripped[et_match.end():].lstrip(': ')
+            current_message_lines = [rest] if rest else []
+            current_file = None
+            current_line_no = None
+
+        elif current_error_type:
+            # Continuation of error message
+            current_message_lines.append(stripped)
+
+        # Detect file:line references
+        fl_match = _file_line_re.search(stripped)
+        if fl_match and current_error_type:
+            current_file = fl_match.group(1) or fl_match.group(3)
+            current_line_no = fl_match.group(2) or fl_match.group(4)
+
+    # Flush last failure
+    if current_error_type and current_message_lines:
+        msg = ' '.join(current_message_lines).strip()
+        if len(msg) > 200:
+            msg = msg[:200] + '...'
+        failure = {
+            'test': current_test or '(unknown test)',
+            'error_type': current_error_type,
+            'message': msg,
+            'file': current_file,
+            'line': current_line_no,
+        }
+        failures.append(failure)
+        error_groups.setdefault(current_error_type, []).append(
+            len(failures) - 1)
+
+    # If we couldn't parse structured failures, fall back to _extract_test_error
+    if not failures:
+        return _extract_test_error(output, max_chars=max_chars)
+
+    # Build the structured summary grouped by error type
+    total = len(failures)
+    unique_files = set()
+    for f in failures:
+        if f.get('file'):
+            unique_files.add(f['file'])
+
+    parts: list[str] = []
+    parts.append(f"FAILED TESTS SUMMARY ({total} failure(s)"
+                 f"{f' across {len(unique_files)} file(s)' if unique_files else ''}):\n")
+
+    # Sort error groups by count (most common first) so LLM fixes root causes
+    sorted_groups = sorted(error_groups.items(),
+                           key=lambda x: len(x[1]), reverse=True)
+
+    failure_num = 0
+    for error_type, indices in sorted_groups:
+        count = len(indices)
+        parts.append(f"--- {error_type} ({count} occurrence(s)) ---")
+
+        for idx in indices:
+            failure_num += 1
+            f = failures[idx]
+            loc = ""
+            if f.get('file'):
+                loc = f"  File: {f['file']}"
+                if f.get('line'):
+                    loc += f":{f['line']}"
+            parts.append(f"  {failure_num}. {f['test']}")
+            parts.append(f"     Error: {f['message']}")
+            if loc:
+                parts.append(f"    {loc}")
+
+        parts.append("")  # blank line between groups
+
+    # Add the test summary line if present
+    for line in lines:
+        stripped = line.strip()
+        if re.search(r'\d+\s+(failed|passed|skipped)', stripped):
+            parts.append(f"Summary: {stripped}")
+            break
+
+    result = '\n'.join(parts).strip()
+    if len(result) > max_chars:
+        result = result[:max_chars] + '\n... [truncated]'
+
+    return result
+
+
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
                       executor: Executor, task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
@@ -1794,6 +2035,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx, "Detected vitest imports → using vitest runner")
 
         prev_output = None
+        prev_fail_count = None
         for run_attempt in range(1, MAX_STEP_RETRIES + 1):
             display.step_info(step_idx, f"Running: {test_cmd} (attempt {run_attempt})...")
             log.info(f"Step {step_idx+1}: Running test command: {test_cmd}" + (f" in {subproject_cwd}" if subproject_cwd else ""))
@@ -1836,6 +2078,22 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                                 f"{run_attempt}, breaking retry loop.")
                     break
             prev_output = output
+
+            # Early exit on no progress: if failure count is not decreasing,
+            # the fix attempts aren't helping — stop wasting LLM calls
+            current_fail_count = _count_test_failures(output or "")
+            if (prev_fail_count is not None
+                    and current_fail_count > 0
+                    and current_fail_count >= prev_fail_count
+                    and run_attempt > 1):
+                display.step_info(step_idx,
+                                  f"No progress ({current_fail_count} failures, "
+                                  f"was {prev_fail_count}) — stopping retry loop.")
+                log.warning(f"Step {step_idx+1}: Failure count not decreasing "
+                            f"({prev_fail_count} → {current_fail_count}), "
+                            f"breaking retry loop at attempt {run_attempt}.")
+                break
+            prev_fail_count = current_fail_count
 
             # Early exit for unfixable error types
             _unfixable = {e for e in _error_classes if e.startswith(('SyntaxError', 'IndentationError'))}
@@ -1922,7 +2180,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             prev_gen_error = output
 
             display.step_info(step_idx, "Tests failed, asking coder to fix...")
-            error_detail = _extract_test_error(output) if output else f"(command `{test_cmd}` produced no output — it may have crashed or the test framework may not be installed)"
+
+            # Use batch error summary for structured, grouped view of ALL failures
+            batch_summary = _build_batch_error_summary(output) if output else ""
+            error_detail = batch_summary or (
+                f"(command `{test_cmd}` produced no output — it may have "
+                f"crashed or the test framework may not be installed)"
+            )
 
             # Search the web for error documentation to help the coder fix
             search_context = ""
@@ -1938,11 +2202,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     log.warning(f"Step {step_idx+1}: Search agent error "
                                 f"during test fix: {exc}")
 
-            # Build a more specific fix prompt that restricts changes to test files
+            # Build fix context with the batch error summary
             test_file_list = ", ".join(test_files.keys())
             fix_context = (
-                f"Test command: `{test_cmd}`\n"
-                f"Test errors:\n{error_detail}\n"
+                f"Test command: `{test_cmd}`\n\n"
+                f"{error_detail}\n\n"
                 f"Test files that need fixing: {test_file_list}\n"
                 f"Project files:\n{code_summary}"
             )
@@ -1953,10 +2217,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     f"to inform your fix:\n\n{search_context}"
                 )
             fix_prompt = (
-                "Fix ONLY the test files so tests pass. "
+                "Below is a structured summary of ALL test failures grouped by error type. "
+                "Analyze the patterns — if multiple failures share a root cause "
+                "(e.g. wrong import path, missing mock, incorrect API usage), "
+                "fix the root cause once rather than patching each test individually. "
+                "Fix ONLY the test files. "
                 "Do NOT modify source files, package.json, or any config files. "
                 "Do NOT add new dependencies. "
-                "Only output the corrected test file(s) using #### [FILE]: format."
+                "Return ALL corrected test file(s) using #### [FILE]: format."
             )
 
             sent_before, recv_before = token_tracker.snapshot()
