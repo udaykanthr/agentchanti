@@ -107,6 +107,38 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
             env["has_vitest_config"] = True
             break
 
+    # Vite config with embedded test section (most common Vite+Vitest setup)
+    if not env["has_vitest_config"]:
+        for vite_cfg in ("vite.config.ts", "vite.config.js",
+                         "vite.config.mts", "vite.config.mjs"):
+            vite_path = os.path.join(cwd, vite_cfg) if cwd else vite_cfg
+            if os.path.isfile(vite_path):
+                try:
+                    with open(vite_path, "r", encoding="utf-8") as f:
+                        vite_content = f.read()
+                    # Check for test config inside vite.config
+                    if "test:" in vite_content or "test :" in vite_content:
+                        env["has_vitest_config"] = True
+                        log.info(f"Detected Vitest config embedded in {vite_cfg}")
+                except OSError:
+                    pass
+                break  # stop after first vite.config found
+
+    # Vite project detection: if project uses Vite, prefer Vitest
+    env["has_vite"] = False
+    if os.path.isfile(os.path.join(cwd, "package.json") if cwd else "package.json"):
+        try:
+            with open(os.path.join(cwd, "package.json") if cwd else "package.json",
+                      "r", encoding="utf-8") as f:
+                _pkg = json.load(f)
+            _all = {}
+            _all.update(_pkg.get("dependencies", {}))
+            _all.update(_pkg.get("devDependencies", {}))
+            env["has_vite"] = ("vite" in _all or
+                               any(k.startswith("@vitejs/") for k in _all))
+        except (json.JSONDecodeError, OSError):
+            pass
+
     # Jest config detection
     for config_name in ("jest.config.js", "jest.config.ts", "jest.config.mjs",
                         "jest.config.cjs", "jest.config.json"):
@@ -117,6 +149,9 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
 
     # Determine test runner: prefer Vitest if detected
     if env["has_vitest_config"] or env["has_vitest"]:
+        env["test_runner"] = "vitest"
+    elif env.get("has_vite") and not env["has_jest_config"]:
+        # Vite project without explicit Jest config → default to Vitest
         env["test_runner"] = "vitest"
     elif env["has_jest_config"] or env["has_jest"]:
         env["test_runner"] = "jest"
@@ -1098,6 +1133,116 @@ def _quick_offline_lint(files: dict[str, str]) -> str:
     return ""
 
 
+# ---- ANSI code pattern (shared) ----
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _extract_test_error(output: str, max_chars: int = 1500) -> str:
+    """Extract actionable error info from verbose test runner output.
+
+    Strips ANSI escape codes, drops DOM/HTML dumps and deep stack traces,
+    and keeps: error type + message, the failing source line, framework
+    suggestions, and the test summary.  Works generically across Jest,
+    Vitest, pytest, Go test, RSpec, etc.
+
+    Returns at most *max_chars* of useful error context.
+    """
+    if not output:
+        return ""
+
+    # 1. Strip ANSI colour codes
+    clean = _ANSI_RE.sub('', output)
+    lines = clean.splitlines()
+
+    kept: list[str] = []
+    skip_block = False  # True while inside a DOM / HTML dump block
+
+    # Patterns for lines we always want to keep
+    _KEEP_PATTERNS = re.compile(
+        r'(FAIL\b|FAILED\b|PASS\b|ERROR\b|Error[:\s]|error[:\s]'
+        r'|TypeError|ReferenceError|SyntaxError|NameError'
+        r'|ModuleNotFoundError|ImportError|AttributeError'
+        r'|IndentationError|FileNotFoundError|AssertionError'
+        r'|AssertError|KeyError|ValueError|TestingLibrary'
+        r'|expect\(|Expected\b|Received\b|Difference:'
+        r'|× |✕ |✗ |✓ |✔ '
+        r'|Tests:|Test Files|Test Suites|Duration'
+        r'|\d+ (failed|passed|skipped|pending)'
+        r'|RUNS?\b)',
+        re.IGNORECASE
+    )
+
+    # Patterns for the source pointer block (e.g. "  > 24 | const x = ...")
+    _SOURCE_PTR = re.compile(r'^\s*(>\s*)?\d+\s*\|')
+
+    # Patterns for suggestion / hint lines
+    _SUGGESTION = re.compile(
+        r'(\(If this is intentional|Hint:|Did you mean'
+        r'|To fix|Possible fix|Consider using|use the .+variant)',
+        re.IGNORECASE
+    )
+
+    # Patterns indicating a DOM / HTML dump to skip
+    _DOM_LINE = re.compile(
+        r'^\s*<(div|span|a|button|nav|header|footer|section|svg|path|ul|li|ol|img|form|input|p|h[1-6])'
+        r'|^\s*\[\d+m<'  # Residual ANSI-prefixed HTML
+        r'|^\s*Ignored nodes:',
+        re.IGNORECASE
+    )
+
+    # Stack trace lines to skip (deep frames only, keep top 2)
+    _STACK_FRAME = re.compile(r'^\s*(at |❯ |\.\.\.\s*\d+ more)')
+    stack_frame_count = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            skip_block = False
+            stack_frame_count = 0
+            continue
+
+        # Detect and skip DOM/HTML dump blocks
+        if _DOM_LINE.match(stripped):
+            if not skip_block:
+                kept.append('    [... DOM/HTML output truncated ...]')
+                skip_block = True
+            continue
+
+        if skip_block:
+            # Still inside a DOM dump — skip unless we hit a keeper
+            if _KEEP_PATTERNS.search(stripped) or _SUGGESTION.search(stripped):
+                skip_block = False
+            else:
+                continue
+
+        # Limit stack trace depth: keep first 2 frames, skip the rest
+        if _STACK_FRAME.match(stripped):
+            stack_frame_count += 1
+            if stack_frame_count > 2:
+                if stack_frame_count == 3:
+                    kept.append('    [... stack frames truncated ...]')
+                continue
+
+        # Always keep: error messages, source pointers, suggestions, summaries
+        if (_KEEP_PATTERNS.search(stripped)
+                or _SOURCE_PTR.match(stripped)
+                or _SUGGESTION.search(stripped)):
+            kept.append(line)
+            continue
+
+        # Keep lines that are short context around errors (e.g. test names)
+        if len(stripped) < 120:
+            kept.append(line)
+
+    result = '\n'.join(kept).strip()
+
+    # Final cap
+    if len(result) > max_chars:
+        result = result[:max_chars] + '\n... [truncated]'
+
+    return result if result else output[:max_chars]
+
+
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
                       executor: Executor, task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
@@ -1105,7 +1250,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       cfg: Config | None = None,
                       auto: bool = False,
                       code_graph=None,
-                      project_profile=None) -> tuple[bool, str]:
+                      project_profile=None,
+                      skip_review: bool = False) -> tuple[bool, str]:
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
@@ -1252,11 +1398,27 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: Skipped review (non-code files: {list(files.keys())})")
             return True, ""
 
-        # Review — pass step description so reviewer scopes to this step
+        # ── Review gate ──────────────────────────────────────────
+        # When a TEST step follows (skip_review=True), skip the LLM
+        # reviewer and rely on test execution to catch real bugs.
+        # Always run the free offline lint check regardless.
+        lint_errors = _quick_offline_lint(files)
+
+        if skip_review:
+            # Lint-only path: skip LLM review, test step will validate
+            if lint_errors:
+                feedback = f"Lint/syntax errors found:\n{lint_errors}\nFix these issues."
+                display.step_info(step_idx, "Lint errors found, retrying...")
+                log.warning(f"Step {step_idx+1}: Code lint errors: {lint_errors[:300]}")
+                continue
+            display.step_info(step_idx, "Review skipped (test step follows) ✔")
+            log.info(f"Step {step_idx+1}: Skipped LLM review (test step follows)")
+            return True, ""
+
+        # Full LLM review path
         display.step_info(step_idx, "Reviewing code...")
         sent_before, recv_before = token_tracker.snapshot()
 
-        lint_errors = _quick_offline_lint(files)
         lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
 
         # Inject KB context so the reviewer has up-to-date framework docs
@@ -1587,49 +1749,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             display.step_info(step_idx, "No valid test files after filtering, retrying...")
             continue
 
-        # Review tests
-        display.step_info(step_idx, "Reviewing tests...")
-        sent_before, recv_before = token_tracker.snapshot()
-
+        # Quick offline lint check (free, no LLM cost) — catches syntax
+        # errors before writing to disk.  Real test failures are caught by
+        # the execution loop below, which provides concrete error output
+        # that the coder can act on.
         lint_errors = _quick_offline_lint(test_files)
-        lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
-
-        review = reviewer.process(
-            f"Review these tests for correctness, especially import paths:\n{test_response}",
-            context=f"Project files: {memory.summary()}\n{code_summary}{lint_context}",
-            language=language,
-        )
-
-        sent_after, recv_after = token_tracker.snapshot()
-        sent_delta = sent_after - sent_before
-        recv_delta = recv_after - recv_before
-        display.step_tokens(step_idx, sent_delta, recv_delta)
-
-        if review:
-            display.add_llm_log(review, source="Reviewer")
-
-        log.info(f"Step {step_idx+1}: Test review:\n{review}")
-
-        review_lower = review.lower()
-        test_approved = any(phrase in review_lower for phrase in (
-            "code looks good", "looks good", "no issues",
-            "no critical issues", "no bugs found", "code is correct",
-            "functionally correct", "lgtm", "tests look good",
-        ))
-
-        # On last attempt, accept if no critical issues found
-        if not test_approved and gen_attempt == MAX_TEST_GEN_RETRIES:
-            has_critical = any(kw in review_lower for kw in (
-                "error", "bug", "crash", "undefined", "missing import",
-                "will fail", "won't work", "incorrect", "wrong import",
-            ))
-            if not has_critical:
-                test_approved = True
-                log.info(f"Step {step_idx+1}: Test accepted on last attempt (minor issues only)")
-
-        if not test_approved:
-            feedback = review
-            display.step_info(step_idx, "Test review found issues, regenerating...")
+        if lint_errors:
+            feedback = f"Lint/syntax errors found:\n{lint_errors}\nFix these issues."
+            display.step_info(step_idx, "Lint errors found, regenerating...")
+            log.warning(f"Step {step_idx+1}: Test lint errors: {lint_errors[:300]}")
             continue
 
         # Show diffs and wait for approval before writing test files
@@ -1648,6 +1776,22 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         written = executor.write_files(test_files)
         memory.update(test_files)
         display.step_info(step_idx, f"Tests written: {', '.join(written)}")
+
+        # Safety check: if generated test files import from 'vitest' but
+        # the detected test command is Jest, override to vitest.
+        # This catches cases where the LLM generates Vitest tests but the
+        # framework detection still defaults to Jest.
+        if "jest" in test_cmd.lower():
+            uses_vitest = any(
+                "from 'vitest'" in content or 'from "vitest"' in content
+                for content in test_files.values()
+            )
+            if uses_vitest:
+                test_cmd = "npx vitest run"
+                test_runner = "vitest"
+                log.info(f"Step {step_idx+1}: Overriding test command to "
+                         f"'{test_cmd}' — test files import from 'vitest'")
+                display.step_info(step_idx, "Detected vitest imports → using vitest runner")
 
         prev_output = None
         for run_attempt in range(1, MAX_STEP_RETRIES + 1):
@@ -1777,7 +1921,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             prev_gen_error = output
 
             display.step_info(step_idx, "Tests failed, asking coder to fix...")
-            error_detail = output[:1000] if output else f"(command `{test_cmd}` produced no output — it may have crashed or the test framework may not be installed)"
+            error_detail = _extract_test_error(output) if output else f"(command `{test_cmd}` produced no output — it may have crashed or the test framework may not be installed)"
 
             # Search the web for error documentation to help the coder fix
             search_context = ""

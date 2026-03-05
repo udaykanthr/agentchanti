@@ -263,8 +263,10 @@ def detect_language_from_files(file_paths: list[str]) -> str | None:
 def detect_test_runner(directory: str | None = None) -> str | None:
     """Detect whether a JS/TS project uses Vitest or Jest.
 
-    Checks for ``vitest.config.*`` files first, then ``jest.config.*`` files,
-    then falls back to inspecting ``package.json`` devDependencies.
+    Checks for ``vitest.config.*`` files first, then ``vite.config.*`` with
+    embedded ``test:`` section, then ``jest.config.*`` files, then falls back
+    to inspecting ``package.json`` devDependencies.  Vite-based projects
+    without an explicit Jest config default to Vitest.
 
     Returns ``"vitest"``, ``"jest"``, or ``None``.
     """
@@ -275,6 +277,20 @@ def detect_test_runner(directory: str | None = None) -> str | None:
                  "vitest.config.mjs"):
         if os.path.isfile(os.path.join(cwd, name)):
             return "vitest"
+
+    # Check for vite.config with embedded test section
+    for name in ("vite.config.ts", "vite.config.js", "vite.config.mts",
+                 "vite.config.mjs"):
+        vite_path = os.path.join(cwd, name)
+        if os.path.isfile(vite_path):
+            try:
+                with open(vite_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "test:" in content or "test :" in content:
+                    return "vitest"
+            except OSError:
+                pass
+            break  # stop after first vite.config found
 
     # Check for jest config files
     for name in ("jest.config.js", "jest.config.ts", "jest.config.mjs",
@@ -288,10 +304,17 @@ def detect_test_runner(directory: str | None = None) -> str | None:
         try:
             with open(pkg_path, "r", encoding="utf-8") as f:
                 pkg = json.load(f)
-            dev_deps = pkg.get("devDependencies", {})
-            if "vitest" in dev_deps:
+            all_deps = {}
+            all_deps.update(pkg.get("dependencies", {}))
+            all_deps.update(pkg.get("devDependencies", {}))
+            if "vitest" in all_deps:
                 return "vitest"
-            if "jest" in dev_deps:
+            # Vite project without Jest → default to Vitest
+            has_vite = ("vite" in all_deps or
+                        any(k.startswith("@vitejs/") for k in all_deps))
+            if has_vite and "jest" not in all_deps:
+                return "vitest"
+            if "jest" in all_deps:
                 return "jest"
         except (json.JSONDecodeError, OSError):
             pass

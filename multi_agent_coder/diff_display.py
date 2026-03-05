@@ -159,9 +159,30 @@ def _detect_hazards(filepath: str, old_content: str, new_content: str) -> list[t
          # NOTE: For now, we'll enforce the "Warning" and rely on the PROMPT to stop the agent.
          # But if we really want to block, we can add:
          if '"dependencies"' in new_content or '"devDependencies"' in new_content:
-             # If content related to deps changed... hard to tell with simple string compare.
-             # We will flag a WARNING for ANY edit to package.json to be safe, asking user to confirm.
-             hazards.append((HAZARD_WARN, "Verify this is not a manual dependency edit (use `npm install` instead)."))
+             # Smart check: only flag if existing dependency versions are CHANGED
+             # (not just if dependencies exist). Additive changes like new scripts
+             # or new test deps are safe — SmartMerge handles protection at write time.
+             import json as _json
+             try:
+                 old_pkg = _json.loads(old_content)
+                 new_pkg = _json.loads(new_content)
+                 changed_deps = []
+                 for section in ('dependencies', 'devDependencies'):
+                     old_deps = old_pkg.get(section, {})
+                     new_deps = new_pkg.get(section, {})
+                     for dep, ver in old_deps.items():
+                         if dep in new_deps and new_deps[dep] != ver:
+                             changed_deps.append(f"{dep}: {ver} → {new_deps[dep]}")
+                 if changed_deps:
+                     hazards.append((HAZARD_WARN,
+                                     f"Dependency version changes detected: "
+                                     f"{', '.join(changed_deps[:3])}. "
+                                     f"Use `npm install` instead of manual edits."))
+             except (ValueError, KeyError):
+                 # JSON parse failed — treat as suspicious
+                 hazards.append((HAZARD_WARN,
+                                 "Could not verify package.json changes — "
+                                 "verify manually."))
 
     # 4. Unicode corruption (mojibake) detection
     # Check if the new content introduces common UTF-8→Latin-1 corruption

@@ -543,6 +543,7 @@ def main():
             step_text = steps[idx]
             idx, success, error_info = _execute_step(
                 idx, step_text,
+                steps=steps,
                 llm_client=llm_client, executor=executor,
                 coder=coder, reviewer=reviewer, tester=tester,
                 task=args.task, memory=memory, display=display,
@@ -568,6 +569,7 @@ def main():
                 # Diagnosis loop
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
+                    steps=steps,
                     llm_client=llm_client, executor=executor,
                     coder=coder, reviewer=reviewer, tester=tester,
                     task=args.task, memory=memory, display=display,
@@ -601,6 +603,7 @@ def main():
                 for idx in pending:
                     f = pool.submit(
                         _execute_step, idx, steps[idx],
+                        steps=steps,
                         llm_client=llm_client, executor=executor,
                         coder=coder, reviewer=reviewer, tester=tester,
                         task=args.task, memory=memory, display=display,
@@ -638,6 +641,7 @@ def main():
                 step_text = steps[idx]
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
+                    steps=steps,
                     llm_client=llm_client, executor=executor,
                     coder=coder, reviewer=reviewer, tester=tester,
                     task=args.task, memory=memory, display=display,

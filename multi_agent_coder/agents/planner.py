@@ -321,8 +321,11 @@ Write a numbered list. Each step MUST be a single, concrete action:
    "Review the code", "Identify the bug", or "Plan the implementation".
    Jump straight to actionable steps.
 
-10. **NO test steps unless asked**: Do NOT add test steps (writing or running
-   tests) UNLESS the user's task EXPLICITLY asks for tests.
+10. **ALWAYS include a test step**: Every plan MUST include at least one TEST
+    step that writes and runs tests for the code created or modified in prior
+    CODE steps. Place the TEST step AFTER all CODE steps it validates.
+    Test execution is the primary quality gate — it catches real bugs that
+    static review cannot.
 
 11. **Shell commands are non-interactive**: Always include --yes, -y, or
     --defaults flags for tools that prompt for input:

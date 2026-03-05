@@ -147,6 +147,7 @@ def build_step_waves(steps: list[str], dependencies: dict[int, set[int]]) -> lis
 
 
 def _execute_step(step_idx: int, step_text: str, *,
+                  steps: list[str],
                   llm_client, executor, coder, reviewer, tester,
                   task: str, memory: FileMemory, display: CLIDisplay,
                   language: str | None, cfg=None,
@@ -278,11 +279,24 @@ def _execute_step(step_idx: int, step_text: str, *,
             _graph = code_graph
             if _graph is None and kb_context_builder is not None:
                 _graph = getattr(kb_context_builder, "_graph", None)
+
+            # Look ahead: skip LLM review if a TEST step follows in the plan
+            # (test execution will catch real bugs more reliably)
+            _test_keywords = re.compile(
+                r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
+                re.IGNORECASE,
+            )
+            _has_test_after = any(
+                _test_keywords.search(steps[j])
+                for j in range(step_idx + 1, len(steps))
+            )
+
             success, error_info = _handle_code_step(
                 step_text, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language, cfg=cfg,
                 auto=auto, code_graph=_graph,
-                project_profile=project_profile)
+                project_profile=project_profile,
+                skip_review=_has_test_after)
             display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "TEST":
@@ -323,6 +337,7 @@ def _execute_step(step_idx: int, step_text: str, *,
 
 
 def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
+                        steps: list[str],
                         llm_client, executor, coder, reviewer, tester,
                         task: str, memory: FileMemory, display: CLIDisplay,
                         language: str | None, cfg=None,
@@ -416,6 +431,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             display.step_info(step_idx, "Fix applied — retrying step...")
             _, success, error_info = _execute_step(
                 step_idx, step_text,
+                steps=steps,
                 llm_client=llm_client, executor=executor,
                 coder=coder, reviewer=reviewer, tester=tester,
                 task=task, memory=memory, display=display,
