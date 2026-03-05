@@ -258,3 +258,67 @@ class TestValidate:
         result = parser.validate(parsed, file_contents)
         assert result is not None
         assert result.parse_successful is True
+
+class TestUnifiedDiffFallback:
+    def test_unified_diff_with_context(self):
+        diff = """\
+@@DIFF_START@@
+FILE: src/auth.py
+@@ -10,5 +10,6 @@
+     def validate(self, token):
+-        if not token:
+-            return False
++        if not token or len(token) < 10:
++            raise ValueError("Invalid token")
+         return True
+@@DIFF_END@@
+"""
+        parser = DiffParser()
+        result = parser.parse(diff)
+
+        assert result is not None
+        assert result.parse_successful is True
+        assert len(result.file_patches) == 1
+        
+        hunk = result.file_patches[0].hunks[0]
+        assert hunk.line_number == 10
+        # Context lines plus the removed lines
+        assert hunk.original_lines == [
+            "    def validate(self, token):",
+            "        if not token:",
+            "            return False",
+            "        return True"
+        ]
+        assert hunk.replacement_lines == [
+            "    def validate(self, token):",
+            "        if not token or len(token) < 10:",
+            "            raise ValueError(\"Invalid token\")",
+            "        return True"
+        ]
+
+    def test_unified_diff_without_headers(self):
+        diff = """\
+@@DIFF_START@@
+FILE: src/api.py
+-def process():
+-    pass
++def process(data):
++    return data
+@@DIFF_END@@
+"""
+        parser = DiffParser()
+        result = parser.parse(diff)
+
+        assert result is not None
+        assert result.parse_successful is True
+        
+        hunk = result.file_patches[0].hunks[0]
+        assert hunk.line_number == 1  # Default fallback
+        assert hunk.original_lines == [
+            "def process():",
+            "    pass"
+        ]
+        assert hunk.replacement_lines == [
+            "def process(data):",
+            "    return data"
+        ]

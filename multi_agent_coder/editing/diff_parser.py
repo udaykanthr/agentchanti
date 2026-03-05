@@ -197,7 +197,12 @@ class DiffParser:
 
         # Find all ORIGINAL markers
         orig_matches = list(_ORIGINAL_PATTERN.finditer(body))
+        
+        # Fallback: if no ORIGINAL markers, see if it's a unified diff format
         if not orig_matches:
+            fallback_hunks = self._parse_unified_diff_fallback(body, file_path)
+            if fallback_hunks:
+                return fallback_hunks
             return hunks
 
         for i, orig_match in enumerate(orig_matches):
@@ -241,6 +246,87 @@ class DiffParser:
                 replacement_lines=replacement_lines,
             ))
 
+        return hunks
+
+    def _parse_unified_diff_fallback(self, body: str, file_path: str) -> list[DiffHunk]:
+        """Attempt to parse standard unified diff format (-/+) as a fallback."""
+        hunks: list[DiffHunk] = []
+        lines = body.split("\n")
+        
+        # We group contiguous sequences of -/+/space lines into a single hunk
+        current_orig: list[str] = []
+        current_repl: list[str] = []
+        in_hunk = False
+        # We don't have a robust line number in this format unless the LLM generated unified diff headers,
+        # but PatchApplier._apply_hunk can fuzz match if we just default to 1
+        current_line_num = 1 
+        
+    def _parse_unified_diff_fallback(self, body: str, file_path: str) -> list[DiffHunk]:
+        """Attempt to parse standard unified diff format (-/+) as a fallback."""
+        hunks: list[DiffHunk] = []
+        lines = body.split("\n")
+        
+        # We group contiguous sequences of -/+/space lines into a single hunk
+        current_orig: list[str] = []
+        current_repl: list[str] = []
+        in_hunk = False
+        # We don't have a robust line number in this format unless the LLM generated unified diff headers,
+        # but PatchApplier._apply_hunk can fuzz match if we just default to 1
+        current_line_num = 1 
+        
+        for line in lines:
+            if line.startswith("@@"):
+                # Try to extract line number from unified diff header like @@ -15,5 +15,7 @@
+                import re
+                m = re.search(r"@@\s*-(\d+)", line)
+                if m:
+                    current_line_num = int(m.group(1))
+                continue
+                
+            if line.startswith("-") and not line.startswith("--- "):
+                in_hunk = True
+                current_orig.append(line[1:])
+            elif line.startswith("+") and not line.startswith("+++ "):
+                in_hunk = True
+                current_repl.append(line[1:])
+            elif line.startswith(" ") or line == "":
+                # Context lines are part of the original block that gets replaced with itself,
+                # but only if we are actively building a hunk OR if we just started, 
+                # we want to capture preceding context.
+                content = line[1:] if line.startswith(" ") else ""
+                current_orig.append(content)
+                current_repl.append(content)
+                in_hunk = True
+            else:
+                # Any other line breaks the hunk
+                # Only save if we actually saw changes (- or +)
+                has_changes = any(orig != repl for orig, repl in zip(current_orig + [""] * len(current_repl), current_repl + [""] * len(current_orig)))
+                if in_hunk and has_changes:
+                    # Strip common leading/trailing context that spans multiple hunks
+                    # but typically PatchApplier handles exact matches well.
+                    hunks.append(DiffHunk(
+                        line_number=current_line_num,
+                        original_lines=list(current_orig),
+                        replacement_lines=list(current_repl),
+                    ))
+                # Reset
+                current_orig = []
+                current_repl = []
+                in_hunk = False
+                current_line_num = 1
+                    
+        # Catch any trailing hunk
+        has_changes = any(orig != repl for orig, repl in zip(current_orig + [""] * len(current_repl), current_repl + [""] * len(current_orig)))
+        if in_hunk and has_changes:
+            hunks.append(DiffHunk(
+                line_number=current_line_num,
+                original_lines=list(current_orig),
+                replacement_lines=list(current_repl),
+            ))
+            
+        if hunks:
+            logger.info("[DiffEdit] Recovered %d hunks using unified diff fallback for %s", len(hunks), file_path)
+            
         return hunks
 
     @staticmethod

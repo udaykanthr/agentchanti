@@ -1806,21 +1806,21 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx, "Tests passed ✔")
                 return True, ""
 
-            # Extract error classes for smarter deduplication
+            # Extract error classes and their messages for smarter deduplication
             import re as _re
-            _error_classes = set(_re.findall(
-                r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+            _error_classes = set(line.strip() for line in _re.findall(
+                r'((?:ModuleNotFoundError|ImportError|SyntaxError|NameError|'
                 r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
-                r'AssertionError|KeyError|ValueError|ReferenceError)',
+                r'AssertionError|KeyError|ValueError|ReferenceError)[^\n]*)',
                 output or ""
             ))
 
             # Detect stuck loop: compare error classes, not just exact output
             if prev_output and run_attempt > 1:
-                prev_error_classes = set(_re.findall(
-                    r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
+                prev_error_classes = set(line.strip() for line in _re.findall(
+                    r'((?:ModuleNotFoundError|ImportError|SyntaxError|NameError|'
                     r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
-                    r'AssertionError|KeyError|ValueError|ReferenceError)',
+                    r'AssertionError|KeyError|ValueError|ReferenceError)[^\n]*)',
                     prev_output or ""
                 ))
                 if _error_classes and _error_classes == prev_error_classes:
@@ -1838,10 +1838,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             prev_output = output
 
             # Early exit for unfixable error types
-            _unfixable = _error_classes & {'SyntaxError', 'IndentationError'}
+            _unfixable = {e for e in _error_classes if e.startswith(('SyntaxError', 'IndentationError'))}
             if _unfixable and run_attempt > 1:
+                _unfixable_names = {e.split(':')[0] for e in _unfixable}
                 display.step_info(step_idx,
-                                  f"Persistent {', '.join(_unfixable)} — likely unfixable, stopping.")
+                                  f"Persistent {', '.join(_unfixable_names)} — likely unfixable, stopping.")
                 log.warning(f"Step {step_idx+1}: Unfixable errors after "
                             f"{run_attempt} attempts: {_unfixable}")
                 break
@@ -2564,17 +2565,21 @@ Respond with ONLY a diff in this exact format — nothing else:
 
 @@DIFF_START@@
 FILE: {{file_path}}
-{{replacement lines}}
+<<<<<<< ORIGINAL (line {{start_line}})
+{{exactly as lines appear in the slice}}
+=======
+{{your replacement lines}}
+>>>>>>> UPDATED
 @@DIFF_END@@
 
 Rules:
-- Use line numbers from the slice annotations
-- Only include blocks that actually change
-- Preserve indentation exactly
-- If no changes needed for a file, omit it entirely
-- ORIGINAL block must match the slice content exactly
-- For multiple changes in the same file, include multiple ORIGINAL/UPDATED blocks under the same FILE header
-- For changes across multiple files, include multiple FILE sections"""
+- Use line numbers exactly as they appear in the ORIGINAL slice block annotations. First line of ORIGINAL must match {{start_line}}.
+- Only include blocks that actually change.
+- Preserve indentation exactly.
+- If no changes are needed for a file, omit it entirely.
+- The ORIGINAL block must EXACTLY MATCH the slice content you want to replace, including all whitespace.
+- For multiple changes in the same file, include multiple ORIGINAL/UPDATED blocks under the same FILE header.
+- For changes across multiple files, include multiple FILE sections."""
 
 
 def _log_fallback_metric(

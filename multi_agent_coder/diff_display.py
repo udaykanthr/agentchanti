@@ -184,7 +184,33 @@ def _detect_hazards(filepath: str, old_content: str, new_content: str) -> list[t
                                  "Could not verify package.json changes — "
                                  "verify manually."))
 
-    # 4. Unicode corruption (mojibake) detection
+    # 4. Export statement loss detection (JS/TS/JSX/TSX)
+    # Common LLM truncation: drops `export default X;` at end of file
+    _, ext = os.path.splitext(filepath)
+    if ext in ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.mts'):
+        import re
+        # Check for export default loss
+        old_has_export_default = bool(re.search(
+            r'export\s+default\s+', old_content))
+        new_has_export_default = bool(re.search(
+            r'export\s+default\s+', new_content))
+        if old_has_export_default and not new_has_export_default:
+            hazards.append((HAZARD_WARN,
+                            "Missing `export default` — likely truncated by LLM. "
+                            "The original file exported a default symbol."))
+
+        # Check for named export loss (e.g., export function, export const, export class)
+        old_exports = set(re.findall(
+            r'export\s+(?:function|const|let|var|class)\s+(\w+)', old_content))
+        new_exports = set(re.findall(
+            r'export\s+(?:function|const|let|var|class)\s+(\w+)', new_content))
+        lost_exports = old_exports - new_exports
+        if lost_exports:
+            hazards.append((HAZARD_WARN,
+                            f"Named export(s) lost: {', '.join(sorted(lost_exports))}. "
+                            "Verify these were intentionally removed."))
+
+    # 5. Unicode corruption (mojibake) detection
     # Check if the new content introduces common UTF-8→Latin-1 corruption
     # patterns that weren't present in the old content.
     import re

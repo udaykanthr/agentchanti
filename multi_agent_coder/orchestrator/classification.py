@@ -70,6 +70,12 @@ def _looks_like_command(text: str) -> bool:
     if re.match(r"^(source|gem|group|require)\s+['\"]", text):
         return False
 
+    # Reject JavaScript export statements — "export function ...", "export default ...",
+    # "export class ...", "export const/let/var ..." are code, not shell commands.
+    # Shell export is "export VAR=value" or "export -n VAR".
+    if re.match(r'^export\s+(function|default|class|const|let|var|async)\b', text):
+        return False
+
     # Extract the first token, splitting on whitespace AND shell operators
     # so that "echo.>file" splits to "echo." and "type nul > file" splits to "type"
     first_token = re.split(r'[\s>|&;<]', text)[0].lower()
