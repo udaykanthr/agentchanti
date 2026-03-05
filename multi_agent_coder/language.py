@@ -65,13 +65,14 @@ TEST_FRAMEWORKS = {
     "javascript:vitest": {
         "command": "npx vitest run",
         "dir": "__tests__",
-        "ext": ".js",
+        "ext": ".jsx",
         "prefix": "",
         "suffix": ".test",
         "setup_cmd": "npm install --save-dev vitest",
         "config_note": (
             "Vitest is the test runner. Use `import { describe, it, expect } from 'vitest';` "
-            "in every test file. Use ES `import` syntax for all imports."
+            "in every test file. Use ES `import` syntax for all imports. "
+            "IMPORTANT: Use .jsx extension for test files containing JSX (Vite cannot parse JSX in .js files)."
         ),
     },
     "typescript": {

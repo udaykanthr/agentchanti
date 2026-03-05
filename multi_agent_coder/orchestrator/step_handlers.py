@@ -64,6 +64,7 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         has_vitest: bool    — True if vitest in devDependencies
         has_vitest_config: bool — True if vitest.config.* exists
         has_tsx: bool       — True if .tsx files exist in project
+        has_jsx: bool       — True if .jsx files exist in project
     """
     env = {
         "is_esm": False,
@@ -75,6 +76,7 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         "has_vitest": False,
         "has_vitest_config": False,
         "has_tsx": False,
+        "has_jsx": False,
     }
 
     # Read package.json
@@ -156,12 +158,15 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
     elif env["has_jest_config"] or env["has_jest"]:
         env["test_runner"] = "jest"
 
-    # Check for .tsx files (useful for React testing guidance)
+    # Check for .tsx/.jsx files (useful for React testing guidance)
     scan_dir = cwd or "."
     if os.path.isdir(os.path.join(scan_dir, "src")):
         for root, _dirs, files in os.walk(os.path.join(scan_dir, "src")):
             if any(f.endswith(".tsx") for f in files):
                 env["has_tsx"] = True
+            if any(f.endswith(".jsx") for f in files):
+                env["has_jsx"] = True
+            if env["has_tsx"] and env["has_jsx"]:
                 break
 
     return env
@@ -1319,7 +1324,7 @@ def _count_test_failures(output: str) -> int:
     return max(count, 1) if 'FAIL' in clean.upper() else 0
 
 
-def _build_batch_error_summary(output: str, max_chars: int = 4000) -> str:
+def _build_batch_error_summary(output: str, max_chars: int = 6000) -> str:
     """Build a structured, compact summary of ALL test failures.
 
     Groups failures by error type so the LLM can identify shared root causes
@@ -1899,6 +1904,130 @@ def _filter_test_only_files(fix_files: dict[str, str],
     return allowed
 
 
+def _cleanup_stale_js_test_files(
+    test_files: dict[str, str],
+    memory: FileMemory,
+    display: CLIDisplay,
+    step_idx: int,
+    subproject_cwd: str | None,
+) -> None:
+    """Remove stale .test.js files when a .test.jsx version was just written.
+
+    Vite/Rollup cannot parse JSX in .js files.  When the TesterAgent generates
+    .test.jsx files, any leftover .test.js with the same base name will still
+    be picked up by the test runner and cause parse errors.
+    """
+    jsx_files = [f for f in test_files if f.endswith(('.test.jsx', '.test.tsx'))]
+    if not jsx_files:
+        return
+
+    removed: list[str] = []
+    for jsx_path in jsx_files:
+        # Derive the .js / .ts counterpart
+        if jsx_path.endswith('.test.jsx'):
+            stale = jsx_path.replace('.test.jsx', '.test.js')
+        else:
+            stale = jsx_path.replace('.test.tsx', '.test.ts')
+
+        abs_stale = (os.path.join(subproject_cwd, stale) if subproject_cwd
+                     else stale)
+        if os.path.isfile(abs_stale):
+            try:
+                os.remove(abs_stale)
+                removed.append(stale)
+                log.info(f"Step {step_idx+1}: Removed stale test file "
+                         f"{stale} (replaced by {jsx_path})")
+            except OSError as e:
+                log.warning(f"Step {step_idx+1}: Failed to remove "
+                            f"stale {stale}: {e}")
+
+    if removed:
+        display.step_info(step_idx,
+                          f"Cleaned up stale .js test files: "
+                          f"{', '.join(removed)}")
+
+
+def _cleanup_ghost_test_files(
+    test_files: dict[str, str],
+    memory: FileMemory,
+    display: CLIDisplay,
+    step_idx: int,
+    subproject_cwd: str | None,
+) -> None:
+    """Remove ghost test files in __tests__/ that are NOT in the current batch.
+
+    Previous generation runs may leave test files at e.g. ``__tests__/Foo.test.js``
+    with stale import paths.  These are picked up by the test runner and cause
+    persistent failures that the fix loop cannot reach (it only knows about
+    files in ``test_files``).  We only remove files that were previously
+    tracked by ``memory`` but are no longer in the current ``test_files`` dict,
+    to avoid deleting user-written tests.
+    """
+    test_dir_name = "__tests__"
+    base = subproject_cwd or "."
+    tests_dir = os.path.join(base, test_dir_name)
+    if not os.path.isdir(tests_dir):
+        return
+
+    current_test_basenames = set()
+    for fpath in test_files:
+        # Normalize: could be "__tests__/Foo.test.jsx" or "react-app/__tests__/..."
+        parts = fpath.replace("\\", "/").split("/")
+        if test_dir_name in parts:
+            idx = parts.index(test_dir_name)
+            current_test_basenames.add("/".join(parts[idx:]))
+
+    removed: list[str] = []
+    memory_files = set(memory.all_files().keys())
+
+    for fname in os.listdir(tests_dir):
+        fpath_rel = os.path.join(test_dir_name, fname)
+        abs_path = os.path.join(base, fpath_rel)
+
+        if not os.path.isfile(abs_path):
+            continue
+
+        # Only remove test-like files
+        if not any(fname.endswith(ext) for ext in
+                   ('.test.js', '.test.jsx', '.test.ts', '.test.tsx',
+                    '.spec.js', '.spec.jsx', '.spec.ts', '.spec.tsx')):
+            continue
+
+        # Skip if it's in the current batch
+        if fpath_rel in current_test_basenames:
+            continue
+
+        # Only remove if it was tracked by memory (i.e. we generated it)
+        # Check various path forms that memory might use
+        is_tracked = False
+        for mem_path in memory_files:
+            if mem_path.endswith(fpath_rel) or mem_path == fpath_rel:
+                is_tracked = True
+                break
+            # Also check with subproject prefix
+            if subproject_cwd:
+                full_rel = os.path.join(
+                    os.path.basename(subproject_cwd), fpath_rel)
+                if mem_path.endswith(full_rel) or mem_path == full_rel:
+                    is_tracked = True
+                    break
+
+        if is_tracked:
+            try:
+                os.remove(abs_path)
+                removed.append(fpath_rel)
+                log.info(f"Step {step_idx+1}: Removed ghost test file "
+                         f"{fpath_rel}")
+            except OSError as e:
+                log.warning(f"Step {step_idx+1}: Failed to remove "
+                            f"ghost {fpath_rel}: {e}")
+
+    if removed:
+        display.step_info(step_idx,
+                          f"Cleaned up {len(removed)} ghost test file(s): "
+                          f"{', '.join(removed)}")
+
+
 def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       reviewer: ReviewerAgent, executor: Executor,
                       task: str, memory: FileMemory,
@@ -2075,6 +2204,20 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         written = executor.write_files(test_files)
         memory.update(test_files)
         display.step_info(step_idx, f"Tests written: {', '.join(written)}")
+
+        # ── Cleanup stale .js test files when .jsx versions exist ──
+        # Vite/Rollup cannot parse JSX in .js files.  When the LLM generates
+        # .test.jsx files, any leftover .test.js file with the same base name
+        # causes persistent "Parse failure: Expression expected" errors.
+        _cleanup_stale_js_test_files(test_files, memory, display, step_idx,
+                                     subproject_cwd)
+
+        # ── Cleanup ghost test files in __tests__/ at project root ──
+        # Previous generation runs may leave test files that are no longer
+        # in the current test_files dict.  These ghost files get picked up
+        # by the test runner and fail with wrong import paths.
+        _cleanup_ghost_test_files(test_files, memory, display, step_idx,
+                                  subproject_cwd)
 
         # Safety check: if generated test files import from 'vitest' but
         # the detected test command is Jest, override to vitest.
@@ -2274,11 +2417,23 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     f"documentation and solutions for this error. Use them "
                     f"to inform your fix:\n\n{search_context}"
                 )
+            jsx_hint = ""
+            if test_runner == "vitest" and language in ("javascript", "typescript"):
+                jsx_ext = ".jsx" if language == "javascript" else ".tsx"
+                js_ext = ".js" if language == "javascript" else ".ts"
+                jsx_hint = (
+                    f"IMPORTANT: Vite/Rollup CANNOT parse JSX in {js_ext} files. "
+                    f"If a test file contains JSX (e.g. <Component />, render(<App />)), "
+                    f"it MUST use the .test{jsx_ext} extension, NOT .test{js_ext}. "
+                    f"If you need to rename a file from .test{js_ext} to .test{jsx_ext}, "
+                    f"output the corrected content under the new .test{jsx_ext} path. "
+                )
             fix_prompt = (
                 "Below is a structured summary of ALL test failures grouped by error type. "
                 "Analyze the patterns — if multiple failures share a root cause "
                 "(e.g. wrong import path, missing mock, incorrect API usage), "
                 "fix the root cause once rather than patching each test individually. "
+                f"{jsx_hint}"
                 "Fix ONLY the test files. "
                 "Do NOT modify source files, package.json, or any config files. "
                 "Do NOT add new dependencies. "
@@ -2313,6 +2468,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     show_diffs(fix_files, log_only=True)
                     executor.write_files(fix_files)
                     memory.update(fix_files)
+                    # Clean up stale .js files if fix produced .jsx
+                    _cleanup_stale_js_test_files(
+                        fix_files, memory, display, step_idx,
+                        subproject_cwd)
                 else:
                     log.warning(f"Step {step_idx+1}: All fix files were "
                                 f"blocked by test-only filter")

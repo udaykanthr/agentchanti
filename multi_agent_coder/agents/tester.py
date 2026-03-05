@@ -32,6 +32,14 @@ class TesterAgent(Agent):
         test_dir = fw.get("dir", "tests")
         test_ext = fw.get("ext", ".py")
 
+        # Override extension for JS/TS projects with JSX — Vite cannot parse
+        # JSX syntax in plain .js/.ts files; test files MUST use .jsx/.tsx.
+        if env_info:
+            if language == "javascript" and env_info.get("has_jsx"):
+                test_ext = ".jsx"
+            elif language == "typescript" and env_info.get("has_tsx"):
+                test_ext = ".tsx"
+
         # Extract file paths from context so LLM knows the real project layout
         file_listing = self._extract_file_listing(context)
 
@@ -54,10 +62,15 @@ Language: {lang_name}
         else:
             prompt += self._python_test_rules()
 
+        test_suffix = fw.get("suffix", "")
+        if test_suffix:
+            example_name = f"Example{test_suffix}{test_ext}"
+        else:
+            example_name = f"{fw.get('prefix', 'test_')}example{test_ext}"
         prompt += f"""
 OUTPUT FORMAT — for EACH test file, use EXACTLY this marker:
 
-#### [FILE]: {test_dir}/test_example{test_ext}
+#### [FILE]: {test_dir}/{example_name}
 ```{lang_tag}
 // test code here
 ```
@@ -131,8 +144,13 @@ WRONG (do NOT do this):
                        env_info: dict | None = None,
                        test_runner: str | None = None) -> str:
         """Return JavaScript/TypeScript-specific test guidance."""
-        ext = ".ts" if language == "typescript" else ".js"
         env = env_info or {}
+        if language == "typescript":
+            ext = ".tsx" if env.get("has_tsx") else ".ts"
+        elif env.get("has_jsx"):
+            ext = ".jsx"
+        else:
+            ext = ".js"
 
         # Vitest path
         if test_runner == "vitest":
@@ -196,17 +214,33 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Jest):
     def _vitest_test_rules(language: str | None, ext: str,
                            env: dict) -> str:
         """Return Vitest-specific test guidance."""
-        tsx_rules = ""
+        jsx_rules = ""
         if language == "typescript":
             ext = ".tsx" if env.get("has_tsx") else ".ts"
-            tsx_rules = (
-                "For React component tests (.tsx files):\n"
-                "   - Use `@testing-library/react` for rendering: "
-                "`import { render, screen } from '@testing-library/react';`\n"
-                "   - Use `@testing-library/user-event` for interactions: "
-                "`import userEvent from '@testing-library/user-event';`\n"
-                "   - Test file extension should be `.test.tsx` for components.\n"
-            )
+            if env.get("has_tsx"):
+                jsx_rules = (
+                    "CRITICAL — JSX extension requirement for Vite:\n"
+                    "   Vite/Rollup CANNOT parse JSX in `.ts` files. Any test file that "
+                    "contains JSX (e.g. `<Component />`, `render(<App />)`) MUST use "
+                    "the `.test.tsx` extension, NOT `.test.ts`.\n"
+                    "   - Use `@testing-library/react` for rendering: "
+                    "`import { render, screen } from '@testing-library/react';`\n"
+                    "   - Use `@testing-library/user-event` for interactions: "
+                    "`import userEvent from '@testing-library/user-event';`\n"
+                )
+        elif language == "javascript":
+            if env.get("has_jsx"):
+                ext = ".jsx"
+                jsx_rules = (
+                    "CRITICAL — JSX extension requirement for Vite:\n"
+                    "   Vite/Rollup CANNOT parse JSX in `.js` files. Any test file that "
+                    "contains JSX (e.g. `<Component />`, `render(<App />)`) MUST use "
+                    "the `.test.jsx` extension, NOT `.test.js`.\n"
+                    "   - Use `@testing-library/react` for rendering: "
+                    "`import { render, screen } from '@testing-library/react';`\n"
+                    "   - Use `@testing-library/user-event` for interactions: "
+                    "`import userEvent from '@testing-library/user-event';`\n"
+                )
 
         return f"""
 JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
@@ -215,7 +249,7 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
    Do NOT use Jest globals — this project uses Vitest, not Jest.
 2. Import source modules using ES `import` syntax:
    `import {{ funcName }} from '../src/module';`
-3. {tsx_rules if tsx_rules else 'Use `import` syntax for ALL imports.'}
+3. {jsx_rules if jsx_rules else 'Use `import` syntax for ALL imports.'}
 4. The import path must be RELATIVE from the test file to the source file.
    Example: test at `__tests__/calc.test{ext}`, source at `src/calculator{ext}`
 5. Do NOT use absolute paths or module aliases unless the project defines them.
