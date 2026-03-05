@@ -1274,22 +1274,33 @@ _TEST_NAME_PATTERNS = [
 def _count_test_failures(output: str) -> int:
     """Count the number of individual test failures in test runner output.
 
-    Returns a best-effort count by looking for common failure indicators
-    across pytest, Jest, Vitest, Go test, and RSpec.
+    Counts BOTH file-level failures (compilation/import errors that prevent
+    the file from running) AND individual test assertion failures — whichever
+    is higher — since file-level failures each require a fix.
+
+    Works across pytest, Jest, Vitest, Go test, and RSpec.
     """
     if not output:
         return 0
 
     clean = _ANSI_RE.sub('', output)
-    count = 0
+    file_failures = 0
+    test_failures = 0
+
+    # Vitest/Jest: "Test Files  X failed" and "Tests  Y failed" on separate lines
+    m_files = re.search(r'Test Files?\s+(\d+)\s+failed', clean)
+    if m_files:
+        file_failures = int(m_files.group(1))
+    m_tests = re.search(r'Tests:\s*(\d+)\s+failed', clean)
+    if m_tests:
+        test_failures = int(m_tests.group(1))
+
+    # If we found Vitest/Jest-style summaries, return the larger count
+    if file_failures or test_failures:
+        return max(file_failures, test_failures)
 
     # pytest summary: "X failed"
     m = re.search(r'(\d+)\s+failed', clean)
-    if m:
-        return int(m.group(1))
-
-    # Jest/Vitest summary: "Tests: X failed"
-    m = re.search(r'Tests:\s+(\d+)\s+failed', clean)
     if m:
         return int(m.group(1))
 
@@ -1299,6 +1310,7 @@ def _count_test_failures(output: str) -> int:
         return count
 
     # Fallback: count failure marker lines
+    count = 0
     for line in clean.splitlines():
         stripped = line.strip()
         if re.match(r'(FAILED\s+|×\s+|✕\s+|✗\s+)', stripped):
@@ -1335,18 +1347,64 @@ def _build_batch_error_summary(output: str, max_chars: int = 4000) -> str:
                 failed_tests.append(m.group(1).strip())
                 break
 
-    # Walk through output to extract error details per failure
-    current_test = None
-    current_error_type = None
-    current_message_lines: list[str] = []
-    current_file = None
-    current_line_no = None
-
     # Pattern for file:line references
     _file_line_re = re.compile(
         r'(?:File\s+["\'](.+?)["\'],\s+line\s+(\d+)'  # Python
         r'|(\S+\.\w+):(\d+))'                           # JS/Go/general
     )
+
+    # ── Pre-pass: capture Vitest/Jest file-level failures ──────────
+    # Vitest/Jest output "FAIL path/to/file.ext" for files that failed
+    # to compile or import.  These often don't have a standard error
+    # type; instead the error (e.g. "SyntaxError", "Cannot find module")
+    # appears on subsequent lines.  We collect them into a dedicated
+    # "FileLoadError" group so the LLM sees them.
+    _FAIL_FILE_RE = re.compile(r'^(?:FAIL)\s+([\w/.@-]+\.\w+)')
+    _seen_fail_files: set[str] = set()
+
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        m = _FAIL_FILE_RE.match(stripped)
+        if m:
+            fail_file = m.group(1)
+            if fail_file not in _seen_fail_files:
+                _seen_fail_files.add(fail_file)
+                # Gather the next non-blank lines as the error message
+                err_lines: list[str] = []
+                j = i + 1
+                while j < len(lines) and j < i + 8:
+                    s = lines[j].strip()
+                    if not s:
+                        break
+                    err_lines.append(s)
+                    j += 1
+                err_msg = ' '.join(err_lines).strip()
+                if len(err_msg) > 200:
+                    err_msg = err_msg[:200] + '...'
+
+                # Try to identify the actual error type from the message
+                et_m = _ERROR_TYPE_RE.search(err_msg)
+                err_type = et_m.group(1) if et_m else 'FileLoadError'
+
+                failure = {
+                    'test': fail_file,
+                    'error_type': err_type,
+                    'message': err_msg or '(file failed to load/compile)',
+                    'file': fail_file,
+                    'line': None,
+                }
+                failures.append(failure)
+                error_groups.setdefault(err_type, []).append(
+                    len(failures) - 1)
+        i += 1
+
+    # ── Main pass: extract error details from assertion/runtime failures ──
+    current_test = None
+    current_error_type = None
+    current_message_lines: list[str] = []
+    current_file = None
+    current_line_no = None
 
     for line in lines:
         stripped = line.strip()
