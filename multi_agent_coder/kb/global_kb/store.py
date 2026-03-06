@@ -95,6 +95,10 @@ class GlobalKBStore:
         """
         Semantic search across all global KB content.
 
+        Tries vector search first, then supplements with file-based
+        keyword search so that registry files added via ``kb update``
+        (not yet embedded) are still discoverable.
+
         Parameters
         ----------
         query:
@@ -113,13 +117,29 @@ class GlobalKBStore:
         list[GlobalKBResult]
             Ranked results.
         """
+        results: list[GlobalKBResult] = []
         try:
             if api_client is None:
                 raise ValueError("api_client required for vector search")
-            return self._vector_search(query, categories, language, top_k, api_client)
+            results = self._vector_search(query, categories, language, top_k, api_client)
         except Exception as exc:
             logger.warning("Vector search failed, falling back to file search: %s", exc)
-            return self._fallback_file_search(query, categories, language, top_k)
+
+        # Supplement with file-based search when vector results are sparse
+        if len(results) < top_k:
+            try:
+                file_results = self._fallback_file_search(
+                    query, categories, language, top_k,
+                )
+                seen = {r.file for r in results}
+                for fr in file_results:
+                    if fr.file not in seen and len(results) < top_k:
+                        results.append(fr)
+                        seen.add(fr.file)
+            except Exception:
+                pass
+
+        return results
 
     def search_errors(
         self,
@@ -204,6 +224,10 @@ class GlobalKBStore:
         results by category — saving embedding API calls compared to
         multiple ``search()`` invocations.
 
+        After vector search, supplements underfilled categories with
+        file-based keyword search so that registry files added via
+        ``kb update`` (which are not yet embedded) are still discoverable.
+
         Parameters
         ----------
         query:
@@ -221,10 +245,12 @@ class GlobalKBStore:
         dict[str, list[GlobalKBResult]]
             Results keyed by category.
         """
+        # Start with vector search if possible
+        result: dict[str, list[GlobalKBResult]] = {}
         try:
             if api_client is None:
                 raise ValueError("api_client required for vector search")
-            return self._vector_batch_search(
+            result = self._vector_batch_search(
                 query, category_limits, language, api_client,
             )
         except Exception as exc:
@@ -232,13 +258,29 @@ class GlobalKBStore:
                 "Batch vector search failed, falling back to per-category "
                 "file search: %s", exc,
             )
-            # Fallback: run individual file-based searches per category
-            result: dict[str, list[GlobalKBResult]] = {}
-            for cat, top_k in category_limits.items():
-                result[cat] = self._fallback_file_search(
-                    query, categories=[cat], language=language, top_k=top_k,
-                )
-            return result
+
+        # Supplement underfilled categories with file-based keyword search.
+        # This ensures registry files added via `kb update` (not yet
+        # embedded in the vector store) are still discoverable.
+        for cat, top_k in category_limits.items():
+            current = result.get(cat, [])
+            if len(current) < top_k:
+                try:
+                    file_results = self._fallback_file_search(
+                        query, categories=[cat], language=language,
+                        top_k=top_k,
+                    )
+                    # Deduplicate by file path
+                    seen = {r.file for r in current}
+                    for fr in file_results:
+                        if fr.file not in seen and len(current) < top_k:
+                            current.append(fr)
+                            seen.add(fr.file)
+                except Exception:
+                    pass
+            result[cat] = current
+
+        return result
 
     def _vector_batch_search(
         self,
@@ -319,6 +361,10 @@ class GlobalKBStore:
                         content = raw[:4000]
                     except OSError:
                         pass
+
+            # Skip results whose file no longer exists on disk
+            if not content:
+                continue
 
             buckets[cat].append(GlobalKBResult(
                 title=payload.get("title", ""),
@@ -413,6 +459,11 @@ class GlobalKBStore:
                     except OSError:
                         pass
 
+            # Skip results whose file no longer exists on disk — don't
+            # waste a top_k slot on a stale vector-store entry.
+            if not content:
+                continue
+
             results.append(GlobalKBResult(
                 title=payload.get("title", ""),
                 category=cat,
@@ -477,11 +528,30 @@ class GlobalKBStore:
                 if language and doc_lang != "all" and doc_lang != language:
                     continue
 
-                # Score: count matching words
+                # Strip frontmatter so content is just the body
+                body = content
+                if content.startswith("---"):
+                    end = content.find("---", 3)
+                    if end != -1:
+                        body = content[end + 3:].strip()
+
+                # Score: count matching words with title/tag boosting.
+                # Title and tag matches are weighted higher because they
+                # indicate the doc's primary topic matches the query.
                 content_lower = content.lower()
-                score = sum(
+                title_lower = meta.get("title", "").lower()
+                tags_lower = meta.get("tags", "").lower()
+
+                body_hits = sum(
                     1.0 for w in query_words if w in content_lower
-                ) / max(len(query_words), 1)
+                )
+                title_hits = sum(
+                    3.0 for w in query_words if w in title_lower
+                )
+                tag_hits = sum(
+                    2.0 for w in query_words if w in tags_lower
+                )
+                score = (body_hits + title_hits + tag_hits) / max(len(query_words), 1)
 
                 if score > 0:
                     tags_str = meta.get("tags", "")
@@ -491,7 +561,7 @@ class GlobalKBStore:
                     results.append((score, GlobalKBResult(
                         title=meta.get("title", fname),
                         category=cat,
-                        content=content[:4000],
+                        content=body[:4000],
                         file=rel_path,
                         score=score,
                         tags=tags,

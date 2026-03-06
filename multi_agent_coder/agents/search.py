@@ -12,8 +12,10 @@ from ..search_provider import web_search, fetch_page_text, SearchResult
 class SearchAgent:
     """Optional agent that enriches error diagnosis with web search context.
 
-    Unlike other agents, SearchAgent does **not** use an LLM — it performs
-    web searches and fetches documentation pages directly.
+    Performs web searches and fetches documentation pages.  When an
+    ``llm_client`` is provided, raw results are summarized into a compact
+    actionable guide before being returned — keeping downstream LLM context
+    small.  Without an LLM client the raw results are returned as-is.
 
     All methods are best-effort: exceptions are caught and logged, never
     propagated.  An empty string return means "no useful context found".
@@ -21,12 +23,14 @@ class SearchAgent:
 
     def __init__(self, provider: str = "duckduckgo",
                  api_key: str = "", api_url: str = "",
-                 max_results: int = 3, max_page_chars: int = 3000):
+                 max_results: int = 3, max_page_chars: int = 3000,
+                 llm_client=None):
         self.provider = provider
         self.api_key = api_key
         self.api_url = api_url
         self.max_results = max_results
         self.max_page_chars = max_page_chars
+        self.llm_client = llm_client
 
     # ── Public API ───────────────────────────────────────────
 
@@ -63,7 +67,8 @@ class SearchAgent:
                 log.info("[SearchAgent] No search results found")
                 return ""
 
-            return self._format_results(results)
+            raw = self._format_results(results)
+            return self._summarize(raw, mode="error", query=query)
 
         except Exception as exc:
             log.warning(f"[SearchAgent] Search failed: {exc}")
@@ -107,7 +112,8 @@ class SearchAgent:
             header = ("=== Web Search Context (latest documentation) ===\n"
                       "Use the information below for accurate, up-to-date "
                       "commands and flags in your plan.")
-            return self._format_results(results, header=header)
+            raw = self._format_results(results, header=header)
+            return self._summarize(raw, mode="task", query=query)
 
         except Exception as exc:
             log.warning(f"[SearchAgent] Planning search failed: {exc}")
@@ -282,6 +288,58 @@ class SearchAgent:
             return stripped
 
         return ""
+
+    def _summarize(self, raw_context: str, *, mode: str = "error",
+                   query: str = "") -> str:
+        """Use LLM to condense raw search results into a compact guide.
+
+        Falls back to the raw text if no LLM client is available or on error.
+        """
+        if not raw_context:
+            return raw_context
+        if self.llm_client is None:
+            return raw_context
+
+        if mode == "error":
+            instruction = (
+                "You are a concise technical assistant. Given the raw web search "
+                "results below about a coding error, produce a SHORT actionable "
+                "summary (max ~300 words). Format as:\n"
+                "- **Root Cause**: one-line explanation\n"
+                "- **Fix Steps**: numbered list of concrete steps/commands\n"
+                "- **Key Details**: any version-specific notes or gotchas\n\n"
+                "Strip all URLs, page boilerplate, and irrelevant content. "
+                "Only include information directly useful for fixing the error.\n\n"
+                f"Search query: {query}\n\n"
+                f"Raw search results:\n{raw_context}"
+            )
+        else:
+            instruction = (
+                "You are a concise technical assistant. Given the raw web search "
+                "results below about a development task, produce a SHORT actionable "
+                "guide (max ~300 words). Format as:\n"
+                "- **Setup**: key install/init commands with exact flags\n"
+                "- **Steps**: numbered list of concrete actions\n"
+                "- **Notes**: version-specific caveats or breaking changes\n\n"
+                "Strip all URLs, page boilerplate, and irrelevant content. "
+                "Only include information directly useful for the task.\n\n"
+                f"Search query: {query}\n\n"
+                f"Raw search results:\n{raw_context}"
+            )
+
+        try:
+            summary = self.llm_client.generate_response(instruction)
+            if summary and len(summary.strip()) > 20:
+                log.info(f"[SearchAgent] Summarized {len(raw_context)} chars "
+                         f"-> {len(summary)} chars")
+                header = ("=== Web Search Context (summarized) ===" if mode == "error"
+                          else "=== Web Search Context (latest docs, summarized) ===")
+                return f"{header}\n{summary.strip()}"
+            # Summary too short / empty — fall back to raw
+            return raw_context
+        except Exception as exc:
+            log.warning(f"[SearchAgent] Summarization failed, using raw: {exc}")
+            return raw_context
 
     def _format_results(self, results: list[SearchResult], *,
                         header: str | None = None) -> str:
