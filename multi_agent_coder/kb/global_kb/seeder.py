@@ -1339,6 +1339,7 @@ def _write_md_file(
         f'language: "{language}"\n'
         f'version: "1.0.0"\n'
         f'created_at: "2025-01-01"\n'
+        f'source: "seeder"\n'
         "---\n\n"
     )
     with open(path, "w", encoding="utf-8") as fh:
@@ -1448,6 +1449,36 @@ def seed(
 
     summary["docs_seeded"] = len(md_files)
     logger.info("Wrote %d markdown documents", summary["docs_seeded"])
+
+    # ── 2b. Clean up stale seeder files ──────────────────────────────────
+    # Remove .md files that were written by a *previous* seed but are no
+    # longer in the current seed dictionaries.  Only delete files whose
+    # frontmatter has source="seeder" — this is the seeder's unique
+    # signature.  Files from `kb update` do not have this field and are
+    # always preserved.
+    _seed_filenames: dict[str, set[str]] = {
+        "patterns": set(_PATTERN_DOCS.keys()),
+        "adrs": set(_ADR_DOCS.keys()),
+        "docs": set(_DOC_DOCS.keys()),
+        "behavioral": set(_BEHAVIORAL_DOCS.keys()),
+    }
+    for subdir, expected in _seed_filenames.items():
+        cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+        if not os.path.isdir(cat_dir):
+            continue
+        for fname in os.listdir(cat_dir):
+            if fname.endswith(".md") and fname not in expected:
+                stale_path = os.path.join(cat_dir, fname)
+                try:
+                    with open(stale_path, encoding="utf-8") as fh:
+                        head = fh.read(500)
+                    meta = _parse_frontmatter(head)
+                    if meta.get("source") != "seeder":
+                        continue  # not a seeder file — keep it
+                    os.remove(stale_path)
+                    logger.info("Removed stale seeder file: %s/%s", subdir, fname)
+                except OSError as exc:
+                    logger.debug("Failed to remove stale file %s: %s", stale_path, exc)
 
     # ── 3. Embed into SQLite vector store (optional) ──────────────────────
     if embed:

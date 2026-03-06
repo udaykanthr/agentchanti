@@ -340,12 +340,16 @@ def _apply_update(
         dest_path = os.path.join(_REGISTRY_DIR, dest_name)
         os.makedirs(dest_path, exist_ok=True)
 
-        for fname in os.listdir(src_path):
-            src_file = os.path.join(src_path, fname)
-            dest_file = os.path.join(dest_path, fname)
-            if os.path.isfile(src_file):
-                shutil.copy2(src_file, dest_file)
-                files_copied += 1
+        # Walk recursively — the registry zip may have nested
+        # subdirectories (e.g. docs/frameworks/guide.md).  Flatten
+        # all .md files into the single registry category directory.
+        for dirpath, _, filenames in os.walk(src_path):
+            for fname in filenames:
+                src_file = os.path.join(dirpath, fname)
+                dest_file = os.path.join(dest_path, fname)
+                if os.path.isfile(src_file):
+                    shutil.copy2(src_file, dest_file)
+                    files_copied += 1
 
     return files_copied
 

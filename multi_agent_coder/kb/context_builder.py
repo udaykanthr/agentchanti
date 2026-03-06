@@ -427,7 +427,13 @@ class ContextBuilder:
         str
             Formatted text ready to prepend to the system prompt.
         """
-        if not context.kb_available and not context.behavioral_instructions:
+        has_any_context = (
+            context.kb_available
+            or context.behavioral_instructions
+            or context.error_fixes
+            or context.global_patterns
+        )
+        if not has_any_context:
             return ""
 
         parts: list[str] = ["=== KNOWLEDGE BASE CONTEXT ==="]

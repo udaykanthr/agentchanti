@@ -247,6 +247,7 @@ def main():
             api_url=cfg.SEARCH_API_URL,
             max_results=cfg.SEARCH_MAX_RESULTS,
             max_page_chars=cfg.SEARCH_MAX_PAGE_CHARS,
+            llm_client=llm_client,
         )
         log.info(f"Search agent enabled (provider: {cfg.SEARCH_PROVIDER})")
     else:
