@@ -264,6 +264,10 @@ def _execute_step(step_idx: int, step_text: str, *,
 
         success, error_info = True, ""
 
+        # ── Dependency check: before-snapshot ─────────────────────
+        _dep_check_enabled = cfg is None or getattr(cfg, "DEPENDENCY_CHECK_ENABLED", True)
+        _before_files = dict(memory.all_files()) if _dep_check_enabled else None
+
         if step_type == "IGNORE":
             display.step_info(step_idx, "Not actionable, skipping.")
             display.complete_step(step_idx, "skipped")
@@ -272,7 +276,6 @@ def _execute_step(step_idx: int, step_text: str, *,
             success, error_info = _handle_cmd_step(
                 step_text, executor, llm_client, memory, display, step_idx,
                 language=language)
-            display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "CODE":
             # Extract code graph from kb_context_builder if available
@@ -297,24 +300,60 @@ def _execute_step(step_idx: int, step_text: str, *,
                 auto=auto, code_graph=_graph,
                 project_profile=project_profile,
                 skip_review=_has_test_after)
-            display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "TEST":
             success, error_info = _handle_test_step(
                 step_text, tester, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language,
                 auto=auto, search_agent=search_agent)
-            display.complete_step(step_idx, "done" if success else "failed")
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
                 step_text, search_agent, memory, display, step_idx,
                 language=language)
-            display.complete_step(step_idx, "done" if success else "failed")
 
         else:
             display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
             display.complete_step(step_idx, "skipped")
+
+        # ── Dependency check: after-snapshot + fix ─────────────────
+        # Runs BEFORE complete_step so the spinner stays active during
+        # gap detection and LLM fix generation.
+        if _before_files is not None and success and step_type not in ("IGNORE",):
+            try:
+                after_files = memory.all_files()
+                new_or_changed = [
+                    f for f in after_files
+                    if f not in _before_files or _before_files[f] != after_files[f]
+                ]
+                # Only run if actual source files changed (skip metadata keys)
+                new_or_changed = [
+                    f for f in new_or_changed if not f.startswith("_")
+                ]
+                if new_or_changed:
+                    from .dependency_check import build_snapshot, run_dependency_check
+                    dep_before = build_snapshot(_before_files, language)
+                    dep_after = build_snapshot(after_files, language)
+                    integration_fixes = run_dependency_check(
+                        step_idx, step_text, new_or_changed,
+                        dep_before, dep_after,
+                        memory, llm_client, executor, display, language, cfg,
+                    )
+                    if integration_fixes:
+                        executor.write_files(integration_fixes)
+                        memory.update(integration_fixes)
+                        display.step_info(
+                            step_idx,
+                            f"[DepCheck] Fixed {len(integration_fixes)} file(s) "
+                            f"for dependency integration",
+                        )
+            except Exception as dep_exc:
+                _logger.warning("[DepCheck] Post-step check failed: %s", dep_exc)
+
+        # Complete the step AFTER dependency check so spinner stays visible.
+        # IGNORE and unknown-type steps already called complete_step above.
+        if step_type in ("CMD", "CODE", "TEST", "SEARCH"):
+            display.complete_step(step_idx, "done" if success else "failed")
 
         # Per-step knowledge upsert (lightweight, no LLM calls)
         # Runs on both success and failure — CMD packages only on success,

@@ -63,6 +63,7 @@ _DEFAULTS = {
     "editing_slim_context": True,
     "editing_reviewer_diff_mode": True,
     "editing_max_chunk_files": 3,
+    "dependency_check_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -355,6 +356,13 @@ class Config:
                                    _DEFAULTS["editing_max_chunk_files"])
         )
 
+        # Dependency check (post-step integration validation)
+        dep_section = yd.get("dependency_check", {}) if isinstance(yd.get("dependency_check"), dict) else {}
+        self.DEPENDENCY_CHECK_ENABLED = _get_bool(
+            "DEPENDENCY_CHECK_ENABLED", "dependency_check_enabled",
+            dep_section.get("enabled", _DEFAULTS["dependency_check_enabled"]),
+        )
+
         # Plugins
         self.PLUGINS: list[str] = yd.get("plugins", _DEFAULTS["plugins"])
         if not isinstance(self.PLUGINS, list):
@@ -424,6 +432,9 @@ class Config:
                 "slim_context": self.EDITING_SLIM_CONTEXT,
                 "reviewer_diff_mode": self.EDITING_REVIEWER_DIFF_MODE,
                 "max_chunk_files": self.EDITING_MAX_CHUNK_FILES,
+            },
+            "dependency_check": {
+                "enabled": self.DEPENDENCY_CHECK_ENABLED,
             },
         }
 
