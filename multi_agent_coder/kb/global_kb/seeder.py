@@ -941,6 +941,31 @@ Ensure you've run indexing first: `agentchanti kb index && agentchanti kb embed`
 Install NumPy for optimized vector operations: `pip install numpy`
 """,
     },
+    "vite-react-setup-guide.md": {
+        "title": "Vite React Setup Guide",
+        "tags": "vite, react, testing, setup, guide",
+        "content": """## Overview
+
+Setting up Vite in a React project requires specific packages and configuration
+to ensure components render correctly and DOM assertions work.
+
+## 1. Required Packages
+
+Install the following development dependencies:
+
+```bash
+npm create vite@latest my-react-app -- --template react --no-interactive
+```
+
+## 2. install NPM packages
+
+```bash
+npm install 
+```
+### Execute these installations for first time.
+
+""",
+    },
     "vitest-react-setup-guide.md": {
         "title": "Vitest React Setup Guide",
         "tags": "vitest, react, vite, testing, setup, guide",
