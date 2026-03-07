@@ -1521,11 +1521,50 @@ def seed(
                     logger.debug("Failed to remove stale file %s: %s", stale_path, exc)
 
     # ── 3. Embed into SQLite vector store (optional) ──────────────────────
+    # Embed ALL registry markdown files — both seeder-owned and files
+    # from ``kb update`` — so that both sources coexist in the vector
+    # store and appear in LLM prompt context.
     if embed:
         try:
             if api_client is None:
                 raise ValueError("api_client required for embedding")
-            embedded = _embed_md_files(md_files, project_root, api_client)
+
+            # Discover non-seeder .md files already in registry (from kb update)
+            all_md_files = list(md_files)  # start with seeder files
+            _seeded_paths = {p for p, _, _ in md_files}
+
+            _DIR_TO_CATEGORY = {
+                "patterns": "pattern",
+                "adrs": "adr",
+                "docs": "doc",
+                "behavioral": "behavioral",
+            }
+            for subdir, category in _DIR_TO_CATEGORY.items():
+                cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+                if not os.path.isdir(cat_dir):
+                    continue
+                for fname in os.listdir(cat_dir):
+                    if not fname.endswith(".md"):
+                        continue
+                    fpath = os.path.join(cat_dir, fname)
+                    if fpath in _seeded_paths:
+                        continue  # already in list from seeder
+                    try:
+                        with open(fpath, encoding="utf-8") as fh:
+                            head = fh.read(500)
+                        meta = _parse_frontmatter(head)
+                        title = meta.get("title", fname)
+                    except OSError:
+                        title = fname
+                    all_md_files.append((fpath, category, title))
+
+            if len(all_md_files) > len(md_files):
+                logger.info(
+                    "Including %d additional file(s) from kb update in embedding",
+                    len(all_md_files) - len(md_files),
+                )
+
+            embedded = _embed_md_files(all_md_files, project_root, api_client)
             summary["chunks_embedded"] = embedded
         except Exception as exc:
             logger.warning("Embedding skipped: %s", exc)

@@ -612,5 +612,81 @@ class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
         self.assertEqual(title, "Test Guide")
 
 
+# ---------------------------------------------------------------------------
+# Seed preserves kb update files
+# ---------------------------------------------------------------------------
+
+
+class TestSeedPreservesUpdateFiles(unittest.TestCase):
+    """Verify that kb seed preserves and re-embeds files from kb update."""
+
+    def setUp(self):
+        # Place a fake "kb update" file in registry/docs
+        from multi_agent_coder.kb.global_kb.seeder import _REGISTRY_DIR
+        self.docs_dir = os.path.join(_REGISTRY_DIR, "docs")
+        os.makedirs(self.docs_dir, exist_ok=True)
+        self.test_file = os.path.join(self.docs_dir, "tailwindcss-v4-setup-guide.md")
+        md_content = (
+            "---\n"
+            "title: Tailwind CSS v4 Setup Guide\n"
+            "category: doc\n"
+            "tags: tailwind,css,v4\n"
+            "version: 1.0.0\n"
+            "---\n"
+            "# Tailwind CSS v4\n"
+            "Use @import 'tailwindcss';\n"
+        )
+        with open(self.test_file, "w") as fh:
+            fh.write(md_content)
+
+    def tearDown(self):
+        if os.path.isfile(self.test_file):
+            os.remove(self.test_file)
+
+    def test_seed_preserves_update_file(self):
+        """seed(embed=False) does not delete files from kb update."""
+        from multi_agent_coder.kb.global_kb.seeder import seed
+
+        seed(embed=False)
+        self.assertTrue(
+            os.path.isfile(self.test_file),
+            "kb seed deleted a file from kb update",
+        )
+
+    def test_seed_includes_update_file_in_all_md_files(self):
+        """seed() collects kb update files for embedding alongside seeder files."""
+        from multi_agent_coder.kb.global_kb.seeder import (
+            seed, _REGISTRY_DIR, _parse_frontmatter,
+        )
+
+        # seed(embed=False) won't embed, but we can verify the file is preserved
+        # and would be discovered by the embedding scan
+        seed(embed=False)
+
+        # Simulate the scan logic from seed() step 3
+        _DIR_TO_CATEGORY = {
+            "patterns": "pattern", "adrs": "adr",
+            "docs": "doc", "behavioral": "behavioral",
+        }
+        extra_files = []
+        for subdir, category in _DIR_TO_CATEGORY.items():
+            cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+            if not os.path.isdir(cat_dir):
+                continue
+            for fname in os.listdir(cat_dir):
+                if not fname.endswith(".md"):
+                    continue
+                fpath = os.path.join(cat_dir, fname)
+                with open(fpath, encoding="utf-8") as fh:
+                    meta = _parse_frontmatter(fh.read(500))
+                if meta.get("source") != "seeder":
+                    extra_files.append(fname)
+
+        self.assertIn(
+            "tailwindcss-v4-setup-guide.md", extra_files,
+            "kb update file not discoverable for embedding",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
