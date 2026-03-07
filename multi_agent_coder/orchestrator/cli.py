@@ -33,6 +33,7 @@ from ..plugins.registry import PluginRegistry
 
 from .memory import FileMemory
 from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from ..agents.analyser import build_project_context, AnalyseAgent
 
 
 def main():
@@ -518,6 +519,35 @@ def main():
             memory.update(source_files)
             log.info(f"Pre-loaded {len(source_files)} source files into memory")
 
+    # ── 11b. Project analysis phase ──
+    # Build structured ProjectContext from static analysis + LLM enrichment.
+    # Gives Coder and Tester awareness of end-to-end goal, installed packages,
+    # import patterns, and test strategy.
+    project_context = build_project_context(
+        args.task, steps,
+        source_files=source_files or {},
+        language=language,
+        project_profile=project_profile,
+    )
+    try:
+        analyser = AnalyseAgent(
+            "Analyser", "Senior Technical Analyst",
+            "Analyse the task and project to guide downstream agents.",
+            _make_llm_for_agent("analyser"))
+        project_context = analyser.enrich_context(
+            project_context, args.task, steps, source_files or {})
+        log.info(
+            "[Analysis] ProjectContext: lang=%s, fw=%s, test_fw=%s, "
+            "%d pkgs, %d testable units",
+            project_context.language, project_context.framework,
+            project_context.test_framework,
+            len(project_context.installed_packages),
+            len(project_context.testable_units),
+        )
+    except Exception as analyse_exc:
+        log.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                    analyse_exc)
+
     # ── 12. Build execution waves ──
     # Re-parse dependencies from current steps (they may have been cleaned)
     _, dependencies = executor.parse_step_dependencies(steps)
@@ -552,6 +582,7 @@ def main():
                 search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
                 knowledge_base=knowledge_base,
+                project_context=project_context,
             )
 
             if success:
@@ -578,6 +609,7 @@ def main():
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
                     knowledge_base=knowledge_base,
+                    project_context=project_context,
                 )
                 if fixed:
                     step_results[idx] = "done"
@@ -612,6 +644,7 @@ def main():
                         search_agent=search_agent,
                         kb_context_builder=kb_context_builder,
                         knowledge_base=knowledge_base,
+                        project_context=project_context,
                     )
                     futures[f] = idx
 
@@ -650,6 +683,7 @@ def main():
                     search_agent=search_agent,
                     kb_context_builder=kb_context_builder,
                     knowledge_base=knowledge_base,
+                    project_context=project_context,
                 )
                 if fixed:
                     step_results[idx] = "done"

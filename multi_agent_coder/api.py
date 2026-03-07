@@ -31,6 +31,7 @@ from .agents.planner import PlannerAgent
 from .agents.coder import CoderAgent
 from .agents.reviewer import ReviewerAgent
 from .agents.tester import TesterAgent
+from .agents.analyser import AnalyseAgent, ProjectContext, build_project_context
 from .executor import Executor
 from .embedding_store import EmbeddingStore
 from .cli_display import CLIDisplay, token_tracker, log
@@ -296,6 +297,39 @@ def _run_task_impl(
     from .orchestrator.plan_optimizer import optimize_plan
     steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base)
 
+    # ── Project analysis phase ──────────────────────────────────
+    # Build structured ProjectContext from static analysis (zero LLM cost).
+    # Optionally enrich with LLM for deeper success criteria and test hints.
+    project_context_obj = build_project_context(
+        task, steps,
+        source_files=source_files or {},
+        language=language,
+        project_profile=project_profile,
+    )
+
+    # LLM enrichment — adds deeper success criteria, assertion hints,
+    # and testable unit identification.  Uses 1 LLM call.
+    try:
+        analyser = AnalyseAgent(
+            "Analyser", "Senior Technical Analyst",
+            "Analyse the task and project to guide downstream agents.",
+            _make_llm("analyser"))
+        project_context_obj = analyser.enrich_context(
+            project_context_obj, task, steps, source_files or {})
+        _logger.info(
+            "[Analysis] ProjectContext built: lang=%s, framework=%s, "
+            "test_fw=%s, %d installed pkgs, %d testable units, %d criteria",
+            project_context_obj.language,
+            project_context_obj.framework,
+            project_context_obj.test_framework,
+            len(project_context_obj.installed_packages),
+            len(project_context_obj.testable_units),
+            len(project_context_obj.success_criteria),
+        )
+    except Exception as analyse_exc:
+        _logger.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                        analyse_exc)
+
     display.set_steps(steps)
 
     # Execute
@@ -309,6 +343,7 @@ def _run_task_impl(
             step_text = steps[idx]
             idx, success, error_info = _execute_step(
                 idx, step_text,
+                steps=steps,
                 llm_client=llm_client, executor=executor,
                 coder=coder, reviewer=reviewer, tester=tester,
                 task=task, memory=memory, display=display,
@@ -316,6 +351,7 @@ def _run_task_impl(
                 kb_context_builder=kb_context_builder,
                 project_profile=project_profile,
                 knowledge_base=knowledge_base,
+                project_context=project_context_obj,
             )
 
             if success:
@@ -327,6 +363,7 @@ def _run_task_impl(
             else:
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
+                    steps=steps,
                     llm_client=llm_client, executor=executor,
                     coder=coder, reviewer=reviewer, tester=tester,
                     task=task, memory=memory, display=display,
@@ -335,6 +372,7 @@ def _run_task_impl(
                     kb_context_builder=kb_context_builder,
                     project_profile=project_profile,
                     knowledge_base=knowledge_base,
+                    project_context=project_context_obj,
                 )
                 if fixed:
                     step_results[idx] = "done"
