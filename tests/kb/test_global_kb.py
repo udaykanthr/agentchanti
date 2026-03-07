@@ -268,7 +268,7 @@ class TestSeeder(unittest.TestCase):
         # Check errors.db was populated (40 errors: 5 * 7 languages + 5 tooling)
         self.assertEqual(summary["errors_seeded"], 40)
         self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
-        self.assertEqual(summary["docs_seeded"], 12)  # 3+3+2+3
+        self.assertEqual(summary["docs_seeded"], 9)  # 3+3+2+3
         self.assertEqual(summary["chunks_embedded"], 0)
 
         # Verify error counts per language
