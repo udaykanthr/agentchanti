@@ -1555,7 +1555,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       auto: bool = False,
                       code_graph=None,
                       project_profile=None,
-                      skip_review: bool = False) -> tuple[bool, str]:
+                      skip_review: bool = False,
+                      project_context=None) -> tuple[bool, str]:
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
@@ -1588,9 +1589,13 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     for attempt in range(1, MAX_STEP_RETRIES + 1):
         # Prepend project orientation + knowledge context
         context_prefix = ""
+        if project_context is not None:
+            coder_analysis = project_context.format_for_coder()
+            if coder_analysis:
+                context_prefix = coder_analysis + "\n\n"
         if project_profile is not None:
             try:
-                context_prefix = project_profile.format_for_prompt() + "\n\n"
+                context_prefix += project_profile.format_for_prompt() + "\n\n"
             except Exception:
                 pass
         kb_ctx = getattr(memory, '_kb_context', '')
@@ -2001,7 +2006,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       display: CLIDisplay, step_idx: int,
                       language: str | None = None,
                       auto: bool = False,
-                      search_agent=None) -> tuple[bool, str]:
+                      search_agent=None,
+                      project_context=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -2094,6 +2100,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         display.step_info(step_idx, f"Generating tests (attempt {gen_attempt}/{MAX_TEST_GEN_RETRIES})...")
         kb_ctx = getattr(memory, '_kb_context', '')
         gen_context = ""
+        # Inject structured project analysis (gives tester awareness of
+        # end-to-end goal, installed packages, import patterns, and
+        # assertion guidance — prevents vacuum-based test generation)
+        if project_context is not None:
+            analysis_block = project_context.format_for_tester()
+            if analysis_block:
+                gen_context += analysis_block + "\n\n"
         if kb_ctx:
             gen_context += kb_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"

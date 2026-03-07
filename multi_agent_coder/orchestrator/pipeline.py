@@ -156,7 +156,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                   kb_context_builder=None,
                   code_graph=None,
                   project_profile=None,
-                  knowledge_base=None) -> tuple[int, bool, str]:
+                  knowledge_base=None,
+                  project_context=None) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
     Catches all exceptions so that a crash inside any handler never
@@ -299,13 +300,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                 task, memory, display, step_idx, language=language, cfg=cfg,
                 auto=auto, code_graph=_graph,
                 project_profile=project_profile,
-                skip_review=_has_test_after)
+                skip_review=_has_test_after,
+                project_context=project_context)
 
         elif step_type == "TEST":
             success, error_info = _handle_test_step(
                 step_text, tester, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language,
-                auto=auto, search_agent=search_agent)
+                auto=auto, search_agent=search_agent,
+                project_context=project_context)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
@@ -384,7 +387,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         search_agent=None,
                         kb_context_builder=None,
                         project_profile=None,
-                        knowledge_base=None) -> bool:
+                        knowledge_base=None,
+                        project_context=None) -> bool:
     """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
 
     All exceptions are caught so that a crash during diagnosis (e.g. an
@@ -479,6 +483,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 kb_context_builder=kb_context_builder,
                 project_profile=project_profile,
                 knowledge_base=knowledge_base,
+                project_context=project_context,
             )
 
             if success:
