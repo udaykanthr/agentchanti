@@ -957,7 +957,13 @@ Install the following development dependencies:
 npm create vite@latest my-react-app -- --template react --no-interactive
 ```
 
-## 2. install NPM packages
+## 2. Install react dependencies
+
+```bash
+npm install react-router-dom
+```
+
+## 3. install NPM packages
 
 ```bash
 npm install 

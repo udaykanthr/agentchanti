@@ -434,17 +434,6 @@ def main():
         plan = None
         raw_steps = None
 
-        # Search for latest documentation to enrich planner context
-        if search_agent:
-            display.show_status("Searching web for latest documentation...")
-            search_context = search_agent.search_for_task(
-                args.task, language=language)
-            if search_context:
-                planner_context += f"\n\n{search_context}"
-                log.info("[Planning] Injected web search context into planner")
-            else:
-                log.info("[Planning] No web search context found")
-
         for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
             display.show_status(
                 f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
@@ -527,7 +516,6 @@ def main():
         args.task, steps,
         source_files=source_files or {},
         language=language,
-        project_profile=project_profile,
     )
     try:
         analyser = AnalyseAgent(

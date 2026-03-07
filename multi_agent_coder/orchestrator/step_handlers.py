@@ -855,7 +855,9 @@ def _handle_search_step(step_text: str, search_agent,
     log.info(f"Step {step_idx+1}: SEARCH — {step_text}")
 
     try:
-        result = search_agent.search_for_task(step_text, language=language)
+        result = search_agent.search_for_task(
+            step_text, language=language,
+            kb_context=getattr(memory, '_kb_context', ''))
     except Exception as exc:
         log.warning(f"Step {step_idx+1}: Search failed: {exc}")
         display.step_info(step_idx, "Search failed (non-blocking), continuing.")
@@ -2380,7 +2382,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx, "Searching web for test error fix...")
                 try:
                     search_context = search_agent.search_for_error(
-                        error_detail, step_text, language=language)
+                        error_detail, step_text, language=language,
+                        kb_context=getattr(memory, '_kb_context', ''))
                     if search_context:
                         log.info(f"Step {step_idx+1}: Search agent found "
                                  f"test error documentation")

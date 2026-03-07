@@ -51,7 +51,8 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         display.step_info(step_idx, "Searching web for error documentation...")
         try:
             search_context = search_agent.search_for_error(
-                error_info, step_text, language=language)
+                error_info, step_text, language=language,
+                kb_context=getattr(memory, '_kb_context', ''))
             if search_context:
                 log.info(f"Step {step_idx+1}: Search agent found documentation")
         except Exception as exc:

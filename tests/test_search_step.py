@@ -67,6 +67,7 @@ class TestHandleSearchStep:
         )
 
         mock_memory = MagicMock()
+        mock_memory._kb_context = "Stack: javascript, Next.js 15"
         mock_display = MagicMock()
 
         success, error = _handle_search_step(
@@ -80,6 +81,7 @@ class TestHandleSearchStep:
         mock_search.search_for_task.assert_called_once_with(
             "Search for the latest Next.js 15 migration guide",
             language="javascript",
+            kb_context="Stack: javascript, Next.js 15",
         )
         # Results should be stored in memory under _search_context/
         mock_memory.update.assert_called_once()
