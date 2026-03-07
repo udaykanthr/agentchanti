@@ -27,6 +27,8 @@ Phase 3 — Global Knowledge Base
 agentchanti kb update                       -- pull latest from GitHub registry
 agentchanti kb update --category errors     -- update specific category only
 agentchanti kb update --check               -- check for updates, don't download
+agentchanti kb clean                        -- remove all global KB data for fresh start
+agentchanti kb clean --force                -- skip confirmation prompt
 agentchanti kb version                      -- show current global KB version
 agentchanti kb error-lookup "<message>"     -- lookup error fix
 agentchanti kb error-lookup "<message>" --language python
@@ -709,6 +711,35 @@ def _cmd_health(args: argparse.Namespace) -> None:
         print(format_health(health))
 
 
+def _cmd_clean(args: argparse.Namespace) -> None:
+    """Remove all global KB data (databases, registry files, manifest)."""
+    from .global_kb.updater import clean
+
+    force = getattr(args, "force", False)
+    if not force:
+        try:
+            answer = input(
+                "This will remove all global KB data (errors.db, "
+                "global_kb.db, registry files, manifest).\n"
+                "You can repopulate with `kb seed` and `kb update`.\n"
+                "Continue? [y/N] "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    print("Cleaning global knowledge base...")
+    summary = clean()
+    print(
+        f"\nClean complete:\n"
+        f"  Files removed     : {summary['files_removed']}\n"
+        f"  Databases removed : {summary['dbs_removed']}"
+    )
+
+
 def _cmd_update(args: argparse.Namespace) -> None:
     """Check for or download global KB updates from GitHub registry."""
     from ..config import Config
@@ -755,6 +786,52 @@ def _cmd_update(args: argparse.Namespace) -> None:
     except ConnectionError as exc:
         print(f"Update failed: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Embed newly downloaded markdown files into the vector store
+    # so they appear in LLM prompt context alongside seeded docs.
+    md_files = summary.get("md_files", [])
+    if md_files:
+        print(f"\nEmbedding {len(md_files)} updated document(s)...")
+        try:
+            from ..config import Config
+            from ..llm.ollama import OllamaClient
+            from ..llm.lm_studio import LMStudioClient
+
+            cfg = Config.load()
+            provider = cfg.PROVIDER
+            embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
+            api_client = None
+
+            if provider == "ollama":
+                api_client = OllamaClient(
+                    base_url=cfg.OLLAMA_BASE_URL, model=embed_model)
+            elif provider == "openai":
+                from ..llm.openai_client import OpenAIClient
+                api_client = OpenAIClient(
+                    base_url=cfg.OPENAI_BASE_URL, model=embed_model,
+                    api_key=cfg.OPENAI_API_KEY)
+            elif provider == "gemini":
+                from ..llm.gemini_client import GeminiClient
+                api_client = GeminiClient(
+                    base_url=cfg.GEMINI_BASE_URL, model=embed_model,
+                    api_key=cfg.GEMINI_API_KEY)
+            elif provider == "anthropic":
+                from ..llm.anthropic_client import AnthropicClient
+                api_client = AnthropicClient(
+                    base_url=cfg.ANTHROPIC_BASE_URL, model=embed_model,
+                    api_key=cfg.ANTHROPIC_API_KEY)
+            else:
+                api_client = LMStudioClient(
+                    base_url=cfg.LM_STUDIO_BASE_URL, model=embed_model)
+
+            from .global_kb.seeder import _embed_md_files
+            chunks = _embed_md_files(md_files, _project_root(), api_client)
+            print(f"  Chunks embedded: {chunks}")
+        except Exception as exc:
+            print(
+                f"  Embedding skipped (docs saved but not indexed): {exc}",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +951,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of results (default: 5)",
     )
     gsearch_p.set_defaults(func=_cmd_global_search)
+
+    # --- clean ---
+    clean_p = subparsers.add_parser(
+        "clean", help="Remove all global KB data for a fresh start"
+    )
+    clean_p.add_argument(
+        "--force", "-f", action="store_true",
+        help="Skip confirmation prompt",
+    )
+    clean_p.set_defaults(func=_cmd_clean)
 
     # --- update ---
     update_p = subparsers.add_parser(

@@ -507,6 +507,105 @@ class TestCLIParsing(unittest.TestCase):
         args = self._parse(["update", "--category", "errors"])
         self.assertEqual(args.category, "errors")
 
+    def test_clean_command(self):
+        args = self._parse(["clean"])
+        self.assertEqual(args.kb_cmd, "clean")
+        self.assertFalse(args.force)
+
+    def test_clean_force(self):
+        args = self._parse(["clean", "--force"])
+        self.assertTrue(args.force)
+
+
+# ---------------------------------------------------------------------------
+# Updater clean tests
+# ---------------------------------------------------------------------------
+
+
+class TestUpdaterClean(unittest.TestCase):
+    """Tests for ``kb.global_kb.updater.clean``."""
+
+    def test_clean_removes_files(self):
+        """clean() removes errors.db, global_kb.db, manifest, and registry."""
+        from multi_agent_coder.kb.global_kb.seeder import seed
+        from multi_agent_coder.kb.global_kb.updater import (
+            clean, _CORE_DIR, _REGISTRY_DIR,
+        )
+
+        # Seed first so there's something to clean
+        seed(embed=False)
+        self.assertTrue(os.path.isfile(os.path.join(_CORE_DIR, "errors.db")))
+        self.assertTrue(os.path.isdir(_REGISTRY_DIR))
+
+        summary = clean()
+        self.assertGreater(summary["files_removed"], 0)
+        self.assertGreater(summary["dbs_removed"], 0)
+        self.assertFalse(os.path.isdir(_REGISTRY_DIR))
+        self.assertFalse(os.path.isfile(os.path.join(_CORE_DIR, "errors.db")))
+
+    def test_clean_idempotent(self):
+        """clean() on already-clean state does not crash."""
+        from multi_agent_coder.kb.global_kb.updater import clean
+
+        # Clean twice — second call should succeed silently
+        clean()
+        summary = clean()
+        self.assertEqual(summary["files_removed"], 0)
+        self.assertEqual(summary["dbs_removed"], 0)
+
+    def test_seed_after_clean(self):
+        """seed() works correctly after clean() — full round trip."""
+        from multi_agent_coder.kb.global_kb.seeder import seed
+        from multi_agent_coder.kb.global_kb.updater import clean
+
+        clean()
+        summary = seed(embed=False)
+        self.assertEqual(summary["errors_seeded"], 40)
+        self.assertGreaterEqual(summary["docs_seeded"], 1)
+
+
+# ---------------------------------------------------------------------------
+# Updater _apply_update returns md_files tests
+# ---------------------------------------------------------------------------
+
+
+class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
+    """Tests that _apply_update returns the list of copied md files."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_apply_update_returns_md_files(self):
+        """_apply_update returns (count, md_files) with correct metadata."""
+        from multi_agent_coder.kb.global_kb.updater import _apply_update
+
+        # Create a fake update directory with a docs/guide.md
+        docs_dir = os.path.join(self.tmpdir, "docs")
+        os.makedirs(docs_dir)
+        md_content = (
+            "---\n"
+            "title: Test Guide\n"
+            "category: doc\n"
+            "tags: test,guide\n"
+            "---\n"
+            "# Test Guide\n"
+            "Some content.\n"
+        )
+        with open(os.path.join(docs_dir, "test-guide.md"), "w") as fh:
+            fh.write(md_content)
+
+        count, md_files = _apply_update(self.tmpdir, categories=["docs"])
+        self.assertEqual(count, 1)
+        self.assertEqual(len(md_files), 1)
+
+        path, category, title = md_files[0]
+        self.assertTrue(path.endswith("test-guide.md"))
+        self.assertEqual(category, "doc")
+        self.assertEqual(title, "Test Guide")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,6 +124,46 @@ def _http_get(url: str, headers: Optional[dict] = None) -> bytes:
 # Public API
 # ---------------------------------------------------------------------------
 
+def clean() -> dict:
+    """
+    Remove all global KB data: vector store, errors DB, registry files,
+    and manifest.
+
+    After running this, ``kb seed`` and ``kb update`` can repopulate the
+    KB from scratch.
+
+    Returns
+    -------
+    dict
+        Summary with keys: files_removed, dbs_removed.
+    """
+    summary = {"files_removed": 0, "dbs_removed": 0}
+
+    # Remove registry markdown files
+    if os.path.isdir(_REGISTRY_DIR):
+        for dirpath, _, filenames in os.walk(_REGISTRY_DIR):
+            for fname in filenames:
+                try:
+                    os.remove(os.path.join(dirpath, fname))
+                    summary["files_removed"] += 1
+                except OSError as exc:
+                    logger.warning("Failed to remove %s: %s", fname, exc)
+        # Remove empty subdirectories
+        shutil.rmtree(_REGISTRY_DIR, ignore_errors=True)
+
+    # Remove SQLite databases and manifest
+    for db_name in ("errors.db", "global_kb.db", "manifest.json"):
+        db_path = os.path.join(_CORE_DIR, db_name)
+        if os.path.isfile(db_path):
+            try:
+                os.remove(db_path)
+                summary["dbs_removed"] += 1
+            except OSError as exc:
+                logger.warning("Failed to remove %s: %s", db_name, exc)
+
+    return summary
+
+
 def get_version() -> str:
     """Return the current local KB version string."""
     manifest = _load_local_manifest()
@@ -209,7 +249,12 @@ def download_update(
     dict
         Summary: {version, files_updated, errors_updated}.
     """
-    summary = {"version": "", "files_updated": 0, "errors_updated": 0}
+    summary: dict = {
+        "version": "",
+        "files_updated": 0,
+        "errors_updated": 0,
+        "md_files": [],
+    }
 
     # Determine which release to fetch
     if version:
@@ -266,8 +311,9 @@ def download_update(
 
         # Apply update atomically
         try:
-            files_updated = _apply_update(extract_dir, categories)
+            files_updated, md_files = _apply_update(extract_dir, categories)
             summary["files_updated"] = files_updated
+            summary["md_files"] = md_files
 
             # Update manifest version
             manifest = _load_local_manifest()
@@ -305,7 +351,7 @@ _CATEGORY_DIRS = {
 def _apply_update(
     source_dir: str,
     categories: Optional[list[str]] = None,
-) -> int:
+) -> tuple[int, list[tuple[str, str, str]]]:
     """
     Copy files from extracted update into registry/.
 
@@ -318,10 +364,24 @@ def _apply_update(
 
     Returns
     -------
-    int
-        Number of files copied.
+    tuple[int, list[tuple[str, str, str]]]
+        A tuple of (number of files copied, list of (path, category, title)
+        for each markdown file that was copied).  The second element can be
+        passed directly to the seeder's ``_embed_md_files`` to index the
+        newly downloaded documents.
     """
+    from .seeder import _parse_frontmatter
+
+    # Map directory names to the KB category names used in the vector store
+    _DIR_TO_CATEGORY = {
+        "patterns": "pattern",
+        "adrs": "adr",
+        "docs": "doc",
+        "behavioral": "behavioral",
+    }
+
     files_copied = 0
+    md_files: list[tuple[str, str, str]] = []
 
     for src_name, dest_name in _CATEGORY_DIRS.items():
         if categories and src_name not in categories:
@@ -351,7 +411,19 @@ def _apply_update(
                     shutil.copy2(src_file, dest_file)
                     files_copied += 1
 
-    return files_copied
+                    # Track markdown files for embedding
+                    if fname.endswith(".md"):
+                        try:
+                            with open(dest_file, encoding="utf-8") as fh:
+                                content = fh.read(500)
+                            meta = _parse_frontmatter(content)
+                            title = meta.get("title", fname)
+                        except OSError:
+                            title = fname
+                        category = _DIR_TO_CATEGORY.get(dest_name, dest_name)
+                        md_files.append((dest_file, category, title))
+
+    return files_copied, md_files
 
 
 def _apply_error_updates(errors_dir: str) -> None:
