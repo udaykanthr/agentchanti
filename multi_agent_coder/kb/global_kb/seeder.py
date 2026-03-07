@@ -1529,34 +1529,8 @@ def seed(
             if api_client is None:
                 raise ValueError("api_client required for embedding")
 
-            # Discover non-seeder .md files already in registry (from kb update)
-            all_md_files = list(md_files)  # start with seeder files
-            _seeded_paths = {p for p, _, _ in md_files}
-
-            _DIR_TO_CATEGORY = {
-                "patterns": "pattern",
-                "adrs": "adr",
-                "docs": "doc",
-                "behavioral": "behavioral",
-            }
-            for subdir, category in _DIR_TO_CATEGORY.items():
-                cat_dir = os.path.join(_REGISTRY_DIR, subdir)
-                if not os.path.isdir(cat_dir):
-                    continue
-                for fname in os.listdir(cat_dir):
-                    if not fname.endswith(".md"):
-                        continue
-                    fpath = os.path.join(cat_dir, fname)
-                    if fpath in _seeded_paths:
-                        continue  # already in list from seeder
-                    try:
-                        with open(fpath, encoding="utf-8") as fh:
-                            head = fh.read(500)
-                        meta = _parse_frontmatter(head)
-                        title = meta.get("title", fname)
-                    except OSError:
-                        title = fname
-                    all_md_files.append((fpath, category, title))
+            all_md_files = collect_all_registry_md_files(exclude_paths={p for p, _, _ in md_files})
+            all_md_files = list(md_files) + all_md_files
 
             if len(all_md_files) > len(md_files):
                 logger.info(
@@ -1571,6 +1545,59 @@ def seed(
             summary["chunks_embedded"] = 0
 
     return summary
+
+
+_DIR_TO_CATEGORY = {
+    "patterns": "pattern",
+    "adrs": "adr",
+    "docs": "doc",
+    "behavioral": "behavioral",
+}
+
+
+def collect_all_registry_md_files(
+    exclude_paths: Optional[set[str]] = None,
+) -> list[tuple[str, str, str]]:
+    """Scan the registry for all ``.md`` files and return metadata tuples.
+
+    This is used by both ``seed()`` and ``kb update`` (via CLI) to ensure
+    ALL registry docs — from both sources — are embedded in the vector
+    store so they coexist in LLM prompt context.
+
+    Parameters
+    ----------
+    exclude_paths:
+        Absolute file paths to skip (already collected by the caller).
+
+    Returns
+    -------
+    list[tuple[str, str, str]]
+        A list of ``(absolute_path, category, title)`` tuples suitable
+        for passing to :func:`_embed_md_files`.
+    """
+    exclude = exclude_paths or set()
+    md_files: list[tuple[str, str, str]] = []
+
+    for subdir, category in _DIR_TO_CATEGORY.items():
+        cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+        if not os.path.isdir(cat_dir):
+            continue
+        for fname in os.listdir(cat_dir):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(cat_dir, fname)
+            if fpath in exclude:
+                continue
+            try:
+                with open(fpath, encoding="utf-8") as fh:
+                    head = fh.read(500)
+                meta = _parse_frontmatter(head)
+                title = meta.get("title", fname)
+            except OSError:
+                title = fname
+            md_files.append((fpath, category, title))
+
+    return md_files
 
 
 def _embed_md_files(

@@ -787,11 +787,12 @@ def _cmd_update(args: argparse.Namespace) -> None:
         print(f"Update failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Embed newly downloaded markdown files into the vector store
-    # so they appear in LLM prompt context alongside seeded docs.
+    # Embed ALL registry markdown files into the vector store —
+    # both newly downloaded files and existing docs (e.g. from kb seed)
+    # so that both sources coexist in LLM prompt context.
     md_files = summary.get("md_files", [])
     if md_files:
-        print(f"\nEmbedding {len(md_files)} updated document(s)...")
+        print(f"\nEmbedding registry documents...")
         try:
             from ..config import Config
             from ..llm.ollama import OllamaClient
@@ -824,8 +825,24 @@ def _cmd_update(args: argparse.Namespace) -> None:
                 api_client = LMStudioClient(
                     base_url=cfg.LM_STUDIO_BASE_URL, model=embed_model)
 
-            from .global_kb.seeder import _embed_md_files
-            chunks = _embed_md_files(md_files, _project_root(), api_client)
+            from .global_kb.seeder import (
+                _embed_md_files, collect_all_registry_md_files,
+            )
+
+            # Collect existing registry files not in the update set
+            update_paths = {p for p, _, _ in md_files}
+            existing_files = collect_all_registry_md_files(
+                exclude_paths=update_paths,
+            )
+            all_files = md_files + existing_files
+
+            if existing_files:
+                print(
+                    f"  Including {len(existing_files)} existing doc(s) "
+                    f"from kb seed"
+                )
+
+            chunks = _embed_md_files(all_files, _project_root(), api_client)
             print(f"  Chunks embedded: {chunks}")
         except Exception as exc:
             print(

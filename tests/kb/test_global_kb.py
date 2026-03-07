@@ -659,38 +659,35 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
         )
 
     def test_seed_includes_update_file_in_all_md_files(self):
-        """seed() collects kb update files for embedding alongside seeder files."""
+        """collect_all_registry_md_files() discovers kb update files."""
         from multi_agent_coder.kb.global_kb.seeder import (
-            seed, _REGISTRY_DIR, _parse_frontmatter,
+            seed, collect_all_registry_md_files,
         )
 
-        # seed(embed=False) won't embed, but we can verify the file is preserved
-        # and would be discovered by the embedding scan
         seed(embed=False)
 
-        # Simulate the scan logic from seed() step 3
-        _DIR_TO_CATEGORY = {
-            "patterns": "pattern", "adrs": "adr",
-            "docs": "doc", "behavioral": "behavioral",
-        }
-        extra_files = []
-        for subdir, category in _DIR_TO_CATEGORY.items():
-            cat_dir = os.path.join(_REGISTRY_DIR, subdir)
-            if not os.path.isdir(cat_dir):
-                continue
-            for fname in os.listdir(cat_dir):
-                if not fname.endswith(".md"):
-                    continue
-                fpath = os.path.join(cat_dir, fname)
-                with open(fpath, encoding="utf-8") as fh:
-                    meta = _parse_frontmatter(fh.read(500))
-                if meta.get("source") != "seeder":
-                    extra_files.append(fname)
-
+        # collect_all_registry_md_files with no exclusions returns everything
+        all_files = collect_all_registry_md_files()
+        filenames = [os.path.basename(p) for p, _, _ in all_files]
         self.assertIn(
-            "tailwindcss-v4-setup-guide.md", extra_files,
+            "tailwindcss-v4-setup-guide.md", filenames,
             "kb update file not discoverable for embedding",
         )
+
+    def test_collect_excludes_given_paths(self):
+        """collect_all_registry_md_files() respects exclude_paths."""
+        from multi_agent_coder.kb.global_kb.seeder import (
+            seed, collect_all_registry_md_files,
+        )
+
+        seed(embed=False)
+
+        # Exclude the test file
+        excluded = collect_all_registry_md_files(
+            exclude_paths={self.test_file},
+        )
+        filenames = [os.path.basename(p) for p, _, _ in excluded]
+        self.assertNotIn("tailwindcss-v4-setup-guide.md", filenames)
 
 
 if __name__ == "__main__":
