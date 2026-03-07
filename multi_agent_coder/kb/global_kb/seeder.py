@@ -423,21 +423,19 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="task,canceled,async,timeout,cancellation,csharp",
     ),
-
     # ── Tooling / Framework (all languages) ──────────────────────────────
     ErrorFix(
         error_type="TailwindCSSDeprecatedInit",
         language="all",
         pattern=r"(tailwindcss\s+init|npx\s+tailwindcss\s+init|tailwind\.config\.(js|ts|cjs|mjs))",
         cause="Tailwind CSS v4 removed the 'tailwindcss init' command and tailwind.config.js. "
-              "The old PostCSS-based setup is no longer supported.",
-        fix_template="Use the new Tailwind CSS v4 installation:\n"
-                     "1. Create Vite project: npm create vite@latest <project-name> -- --template react --no-interactive\n"
-                     "   IMPORTANT: Replace <project-name> with the EXACT name from the user's task.\n"
-                     "2. Install Tailwind: cd <project-name> && npm install tailwindcss @tailwindcss/vite\n"
-                     "3. Add Tailwind plugin to vite.config.ts (import tailwindcss from '@tailwindcss/vite')\n"
-                     "4. Add @import \"tailwindcss\"; to main CSS file\n"
-                     "5. Configuration is now done via CSS @theme directive, NOT tailwind.config.js",
+              "The old v3 setup is no longer supported.",
+        fix_template="Use the new Tailwind CSS v4 installation as a PostCSS plugin:\n"
+                     "1. Install packages: npm install tailwindcss @tailwindcss/postcss postcss\n"
+                     "2. Add Tailwind to your postcss.config.mjs:\n"
+                     "   export default { plugins: { \"@tailwindcss/postcss\": {} } }\n"
+                     "3. Add @import \"tailwindcss\"; to your main CSS file.\n"
+                     "4. Configuration is now done directly in CSS using the @theme directive, NOT tailwind.config.js",
         severity="error",
         tags="tailwindcss,tailwind,init,config,postcss,css,deprecated,v4",
     ),
