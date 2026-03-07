@@ -949,9 +949,12 @@ Install NumPy for optimized vector operations: `pip install numpy`
 Setting up Vite in a React project requires specific packages and configuration
 to ensure components render correctly and DOM assertions work.
 
+*** Do not create TS or TSX files if JS or JSX already exists, Update those files insetead ***
+
 ## 1. Required Packages
 
-Install the following development dependencies:
+Install the following React vite packages initialization:
+*** This step is very important to create necessary files and folders example, src/App.jsx, src/index.jsx, src/main.jsx, src/App.css, src/index.css, vite.config.js, package.json ***
 
 ```bash
 npm create vite@latest my-react-app -- --template react --no-interactive
@@ -979,6 +982,8 @@ npm install
 
 Setting up Vitest in a React + Vite project requires specific packages and configuration
 to ensure components render correctly and DOM assertions work.
+
+*** Do not create TS or TSX files if JS or JSX already exists, Update those files insetead ***
 
 ## 1. Required Packages
 
@@ -1056,6 +1061,8 @@ npm pkg set scripts.test:coverage="vitest run --coverage"
 
 - **ReferenceError: describe is not defined**: Ensure `globals: true` is in
   `vite.config.ts`, and `vitest/globals` is in `tsconfig.json` types.
+- **ReferenceError: jest is not defined**:  Ensure `import { describe, test, expect } from 'vitest'` is in .test files and remove and never use jest related imports and functions.
+- **Error: Failed to resolve import**: Ensure `import <component-name> from '<component-path>'` is in .test files and component-path is correct.  
 - **document/window is not defined**: Ensure `environment: 'jsdom'` is set in
   your test config and `jsdom` is installed.
 """,
@@ -1163,6 +1170,8 @@ npm pkg set scripts.test:coverage="vitest run --coverage"
 ## Troubleshooting
 
 - **ReferenceError: describe is not defined**: Ensure `globals: true` is in your `vite.config.ts` and `vitest/globals` is in your `tsconfig.spec.json` types.
+- **ReferenceError: jest is not defined**:  Ensure `import { describe, test, expect } from 'vitest'` is in .test files and remove and never use jest related imports and functions.
+- **Error: Failed to resolve import**: Ensure `import <component-name> from '<component-path>'` is in .test files and component-path is correct.
 - **Can't bind to 'x' since it isn't a known property of 'y'**: The component is not properly configured in your test module. Ensure proper imports when using `@testing-library/angular` `render()` or `TestBed.configureTestingModule()`.
 """,
     },
