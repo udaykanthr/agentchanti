@@ -1125,6 +1125,17 @@ def _quick_offline_lint(files: dict[str, str]) -> str:
         if ext.startswith('.'):
             ext = ext[1:]
 
+        # ── Built-in Python syntax validation (Enhancement #7) ──
+        # Use Python's compile() for .py files — catches syntax errors
+        # before writing to disk, saving a full test run cycle.
+        if ext == 'py':
+            try:
+                compile(content, filepath, 'exec')
+            except SyntaxError as e:
+                line_info = f":{e.lineno}" if e.lineno else ""
+                errors.append(f"{filepath}{line_info}: SyntaxError: {e.msg}")
+                continue  # skip syntax_checker for this file
+
         if check_syntax:
             supported_exts = {k.lstrip('.') for k in EXTENSION_MAP.keys()}
             if ext in supported_exts:
@@ -2002,6 +2013,124 @@ def _cleanup_ghost_test_files(
                           f"{', '.join(removed)}")
 
 
+# ── Enhancement #6: Import-trace context injection ──────────────
+def _extract_imported_sources(test_files: dict[str, str],
+                              memory: FileMemory) -> dict[str, str]:
+    """Parse import statements in test files to identify tested source files.
+
+    Returns a dict of {filepath: content} for source files that are
+    directly imported by the test files.
+    """
+    import re as _re
+
+    # Python: from src.snake_game import ... / import snake_game
+    _PY_IMPORT_RE = _re.compile(
+        r'(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))')
+    # JS/TS: import ... from '../src/app' / require('../src/app')
+    _JS_IMPORT_RE = _re.compile(
+        r'''(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))''')
+
+    all_files = memory.all_files()
+    imported_sources: dict[str, str] = {}
+
+    for _tpath, tcontent in test_files.items():
+        # Collect candidate module paths from imports
+        candidates: set[str] = set()
+        for m in _PY_IMPORT_RE.finditer(tcontent):
+            mod = m.group(1) or m.group(2)
+            if mod:
+                candidates.add(mod.replace('.', '/'))
+        for m in _JS_IMPORT_RE.finditer(tcontent):
+            rel = m.group(1) or m.group(2)
+            if rel:
+                # Strip leading ./ or ../
+                clean = _re.sub(r'^\.\.?/', '', rel)
+                candidates.add(clean)
+
+        # Match candidates against known memory files
+        for fpath, content in all_files.items():
+            if fpath in imported_sources:
+                continue
+            # Skip test files themselves
+            if 'test' in fpath.lower():
+                continue
+            for cand in candidates:
+                if cand in fpath or fpath.endswith(cand) or fpath.endswith(cand + '.py'):
+                    imported_sources[fpath] = content
+                    break
+
+    return imported_sources
+
+
+# ── Enhancement #9: Spec-driven test generation ─────────────────
+def _extract_source_specs(code_summary: str) -> str:
+    """Extract function/class signatures and docstrings from source code.
+
+    Returns a compact spec block the tester can use to understand
+    what behaviors to test.
+    """
+    import re as _re
+
+    specs: list[str] = []
+    # Parse #### [FILE]: ... ```...``` blocks
+    for match in _re.finditer(
+            r'####\s+\[FILE\]:\s*(.+?)\n```\w*\n(.*?)```',
+            code_summary, _re.DOTALL):
+        filepath, content = match.groups()
+        if 'test' in filepath.lower():
+            continue
+        file_specs: list[str] = []
+        # Extract class/function definitions + docstrings
+        for func_match in _re.finditer(
+                r'((?:class|def)\s+\w+[^:]*:)\s*\n(\s+(?:""".*?"""|\'\'\'.*?\'\'\'))?',
+                content, _re.DOTALL):
+            sig = func_match.group(1).strip()
+            doc = func_match.group(2)
+            if doc:
+                file_specs.append(f"  {sig}\n    {doc.strip()}")
+            else:
+                file_specs.append(f"  {sig}")
+        if file_specs:
+            specs.append(f"# {filepath}\n" + "\n".join(file_specs))
+
+    return "\n\n".join(specs) if specs else ""
+
+
+# ── Enhancement #5: Bidirectional bug detection ──────────────────
+def _triage_test_failure(error_detail: str, source_summary: str,
+                         test_summary: str, llm_client,
+                         display: CLIDisplay, step_idx: int) -> str:
+    """Determine whether a test failure is a TEST_BUG or SOURCE_BUG.
+
+    Returns 'TEST_BUG' or 'SOURCE_BUG'.
+    """
+    triage_prompt = (
+        "A test has failed. Analyze the error and determine the root cause.\n"
+        "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
+        "- TEST_BUG = the test assertion, setup, or import is incorrect\n"
+        "- SOURCE_BUG = the source code under test has a logic, syntax, "
+        "or implementation error\n\n"
+        f"Test output:\n{error_detail[:3000]}\n\n"
+    )
+    if source_summary:
+        triage_prompt += f"Source files:\n{source_summary[:4000]}\n\n"
+    if test_summary:
+        triage_prompt += f"Test files:\n{test_summary[:4000]}\n"
+
+    display.step_info(step_idx, "Analyzing failure origin (test vs source)...")
+
+    sent_before, recv_before = token_tracker.snapshot()
+    response = llm_client.generate_response(triage_prompt).strip().upper()
+    sent_after, recv_after = token_tracker.snapshot()
+    display.step_tokens(step_idx, sent_after - sent_before,
+                        recv_after - recv_before)
+
+    if "SOURCE_BUG" in response:
+        log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG")
+        return "SOURCE_BUG"
+    log.info(f"Step {step_idx+1}: Triage result: TEST_BUG")
+    return "TEST_BUG"
+
 def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       reviewer: ReviewerAgent, executor: Executor,
                       task: str, memory: FileMemory,
@@ -2112,6 +2241,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         if kb_ctx:
             gen_context += kb_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"
+
+        # ── Enhancement #9: spec-driven test generation ──
+        source_specs = _extract_source_specs(code_summary)
+        if source_specs:
+            gen_context += (
+                "\nSOURCE CODE SPECIFICATIONS (test these behaviors):\n"
+                f"{source_specs}\n"
+            )
+
         if feedback:
             gen_context += f"\nFeedback: {feedback}"
         # Add JS/TS environment info to context
@@ -2367,7 +2505,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     break
             prev_gen_error = output
 
-            display.step_info(step_idx, "Tests failed, asking coder to fix...")
+            display.step_info(step_idx, "Tests failed, analyzing failure origin...")
+
+            # ── Enhancement #6: import-trace context injection ──
+            imported_sources = _extract_imported_sources(test_files, memory)
+            source_context = ""
+            for fpath, content in imported_sources.items():
+                source_context += f"#### [FILE]: {fpath}\n```{lang_tag}\n{content}\n```\n\n"
 
             # Use batch error summary for structured, grouped view of ALL failures
             batch_summary = _build_batch_error_summary(output) if output else ""
@@ -2375,6 +2519,20 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 f"(command `{test_cmd}` produced no output — it may have "
                 f"crashed or the test framework may not be installed)"
             )
+
+            # ── Enhancement #5: bidirectional bug detection ──
+            # Determine whether the bug is in the test or the source code.
+            test_summary_for_triage = ""
+            for fpath, content in test_files.items():
+                test_summary_for_triage += f"{fpath}:\n{content[:1000]}\n\n"
+            bug_origin = _triage_test_failure(
+                error_detail, source_context, test_summary_for_triage,
+                coder.llm_client, display, step_idx)
+
+            is_source_bug = (bug_origin == "SOURCE_BUG")
+            if is_source_bug:
+                display.step_info(step_idx,
+                                  "Bug detected in SOURCE code, asking coder to fix source...")
 
             # Search the web for error documentation to help the coder fix
             search_context = ""
@@ -2396,9 +2554,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             fix_context = (
                 f"Test command: `{test_cmd}`\n\n"
                 f"{error_detail}\n\n"
-                f"Test files that need fixing: {test_file_list}\n"
-                f"Project files:\n{code_summary}"
             )
+            if is_source_bug:
+                # Include imported source files for source bug fixes
+                fix_context += (
+                    f"Source files under test:\n{source_context}\n\n"
+                    f"Test files (for reference): {test_file_list}\n"
+                )
+            else:
+                fix_context += (
+                    f"Test files that need fixing: {test_file_list}\n"
+                )
+            fix_context += f"Project files:\n{code_summary}"
             if search_context:
                 fix_context += (
                     f"\n\nThe following web search results contain relevant "
@@ -2416,17 +2583,29 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     f"If you need to rename a file from .test{js_ext} to .test{jsx_ext}, "
                     f"output the corrected content under the new .test{jsx_ext} path. "
                 )
-            fix_prompt = (
-                "Below is a structured summary of ALL test failures grouped by error type. "
-                "Analyze the patterns — if multiple failures share a root cause "
-                "(e.g. wrong import path, missing mock, incorrect API usage), "
-                "fix the root cause once rather than patching each test individually. "
-                f"{jsx_hint}"
-                "Fix ONLY the test files. "
-                "Do NOT modify source files, package.json, or any config files. "
-                "Do NOT add new dependencies. "
-                "Return ALL corrected test file(s) using #### [FILE]: format."
-            )
+
+            # ── Enhancement #8: targeted patching + #5: bidirectional fix ──
+            if is_source_bug:
+                fix_prompt = (
+                    "The tests have revealed a BUG IN THE SOURCE CODE, not in the tests.\n"
+                    "Analyze the test failures and fix the SOURCE files to make the tests pass.\n"
+                    "Do NOT modify test files. Fix ONLY the source implementation files.\n"
+                    f"{jsx_hint}"
+                    "Return ALL corrected source file(s) using #### [FILE]: format."
+                )
+            else:
+                fix_prompt = (
+                    "Below is a structured summary of ALL test failures grouped by error type. "
+                    "Analyze the patterns — if multiple failures share a root cause "
+                    "(e.g. wrong import path, missing mock, incorrect API usage), "
+                    "fix the root cause once rather than patching each test individually.\n"
+                    "Focus on fixing ONLY the failing tests. Do NOT rewrite passing tests.\n"
+                    f"{jsx_hint}"
+                    "Fix ONLY the test files. "
+                    "Do NOT modify source files, package.json, or any config files. "
+                    "Do NOT add new dependencies. "
+                    "Return ALL corrected test file(s) using #### [FILE]: format."
+                )
 
             sent_before, recv_before = token_tracker.snapshot()
 
@@ -2448,21 +2627,31 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             if fix_files:
                 # Strip protected manifest files
                 fix_files = _strip_protected_files(fix_files)
-                # Normalize paths and filter to test-only files
+                # Normalize paths
                 fix_files = _normalize_fix_paths(fix_files, memory)
-                fix_files = _filter_test_only_files(
-                    fix_files, test_files, memory)
-                if fix_files:
+
+                if is_source_bug:
+                    # For source bugs: write source fixes directly, skip test-only filter
                     show_diffs(fix_files, log_only=True)
                     executor.write_files(fix_files)
                     memory.update(fix_files)
-                    # Clean up stale .js files if fix produced .jsx
-                    _cleanup_stale_js_test_files(
-                        fix_files, memory, display, step_idx,
-                        subproject_cwd)
+                    log.info(f"Step {step_idx+1}: Applied SOURCE fix to: "
+                             f"{', '.join(fix_files.keys())}")
                 else:
-                    log.warning(f"Step {step_idx+1}: All fix files were "
-                                f"blocked by test-only filter")
+                    # For test bugs: filter to test-only files
+                    fix_files = _filter_test_only_files(
+                        fix_files, test_files, memory)
+                    if fix_files:
+                        show_diffs(fix_files, log_only=True)
+                        executor.write_files(fix_files)
+                        memory.update(fix_files)
+                        # Clean up stale .js files if fix produced .jsx
+                        _cleanup_stale_js_test_files(
+                            fix_files, memory, display, step_idx,
+                            subproject_cwd)
+                    else:
+                        log.warning(f"Step {step_idx+1}: All fix files were "
+                                    f"blocked by test-only filter")
                 code_summary = ""
                 for fname, content in memory.all_files().items():
                     code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"

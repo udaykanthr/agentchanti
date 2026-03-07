@@ -3,6 +3,7 @@ Diagnosis and fix helpers — analyze step failures and apply fixes.
 """
 
 import os
+import re
 
 from ..executor import Executor
 from ..cli_display import CLIDisplay, token_tracker, log
@@ -102,6 +103,34 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += f"{prior_context}\n"
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
+
+    # ── Enhancement #3: extract file paths from error output ──────
+    # Parse file paths mentioned in the error (e.g. tracebacks, lint output)
+    # and inject matching full source files from memory so the LLM sees the
+    # actual buggy code, not just what related_context() guesses.
+    _FILE_PATH_RE = re.compile(
+        r'(?:File\s+["\'](.+?)["\']'
+        r'|([\w./\\-]+\.(?:py|js|ts|jsx|tsx|rb|go|rs|java|c|cpp|cs|php)):\d+)'
+    )
+    _error_file_paths: set[str] = set()
+    for _m in _FILE_PATH_RE.finditer(error_info or ""):
+        _p = _m.group(1) or _m.group(2)
+        if _p:
+            _error_file_paths.add(_p)
+    if _error_file_paths:
+        _injected: list[str] = []
+        for fpath, content in memory.all_files().items():
+            for efp in _error_file_paths:
+                if fpath.endswith(efp) or efp.endswith(fpath):
+                    _injected.append(
+                        f"#### [FILE]: {fpath}\n```\n{content}\n```")
+                    break
+        if _injected:
+            prompt += (
+                "Source files referenced in the error output:\n\n"
+                + "\n\n".join(_injected) + "\n\n"
+            )
+
     prompt += f"All project files: {memory.summary()}\n\n"
 
     if previous_diagnosis:
@@ -116,18 +145,28 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     # Step-type-specific fix instructions
     if step_type == "CMD":
         prompt += (
-            "This is a COMMAND step. Do NOT generate code files.\n"
+            "This is a COMMAND step.\n"
+            "If the failure is purely a command/environment error, respond with a shell command fix.\n"
+            "If the failure is a CODE ERROR (e.g. failing tests, lint errors, syntax errors), provide the COMPLETE corrected file(s).\n"
+            "You may provide both a file replacement and a shell command if necessary.\n"
             "Use the exact names, paths, and values from previous steps.\n"
             "Respond with:\n"
             "1. ROOT CAUSE: one-line explanation of what went wrong\n"
-            "2. FIX: provide the corrected shell command inside a code block:\n"
+            "2. FIX: provide the corrected shell command inside a code block (if applicable):\n"
             "```bash\n"
             "command here\n"
             "```\n"
-            "3. SPECIAL CASE: If the command failed because the directory is not empty (e.g. create-react-app .), "
+            "3. CODE FIX: If code needs to be modified to fix the issue, provide the COMPLETE corrected file(s). Do NOT use diffs or patches.\n"
+            "   Write the ENTIRE file content, not just the changed parts.\n"
+            "   CRITICAL FORMAT — the #### [FILE]: marker must be OUTSIDE and BEFORE the code block:\n"
+            "   #### [FILE]: path/to/file.py\n"
+            "   ```python\n"
+            "   # entire file contents here\n"
+            "   ```\n"
+            "4. SPECIAL CASE: If the command failed because the directory is not empty (e.g. create-react-app .), "
             "the FIX is to create the app in a new subdirectory (e.g. `npx create-react-app my-app ...`) "
             "instead of the current directory.\n"
-            "4. DEPRECATED / UNKNOWN COMMAND: If the error says 'Unknown command' or "
+            "5. DEPRECATED / UNKNOWN COMMAND: If the error says 'Unknown command' or "
             "'command not found', the tool may have been removed or renamed in a newer version. "
             "Provide the modern replacement command. Common examples:\n"
             "   - `npm set-script` removed in npm v7+ → use `npm pkg set scripts.<name>=\"<value>\"`\n"
@@ -178,13 +217,14 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                display: CLIDisplay, step_idx: int,
                step_type: str = "CODE",
-               original_error_cmd: str | None = None) -> tuple[bool, bool]:
+               original_error_cmd: str | None = None) -> tuple[bool, bool, bool]:
     """Apply fixes from a diagnosis response.
 
-    Returns ``(applied, cmds_succeeded)`` where *applied* is True if any
-    fix action was taken and *cmds_succeeded* is True if all fix commands
+    Returns ``(applied, cmds_succeeded, has_fix_commands)`` where *applied* is True if any
+    fix action was taken, *cmds_succeeded* is True if all fix commands
     ran successfully (relevant for CMD steps where the fix command itself
-    is the corrected step).
+    is the corrected step), and *has_fix_commands* is True if at least one parameter
+    was executed as a shell command.
 
     Parameters
     ----------
@@ -195,62 +235,68 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     """
     applied = False
     cmds_succeeded = True
+    has_fix_commands = False
 
-    # Only write code files for CODE / TEST steps, never for CMD
-    if step_type != "CMD":
-        files = executor.parse_code_blocks(diagnosis)
+    # Extract code file fixes regardless of step type, allowing CMD steps to fix code bugs
+    files = executor.parse_code_blocks(diagnosis)
 
-        # Fallback: try fuzzy parsing (handles diff blocks, inline file
-        # comments, and other common LLM diagnosis formats)
-        if not files:
-            files = executor.parse_code_blocks_fuzzy(diagnosis)
-            if files:
-                log.info(f"Step {step_idx+1}: Standard parser found nothing, "
-                         f"fuzzy parser extracted: {list(files.keys())}")
-
+    # Fallback: try fuzzy parsing (handles diff blocks, inline file
+    # comments, and other common LLM diagnosis formats)
+    if not files:
+        files = executor.parse_code_blocks_fuzzy(diagnosis)
         if files:
-            # Strip protected manifest files before any further processing
-            files = _strip_protected_files(files)
-            # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
-            content_fixes = getattr(memory, '_content_fixes', None)
-            files = _apply_content_fixes(files, content_fixes)
+            log.info(f"Step {step_idx+1}: Standard parser found nothing, "
+                     f"fuzzy parser extracted: {list(files.keys())}")
 
-        if files:
-            # Filter out files with hazardous diffs (e.g. truncation,
-            # dependency removal) — these would corrupt the project.
-            safe_files: dict[str, str] = {}
-            for filepath, content in files.items():
-                full_path = os.path.join(".", filepath)
-                if os.path.isfile(full_path):
-                    try:
-                        with open(full_path, "r", encoding="utf-8",
-                                  errors="replace") as f:
-                            old_content = f.read()
-                        hazards = _detect_hazards(filepath, old_content, content)
-                        if hazards:
-                            msgs = "; ".join(m for _, m in hazards)
-                            log.warning(f"Step {step_idx+1}: Skipping hazardous "
-                                        f"fix for {filepath}: {msgs}")
-                            display.step_info(step_idx,
-                                              f"Skipped unsafe fix for {filepath}")
-                            continue
-                    except OSError:
-                        pass
-                safe_files[filepath] = content
+    if files:
+        # Strip protected manifest files before any further processing
+        files = _strip_protected_files(files)
+        # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
+        content_fixes = getattr(memory, '_content_fixes', None)
+        files = _apply_content_fixes(files, content_fixes)
 
-            if safe_files:
-                show_diffs(safe_files, log_only=True)
-                written = executor.write_files(safe_files)
-                memory.update(safe_files)
-                display.step_info(step_idx, f"Fixed files: {', '.join(written)}")
-                log.info(f"Step {step_idx+1}: Applied code fixes to: "
-                         f"{', '.join(written)}")
-                applied = True
+    if files:
+        # Filter out files with hazardous diffs (e.g. truncation,
+        # dependency removal) — these would corrupt the project.
+        safe_files: dict[str, str] = {}
+        for filepath, content in files.items():
+            full_path = os.path.join(".", filepath)
+            if os.path.isfile(full_path):
+                try:
+                    with open(full_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        old_content = f.read()
+                    hazards = _detect_hazards(filepath, old_content, content)
+                    if hazards:
+                        msgs = "; ".join(m for _, m in hazards)
+                        log.warning(f"Step {step_idx+1}: Skipping hazardous "
+                                    f"fix for {filepath}: {msgs}")
+                        display.step_info(step_idx,
+                                          f"Skipped unsafe fix for {filepath}")
+                        continue
+                except OSError:
+                    pass
+            safe_files[filepath] = content
+
+        if safe_files:
+            show_diffs(safe_files, log_only=True)
+            written = executor.write_files(safe_files)
+            memory.update(safe_files)
+            display.step_info(step_idx, f"Fixed files: {', '.join(written)}")
+            log.info(f"Step {step_idx+1}: Applied code fixes to: "
+                     f"{', '.join(written)}")
+            applied = True
+
+            # ── Enhancement #4: skip shell commands when code fixes are present ──
+            # For CMD steps, the code fix IS the real fix.  The shell commands
+            # the LLM emits are usually just re-runs of the same failing command.
+            # Let the pipeline re-run the original step to verify the code fix.
+            if step_type == "CMD":
+                return applied, True, False
 
     # Extract and run fix commands.
     # For CMD steps, only extract from triple-backtick code blocks to avoid
-    # picking up the *broken* original command from inline backtick references
-    # in the diagnosis analysis text (e.g. "The command `npm set-script ...` failed").
+    # picking up the *broken* original command or the new file contents.
     fix_commands = _extract_commands_from_text(
         diagnosis, code_blocks_only=(step_type == "CMD"))
 
@@ -322,5 +368,6 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         if not success:
             cmds_succeeded = False
         applied = True
+        has_fix_commands = True
 
-    return applied, cmds_succeeded
+    return applied, cmds_succeeded, has_fix_commands

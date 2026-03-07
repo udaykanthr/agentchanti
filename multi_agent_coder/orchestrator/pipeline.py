@@ -21,7 +21,7 @@ from .diagnosis import _diagnose_failure, _apply_fix
 _logger = logging.getLogger(__name__)
 
 
-MAX_DIAGNOSIS_RETRIES = 1   # outer retries: diagnose failure → fix → re-run step
+MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
 
 # ── External service dependency detection ─────────────────────
 # Patterns that indicate the command failed because an external
@@ -449,7 +449,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 r"Command `(.+?)` failed\.", error_info or "")
             _orig_cmd = _orig_cmd_match.group(1) if _orig_cmd_match else None
 
-            fix_applied, cmds_succeeded = _apply_fix(
+            fix_applied, cmds_succeeded, has_fix_commands = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type,
                 original_error_cmd=_orig_cmd)
@@ -463,7 +463,9 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             # For CMD steps, the fix commands ARE the corrected step.
             # If they all succeeded, the step is done — no need to re-run
             # the original (which would likely fail again).
-            if step_type == "CMD" and cmds_succeeded:
+            # ONLY exit if actual shell commands were executed as part of the fix.
+            # If a code-only fix was applied, we MUST re-run the step to verify the fix works.
+            if step_type == "CMD" and cmds_succeeded and has_fix_commands:
                 display.step_info(step_idx, "Fix commands succeeded — step resolved.")
                 log.info(f"Task {step_idx+1}: CMD fix commands succeeded, "
                          f"treating step as resolved.")

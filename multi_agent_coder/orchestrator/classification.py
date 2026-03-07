@@ -7,8 +7,28 @@ import re
 from ..cli_display import CLIDisplay, token_tracker
 
 
+# ── Deterministic classification: test runner commands ──────────
+# If the step text mentions a known test runner, skip the LLM entirely
+# and classify as TEST.  This is faster and more reliable than relying
+# on prompt hints.
+_TEST_CMD_RE = re.compile(
+    r'\b(pytest|jest|vitest|mocha|rspec|phpunit'
+    r'|npm\s+test|yarn\s+test|pnpm\s+test'
+    r'|go\s+test|cargo\s+test'
+    r'|python\s+-m\s+pytest'
+    r'|npx\s+vitest|npx\s+jest)\b',
+    re.IGNORECASE,
+)
+
+
 def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: int) -> str:
     display.step_info(step_idx, "Classifying step...")
+
+    # Fast path: deterministic classification for test commands
+    if _TEST_CMD_RE.search(step_text):
+        display.step_tokens(step_idx, 0, 0)
+        return "TEST"
+
     prompt = (
         "Classify the following task step into exactly one category.\n"
         "Reply with ONLY one word: CMD, CODE, TEST, SEARCH, or IGNORE\n\n"
@@ -18,9 +38,10 @@ def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: in
         "           - checking project structure or dependencies\n"
         "           - installing packages (pip install, npm install)\n"
         "           - running scripts, builds, or any CLI tool\n"
-        "           - navigating or exploring a codebase\n\n"
+        "           - navigating or exploring a codebase\n"
+        "           (Do NOT use CMD for commands that run tests. Use TEST instead.)\n\n"
         "  CODE   = create or modify source code files (writing new code or editing existing files)\n\n"
-        "  TEST   = write or run unit/integration tests\n\n"
+        "  TEST   = write or run unit/integration tests (e.g. running pytest, jest, npm test)\n\n"
         "  SEARCH = search the web for documentation, API references, error solutions,\n"
         "           or latest framework / library information\n\n"
         "  IGNORE = not actionable by a program (e.g. open an IDE, review code visually,\n"
