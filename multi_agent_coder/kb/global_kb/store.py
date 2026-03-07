@@ -304,8 +304,11 @@ class GlobalKBStore:
 
         store = self._get_vector_store()
 
-        # Fetch enough results to fill all category buckets
-        total_top_k = sum(category_limits.values()) + 5  # small headroom
+        # Fetch enough results to fill all category buckets.
+        # Use a multiplier (not flat offset) so that chunk deduplication
+        # doesn't starve categories — a single doc may produce 2-4
+        # chunks, all consuming top_k slots before dedup discards them.
+        total_top_k = max(sum(category_limits.values()) * 3, 15)
         filters: Optional[dict] = {}
         if language:
             filters["language"] = language
@@ -413,9 +416,12 @@ class GlobalKBStore:
         if not filters:
             filters = None
 
+        # Overfetch to compensate for chunk dedup and multi-category
+        # post-filtering — a single doc may produce 2-4 chunks that
+        # all consume raw result slots before dedup discards them.
         raw_results = store.search(
             query_vector=query_vector,
-            top_k=top_k,
+            top_k=max(top_k * 3, 15),
             filters=filters,
         )
 
@@ -494,7 +500,15 @@ class GlobalKBStore:
         """
         from .seeder import _REGISTRY_DIR, _parse_frontmatter
 
-        query_words = set(query.lower().split())
+        import re as _re
+        # Strip punctuation so "React," → "react", "vite:" → "vite"
+        query_words = set(
+            w for w in (
+                _re.sub(r'[^\w]', '', tok)
+                for tok in query.lower().split()
+            )
+            if len(w) >= 2
+        )
         results: list[tuple[float, GlobalKBResult]] = []
 
         category_dirs = {
