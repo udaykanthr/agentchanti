@@ -3,6 +3,7 @@ Post-planning optimizer — pure Python (no LLM calls) step merging and pruning.
 
 Applied after the planner generates raw steps but before execution.
 Reduces token waste and execution time by:
+- Replacing LLM-generated commands with KB-known correct commands
 - Merging install commands into single steps
 - Combining same-file CODE steps
 - Skipping already-installed packages
@@ -12,6 +13,7 @@ Reduces token waste and execution time by:
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 _logger = logging.getLogger(__name__)
@@ -80,6 +82,7 @@ _MIN_REAL_STEP_LENGTH = 30
 def optimize_plan(
     steps: list[str],
     knowledge_base=None,
+    kb_context_builder=None,
 ) -> tuple[list[str], dict[int, set[int]]]:
     """Optimize a raw plan by merging, deduplicating, and pruning steps.
 
@@ -93,6 +96,13 @@ def optimize_plan(
 
     # Parse existing dependencies before optimization
     clean_steps, deps = _parse_dependencies(steps)
+
+    # Pass 0: Replace LLM-generated commands with KB-known correct commands.
+    # This is the KB-first pass — if the KB has exact commands for a step
+    # (e.g. install commands, config setup), use those INSTEAD of what the
+    # LLM generated.  The LLM's training data is often outdated; KB docs
+    # are curated and current.
+    clean_steps = _apply_kb_command_overrides(clean_steps, kb_context_builder)
 
     # Pass 1: Remove meta/no-op steps
     clean_steps, deps = _remove_noop_steps(clean_steps, deps)
@@ -118,6 +128,207 @@ def optimize_plan(
         )
 
     return clean_steps, deps
+
+
+# ── KB command extraction helpers ─────────────────────────────────
+
+# Patterns to extract bash commands from KB markdown docs
+_KB_BASH_BLOCK_RE = re.compile(
+    r'```(?:bash|sh|shell)\s*\n(.+?)```',
+    re.DOTALL,
+)
+
+# Keywords that indicate a step is about installing / setting up
+_SETUP_KEYWORDS = re.compile(
+    r'\b(install|setup|set\s*up|create|init|scaffold|bootstrap|configure)\b',
+    re.IGNORECASE,
+)
+
+# Keywords to match KB docs against plan steps
+_TECH_KEYWORDS = re.compile(
+    r'\b(vite|vitest|jest|react|angular|vue|next|nuxt|django|flask|fastapi|'
+    r'express|tailwind|pytest|mocha|webpack|rollup|svelte|solid|astro|'
+    r'spring|rails|laravel|gin|echo|fiber)\b',
+    re.IGNORECASE,
+)
+
+
+def _extract_commands_from_kb_doc(content: str) -> list[str]:
+    """Extract bash commands from a KB doc's code blocks.
+
+    Returns a list of individual commands (one per line), stripping
+    comments and empty lines.
+    """
+    commands: list[str] = []
+    for match in _KB_BASH_BLOCK_RE.finditer(content):
+        block = match.group(1)
+        for line in block.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                commands.append(line)
+    return commands
+
+
+def _find_kb_commands_for_step(step_text: str, kb_context_builder) -> list[str]:
+    """Search KB docs for commands relevant to a plan step.
+
+    Returns a list of bash commands that the KB prescribes for this
+    kind of step, or empty list if no KB match.
+    """
+    if kb_context_builder is None:
+        return []
+
+    try:
+        kb_context_builder._ensure_global()
+        if kb_context_builder._global_store is None:
+            return []
+
+        results = kb_context_builder._global_store.search(
+            query=step_text,
+            categories=["doc"],
+            top_k=2,
+            api_client=kb_context_builder._api_client,
+        )
+        if not results:
+            return []
+
+        # Only use results that share tech keywords with the step
+        step_techs = set(w.lower() for w in _TECH_KEYWORDS.findall(step_text))
+        if not step_techs:
+            return []
+
+        commands: list[str] = []
+        for result in results:
+            doc_content = result.content or ""
+            doc_title = (result.title or "").lower()
+            doc_tags = " ".join(result.tags) if result.tags else ""
+
+            # Check if this doc is relevant to the step's tech stack
+            doc_techs = set(w.lower() for w in _TECH_KEYWORDS.findall(
+                doc_title + " " + doc_tags + " " + doc_content[:200]))
+            overlap = step_techs & doc_techs
+            if not overlap:
+                continue
+
+            doc_cmds = _extract_commands_from_kb_doc(doc_content)
+            if doc_cmds:
+                _logger.info(
+                    f"[PlanOptimizer] KB doc '{result.title}' matched step "
+                    f"(overlap: {overlap}), found {len(doc_cmds)} commands"
+                )
+                commands.extend(doc_cmds)
+
+        return commands
+
+    except Exception as exc:
+        _logger.debug(f"[PlanOptimizer] KB command lookup failed: {exc}")
+        return []
+
+
+def _is_shell_command(text: str) -> bool:
+    """Check if backtick content is a shell command (not a file path or name)."""
+    first_word = text.split()[0].lower() if text.split() else ""
+    # Strip leading path components (e.g. ./node_modules/.bin/vitest → vitest)
+    first_word = first_word.rsplit("/", 1)[-1]
+    shell_prefixes = {
+        "pip", "pip3", "npm", "npx", "yarn", "pnpm", "node", "python",
+        "python3", "go", "cargo", "gem", "mkdir", "cd", "echo", "cat",
+        "rm", "cp", "mv", "chmod", "curl", "wget", "git", "ng", "nx",
+        "bunx", "bun", "deno", "docker", "apt", "brew", "choco",
+    }
+    return first_word in shell_prefixes
+
+
+# Command operation type classification for precise matching
+_CMD_OP_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("install",   re.compile(r'\b(npm\s+install|npm\s+i\b|pip\s+install|yarn\s+add|pnpm\s+add|gem\s+install|cargo\s+add|go\s+get)\b', re.I)),
+    ("create",    re.compile(r'\b(npm\s+create|npx\s+create|yarn\s+create|npm\s+init)\b', re.I)),
+    ("pkg_set",   re.compile(r'\b(npm\s+pkg\s+set)\b', re.I)),
+    ("run",       re.compile(r'\b(npm\s+run|yarn\s+run|npx\s+|bunx\s+)\b', re.I)),
+    ("config",    re.compile(r'\b(npm\s+pkg|ng\s+add|ng\s+generate)\b', re.I)),
+]
+
+
+def _classify_cmd_operation(cmd: str) -> str | None:
+    """Classify a shell command into an operation type."""
+    for op_type, pattern in _CMD_OP_PATTERNS:
+        if pattern.search(cmd):
+            return op_type
+    return None
+
+
+def _apply_kb_command_overrides(
+    steps: list[str], kb_context_builder
+) -> list[str]:
+    """Replace LLM-generated commands with KB-known correct commands.
+
+    For each CMD-like step (install, setup, configure), searches the KB
+    for matching documentation.  If the KB has concrete bash commands for
+    the same operation, the LLM's command is REPLACED with the KB command.
+
+    Only replaces actual shell commands (not file paths or folder names),
+    and only when the KB command matches the same operation type
+    (install→install, create→create, etc.).
+    """
+    if kb_context_builder is None:
+        return steps
+
+    result = list(steps)
+    for i, step in enumerate(steps):
+        # Only override CMD-like steps (installs, setup, config)
+        if not _SETUP_KEYWORDS.search(step):
+            continue
+
+        # Must mention a specific technology
+        if not _TECH_KEYWORDS.search(step):
+            continue
+
+        # Find all backtick segments that are actual shell commands
+        llm_cmd_match = None
+        for m in re.finditer(r'`([^`]+)`', step):
+            candidate = m.group(1)
+            if _is_shell_command(candidate):
+                llm_cmd_match = m
+                break  # use the first shell command found
+
+        if not llm_cmd_match:
+            continue
+
+        llm_cmd = llm_cmd_match.group(1)
+        llm_op = _classify_cmd_operation(llm_cmd)
+
+        # Search KB for the correct command
+        kb_commands = _find_kb_commands_for_step(step, kb_context_builder)
+        if not kb_commands:
+            continue
+
+        # Find the best matching KB command by operation type.
+        # Only replace when the operation types match exactly.
+        best_kb_cmd = None
+        if llm_op is not None:
+            for kb_cmd in kb_commands:
+                kb_op = _classify_cmd_operation(kb_cmd)
+                if kb_op == llm_op:
+                    best_kb_cmd = kb_cmd
+                    break
+
+        # No match — do NOT fallback to an unrelated command
+        if not best_kb_cmd:
+            continue
+
+        # Only replace if the commands are actually different
+        if best_kb_cmd.strip() == llm_cmd.strip():
+            continue
+
+        # Replace the command in the step text
+        new_step = step.replace(f'`{llm_cmd}`', f'`{best_kb_cmd}`')
+        result[i] = new_step
+        _logger.info(
+            f"[PlanOptimizer] KB override step {i+1}: "
+            f"`{llm_cmd}` → `{best_kb_cmd}`"
+        )
+
+    return result
 
 
 # ── Internal passes ──────────────────────────────────────────────

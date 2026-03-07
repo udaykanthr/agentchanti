@@ -295,7 +295,8 @@ def _run_task_impl(
 
     # Post-plan optimization
     from .orchestrator.plan_optimizer import optimize_plan
-    steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base)
+    steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
+                                        kb_context_builder=kb_context_builder)
 
     # ── Project analysis phase ──────────────────────────────────
     # Build structured ProjectContext from static analysis (zero LLM cost).

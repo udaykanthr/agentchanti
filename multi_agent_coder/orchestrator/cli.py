@@ -467,7 +467,8 @@ def main():
 
         # ── 10b. Post-plan optimization ──
         pre_opt_count = len(steps)
-        steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base)
+        steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
+                                            kb_context_builder=kb_context_builder)
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
 
@@ -491,7 +492,8 @@ def main():
                     print("\n  [ERROR] Could not parse re-plan steps.\n")
                     return
                 steps, dependencies = executor.parse_step_dependencies(raw_steps)
-                steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base)
+                steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
+                                            kb_context_builder=kb_context_builder)
             elif action == "edit" and edited_steps:
                 steps = edited_steps
                 _, dependencies = executor.parse_step_dependencies(steps)

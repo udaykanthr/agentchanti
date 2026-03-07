@@ -956,12 +956,12 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         import re as _re_sp
         # Commands that should run inside the sub-project directory
         _subproject_cmd_patterns = (
-            r'\bnpm\s+(install|start|run|test|build|ci)\b',
+            r'\bnpm\s+(install|start|run|test|build|ci|pkg|exec|init)\b',
             r'\bnpx\s+',
             r'\byarn\s+(install|add|start|dev|build|test)\b',
             r'\bpnpm\s+(install|add|start|dev|build|test)\b',
             r'\bnode\s+',
-            r'\bng\s+(serve|build|test)\b',
+            r'\bng\s+(serve|build|test|generate|add)\b',
         )
         needs_subproject = any(
             _re_sp.search(p, cmd, _re_sp.IGNORECASE)
