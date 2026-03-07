@@ -577,6 +577,11 @@ class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+        # Clean up any files copied into the real registry by _apply_update
+        from multi_agent_coder.kb.global_kb.updater import _REGISTRY_DIR
+        test_file = os.path.join(_REGISTRY_DIR, "docs", "test-guide.md")
+        if os.path.isfile(test_file):
+            os.remove(test_file)
 
     def test_apply_update_returns_md_files(self):
         """_apply_update returns (count, md_files) with correct metadata."""

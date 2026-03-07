@@ -138,6 +138,15 @@ _KB_BASH_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# Negation/deprecation text that precedes a code block — commands in such
+# blocks should be EXCLUDED because they show what NOT to do.
+_KB_NEGATION_RE = re.compile(
+    r'(?:do\s*n[\'o]t|don\'t|avoid|deprecated|removed|no\s+longer|'
+    r'instead\s+of|not\s+needed|not\s+required|obsolete|legacy|'
+    r'wrong|incorrect|old\s+way|v3\b)',
+    re.IGNORECASE,
+)
+
 # Keywords that indicate a step is about installing / setting up
 _SETUP_KEYWORDS = re.compile(
     r'\b(install|setup|set\s*up|create|init|scaffold|bootstrap|configure)\b',
@@ -157,10 +166,22 @@ def _extract_commands_from_kb_doc(content: str) -> list[str]:
     """Extract bash commands from a KB doc's code blocks.
 
     Returns a list of individual commands (one per line), stripping
-    comments and empty lines.
+    comments and empty lines.  Code blocks preceded by negation or
+    deprecation text (e.g. "Do NOT use", "Deprecated", "Old way") are
+    skipped so that deprecated commands are never used as overrides.
     """
     commands: list[str] = []
     for match in _KB_BASH_BLOCK_RE.finditer(content):
+        # Check the 200 chars before this code block for negation context
+        pre_start = max(0, match.start() - 200)
+        preceding_text = content[pre_start:match.start()]
+        if _KB_NEGATION_RE.search(preceding_text):
+            _logger.debug(
+                "[PlanOptimizer] Skipping negated code block: %s",
+                match.group(1)[:60].replace("\n", " "),
+            )
+            continue
+
         block = match.group(1)
         for line in block.splitlines():
             line = line.strip()
@@ -257,6 +278,37 @@ def _classify_cmd_operation(cmd: str) -> str | None:
     return None
 
 
+def _is_deprecated_command(cmd: str, kb_context_builder) -> bool:
+    """Check if a command matches a deprecated error pattern in the KB.
+
+    Uses the global error dict to catch commands like ``tailwindcss init``
+    that have a corresponding ``TailwindCSSDeprecatedInit`` error entry.
+    Only considers a match valid if the error pattern actually matches
+    the command text (not just keyword overlap).
+    """
+    try:
+        if (
+            kb_context_builder is not None
+            and kb_context_builder._global_store is not None
+        ):
+            fixes = kb_context_builder._global_store.search_errors(cmd)
+            for fix in fixes:
+                etype = (fix.error_type or "").lower()
+                if "deprecated" not in etype and "obsolete" not in etype:
+                    continue
+                # Verify the error pattern actually matches the command
+                if fix.pattern:
+                    import re as _re
+                    try:
+                        if _re.search(fix.pattern, cmd):
+                            return True
+                    except _re.error:
+                        pass
+    except Exception:
+        pass
+    return False
+
+
 def _apply_kb_command_overrides(
     steps: list[str], kb_context_builder
 ) -> list[str]:
@@ -304,11 +356,19 @@ def _apply_kb_command_overrides(
 
         # Find the best matching KB command by operation type.
         # Only replace when the operation types match exactly.
+        # Also skip commands flagged as deprecated in the error dict.
         best_kb_cmd = None
         if llm_op is not None:
             for kb_cmd in kb_commands:
                 kb_op = _classify_cmd_operation(kb_cmd)
                 if kb_op == llm_op:
+                    # Check if this command is deprecated per error dict
+                    if _is_deprecated_command(kb_cmd, kb_context_builder):
+                        _logger.info(
+                            f"[PlanOptimizer] Skipping deprecated KB cmd: "
+                            f"`{kb_cmd}`"
+                        )
+                        continue
                     best_kb_cmd = kb_cmd
                     break
 
