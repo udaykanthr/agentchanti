@@ -540,7 +540,12 @@ class TestUpdaterClean(unittest.TestCase):
         summary = clean()
         self.assertGreater(summary["files_removed"], 0)
         self.assertGreater(summary["dbs_removed"], 0)
-        self.assertFalse(os.path.isdir(_REGISTRY_DIR))
+        # Registry dir may still exist (with .gitignore), but no .md files
+        md_count = 0
+        if os.path.isdir(_REGISTRY_DIR):
+            for _, _, fnames in os.walk(_REGISTRY_DIR):
+                md_count += sum(1 for f in fnames if f.endswith(".md"))
+        self.assertEqual(md_count, 0)
         self.assertFalse(os.path.isfile(os.path.join(_CORE_DIR, "errors.db")))
 
     def test_clean_idempotent(self):

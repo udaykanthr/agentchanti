@@ -139,17 +139,25 @@ def clean() -> dict:
     """
     summary = {"files_removed": 0, "dbs_removed": 0}
 
-    # Remove registry markdown files
+    # Remove registry markdown files (preserve .gitignore)
     if os.path.isdir(_REGISTRY_DIR):
         for dirpath, _, filenames in os.walk(_REGISTRY_DIR):
             for fname in filenames:
+                if fname == ".gitignore":
+                    continue
                 try:
                     os.remove(os.path.join(dirpath, fname))
                     summary["files_removed"] += 1
                 except OSError as exc:
                     logger.warning("Failed to remove %s: %s", fname, exc)
-        # Remove empty subdirectories
-        shutil.rmtree(_REGISTRY_DIR, ignore_errors=True)
+        # Remove empty subdirectories but keep registry/ itself
+        for dirpath, dirnames, filenames in os.walk(_REGISTRY_DIR, topdown=False):
+            if dirpath == _REGISTRY_DIR:
+                continue
+            try:
+                os.rmdir(dirpath)  # only removes if empty
+            except OSError:
+                pass
 
     # Remove SQLite databases and manifest
     for db_name in ("errors.db", "global_kb.db", "manifest.json"):
