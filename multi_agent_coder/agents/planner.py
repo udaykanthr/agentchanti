@@ -237,12 +237,36 @@ class PlannerAgent(Agent):
                     docs = kb_context_builder._global_store.search(
                         query=task,
                         categories=["doc", "pattern"],
-                        top_k=3,
+                        top_k=5,
                         api_client=kb_context_builder._api_client,
                     )
                     if docs:
+                        # Filter out docs about conflicting frameworks
+                        # (e.g. Angular docs for a React task)
+                        from ..orchestrator.plan_optimizer import (
+                            _TECH_KEYWORDS as _TK,
+                            has_framework_conflict,
+                        )
+                        task_techs = set(
+                            w.lower() for w in _TK.findall(task)
+                        )
                         doc_hints: list[str] = []
                         for doc in docs:
+                            if task_techs:
+                                doc_text = (
+                                    (doc.title or "") + " "
+                                    + " ".join(doc.tags or [])
+                                )
+                                doc_techs = set(
+                                    w.lower() for w in _TK.findall(doc_text)
+                                )
+                                if has_framework_conflict(task_techs, doc_techs):
+                                    _logger.debug(
+                                        "[PreAnalysis] Skipping '%s' — "
+                                        "framework conflict",
+                                        doc.title,
+                                    )
+                                    continue
                             content = doc.content or doc.title
                             if content:
                                 doc_hints.append(f"### {doc.title}\n{content}")

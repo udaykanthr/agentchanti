@@ -1447,17 +1447,55 @@ def _embed_md_files(
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
-    """Parse YAML frontmatter from markdown text."""
+    """Parse YAML frontmatter from markdown text.
+
+    Handles both inline values (``tags: "a, b, c"``) and YAML list
+    format::
+
+        tags:
+          - a
+          - b
+          - c
+
+    List items are joined with ``", "`` so downstream code can treat
+    them identically to inline comma-separated values.
+    """
     if not text.startswith("---"):
         return {}
     parts = text.split("---", 2)
     if len(parts) < 3:
         return {}
     meta: dict[str, str] = {}
+    current_key: str | None = None
+    list_items: list[str] = []
+
     for line in parts[1].strip().split("\n"):
+        stripped = line.strip()
+        # YAML list item (e.g. "  - tailwindcss")
+        if stripped.startswith("- ") and current_key is not None:
+            list_items.append(stripped[2:].strip().strip('"').strip("'"))
+            continue
+        # Flush any accumulated list items into the previous key
+        if list_items and current_key is not None:
+            meta[current_key] = ", ".join(list_items)
+            list_items = []
+            current_key = None
+        # Regular key: value line
         if ":" in line:
             key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip().strip('"').strip("'")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if val:
+                meta[key] = val
+                current_key = None
+            else:
+                # Value is empty — next lines might be YAML list items
+                current_key = key
+                meta[key] = ""
+    # Flush trailing list items
+    if list_items and current_key is not None:
+        meta[current_key] = ", ".join(list_items)
+
     return meta
 
 

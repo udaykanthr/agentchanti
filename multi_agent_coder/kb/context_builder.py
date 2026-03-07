@@ -299,7 +299,7 @@ class ContextBuilder:
             try:
                 # Build category limits based on intent
                 category_limits: dict[str, int] = {
-                    "doc": 2,
+                    "doc": 4,
                     "behavioral": 3,
                 }
                 if is_review:

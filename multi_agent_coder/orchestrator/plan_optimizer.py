@@ -161,6 +161,28 @@ _TECH_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Mutually exclusive framework groups — if a step/task mentions one
+# framework from a group, KB docs about a DIFFERENT framework in the
+# same group are irrelevant (e.g. React task should not use Angular docs).
+_EXCLUSIVE_FRAMEWORK_GROUPS: list[set[str]] = [
+    {"react", "angular", "vue", "svelte", "solid"},
+]
+
+
+def has_framework_conflict(context_techs: set[str], doc_techs: set[str]) -> bool:
+    """Return True if the doc targets a different exclusive framework.
+
+    Both *context_techs* and *doc_techs* should be lowercase tech keyword
+    sets extracted via ``_TECH_KEYWORDS``.
+    """
+    for group in _EXCLUSIVE_FRAMEWORK_GROUPS:
+        ctx_in = context_techs & group
+        doc_in = doc_techs & group
+        # Both mention frameworks from the same group, but different ones
+        if ctx_in and doc_in and not (ctx_in & doc_in):
+            return True
+    return False
+
 
 def _extract_commands_from_kb_doc(content: str) -> list[str]:
     """Extract bash commands from a KB doc's code blocks.
@@ -229,6 +251,16 @@ def _find_kb_commands_for_step(step_text: str, kb_context_builder) -> list[str]:
                 doc_title + " " + doc_tags + " " + doc_content[:200]))
             overlap = step_techs & doc_techs
             if not overlap:
+                continue
+
+            # Skip docs about a conflicting framework (e.g. Angular
+            # doc for a React step)
+            if has_framework_conflict(step_techs, doc_techs):
+                _logger.debug(
+                    f"[PlanOptimizer] Skipping '{result.title}' — "
+                    f"framework conflict (step={step_techs & doc_techs}, "
+                    f"doc has {doc_techs})"
+                )
                 continue
 
             doc_cmds = _extract_commands_from_kb_doc(doc_content)
