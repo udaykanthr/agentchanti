@@ -107,6 +107,53 @@ class TestExtractCommandsFromKBDoc(unittest.TestCase):
         self.assertEqual(cmds, ["npm install tailwindcss"])
 
 
+    def test_negation_separated_by_heading_keeps_block(self):
+        """Negation in a DIFFERENT section (separated by ##) should not
+        suppress the code block in the NEXT section.
+
+        Reproduces the real-world bug where:
+          *** Do not create TS files ***
+          ## 1. Required Packages
+          ```bash
+          npm install -D vitest jsdom
+          ```
+        incorrectly skipped the install command.
+        """
+        from multi_agent_coder.orchestrator.plan_optimizer import (
+            _extract_commands_from_kb_doc,
+        )
+
+        content = (
+            "*** Do not create TS or TSX files if JS or JSX already exists ***\n\n"
+            "## 1. Required Packages\n\n"
+            "Install the following development dependencies:\n\n"
+            "```bash\n"
+            "npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom\n"
+            "```\n"
+        )
+        cmds = _extract_commands_from_kb_doc(content)
+        self.assertEqual(
+            cmds,
+            ["npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom"],
+        )
+
+    def test_negation_same_section_still_skips(self):
+        """Negation in the SAME section (no heading between) should still skip."""
+        from multi_agent_coder.orchestrator.plan_optimizer import (
+            _extract_commands_from_kb_doc,
+        )
+
+        content = (
+            "## Deprecated Commands\n\n"
+            "Do NOT use the old init command:\n"
+            "```bash\n"
+            "npx tailwindcss init -p\n"
+            "```\n"
+        )
+        cmds = _extract_commands_from_kb_doc(content)
+        self.assertEqual(cmds, [])
+
+
 class TestIsDeprecatedCommand(unittest.TestCase):
     """Tests for _is_deprecated_command error dict check."""
 

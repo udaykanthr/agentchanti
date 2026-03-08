@@ -206,12 +206,25 @@ def _extract_commands_from_kb_doc(content: str) -> list[str]:
         # Check the 200 chars before this code block for negation context
         pre_start = max(0, match.start() - 200)
         preceding_text = content[pre_start:match.start()]
-        if _KB_NEGATION_RE.search(preceding_text):
-            _logger.debug(
-                "[PlanOptimizer] Skipping negated code block: %s",
-                match.group(1)[:60].replace("\n", " "),
-            )
-            continue
+        neg_match = _KB_NEGATION_RE.search(preceding_text)
+        if neg_match:
+            # If a section heading (## ...) appears BETWEEN the negation
+            # text and this code block, the negation belongs to a previous
+            # section and should NOT suppress this block.
+            # e.g. "Do not create TS files...\n## Required Packages\n```bash"
+            text_after_neg = preceding_text[neg_match.end():]
+            if re.search(r'^#{1,4}\s', text_after_neg, re.MULTILINE):
+                _logger.debug(
+                    "[PlanOptimizer] Negation separated by heading, "
+                    "keeping code block: %s",
+                    match.group(1)[:60].replace("\n", " "),
+                )
+            else:
+                _logger.debug(
+                    "[PlanOptimizer] Skipping negated code block: %s",
+                    match.group(1)[:60].replace("\n", " "),
+                )
+                continue
 
         block = match.group(1)
         for line in block.splitlines():

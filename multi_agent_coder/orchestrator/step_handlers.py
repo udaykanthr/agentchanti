@@ -42,6 +42,16 @@ _RUNNER_INSTALL = {
 }
 
 
+_DEV_ONLY_PACKAGES = re.compile(
+    r'^(@types/|eslint|prettier|@eslint|stylelint|'
+    r'jest|vitest|mocha|chai|sinon|nyc|c8|cypress|playwright|'
+    r'@testing-library/|@jest/|ts-jest|babel-jest|'
+    r'webpack-dev-server|@vitejs/plugin-|vite$|'
+    r'typescript$|ts-node|tsx$|nodemon|concurrently)',
+    re.IGNORECASE,
+)
+
+
 def _ensure_packages_installed(
     project_context,
     executor: Executor,
@@ -51,21 +61,24 @@ def _ensure_packages_installed(
     subproject_cwd: str | None = None,
     language: str | None = None,
 ) -> None:
-    """Proactively install missing packages before test/server commands.
+    """Proactively install missing packages before code/test/server steps.
 
     Reads the project manifest (``package.json`` or ``requirements.txt``)
     from the **subproject root** to determine what is currently installed,
     then compares against ``project_context.required_packages`` and runs
-    a single bulk install for anything missing.
+    bulk installs for anything missing.
 
     Designed to be called just-in-time — i.e. after the project scaffold
-    has been created by earlier CMD steps but before the first test suite
-    or dev server command runs.
+    has been created by earlier CMD steps but before the first CODE, TEST,
+    or dev-server step runs.
 
     Key behaviours:
     - **One-time**: sets ``memory._packages_preinstalled`` to skip re-runs.
     - **Non-fatal**: failures are logged as warnings, never halt the pipeline.
     - **Subproject-aware**: installs inside the correct ``cwd``.
+    - **npm**: splits into ``npm install`` (production) and
+      ``npm install --save-dev`` (dev-only) so packages land in the
+      correct section of ``package.json``.
     """
     # Already ran for this pipeline execution
     if getattr(memory, '_packages_preinstalled', False):
@@ -124,19 +137,40 @@ def _ensure_packages_installed(
         memory._packages_preinstalled = True
         return
 
-    # Bulk install
-    # For npm: use --save-dev since these are typically dev dependencies
-    if "npm" in install_tool:
-        cmd = f"npm install --save-dev {' '.join(missing)}"
-    else:
-        cmd = f"{install_tool} {' '.join(missing)}"
-
     log.info(f"[Pre-install] Installing {len(missing)} missing package(s): "
              f"{', '.join(missing)}")
     display.step_info(step_idx,
                       f"Pre-installing {len(missing)} missing package(s)...")
 
-    ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+    # For npm: split into production deps and dev-only deps so they land
+    # in the correct section of package.json.
+    if "npm" in install_tool:
+        prod_pkgs = [p for p in missing if not _DEV_ONLY_PACKAGES.match(p)]
+        dev_pkgs = [p for p in missing if _DEV_ONLY_PACKAGES.match(p)]
+
+        all_ok = True
+        combined_output = ""
+
+        if prod_pkgs:
+            cmd = f"npm install {' '.join(prod_pkgs)}"
+            log.info(f"[Pre-install] Production: {cmd}")
+            ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+            all_ok &= ok
+            combined_output += output + "\n"
+
+        if dev_pkgs:
+            cmd = f"npm install --save-dev {' '.join(dev_pkgs)}"
+            log.info(f"[Pre-install] Dev: {cmd}")
+            ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+            all_ok &= ok
+            combined_output += output + "\n"
+
+        ok = all_ok
+        output = combined_output
+    else:
+        cmd = f"{install_tool} {' '.join(missing)}"
+        ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+
     if ok:
         log.info(f"[Pre-install] Successfully installed: {', '.join(missing)}")
         display.step_info(step_idx, f"Pre-installed {len(missing)} package(s)")
@@ -1276,6 +1310,288 @@ def _quick_offline_lint(files: dict[str, str]) -> str:
     return ""
 
 
+# ── Relative-import path resolution extensions ────────────────────
+# For JS/TS files, import './Foo' can resolve to Foo.js, Foo.jsx,
+# Foo.ts, Foo.tsx, Foo/index.js, Foo/index.jsx, etc.
+_JS_IMPORT_EXTENSIONS = (
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '/index.js', '/index.jsx', '/index.ts', '/index.tsx',
+)
+
+# Matches: import ... from '...', import '...', export ... from '...'
+_JS_IMPORT_RE = re.compile(
+    r'''(?:import|export)\s+.*?from\s+['"](\.\.?/[^'"]+)['"]'''
+    r'''|import\s+['"](\.\.?/[^'"]+)['"]''',
+)
+
+# Python relative imports: from .foo import bar, from ..pkg import baz
+_PY_IMPORT_RE = re.compile(
+    r'^from\s+(\.+\w[\w.]*)\s+import\b',
+    re.MULTILINE,
+)
+
+
+def _validate_import_paths(
+    files: dict[str, str],
+    memory: "FileMemory",
+) -> str:
+    """Check that relative imports in generated files resolve to known files.
+
+    Validates JS/TS/JSX/TSX and Python files.  Returns an error string
+    describing broken imports, or empty string if all imports resolve.
+    """
+    # Build a set of all known file paths (memory + newly generated)
+    all_paths: set[str] = set(memory.all_files().keys()) | set(files.keys())
+    # Normalise to forward slashes for matching
+    all_paths_norm: set[str] = {p.replace("\\", "/") for p in all_paths}
+
+    errors: list[str] = []
+
+    for filepath, content in files.items():
+        ext = os.path.splitext(filepath)[1].lower()
+        dir_of_file = os.path.dirname(filepath).replace("\\", "/")
+
+        if ext in ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'):
+            for m in _JS_IMPORT_RE.finditer(content):
+                import_path = m.group(1) or m.group(2)
+                if not import_path:
+                    continue
+
+                resolved = os.path.normpath(
+                    os.path.join(dir_of_file, import_path)
+                ).replace("\\", "/")
+
+                # Check if it resolves directly (with extension already)
+                if resolved in all_paths_norm:
+                    continue
+
+                # Try appending standard extensions
+                found = False
+                for try_ext in _JS_IMPORT_EXTENSIONS:
+                    if (resolved + try_ext) in all_paths_norm:
+                        found = True
+                        break
+                if found:
+                    continue
+
+                # Try to find the correct path by basename
+                basename = os.path.basename(resolved)
+                suggestions = [
+                    p for p in all_paths_norm
+                    if os.path.basename(p).startswith(basename + '.')
+                    or os.path.basename(p) == basename
+                    or p.endswith('/' + basename + '.jsx')
+                    or p.endswith('/' + basename + '.js')
+                    or p.endswith('/' + basename + '.tsx')
+                    or p.endswith('/' + basename + '.ts')
+                ]
+                if suggestions:
+                    # Calculate what the correct import should be
+                    best = suggestions[0]
+                    correct_rel = os.path.relpath(
+                        best, dir_of_file
+                    ).replace("\\", "/")
+                    # Strip extension for JS imports
+                    correct_rel_no_ext = re.sub(
+                        r'\.(jsx?|tsx?|mjs|cjs)$', '', correct_rel
+                    )
+                    if not correct_rel_no_ext.startswith('.'):
+                        correct_rel_no_ext = './' + correct_rel_no_ext
+                    errors.append(
+                        f"{filepath}: import '{import_path}' not found. "
+                        f"Did you mean '{correct_rel_no_ext}'? "
+                        f"(actual file: {best})"
+                    )
+                else:
+                    errors.append(
+                        f"{filepath}: import '{import_path}' does not "
+                        f"resolve to any known file."
+                    )
+
+        elif ext == '.py':
+            for m in _PY_IMPORT_RE.finditer(content):
+                rel_import = m.group(1)
+                # Count leading dots
+                dots = len(rel_import) - len(rel_import.lstrip('.'))
+                module_path = rel_import[dots:]
+                if not module_path:
+                    continue
+
+                # Walk up `dots` directories
+                base = dir_of_file
+                for _ in range(dots - 1):
+                    base = os.path.dirname(base)
+
+                py_path = os.path.join(
+                    base, module_path.replace('.', '/')
+                ).replace("\\", "/")
+
+                # Check module.py or module/__init__.py
+                if (py_path + '.py') in all_paths_norm:
+                    continue
+                if (py_path + '/__init__.py') in all_paths_norm:
+                    continue
+
+                errors.append(
+                    f"{filepath}: relative import '{rel_import}' does not "
+                    f"resolve to any known file."
+                )
+
+    if errors:
+        return "IMPORT ERRORS FOUND:\n" + "\n".join(errors) + "\n\n"
+    return ""
+
+
+# ── Package import detection and auto-install ─────────────────────
+
+# Matches ALL JS/TS imports (package AND relative):
+#   import X from 'pkg'  |  import 'pkg'  |  export { X } from 'pkg'
+#   Also handles dynamic: await import('pkg')
+_JS_ALL_IMPORT_RE = re.compile(
+    r'''(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]'''
+    r'''|import\s+['"]([^'"]+)['"]'''
+    r'''|import\(\s*['"]([^'"]+)['"]\s*\)''',
+)
+
+# Node built-in modules — never need npm install
+_NODE_BUILTINS = frozenset({
+    'assert', 'async_hooks', 'buffer', 'child_process', 'cluster',
+    'console', 'constants', 'crypto', 'dgram', 'diagnostics_channel',
+    'dns', 'domain', 'events', 'fs', 'http', 'http2', 'https',
+    'inspector', 'module', 'net', 'os', 'path', 'perf_hooks',
+    'process', 'punycode', 'querystring', 'readline', 'repl',
+    'stream', 'string_decoder', 'sys', 'timers', 'tls', 'trace_events',
+    'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib',
+    # node: protocol prefixed versions are caught by startswith check
+})
+
+
+def _extract_npm_package_name(specifier: str) -> str | None:
+    """Extract the npm package name from an import specifier.
+
+    Examples:
+        'react'                       → 'react'
+        'react-router-dom'            → 'react-router-dom'
+        '@heroicons/react/outline'    → '@heroicons/react'
+        '@testing-library/react'      → '@testing-library/react'
+        './App'                       → None  (relative)
+        'fs'                          → None  (built-in)
+        'node:path'                   → None  (built-in)
+    """
+    if not specifier:
+        return None
+
+    # Skip relative imports
+    if specifier.startswith('.') or specifier.startswith('/'):
+        return None
+
+    # Skip node: protocol
+    if specifier.startswith('node:'):
+        return None
+
+    # Scoped packages: @scope/package/subpath → @scope/package
+    if specifier.startswith('@'):
+        parts = specifier.split('/')
+        if len(parts) >= 2:
+            pkg_name = parts[0] + '/' + parts[1]
+        else:
+            return None  # malformed
+    else:
+        # Regular packages: package/subpath → package
+        pkg_name = specifier.split('/')[0]
+
+    # Skip Node built-ins
+    if pkg_name in _NODE_BUILTINS:
+        return None
+
+    return pkg_name
+
+
+def _auto_install_code_imports(
+    files: dict[str, str],
+    executor: Executor,
+    memory: "FileMemory",
+    display: CLIDisplay,
+    step_idx: int,
+) -> None:
+    """Scan generated JS/TS files for package imports and auto-install missing ones.
+
+    After the coder generates code, it may import packages that weren't
+    listed in ``required_packages`` (e.g. ``@heroicons/react``).  This
+    function detects those imports, checks ``package.json``, and runs
+    ``npm install`` for anything missing.
+    """
+    # Only process JS/TS files
+    js_exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+    imported_packages: set[str] = set()
+
+    for filepath, content in files.items():
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in js_exts:
+            continue
+
+        for m in _JS_ALL_IMPORT_RE.finditer(content):
+            specifier = m.group(1) or m.group(2) or m.group(3)
+            pkg = _extract_npm_package_name(specifier)
+            if pkg:
+                imported_packages.add(pkg)
+
+    if not imported_packages:
+        return
+
+    # Also scan existing memory files — packages already imported before
+    # this step have presumably been installed already, so don't re-install
+    for filepath, content in memory.all_files().items():
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in js_exts:
+            continue
+        for m in _JS_ALL_IMPORT_RE.finditer(content):
+            specifier = m.group(1) or m.group(2) or m.group(3)
+            pkg = _extract_npm_package_name(specifier)
+            if pkg:
+                imported_packages.add(pkg)
+
+    # Read package.json to see what's already installed
+    subproject_cwd = _detect_subproject_root(memory)
+    root = subproject_cwd or "."
+    pkg_json_path = os.path.join(root, "package.json")
+
+    installed: set[str] = set()
+    if os.path.isfile(pkg_json_path):
+        try:
+            with open(pkg_json_path, "r", encoding="utf-8") as f:
+                pkg_data = json.loads(f.read())
+            installed.update(pkg_data.get("dependencies", {}).keys())
+            installed.update(pkg_data.get("devDependencies", {}).keys())
+            installed.update(pkg_data.get("peerDependencies", {}).keys())
+        except Exception:
+            pass
+    else:
+        # No package.json — can't determine what's installed
+        return
+
+    missing = sorted(imported_packages - installed)
+    if not missing:
+        return
+
+    cmd = f"npm install {' '.join(missing)}"
+    cwd_note = f" (in {subproject_cwd}/)" if subproject_cwd else ""
+    display.step_info(step_idx,
+                      f"Auto-installing {len(missing)} imported package(s){cwd_note}")
+    log.info(f"Step {step_idx+1}: Auto-installing packages from code imports: "
+             f"{', '.join(missing)}")
+
+    ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+    if ok:
+        log.info(f"Step {step_idx+1}: Auto-install succeeded: {', '.join(missing)}")
+        display.step_info(step_idx,
+                          f"Auto-installed {len(missing)} package(s): "
+                          f"{', '.join(missing)}")
+    else:
+        log.warning(f"Step {step_idx+1}: Auto-install failed (non-fatal): "
+                    f"{output[:300]}")
+
+
 # ---- ANSI code pattern (shared) ----
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -1695,6 +2011,17 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       project_profile=None,
                       skip_review: bool = False,
                       project_context=None) -> tuple[bool, str]:
+    # --- Proactive pre-install: ensure all required packages are installed ---
+    # CMD steps scaffold the project first (e.g. npm create vite@latest).
+    # By the first CODE step the manifest exists, so we bulk-install any
+    # packages from the plan summary that are still missing.
+    if project_context is not None:
+        subproject_cwd = _detect_subproject_root(memory)
+        _ensure_packages_installed(
+            project_context, executor, memory, display, step_idx,
+            subproject_cwd=subproject_cwd, language=language,
+        )
+
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
@@ -1839,6 +2166,11 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         memory.update(files)
         display.step_info(step_idx, f"Written: {', '.join(written)}")
 
+        # Auto-install any new package imports found in the generated code
+        # (e.g. @heroicons/react, lucide-react, etc. that the LLM used
+        # but didn't list in required_packages)
+        _auto_install_code_imports(files, executor, memory, display, step_idx)
+
         # Skip review for non-code files (README, LICENSE, configs, etc.)
         if _all_non_code_files(list(files.keys())):
             display.step_info(step_idx, "Non-code files, skipping review ✔")
@@ -1848,8 +2180,10 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         # ── Review gate ──────────────────────────────────────────
         # When a TEST step follows (skip_review=True), skip the LLM
         # reviewer and rely on test execution to catch real bugs.
-        # Always run the free offline lint check regardless.
+        # Always run the free offline lint + import checks regardless.
         lint_errors = _quick_offline_lint(files)
+        import_errors = _validate_import_paths(files, memory)
+        lint_errors = lint_errors + import_errors
 
         if skip_review:
             # Lint-only path: skip LLM review, test step will validate
