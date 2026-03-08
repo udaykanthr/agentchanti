@@ -378,6 +378,14 @@ def main():
         steps = checkpoint_state["steps"]
         step_results = checkpoint_state.get("step_results", {})
         start_from = checkpoint_state.get("completed_step", -1) + 1
+        
+        # Load dependencies if saved, else parse them out of saved strings as a fallback
+        loaded_deps = checkpoint_state.get("dependencies")
+        if loaded_deps is not None:
+            dependencies = {int(k): set(v) for k, v in loaded_deps.items()}
+        else:
+            _, dependencies = executor.parse_step_dependencies(steps)
+            
         language = checkpoint_state.get("language", language)
         display.set_steps(steps)
         # Mark completed steps
@@ -468,7 +476,8 @@ def main():
         # ── 10b. Post-plan optimization ──
         pre_opt_count = len(steps)
         steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
-                                            kb_context_builder=kb_context_builder)
+                                            kb_context_builder=kb_context_builder,
+                                            dependencies=dependencies)
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
 
@@ -477,9 +486,18 @@ def main():
             log.info(f"Auto-approved {len(steps)} steps (--auto mode)")
         while not args.auto:
             display.stop_spinner()
+            # Reattach dependency markers so they are visible and editable in TUI
+            display_steps = []
+            for i, step in enumerate(steps):
+                if dependencies.get(i):
+                    deps_str = ", ".join(str(d + 1) for d in sorted(dependencies[i]))
+                    display_steps.append(f"{step} (depends: {deps_str})")
+                else:
+                    display_steps.append(f"{step} (depends: none)")
+
             # Try TUI editor first, fall back to text-based approval
             action, removed, edited_steps = CLIDisplay.prompt_plan_approval(
-                steps, use_tui=True)
+                display_steps, use_tui=True)
             if action == "approve":
                 break
             elif action == "replan":
@@ -493,10 +511,10 @@ def main():
                     return
                 steps, dependencies = executor.parse_step_dependencies(raw_steps)
                 steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
-                                            kb_context_builder=kb_context_builder)
+                                            kb_context_builder=kb_context_builder,
+                                            dependencies=dependencies)
             elif action == "edit" and edited_steps:
-                steps = edited_steps
-                _, dependencies = executor.parse_step_dependencies(steps)
+                steps, dependencies = executor.parse_step_dependencies(edited_steps)
 
         display.set_steps(steps)
         display.render()
@@ -539,8 +557,7 @@ def main():
                     analyse_exc)
 
     # ── 12. Build execution waves ──
-    # Re-parse dependencies from current steps (they may have been cleaned)
-    _, dependencies = executor.parse_step_dependencies(steps)
+    # `dependencies` is already set by optimize_plan() / parse_step_dependencies()
     waves = build_step_waves(steps, dependencies)
     log.info(f"Execution waves: {waves}")
 

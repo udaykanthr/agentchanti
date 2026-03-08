@@ -385,24 +385,27 @@ class ContextBuilder:
                  + pattern_tokens + related_tokens + remaining_tokens)
 
         # Trim from lowest priority upward
-        if total > max_tokens:
-            ctx.local_symbols = ctx.local_symbols[:3]
-            total -= remaining_tokens
-            remaining_tokens = 0
+        while total > max_tokens and remaining_tokens > 0 and len(ctx.local_symbols) > 3:
+            popped = ctx.local_symbols.pop()
+            popped_tokens = _list_tokens([popped])
+            total -= popped_tokens
+            remaining_tokens -= popped_tokens
 
-        if total > max_tokens:
-            ctx.related_symbols = []
-            total -= related_tokens
-            related_tokens = 0
+        while total > max_tokens and related_tokens > 0 and ctx.related_symbols:
+            popped = ctx.related_symbols.pop()
+            popped_tokens = _list_tokens([popped])
+            total -= popped_tokens
+            related_tokens -= popped_tokens
 
-        if total > max_tokens:
-            ctx.global_patterns = []
-            total -= pattern_tokens
-            pattern_tokens = 0
+        while total > max_tokens and pattern_tokens > 0 and ctx.global_patterns:
+            popped = ctx.global_patterns.pop()
+            popped_tokens = _list_tokens([popped])
+            total -= popped_tokens
+            pattern_tokens -= popped_tokens
 
-        if total > max_tokens and ctx.local_symbols:
-            ctx.local_symbols = ctx.local_symbols[:3]
-            # Already trimmed above
+        while total > max_tokens and ctx.local_symbols:
+            popped = ctx.local_symbols.pop()
+            total -= _list_tokens([popped])
 
         # behavioral_instructions and error_fixes are never trimmed
 

@@ -42,6 +42,121 @@ _RUNNER_INSTALL = {
 }
 
 
+def _ensure_packages_installed(
+    project_context,
+    executor: Executor,
+    memory: FileMemory,
+    display: CLIDisplay,
+    step_idx: int,
+    subproject_cwd: str | None = None,
+    language: str | None = None,
+) -> None:
+    """Proactively install missing packages before test/server commands.
+
+    Reads the project manifest (``package.json`` or ``requirements.txt``)
+    from the **subproject root** to determine what is currently installed,
+    then compares against ``project_context.required_packages`` and runs
+    a single bulk install for anything missing.
+
+    Designed to be called just-in-time — i.e. after the project scaffold
+    has been created by earlier CMD steps but before the first test suite
+    or dev server command runs.
+
+    Key behaviours:
+    - **One-time**: sets ``memory._packages_preinstalled`` to skip re-runs.
+    - **Non-fatal**: failures are logged as warnings, never halt the pipeline.
+    - **Subproject-aware**: installs inside the correct ``cwd``.
+    """
+    # Already ran for this pipeline execution
+    if getattr(memory, '_packages_preinstalled', False):
+        return
+
+    if project_context is None:
+        return
+
+    required = getattr(project_context, 'required_packages', [])
+    if not required:
+        return
+
+    # Read the *current* manifest from disk (may differ from the snapshot
+    # taken during analysis, because earlier CMD steps installed packages).
+    root = subproject_cwd or "."
+    pkg_json_path = os.path.join(root, "package.json")
+    reqs_txt_path = os.path.join(root, "requirements.txt")
+
+    currently_installed: set[str] = set()
+    install_tool: str | None = None
+
+    if os.path.isfile(pkg_json_path):
+        try:
+            with open(pkg_json_path, "r", encoding="utf-8") as f:
+                pkg = json.loads(f.read())
+            currently_installed.update(pkg.get("dependencies", {}).keys())
+            currently_installed.update(pkg.get("devDependencies", {}).keys())
+            install_tool = "npm install"
+        except Exception:
+            pass
+    elif os.path.isfile(reqs_txt_path):
+        try:
+            with open(reqs_txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        pkg_name = re.split(r'[>=<~!\[]', line)[0].strip()
+                        if pkg_name:
+                            currently_installed.add(pkg_name)
+            install_tool = "pip install"
+        except Exception:
+            pass
+
+    if not install_tool:
+        # No manifest found yet — project may not be scaffolded
+        return
+
+    # Determine what's truly missing right now
+    missing = [
+        pkg for pkg in required
+        if pkg not in currently_installed
+        and pkg not in ('--save-dev', '--save', '-D', '-g')
+    ]
+
+    if not missing:
+        memory._packages_preinstalled = True
+        return
+
+    # Bulk install
+    # For npm: use --save-dev since these are typically dev dependencies
+    if "npm" in install_tool:
+        cmd = f"npm install --save-dev {' '.join(missing)}"
+    else:
+        cmd = f"{install_tool} {' '.join(missing)}"
+
+    log.info(f"[Pre-install] Installing {len(missing)} missing package(s): "
+             f"{', '.join(missing)}")
+    display.step_info(step_idx,
+                      f"Pre-installing {len(missing)} missing package(s)...")
+
+    ok, output = executor.run_command(cmd, cwd=subproject_cwd)
+    if ok:
+        log.info(f"[Pre-install] Successfully installed: {', '.join(missing)}")
+        display.step_info(step_idx, f"Pre-installed {len(missing)} package(s)")
+        # Update project_context so downstream agents see the new state
+        for pkg in missing:
+            if pkg not in project_context.installed_packages:
+                project_context.installed_packages.append(pkg)
+        project_context.missing_packages = [
+            p for p in project_context.missing_packages
+            if p not in missing
+        ]
+    else:
+        log.warning(f"[Pre-install] Bulk install failed (non-fatal): "
+                    f"{output[:300]}")
+        display.step_info(step_idx, "Pre-install failed (non-fatal)")
+
+    # Mark as done regardless of success — individual install steps will retry
+    memory._packages_preinstalled = True
+
+
 def _get_runner_install_cmd(runner: str) -> str | None:
     """Return the install command for a test runner binary.
 
@@ -880,7 +995,8 @@ def _handle_search_step(step_text: str, search_agent,
 def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
-                     language: str | None = None) -> tuple[bool, str]:
+                     language: str | None = None,
+                     project_context=None) -> tuple[bool, str]:
     cmd = _extract_command_from_step(step_text)
 
     if cmd:
@@ -994,7 +1110,16 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         r'\bpnpm\s+(start|dev)\b',
     )
     is_background = any(_re.search(p, cmd, _re.IGNORECASE) for p in _bg_cmd_patterns)
-    
+
+    # ── Proactive pre-install: ensure packages are installed ──
+    # Runs once, just before the first server or test-suite command,
+    # when the project scaffold already exists.
+    if is_background and project_context is not None:
+        _ensure_packages_installed(
+            project_context, executor, memory, display, step_idx,
+            subproject_cwd=subproject_cwd, language=language,
+        )
+
     cwd_note = f" (in {subproject_cwd}/)" if subproject_cwd else ""
     if is_background:
         display.step_info(step_idx, f"Running background: {cmd}{cwd_note}")
@@ -2141,6 +2266,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       project_context=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
+
+    # ── Proactive pre-install: ensure packages are installed ──
+    # Runs once, just before the first test suite command,
+    # when the project scaffold already exists.
+    if project_context is not None:
+        _ensure_packages_installed(
+            project_context, executor, memory, display, step_idx,
+            subproject_cwd=subproject_cwd, language=language,
+        )
 
     # Infer language from memory file paths when not explicitly provided
     if language is None:

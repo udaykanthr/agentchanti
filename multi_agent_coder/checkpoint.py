@@ -12,7 +12,8 @@ DEFAULT_CHECKPOINT_FILE = ".agentchanti_checkpoint.json"
 def save_checkpoint(filepath: str, task: str, steps: list[str],
                     completed_step: int, file_memory_dict: dict[str, str],
                     step_results: dict[int, str], language: str,
-                    display_state: dict | None = None) -> None:
+                    display_state: dict | None = None,
+                    dependencies: dict[int, set[int]] | None = None) -> None:
     """Persist current pipeline state to *filepath* as JSON."""
     state = {
         "task": task,
@@ -22,6 +23,8 @@ def save_checkpoint(filepath: str, task: str, steps: list[str],
         "step_results": {str(k): v for k, v in step_results.items()},
         "language": language,
     }
+    if dependencies is not None:
+        state["dependencies"] = {str(k): list(v) for k, v in dependencies.items()}
     if display_state is not None:
         state["display_state"] = display_state
     tmp = filepath + ".tmp"

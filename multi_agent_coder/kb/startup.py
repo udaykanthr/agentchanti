@@ -129,9 +129,22 @@ class KBStartupManager:
         """
         Check if the global KB has been seeded.
 
-        Checks errors.db has records — this is the most reliable indicator.
+        Uses a persistent ``.seeded`` marker file as the primary indicator
+        so that transient SQLite errors (e.g. DB locked by a background
+        thread) never cause a spurious re-seed that wipes registry files.
+
+        Falls back to checking ``errors.db`` record count for backwards
+        compatibility (pre-marker installs).
         """
         try:
+            from .global_kb.seeder import _CORE_DIR
+
+            # Primary: marker file survives DB corruption / lock errors
+            marker = os.path.join(_CORE_DIR, ".seeded")
+            if os.path.isfile(marker):
+                return True
+
+            # Secondary: DB record count (backwards compat for old installs)
             from .global_kb.error_dict import ErrorDict
             from .global_kb.seeder import _errors_db_path
 

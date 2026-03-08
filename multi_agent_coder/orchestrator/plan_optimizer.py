@@ -83,19 +83,28 @@ def optimize_plan(
     steps: list[str],
     knowledge_base=None,
     kb_context_builder=None,
+    dependencies: dict[int, set[int]] | None = None,
 ) -> tuple[list[str], dict[int, set[int]]]:
     """Optimize a raw plan by merging, deduplicating, and pruning steps.
 
     Returns (optimized_steps, dependencies).
     All operations are pure Python — no LLM calls.
+
+    If *dependencies* is provided (already parsed upstream), it is used
+    directly instead of re-parsing — this avoids the bug where markers
+    have already been stripped from *steps*.
     """
     if not steps:
         return steps, {}
 
     original_count = len(steps)
 
-    # Parse existing dependencies before optimization
-    clean_steps, deps = _parse_dependencies(steps)
+    # Use pre-parsed dependencies if available, otherwise parse from steps
+    if dependencies is not None:
+        clean_steps = list(steps)
+        deps = dict(dependencies)
+    else:
+        clean_steps, deps = _parse_dependencies(steps)
 
     # Pass 0: Replace LLM-generated commands with KB-known correct commands.
     # This is the KB-first pass — if the KB has exact commands for a step
@@ -430,7 +439,11 @@ def _parse_dependencies(steps: list[str]) -> tuple[list[str], dict[int, set[int]
     cleaned: list[str] = []
     deps: dict[int, set[int]] = {}
 
-    dep_re = re.compile(r'\(depends?:\s*([\d,\s]+)\)\s*$', re.I)
+    # Match dependency markers in various LLM formats:
+    # - Standalone: (depends: 1) or (depends: 1, 3)
+    # - Combined with step type: (CMD, depends: 1) or (CODE, depends: 2, 3)
+    # - With optional trailing colon: (depends: 1): or (CMD, depends: 1):
+    dep_re = re.compile(r'\([^)]*?depends?:\s*([\d,\s]+)\)[:\s]*$', re.I)
 
     for i, step in enumerate(steps):
         m = dep_re.search(step)
@@ -438,7 +451,7 @@ def _parse_dependencies(steps: list[str]) -> tuple[list[str], dict[int, set[int]
             dep_nums = {int(x.strip()) - 1 for x in m.group(1).split(",")
                         if x.strip().isdigit()}
             deps[i] = dep_nums
-            step = dep_re.sub("", step).strip()
+            step = step[:m.start()].strip()
         cleaned.append(step)
 
     return cleaned, deps

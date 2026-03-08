@@ -1190,14 +1190,22 @@ def seed(
     # ── 1a. Seed errors.db ──────────────────────────────────────────────
     db_path = _errors_db_path()
     edict = ErrorDict(db_path)
-    edict.clear()
-    edict.bulk_insert(_ERROR_SEEDS)
+    # Idempotent: skip clear+insert if already populated (avoids
+    # destroying data when seed() is triggered spuriously by a
+    # transient SQLite error in _global_kb_exists()).
+    if edict.count() == 0:
+        edict.bulk_insert(_ERROR_SEEDS)
+    else:
+        logger.debug("errors.db already populated (%d records), skipping re-seed",
+                     edict.count())
     summary["errors_seeded"] = edict.count()
     logger.info("Seeded %d errors into %s", summary["errors_seeded"], db_path)
 
     # ── 1b. Seed content fixes ───────────────────────────────────────────
-    edict.clear_content_fixes()
-    edict.bulk_insert_content_fixes(_CONTENT_FIX_SEEDS)
+    if edict.count_content_fixes() == 0:
+        edict.bulk_insert_content_fixes(_CONTENT_FIX_SEEDS)
+    else:
+        logger.debug("content_fixes already populated, skipping re-seed")
     summary["content_fixes_seeded"] = edict.count_content_fixes()
     logger.info("Seeded %d content fixes into %s",
                 summary["content_fixes_seeded"], db_path)
@@ -1309,6 +1317,18 @@ def seed(
         except Exception as exc:
             logger.warning("Embedding skipped: %s", exc)
             summary["chunks_embedded"] = 0
+
+    # ── 4. Write .seeded marker ─────────────────────────────────────────
+    # Persistent marker so _global_kb_exists() can answer True without
+    # touching the SQLite database.  This prevents spurious re-seeds
+    # caused by transient DB lock errors during concurrent access.
+    marker_path = os.path.join(_CORE_DIR, ".seeded")
+    try:
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, "w", encoding="utf-8") as fh:
+            fh.write("seeded\n")
+    except OSError as exc:
+        logger.warning("Failed to write .seeded marker: %s", exc)
 
     return summary
 

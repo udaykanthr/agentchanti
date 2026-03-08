@@ -266,8 +266,8 @@ class TestTokenBudget:
         for i in range(5):
             ctx.related_symbols.append({"name": f"rel_{i}", "x": "y" * 400})
 
-        # Low budget
-        result = builder._apply_token_budget(ctx, max_tokens=500)
+        # Low budget, requires flushing all related_symbols to fit (top 3 local cost ~315)
+        result = builder._apply_token_budget(ctx, max_tokens=350)
         # local_symbols should be trimmed to 3
         assert len(result.local_symbols) <= 3
         # related_symbols should be empty

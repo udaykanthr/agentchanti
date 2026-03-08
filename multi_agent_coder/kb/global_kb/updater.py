@@ -160,7 +160,7 @@ def clean() -> dict:
                 pass
 
     # Remove SQLite databases and manifest
-    for db_name in ("errors.db", "global_kb.db", "manifest.json"):
+    for db_name in ("errors.db", "global_kb.db", "manifest.json", ".seeded"):
         db_path = os.path.join(_CORE_DIR, db_name)
         if os.path.isfile(db_path):
             try:

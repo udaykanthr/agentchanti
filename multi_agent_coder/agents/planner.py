@@ -237,7 +237,7 @@ class PlannerAgent(Agent):
                     docs = kb_context_builder._global_store.search(
                         query=task,
                         categories=["doc", "pattern"],
-                        top_k=5,
+                        top_k=15,
                         api_client=kb_context_builder._api_client,
                     )
                     if docs:

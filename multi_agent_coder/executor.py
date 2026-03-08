@@ -100,9 +100,16 @@ class Executor:
             match = re.match(pattern, line)
             if match:
                 step_text = match.group(1).strip()
-                if step_text:
-                    steps.append(step_text)
-        return steps
+                # Append even if empty so we have an entry to append continuation lines to
+                steps.append(step_text)
+            elif steps:
+                # Append continuation lines to the current step
+                line_stripped = line.strip()
+                if line_stripped:
+                    steps[-1] += " " + line_stripped
+                    
+        # Remove any completely empty steps
+        return [s for s in steps if s.strip()]
 
     # Generic placeholder path segments that local models hallucinate
     _PLACEHOLDER_SEGMENTS = {
@@ -1011,10 +1018,22 @@ class Executor:
         If **no** dependency markers are found at all, falls back to
         strict sequential ordering (each step depends on the previous)
         so that steps never run out of order.
+
+        Handles LLM output formats like:
+        - ``(depends: 1)``
+        - ``(depends: 1, 3)``
+        - ``(CMD, depends: 1):``
+        - ``(CODE, depends: 2, 3):``
         """
         cleaned: List[str] = []
         deps: Dict[int, set] = {}
-        dep_pattern = re.compile(r"\s*\(depends?:\s*([\d,\s]+)\)\s*$", re.IGNORECASE)
+        # Match dependency markers in various LLM formats:
+        # - Standalone: (depends: 1) or (depends: 1, 3)
+        # - Combined with step type: (CMD, depends: 1) or (CODE, depends: 2, 3)
+        # - With optional trailing colon: (depends: 1): or (CMD, depends: 1):
+        dep_pattern = re.compile(
+            r"\s*\([^)]*?depends?:\s*([\d,\s]+)\)[:\s]*$", re.IGNORECASE
+        )
         found_any_marker = False
 
         for idx, step in enumerate(steps):

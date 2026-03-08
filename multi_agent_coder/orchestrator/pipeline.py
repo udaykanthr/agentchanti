@@ -276,7 +276,7 @@ def _execute_step(step_idx: int, step_text: str, *,
         elif step_type == "CMD":
             success, error_info = _handle_cmd_step(
                 step_text, executor, llm_client, memory, display, step_idx,
-                language=language)
+                language=language, project_context=project_context)
 
         elif step_type == "CODE":
             # Extract code graph from kb_context_builder if available
