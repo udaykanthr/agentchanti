@@ -20,12 +20,31 @@ _TEST_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Steps that mention test runners but are NOT test execution steps.
+# These are configuration/setup steps (adding scripts, config, etc.)
+# and should be classified by the LLM, not fast-tracked as TEST.
+_TEST_CONFIG_RE = re.compile(
+    r'(add\s+.*scripts?\s+to\b'
+    r'|update\s+.*scripts?\s+in\b'
+    r'|configure\s+.*test'
+    r'|setup\s+.*test'
+    r'|set\s+up\s+.*test'
+    r'|install\s+.*test'
+    r'|create\s+.*config'
+    r'|modify\s+.*package\.json'
+    r'|add\s+.*to\s+.*package\.json'
+    r'|edit\s+.*package\.json)',
+    re.IGNORECASE,
+)
+
 
 def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: int) -> str:
     display.step_info(step_idx, "Classifying step...")
 
-    # Fast path: deterministic classification for test commands
-    if _TEST_CMD_RE.search(step_text):
+    # Fast path: deterministic classification for test commands.
+    # Skip the fast path if the step looks like test configuration/setup
+    # (e.g. "Add test scripts to package.json") — those should go to the LLM.
+    if _TEST_CMD_RE.search(step_text) and not _TEST_CONFIG_RE.search(step_text):
         display.step_tokens(step_idx, 0, 0)
         return "TEST"
 
@@ -50,6 +69,7 @@ def _classify_step(step_text: str, llm_client, display: CLIDisplay, step_idx: in
         "Category:"
     )
     sent_before, recv_before = token_tracker.snapshot()
+    display.step_info(step_idx, "Classifying step via LLM...")
 
     response = llm_client.generate_response(prompt).strip().upper()
 

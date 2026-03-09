@@ -645,7 +645,10 @@ class CLIDisplay:
         if any(kw in message.lower() for kw in (
             "generating", "coding", "classifying", "reviewing",
             "analyzing", "requesting", "running", "installing",
-            "re-planning", "retrying",
+            "re-planning", "retrying", "searching", "sending",
+            "resolving", "diagnosing", "fixing", "auto-fixing",
+            "pre-install", "building", "processing", "waiting",
+            "loading", "applying", "scoping",
         )):
             self._start_spinner(message)
 

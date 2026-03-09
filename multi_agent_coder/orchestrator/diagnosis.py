@@ -7,7 +7,7 @@ import re
 
 from ..executor import Executor
 from ..cli_display import CLIDisplay, token_tracker, log
-from ..diff_display import show_diffs, _detect_hazards
+from ..diff_display import show_diffs, _detect_hazards, HAZARD_BLOCK
 
 from .memory import FileMemory
 from .step_handlers import _shell_instructions, _strip_protected_files, _apply_content_fixes, _detect_subproject_root
@@ -198,6 +198,7 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         )
 
     sent_before, recv_before = token_tracker.snapshot()
+    display.step_info(step_idx, "Requesting diagnosis from LLM...")
 
     diagnosis = llm_client.generate_response(prompt)
 
@@ -206,6 +207,7 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     recv_delta = recv_after - recv_before
     display.step_tokens(step_idx, sent_delta, recv_delta)
 
+    display.step_info(step_idx, "Processing diagnosis response...")
     explanation = CLIDisplay.extract_explanation(diagnosis)
     if explanation:
         display.add_llm_log(explanation, source="Diagnosis")
@@ -237,6 +239,8 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     cmds_succeeded = True
     has_fix_commands = False
 
+    display.step_info(step_idx, "Applying diagnosis fix...")
+
     # Extract code file fixes regardless of step type, allowing CMD steps to fix code bugs
     files = executor.parse_code_blocks(diagnosis)
 
@@ -256,8 +260,13 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         files = _apply_content_fixes(files, content_fixes)
 
     if files:
-        # Filter out files with hazardous diffs (e.g. truncation,
-        # dependency removal) — these would corrupt the project.
+        # Filter out files with hazardous diffs.
+        # In diagnosis context, the LLM was specifically asked to fix a
+        # failure — size reduction is often intentional (e.g. removing
+        # broken imports).  Only block truly dangerous hazards like
+        # HAZARD_BLOCK or structural loss (export removal, dependency
+        # deletion from manifests).  Warn-only hazards like "size
+        # reduction" are logged but allowed through.
         safe_files: dict[str, str] = {}
         for filepath, content in files.items():
             full_path = os.path.join(".", filepath)
@@ -268,12 +277,28 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                         old_content = f.read()
                     hazards = _detect_hazards(filepath, old_content, content)
                     if hazards:
-                        msgs = "; ".join(m for _, m in hazards)
-                        log.warning(f"Step {step_idx+1}: Skipping hazardous "
-                                    f"fix for {filepath}: {msgs}")
-                        display.step_info(step_idx,
-                                          f"Skipped unsafe fix for {filepath}")
-                        continue
+                        # Separate blocking hazards from size-reduction warnings
+                        blocking = [
+                            (sev, msg) for sev, msg in hazards
+                            if sev == HAZARD_BLOCK
+                            or "export" in msg.lower()
+                            or "dependencies" in msg.lower()
+                        ]
+                        warn_only = [
+                            (sev, msg) for sev, msg in hazards
+                            if (sev, msg) not in blocking
+                        ]
+                        if blocking:
+                            msgs = "; ".join(m for _, m in blocking)
+                            log.warning(f"Step {step_idx+1}: Skipping hazardous "
+                                        f"fix for {filepath}: {msgs}")
+                            display.step_info(step_idx,
+                                              f"Skipped unsafe fix for {filepath}")
+                            continue
+                        if warn_only:
+                            msgs = "; ".join(m for _, m in warn_only)
+                            log.info(f"Step {step_idx+1}: Diagnosis fix for "
+                                     f"{filepath} has warnings (allowed): {msgs}")
                 except OSError:
                     pass
             safe_files[filepath] = content

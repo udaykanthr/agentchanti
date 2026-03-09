@@ -496,6 +496,111 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="angular,flex-layout,deprecated,npm,install,flexbox,grid",
     ),
+    # ── React Testing Library — common test-source mismatch patterns ────
+    ErrorFix(
+        error_type="TestingLibraryElementNotFound",
+        language="javascript",
+        pattern=r"TestingLibraryElementError:\s*Unable to find an element",
+        cause="The test asserts text, role, or label that does not exist in the component's "
+              "actual rendered output. Common causes: (1) the test hardcodes text content the "
+              "component doesn't render, (2) text is split across multiple DOM elements so "
+              "exact string matching fails, (3) the element uses a different role/tag than expected.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. READ THE ACTUAL DOM OUTPUT shown in the error message — it shows exactly "
+                     "what the component renders.\n"
+                     "2. Match your query to ACTUAL rendered text, not assumed text.\n"
+                     "3. For text split across elements, use a function matcher:\n"
+                     "   screen.getByText((content, element) => element?.textContent === 'expected full text')\n"
+                     "4. Prefer getByRole() over getByText() for more robust queries:\n"
+                     "   screen.getByRole('button', { name: /submit/i })\n"
+                     "   screen.getByRole('heading', { name: /welcome/i })\n"
+                     "5. NEVER hardcode assumed text content — always derive expected values "
+                     "from the actual source component props or rendered DOM.\n"
+                     "6. Use { exact: false } for partial text matching: screen.getByText('partial', { exact: false })",
+        severity="error",
+        tags="testing-library,react,getByText,getByRole,element,not,found,query,dom,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="TestAssertionLengthMismatch",
+        language="javascript",
+        pattern=r"expected .* to have a length of \d+ but got \d+",
+        cause="The test hardcodes an expected element count (e.g. toHaveLength(3)) but the "
+              "component renders a different number of elements. The LLM assumed a count "
+              "without reading the actual source code.",
+        fix_template="FIX STEPS:\n"
+                     "1. Do NOT hardcode expected element counts in tests.\n"
+                     "2. Read the ACTUAL component source to determine how many elements it renders.\n"
+                     "3. If elements come from props/data, check the test's mock data length.\n"
+                     "4. Use more specific selectors to narrow down:\n"
+                     "   - screen.getAllByRole('button', { name: /buy/i }) instead of screen.getAllByRole('button')\n"
+                     "   - within(container).getAllByRole('listitem') to scope to a section\n"
+                     "5. If the count is dynamic, assert against the test data length:\n"
+                     "   expect(items).toHaveLength(mockData.length)\n"
+                     "6. Check for duplicate elements from nested components.",
+        severity="error",
+        tags="assertion,length,count,toHaveLength,mismatch,testing,react,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="MockCallbackNotCalled",
+        language="javascript",
+        pattern=r'expected "(vi\.fn|jest\.fn)\(\)" to be called \d+ times?, but got 0',
+        cause="The test expects a mock callback (vi.fn()/jest.fn()) to be called when an "
+              "element is clicked, but the component does not call it. Common causes: "
+              "(1) the prop name in the test doesn't match the component's prop name, "
+              "(2) the component doesn't wire the callback to an onClick handler, "
+              "(3) the event target element isn't the one with the handler (event delegation).",
+        fix_template="FIX STEPS:\n"
+                     "1. READ the actual component source to verify the EXACT prop names for callbacks.\n"
+                     "   Common mismatches: onCtaClick vs onClick, handleSubmit vs onSubmit\n"
+                     "2. Verify the component actually passes the callback to an onClick/onChange handler.\n"
+                     "3. Use userEvent (not fireEvent) for realistic interaction:\n"
+                     "   await userEvent.click(button)\n"
+                     "4. Check if the button is disabled — disabled buttons don't fire click events.\n"
+                     "5. Check if the handler is conditional (e.g. only fires after form validation).\n"
+                     "6. For event delegation, click the actual target element, not a parent container.\n"
+                     "7. If the component uses a link (<a>) instead of <button>, the callback may be "
+                     "on navigation, not onClick.",
+        severity="error",
+        tags="mock,callback,vi.fn,jest.fn,click,called,event,handler,react,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="ReactTestPropsNotMatching",
+        language="javascript",
+        pattern=r"(received.*undefined|expected.*undefined|Cannot read properties of undefined.*reading)",
+        cause="The test passes props that don't match the component's expected prop interface, "
+              "or accesses props/state that the component doesn't expose. The LLM assumed "
+              "a component API without reading the actual source.",
+        fix_template="FIX STEPS:\n"
+                     "1. Read the component source to find the EXACT prop names and types.\n"
+                     "2. Check if the component destructures props — misspelled prop names become undefined.\n"
+                     "3. Ensure required props are provided in the test render:\n"
+                     "   render(<Component requiredProp='value' />)\n"
+                     "4. For components using React Router, wrap with <MemoryRouter>.\n"
+                     "5. For components using context providers, wrap with the appropriate provider.\n"
+                     "6. Check default prop values — the component may handle missing props gracefully.",
+        severity="error",
+        tags="props,undefined,component,react,render,testing,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="NoTestSuiteFound",
+        language="javascript",
+        pattern=r"No test suite found in file",
+        cause="The test file exists but contains no describe/it/test blocks. "
+              "It is likely a setup file, configuration scaffold, or vitest/jest "
+              "setup file (e.g. vitestSetup.test.js) that was mistakenly given "
+              "a .test. extension. Test runners require at least one test block.",
+        fix_template="FIX: Do NOT generate setup/scaffold files with .test. extensions.\n"
+                     "1. DELETE or rename the file to remove the .test. part "
+                     "(e.g. vitestSetup.test.js → vitest.setup.js).\n"
+                     "2. Setup files should NOT have .test. in the name — use "
+                     ".setup.js, .config.js, or conftest.py instead.\n"
+                     "3. Every .test. or .spec. file MUST contain at least one "
+                     "describe/it/test block with actual assertions.\n"
+                     "4. If the file was meant to configure vitest, put it in "
+                     "vitest.config.ts or a setup file referenced by setupFiles.",
+        severity="error",
+        tags="vitest,jest,test,suite,empty,setup,scaffold,no,found,javascript,typescript",
+    ),
     # ── Vitest + @testing-library/jest-dom ──────────────────────────────
     ErrorFix(
         error_type="VitestJestDomExpectNotDefined",

@@ -1269,6 +1269,66 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
     return fixed_files
 
 
+# Regex to detect at least one test block in JS/TS/Python test files.
+# Matches: describe(, it(, test(, def test_, @pytest, @Test
+_HAS_TEST_BLOCK_RE = re.compile(
+    r'(?:'
+    r'\b(?:describe|it|test)\s*\('          # JS/TS: describe(, it(, test(
+    r'|\bdef\s+test_'                       # Python: def test_
+    r'|\b@(?:pytest\.mark|Test)\b'          # Python/Java annotations
+    r'|\bcontext\s+["\']'                   # RSpec: context "..."
+    r')',
+)
+
+# File names that are typically setup/config, not test suites
+_SETUP_FILE_RE = re.compile(
+    r'(setup|config|fixture|helper|util|mock|factory|conftest)'
+    r'\.test\.',
+    re.IGNORECASE,
+)
+
+
+def _strip_empty_test_files(files: dict[str, str]) -> dict[str, str]:
+    """Remove test files that contain no actual test blocks.
+
+    LLMs sometimes generate scaffold files like ``vitestSetup.test.js``
+    that only contain configuration/setup code (imports, vi.mock calls,
+    custom matchers) but no ``describe``/``it``/``test`` blocks.  These
+    cause "No test suite found" errors from every test runner.
+
+    Returns the dict with empty test files removed.  Non-test files
+    (e.g. source files in a source-bug fix) are always kept.
+    """
+    result: dict[str, str] = {}
+    for fpath, content in files.items():
+        basename = fpath.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+        # Only check files that look like test files
+        is_test_file = (
+            ".test." in basename
+            or ".spec." in basename
+            or basename.startswith("test_")
+            or "_test." in basename
+            or "_spec." in basename
+        )
+
+        if not is_test_file:
+            # Not a test file (e.g. source fix) — keep as-is
+            result[fpath] = content
+            continue
+
+        # Check if the file has at least one test block
+        if _HAS_TEST_BLOCK_RE.search(content):
+            result[fpath] = content
+        else:
+            log.warning(
+                f"[TestFilter] Stripped '{fpath}' — no test blocks found "
+                f"(setup/scaffold file)"
+            )
+
+    return result
+
+
 def _quick_offline_lint(files: dict[str, str]) -> str:
     """Perform a quick offline syntax/linter check on generated files."""
     errors = []
@@ -2164,6 +2224,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         if explanation:
             display.add_llm_log(explanation, source="Coder")
 
+        display.step_info(step_idx, "Processing LLM response...")
         files = executor.parse_code_blocks(response)
         if not files:
             files = executor.parse_code_blocks_fuzzy(response)
@@ -2203,12 +2264,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                                   step_text, language=language)
 
         # Show diffs and wait for approval before writing
+        display.stop_spinner()
         approved = prompt_diff_approval(files, auto=auto)
         if not approved:
             feedback = "User rejected the changes. Try a different approach."
             display.step_info(step_idx, "Changes rejected by user, retrying...")
             log.info(f"Step {step_idx+1}: User rejected diff, retrying.")
             continue
+
+        display.step_info(step_idx, "Processing approved changes...")
 
         # Build review context before updating memory/disk so diffs are captured correctly
         use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
@@ -2661,7 +2725,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       language: str | None = None,
                       auto: bool = False,
                       search_agent=None,
-                      project_context=None) -> tuple[bool, str]:
+                      project_context=None,
+                      kb_context_builder=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -2834,6 +2899,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             display.step_info(step_idx, "No valid test files after filtering, retrying...")
             continue
 
+        # Strip scaffold/setup files that have no actual test blocks.
+        # LLMs sometimes generate "vitestSetup.test.js" or similar files
+        # that contain only config/setup but no describe/it/test blocks,
+        # causing "No test suite found" errors from the runner.
+        test_files = _strip_empty_test_files(test_files)
+        if not test_files:
+            feedback = ("All generated files were setup/scaffold files with no test blocks. "
+                        "Generate ONLY test files containing describe/it/test blocks.")
+            display.step_info(step_idx, "No test suites found in generated files, retrying...")
+            log.warning(f"Step {step_idx+1}: All generated test files stripped — no test blocks")
+            continue
+
         # Quick offline lint check (free, no LLM cost) — catches syntax
         # errors before writing to disk.  Real test failures are caught by
         # the execution loop below, which provides concrete error output
@@ -2846,12 +2923,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             continue
 
         # Show diffs and wait for approval before writing test files
+        display.stop_spinner()
         approved = prompt_diff_approval(test_files, auto=auto)
         if not approved:
             feedback = "User rejected the test changes. Try a different approach."
             display.step_info(step_idx, "Test changes rejected by user, retrying...")
             log.info(f"Step {step_idx+1}: User rejected test diff, retrying.")
             continue
+
+        display.step_info(step_idx, "Processing approved test files...")
 
         # Prefix test file paths with sub-project root (same as CODE steps)
         if subproject_cwd:
@@ -3078,6 +3158,27 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 display.step_info(step_idx,
                                   "Bug detected in SOURCE code, asking coder to fix source...")
 
+            # ── KB error-fix lookup for test failures ──
+            # Consult the global KB for known error patterns (e.g.
+            # TestingLibraryElementError, assertion count mismatches,
+            # mock callback issues) to give the coder concrete guidance.
+            kb_fix_context = ""
+            if kb_context_builder is not None:
+                try:
+                    kb_ctx = kb_context_builder.build_context(
+                        task_description=step_text,
+                        error_output=output,
+                        max_tokens=2000,
+                    )
+                    if kb_ctx.error_fixes:
+                        kb_fix_context = kb_context_builder.format_context_for_prompt(kb_ctx)
+                        log.info(f"Step {step_idx+1}: KB matched "
+                                 f"{len(kb_ctx.error_fixes)} error fix patterns "
+                                 f"for test fix loop")
+                except Exception as exc:
+                    log.debug(f"Step {step_idx+1}: KB error lookup in test "
+                              f"fix loop failed: {exc}")
+
             # Search the web for error documentation to help the coder fix
             search_context = ""
             if search_agent is not None:
@@ -3110,6 +3211,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     f"Test files that need fixing: {test_file_list}\n"
                 )
             fix_context += f"Project files:\n{code_summary}"
+            if kb_fix_context:
+                fix_context += (
+                    f"\n\n{kb_fix_context}"
+                )
             if search_context:
                 fix_context += (
                     f"\n\nThe following web search results contain relevant "
@@ -3151,6 +3256,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     "Return ALL corrected test file(s) using #### [FILE]: format."
                 )
 
+            display.step_info(step_idx, "Generating fix from LLM...")
             sent_before, recv_before = token_tracker.snapshot()
 
             fix_response = coder.process(
@@ -3161,6 +3267,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             recv_delta = recv_after - recv_before
             display.step_tokens(step_idx, sent_delta, recv_delta)
 
+            display.step_info(step_idx, "Processing fix response...")
             explanation = CLIDisplay.extract_explanation(fix_response)
             if explanation:
                 display.add_llm_log(explanation, source="Coder")
@@ -3699,11 +3806,13 @@ def _try_chunk_edit(
     # Build review context before updating memory/disk so diffs are captured correctly
     review_ctx = _build_review_context(result_files, memory, step_text)
 
+    display.stop_spinner()
     approved = prompt_diff_approval(result_files, auto=auto)
     if not approved:
         display.step_info(step_idx, "Changes rejected by user")
         return False, "User rejected chunk edits."
 
+    display.step_info(step_idx, "Processing approved changes...")
     written = executor.write_files(result_files)
     memory.update(result_files)
     display.step_info(step_idx, f"[ChunkEdit] Written: {', '.join(written)}")

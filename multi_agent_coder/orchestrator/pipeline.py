@@ -258,6 +258,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                  f"Memory: {memory.summary()}\n{'='*60}")
 
         display.start_step(step_idx)
+        display.step_info(step_idx, "Loading context and classifying...")
         step_type = _classify_step(step_text, llm_client, display, step_idx)
         display.steps[step_idx]["type"] = step_type
         display.render()
@@ -308,7 +309,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                 step_text, tester, coder, reviewer, executor,
                 task, memory, display, step_idx, language=language,
                 auto=auto, search_agent=search_agent,
-                project_context=project_context)
+                project_context=project_context,
+                kb_context_builder=kb_context_builder)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
@@ -334,6 +336,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                     f for f in new_or_changed if not f.startswith("_")
                 ]
                 if new_or_changed:
+                    display.step_info(step_idx, "Running dependency check...")
                     from .dependency_check import build_snapshot, run_dependency_check
                     dep_before = build_snapshot(_before_files, language)
                     dep_after = build_snapshot(after_files, language)

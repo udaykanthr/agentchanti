@@ -262,6 +262,14 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
 12. CRITICAL — @testing-library/jest-dom: If you need DOM matchers (toBeInTheDocument, toHaveClass, etc.),
    you MUST import `'@testing-library/jest-dom/vitest'` — NOT `'@testing-library/jest-dom'`.
    The bare import crashes because it calls expect.extend() but Vitest does not expose expect globally.
+13. CRITICAL — React component testing: Base ALL assertions on the ACTUAL source code provided.
+   - NEVER hardcode expected text content, element counts, or prop names from assumption.
+   - READ the component source to find exact text, prop names, and rendered elements BEFORE writing assertions.
+   - Use `getByRole()` over `getByText()` for robust queries: `screen.getByRole('button', {{ name: /submit/i }})`
+   - For text split across DOM elements, use function matchers:
+     `screen.getByText((content, el) => el?.textContent === 'expected')`
+   - NEVER assume element counts — check the source data/props to determine expected counts.
+   - Verify callback prop names match the EXACT prop name in the component (e.g. onClick vs onCtaClick).
 """
 
     @staticmethod
