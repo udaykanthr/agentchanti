@@ -102,8 +102,10 @@ _IMPORT_PATTERNS = [
 ]
 
 # Response parsing patterns
+# Note: chunk names can be multi-word (e.g. "function HeroBanner", "class MyApp")
+# so we use [^(]+? instead of \S+ to capture everything up to the opening paren.
 _EDIT_MARKER = re.compile(
-    r"####\s*\[EDIT\]:\s*(\S+?)(?::(\S+))?\s*\(lines?\s*(\d+)\s*-\s*(\d+)\)",
+    r"####\s*\[EDIT\]:\s*(\S+?)(?::([^(]+?))?\s*\(lines?\s*(\d+)\s*-\s*(\d+)\)",
 )
 _NEW_MARKER = re.compile(
     r"####\s*\[NEW\]:\s*(\S+)\s*\(after\s+line\s+(\d+)\)",
@@ -404,7 +406,7 @@ class ChunkEditor:
             edit_match = _EDIT_MARKER.match(line.strip())
             if edit_match:
                 fpath = edit_match.group(1)
-                chunk_name = edit_match.group(2) or ""
+                chunk_name = (edit_match.group(2) or "").strip()
                 line_start = int(edit_match.group(3))
                 line_end = int(edit_match.group(4))
 

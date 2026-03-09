@@ -220,6 +220,37 @@ def func():
         edits = editor.parse_chunk_response(response)
         assert edits is None  # Should signal fallback
 
+    def test_parse_multiword_chunk_name(self):
+        """Chunk names like 'function HeroBanner' must be parsed correctly."""
+        editor = ChunkEditor()
+        response = """
+#### [EDIT]: src/components/HeroBanner.jsx:function HeroBanner (lines 5-35)
+```javascript
+export function HeroBanner({ headline }) {
+  return <h1>{headline}</h1>;
+}
+```
+
+#### [EDIT]: src/components/HeroBanner.jsx (lines 1-3)
+```javascript
+import React from 'react';
+```
+"""
+        edits = editor.parse_chunk_response(response)
+        assert edits is not None
+        assert len(edits) == 2
+        # First edit: multi-word chunk name
+        assert edits[0].file_path == "src/components/HeroBanner.jsx"
+        assert edits[0].chunk_id == "function HeroBanner"
+        assert edits[0].line_start == 5
+        assert edits[0].line_end == 35
+        assert "headline" in edits[0].new_content
+        # Second edit: no chunk name
+        assert edits[1].file_path == "src/components/HeroBanner.jsx"
+        assert edits[1].chunk_id == ""
+        assert edits[1].line_start == 1
+        assert edits[1].line_end == 3
+
     def test_no_edits(self):
         editor = ChunkEditor()
         response = "No changes needed, the code looks correct."

@@ -496,6 +496,51 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="angular,flex-layout,deprecated,npm,install,flexbox,grid",
     ),
+    # ── Vitest + @testing-library/jest-dom ──────────────────────────────
+    ErrorFix(
+        error_type="VitestJestDomExpectNotDefined",
+        language="javascript",
+        pattern=r"ReferenceError:\s*expect\s+is\s+not\s+defined.*@testing-library/jest-dom",
+        cause="@testing-library/jest-dom calls expect.extend() at import time, but Vitest "
+              "does not expose `expect` as a global unless `globals: true` is set in vitest.config. "
+              "Importing '@testing-library/jest-dom' directly crashes in Vitest projects.",
+        fix_template="Replace the import in ALL test files:\n\n"
+                     "WRONG (crashes in Vitest):\n"
+                     "  import '@testing-library/jest-dom';\n\n"
+                     "CORRECT (Vitest-compatible, jest-dom v6+):\n"
+                     "  import '@testing-library/jest-dom/vitest';\n\n"
+                     "This import auto-registers jest-dom matchers (toBeInTheDocument, toHaveClass, etc.) "
+                     "with Vitest's expect without requiring globals: true.\n\n"
+                     "If using jest-dom v5 or earlier, upgrade to v6+:\n"
+                     "  npm install @testing-library/jest-dom@latest\n\n"
+                     "Alternatively, add a Vitest setup file:\n"
+                     "  // vitest.setup.ts\n"
+                     "  import '@testing-library/jest-dom/vitest';\n"
+                     "  // vitest.config.ts: setupFiles: ['./vitest.setup.ts']",
+        severity="error",
+        tags="vitest,jest-dom,expect,testing-library,react,undefined,globals,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="VitestExpectNotDefined",
+        language="javascript",
+        pattern=r"ReferenceError:\s*expect\s+is\s+not\s+defined",
+        cause="Vitest does not expose test globals (expect, describe, it, etc.) by default. "
+              "They must be explicitly imported from 'vitest', or globals: true must be set "
+              "in vitest.config. This commonly happens when @testing-library/jest-dom is "
+              "imported before vitest's expect is available.",
+        fix_template="Fix test files in ONE of these ways:\n\n"
+                     "Option 1 — Explicit imports (recommended, no config change):\n"
+                     "  import { describe, it, expect, beforeEach, vi } from 'vitest';\n"
+                     "  import '@testing-library/jest-dom/vitest';  // NOT '@testing-library/jest-dom'\n\n"
+                     "Option 2 — Enable globals in vitest.config:\n"
+                     "  // vitest.config.ts\n"
+                     "  export default defineConfig({ test: { globals: true } });\n"
+                     "  // Then add to tsconfig.json: \"types\": [\"vitest/globals\"]\n\n"
+                     "IMPORTANT: If using @testing-library/jest-dom, you MUST use the "
+                     "'/vitest' subpath import, not the bare import.",
+        severity="error",
+        tags="vitest,expect,globals,undefined,testing,ReferenceError,javascript,typescript",
+    ),
 ]
 
 
@@ -517,6 +562,22 @@ _CONTENT_FIX_SEEDS: list[ContentFix] = [
         description=(
             "Tailwind CSS v4 removed @tailwind base/components/utilities "
             "directives. Replace with @import \"tailwindcss\"."
+        ),
+    ),
+    ContentFix(
+        name="vitest-jest-dom-import",
+        file_glob="*.test.*",
+        content_pattern=r"""import\s+['"]@testing-library/jest-dom['"];?""",
+        replacement="import '@testing-library/jest-dom/vitest';",
+        ensure_content="",
+        flags="MULTILINE",
+        collapse_blanks=False,
+        language="javascript",
+        source="core",
+        description=(
+            "Replace bare @testing-library/jest-dom import with the "
+            "Vitest-compatible subpath import (@testing-library/jest-dom/vitest). "
+            "The bare import crashes in Vitest because expect is not global."
         ),
     ),
 ]
@@ -1190,19 +1251,35 @@ def seed(
     # ── 1a. Seed errors.db ──────────────────────────────────────────────
     db_path = _errors_db_path()
     edict = ErrorDict(db_path)
-    # Idempotent: skip clear+insert if already populated (avoids
-    # destroying data when seed() is triggered spuriously by a
-    # transient SQLite error in _global_kb_exists()).
-    if edict.count() == 0:
+    # Re-seed when the seed list has grown (new entries added to code).
+    # This ensures new KB error fixes are picked up without requiring
+    # users to manually delete errors.db.
+    current_count = edict.count()
+    if current_count == 0:
+        edict.bulk_insert(_ERROR_SEEDS)
+    elif current_count < len(_ERROR_SEEDS):
+        logger.info(
+            "errors.db has %d records but seed list has %d — re-seeding",
+            current_count, len(_ERROR_SEEDS),
+        )
+        edict.clear()
         edict.bulk_insert(_ERROR_SEEDS)
     else:
         logger.debug("errors.db already populated (%d records), skipping re-seed",
-                     edict.count())
+                     current_count)
     summary["errors_seeded"] = edict.count()
     logger.info("Seeded %d errors into %s", summary["errors_seeded"], db_path)
 
     # ── 1b. Seed content fixes ───────────────────────────────────────────
-    if edict.count_content_fixes() == 0:
+    current_cf_count = edict.count_content_fixes()
+    if current_cf_count == 0:
+        edict.bulk_insert_content_fixes(_CONTENT_FIX_SEEDS)
+    elif current_cf_count < len(_CONTENT_FIX_SEEDS):
+        logger.info(
+            "content_fixes has %d records but seed list has %d — re-seeding",
+            current_cf_count, len(_CONTENT_FIX_SEEDS),
+        )
+        edict.clear_content_fixes()
         edict.bulk_insert_content_fixes(_CONTENT_FIX_SEEDS)
     else:
         logger.debug("content_fixes already populated, skipping re-seed")

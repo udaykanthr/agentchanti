@@ -1730,6 +1730,59 @@ _TEST_NAME_PATTERNS = [
 ]
 
 
+def _build_scoped_test_cmd(
+    base_cmd: str,
+    test_files: dict[str, str],
+    subproject_cwd: str | None = None,
+) -> str:
+    """Build a test command scoped to only the files from this step.
+
+    Appends file paths to the base test command so the runner only
+    executes the tests that were written/modified in the current step,
+    rather than the entire test suite.
+
+    Supports pytest, vitest, jest, go test, and rspec.
+    """
+    if not test_files:
+        return base_cmd
+
+    # Get file paths relative to the test runner's working directory
+    scoped_paths: list[str] = []
+    for fpath in test_files:
+        # If subproject_cwd is set, file paths in memory are already
+        # prefixed with it (e.g. "react-app/src/__tests__/Foo.test.jsx").
+        # The test command runs inside subproject_cwd, so strip the prefix.
+        if subproject_cwd:
+            prefix = subproject_cwd.rstrip("/\\") + "/"
+            prefix_back = subproject_cwd.rstrip("/\\") + "\\"
+            if fpath.startswith(prefix):
+                fpath = fpath[len(prefix):]
+            elif fpath.startswith(prefix_back):
+                fpath = fpath[len(prefix_back):]
+        # Use forward slashes for consistency
+        scoped_paths.append(fpath.replace("\\", "/"))
+
+    if not scoped_paths:
+        return base_cmd
+
+    # Build the scoped command based on the runner
+    base_lower = base_cmd.lower()
+
+    # pytest: `pytest file1.py file2.py`
+    # vitest: `npx vitest run file1.test.jsx file2.test.jsx`
+    # jest:   `npx jest file1.test.jsx file2.test.jsx`
+    # go:     `go test ./path/to/...` (different pattern, skip scoping)
+    # rspec:  `rspec file1_spec.rb file2_spec.rb`
+
+    if "go test" in base_lower:
+        # Go test uses package paths, not file paths — skip scoping
+        return base_cmd
+
+    # For all other runners, append file paths
+    path_args = " ".join(scoped_paths)
+    return f"{base_cmd} {path_args}"
+
+
 def _count_test_failures(output: str) -> int:
     """Count the number of individual test failures in test runner output.
 
@@ -2041,6 +2094,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             display=display, step_idx=step_idx,
             language=language, cfg=cfg, auto=auto,
             project_profile=project_profile,
+            project_context=project_context,
         )
         if chunk_result is not None:
             return chunk_result
@@ -2211,18 +2265,28 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 f"{kb_ctx}\n"
             )
 
+        # Inject success criteria so the reviewer validates completeness
+        criteria_ctx = ""
+        if project_context is not None:
+            criteria = getattr(project_context, 'success_criteria', [])
+            if criteria:
+                criteria_ctx = (
+                    "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
+                    + "\n".join(f"- {c}" for c in criteria)
+                )
+
         use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
         if use_diff_review:
             review = reviewer.process(
                 f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}",
+                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}",
                 language=language,
                 review_mode="diff",
             )
         else:
             review = reviewer.process(
                 f"Review this code for the step: {step_text}\n\n{response}",
-                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}{reviewer_kb}",
+                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}{reviewer_kb}{criteria_ctx}",
                 language=language,
             )
 
@@ -2756,6 +2820,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # Strip protected manifest files before they reach memory
         test_files = _strip_protected_files(test_files)
 
+        # Apply KB-driven content fixes (e.g. jest-dom → jest-dom/vitest)
+        content_fixes = getattr(memory, '_content_fixes', None)
+        test_files = _apply_content_fixes(test_files, content_fixes)
+
         # Normalize paths: fix LLM-generated paths that are suffixes of known files
         test_files = _normalize_fix_paths(test_files, memory)
 
@@ -2828,12 +2896,20 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                          f"'{test_cmd}' — test files import from 'vitest'")
                 display.step_info(step_idx, "Detected vitest imports → using vitest runner")
 
+        # Scope the test command to only run files from THIS step.
+        # This prevents failures in unrelated test files from blocking
+        # the current step's fix loop.
+        scoped_test_cmd = _build_scoped_test_cmd(
+            test_cmd, test_files, subproject_cwd)
+        if scoped_test_cmd != test_cmd:
+            log.info(f"Step {step_idx+1}: Scoped test command: {scoped_test_cmd}")
+
         prev_output = None
         prev_fail_count = None
         for run_attempt in range(1, MAX_STEP_RETRIES + 1):
-            display.step_info(step_idx, f"Running: {test_cmd} (attempt {run_attempt})...")
-            log.info(f"Step {step_idx+1}: Running test command: {test_cmd}" + (f" in {subproject_cwd}" if subproject_cwd else ""))
-            success, output = executor.run_tests(test_cmd, cwd=subproject_cwd)
+            display.step_info(step_idx, f"Running: {scoped_test_cmd} (attempt {run_attempt})...")
+            log.info(f"Step {step_idx+1}: Running test command: {scoped_test_cmd}" + (f" in {subproject_cwd}" if subproject_cwd else ""))
+            success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
             log.info(f"Step {step_idx+1}: Test run output:\n{output or '(no output)'}")
 
             last_test_output = output
@@ -2928,7 +3004,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 ok, out = executor.run_command(install_cmd, cwd=subproject_cwd)
                 if ok:
                     display.step_info(step_idx, f"Installed `{actual_tool}`, re-running...")
-                    success, output = executor.run_tests(test_cmd, cwd=subproject_cwd)
+                    success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
                     last_test_output = output
                     if success:
                         display.step_info(step_idx, "Tests passed after runner install ✔")
@@ -2945,8 +3021,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 install_ok, install_out = executor.install_packages(missing_pkgs, tool=install_tool, cwd=subproject_cwd)
                 if install_ok:
                     display.step_info(step_idx, "Packages installed, re-running tests...")
-                    log.info(f"Step {step_idx+1}: Re-running test command: {test_cmd}")
-                    success, output = executor.run_tests(test_cmd, cwd=subproject_cwd)
+                    log.info(f"Step {step_idx+1}: Re-running test command: {scoped_test_cmd}")
+                    success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
                     log.info(f"Step {step_idx+1}: Test re-run after install:\n{output or '(no output)'}")
                     last_test_output = output
                     if success:
@@ -3117,6 +3193,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         _cleanup_stale_js_test_files(
                             fix_files, memory, display, step_idx,
                             subproject_cwd)
+                        # Update scoped command if fix introduced new test files
+                        merged_test_files = {**test_files, **fix_files}
+                        scoped_test_cmd = _build_scoped_test_cmd(
+                            test_cmd, merged_test_files, subproject_cwd)
                     else:
                         log.warning(f"Step {step_idx+1}: All fix files were "
                                     f"blocked by test-only filter")
@@ -3480,6 +3560,7 @@ def _try_chunk_edit(
     cfg: Config,
     auto: bool = False,
     project_profile=None,
+    project_context=None,
 ) -> tuple[bool, str] | None:
     """Attempt chunk-level editing. Returns (success, error) or None for fallback."""
     try:
@@ -3568,6 +3649,21 @@ def _try_chunk_edit(
         log.info("[ChunkEdit] LLM used full-file format or no edits parsed, falling back")
         return None
 
+    # Detect dropped edits: count [EDIT] markers in the raw response and
+    # compare against parsed edits.  If the LLM produced EDIT markers that
+    # failed to parse (e.g. multi-word chunk names before the regex fix),
+    # fall back to full-file mode rather than applying partial edits.
+    raw_edit_count = len(re.findall(
+        r"####\s*\[EDIT\]:", llm_response,
+    ))
+    if raw_edit_count > len(edits):
+        log.warning(
+            "[ChunkEdit] Parsed %d edits but found %d [EDIT] markers in "
+            "response — some edits were dropped, falling back to full-file",
+            len(edits), raw_edit_count,
+        )
+        return None
+
     edits_by_file: dict[str, list] = {}
     for edit in edits:
         edits_by_file.setdefault(edit.file_path, []).append(edit)
@@ -3632,9 +3728,19 @@ def _try_chunk_edit(
             f"{kb_ctx}\n"
         )
 
+    # Inject success criteria so the reviewer validates completeness
+    criteria_ctx = ""
+    if project_context is not None:
+        criteria = getattr(project_context, 'success_criteria', [])
+        if criteria:
+            criteria_ctx = (
+                "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
+                + "\n".join(f"- {c}" for c in criteria)
+            )
+
     review = reviewer.process(
         f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-        context=f"Step: {step_text}\nReview ONLY the changes shown. {lint_context}{reviewer_kb}",
+        context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}",
         language=language,
         review_mode=reviewer_mode,
     )

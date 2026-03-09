@@ -259,6 +259,9 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
 9. Use `expect(...).toBe(...)`, `toEqual(...)`, `toThrow(...)` etc. for assertions.
 10. For mocking, use `vi.fn()`, `vi.spyOn()`, `vi.mock()` (NOT `jest.fn()`).
 11. For async functions, use `async/await` with `expect(...).resolves` or `await expect(...)`.
+12. CRITICAL — @testing-library/jest-dom: If you need DOM matchers (toBeInTheDocument, toHaveClass, etc.),
+   you MUST import `'@testing-library/jest-dom/vitest'` — NOT `'@testing-library/jest-dom'`.
+   The bare import crashes because it calls expect.extend() but Vitest does not expose expect globally.
 """
 
     @staticmethod
