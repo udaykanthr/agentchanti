@@ -191,6 +191,7 @@ class ContextBuilder:
         current_file: Optional[str] = None,
         max_tokens: int = 4000,
         error_output: Optional[str] = None,
+        language: Optional[str] = None,
     ) -> KBContext:
         """
         Build aggregated KB context for a single pipeline step.
@@ -223,7 +224,7 @@ class ContextBuilder:
             or self._detect_error_intent(task_description)
         )
         is_review = self._detect_review_intent(task_description)
-        language = self._detect_language(current_file)
+        language = language or self._detect_language(current_file)
 
         # Initialise the global KB store once (used by steps 4, 5, 5b, 6)
         self._ensure_global()
@@ -309,6 +310,7 @@ class ContextBuilder:
                 buckets = self._global_store.batch_search(
                     task_description,
                     category_limits=category_limits,
+                    language=language,
                     api_client=self._api_client,
                 )
 

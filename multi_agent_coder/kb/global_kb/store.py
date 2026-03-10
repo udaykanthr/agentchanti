@@ -125,19 +125,39 @@ class GlobalKBStore:
         except Exception as exc:
             logger.warning("Vector search failed, falling back to file search: %s", exc)
 
-        # Supplement with file-based search when vector results are sparse
-        if len(results) < top_k:
-            try:
-                file_results = self._fallback_file_search(
-                    query, categories, language, top_k,
+        # Always merge file-based search results so that registry docs
+        # added after the last `kb update` (not yet embedded) are still
+        # discoverable — even when vector results already fill top_k.
+        try:
+            file_results = self._fallback_file_search(
+                query, categories, language, top_k,
+            )
+            seen = {r.file for r in results}
+            added = 0
+            for fr in file_results:
+                if fr.file not in seen:
+                    results.append(fr)
+                    seen.add(fr.file)
+                    added += 1
+            if added:
+                logger.debug(
+                    "File search added %d result(s): %s",
+                    added,
+                    [r.title for r in results[-added:]],
                 )
-                seen = {r.file for r in results}
-                for fr in file_results:
-                    if fr.file not in seen and len(results) < top_k:
-                        results.append(fr)
-                        seen.add(fr.file)
-            except Exception:
-                pass
+            # Re-rank by score and trim to top_k
+            if len(results) > top_k:
+                results.sort(key=lambda r: r.score, reverse=True)
+                results = results[:top_k]
+        except Exception:
+            pass
+
+        if results:
+            logger.debug(
+                "KB search returned %d result(s): %s",
+                len(results),
+                [r.title for r in results],
+            )
 
         return results
 
@@ -259,25 +279,27 @@ class GlobalKBStore:
                 "file search: %s", exc,
             )
 
-        # Supplement underfilled categories with file-based keyword search.
-        # This ensures registry files added via `kb update` (not yet
-        # embedded in the vector store) are still discoverable.
+        # Always merge file-based keyword search results so that registry
+        # docs added after the last `kb update` are still discoverable.
         for cat, top_k in category_limits.items():
             current = result.get(cat, [])
-            if len(current) < top_k:
-                try:
-                    file_results = self._fallback_file_search(
-                        query, categories=[cat], language=language,
-                        top_k=top_k,
-                    )
-                    # Deduplicate by file path
-                    seen = {r.file for r in current}
-                    for fr in file_results:
-                        if fr.file not in seen and len(current) < top_k:
-                            current.append(fr)
-                            seen.add(fr.file)
-                except Exception:
-                    pass
+            try:
+                file_results = self._fallback_file_search(
+                    query, categories=[cat], language=language,
+                    top_k=top_k,
+                )
+                # Deduplicate by file path
+                seen = {r.file for r in current}
+                for fr in file_results:
+                    if fr.file not in seen:
+                        current.append(fr)
+                        seen.add(fr.file)
+                # Re-rank by score and trim to top_k
+                if len(current) > top_k:
+                    current.sort(key=lambda r: r.score, reverse=True)
+                    current = current[:top_k]
+            except Exception:
+                pass
             result[cat] = current
 
         return result
@@ -555,12 +577,16 @@ class GlobalKBStore:
                 content_lower = content.lower()
                 title_lower = meta.get("title", "").lower()
                 tags_lower = meta.get("tags", "").lower()
+                # Compressed title for compound-name matching:
+                # "Tailwind CSS" → "tailwindcss" so query "tailwindcss" matches
+                title_compressed = _re.sub(r'[\s\-_]+', '', title_lower)
 
                 body_hits = sum(
                     1.0 for w in query_words if w in content_lower
                 )
                 title_hits = sum(
-                    3.0 for w in query_words if w in title_lower
+                    3.0 for w in query_words
+                    if w in title_lower or w in title_compressed
                 )
                 tag_hits = sum(
                     2.0 for w in query_words if w in tags_lower

@@ -477,7 +477,8 @@ def main():
         pre_opt_count = len(steps)
         steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
                                             kb_context_builder=kb_context_builder,
-                                            dependencies=dependencies)
+                                            dependencies=dependencies,
+                                            language=language)
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
 
@@ -512,7 +513,8 @@ def main():
                 steps, dependencies = executor.parse_step_dependencies(raw_steps)
                 steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
                                             kb_context_builder=kb_context_builder,
-                                            dependencies=dependencies)
+                                            dependencies=dependencies,
+                                            language=language)
             elif action == "edit" and edited_steps:
                 steps, dependencies = executor.parse_step_dependencies(edited_steps)
 
@@ -537,6 +539,7 @@ def main():
         source_files=source_files or {},
         language=language,
     )
+    display.show_status("Analysing project...")
     try:
         analyser = AnalyseAgent(
             "Analyser", "Senior Technical Analyst",

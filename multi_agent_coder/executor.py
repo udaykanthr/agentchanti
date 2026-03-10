@@ -997,6 +997,32 @@ class Executor:
                 packages.append(pkg)
                 seen.add(pkg)
 
+        # Vite/Vitest: Failed to resolve import "pkg"
+        # e.g. 'Failed to resolve import "@testing-library/user-event"'
+        for m in re.finditer(
+            r'Failed to resolve import\s+"([^"]+)"',
+            test_output,
+        ):
+            pkg = m.group(1)
+            if pkg not in seen:
+                packages.append(pkg)
+                seen.add(pkg)
+
+        # Vite/Vitest/Node: Cannot find module/package 'pkg'
+        for m in re.finditer(
+            r"Cannot find (?:module|package) ['\"]([^'\"]+)['\"]",
+            test_output,
+        ):
+            pkg = m.group(1)
+            # Skip relative imports — only catch package names
+            if not pkg.startswith(".") and pkg not in seen:
+                # Normalize scoped package subpaths: '@heroicons/react/24/outline' → '@heroicons/react'
+                if pkg.startswith("@") and pkg.count("/") >= 2:
+                    pkg = "/".join(pkg.split("/")[:2])
+                if pkg not in seen:
+                    packages.append(pkg)
+                    seen.add(pkg)
+
         return packages
 
     def install_packages(self, packages: List[str], tool: str = "pip install", cwd: str | None = None) -> Tuple[bool, str]:

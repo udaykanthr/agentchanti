@@ -53,3 +53,4 @@ multi_agent_coder/llm/__pycache__/ollama.cpython-312.pyc
 multi_agent_coder/kb/global_kb/core/global_kb.db
 multi_agent_coder/kb/global_kb/core/manifest.json
 multi_agent_coder/kb/global_kb/registry/
+multi_agent_coder/kb/global_kb/store.py

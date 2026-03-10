@@ -12,11 +12,17 @@ from ..cli_display import CLIDisplay, token_tracker
 # and classify as TEST.  This is faster and more reliable than relying
 # on prompt hints.
 _TEST_CMD_RE = re.compile(
-    r'\b(pytest|jest|vitest|mocha|rspec|phpunit'
+    # Match test runner names only when they are standalone commands,
+    # NOT when part of a hyphenated package name (e.g. jest-dom,
+    # jest-environment-jsdom, vitest-dev).  Uses negative lookbehind
+    # and lookahead for hyphens.
+    r'(?<![-/])(?:'
+    r'pytest|jest|vitest|mocha|rspec|phpunit'
     r'|npm\s+test|yarn\s+test|pnpm\s+test'
     r'|go\s+test|cargo\s+test'
     r'|python\s+-m\s+pytest'
-    r'|npx\s+vitest|npx\s+jest)\b',
+    r'|npx\s+vitest|npx\s+jest'
+    r')(?![-\w]*[-])',          # reject jest-dom, vitest-dev, etc.
     re.IGNORECASE,
 )
 
@@ -24,16 +30,24 @@ _TEST_CMD_RE = re.compile(
 # These are configuration/setup steps (adding scripts, config, etc.)
 # and should be classified by the LLM, not fast-tracked as TEST.
 _TEST_CONFIG_RE = re.compile(
-    r'(add\s+.*scripts?\s+to\b'
+    r'('
+    # Script/package.json edits
+    r'add\s+.*scripts?\s+to\b'
     r'|update\s+.*scripts?\s+in\b'
-    r'|configure\s+.*test'
-    r'|setup\s+.*test'
-    r'|set\s+up\s+.*test'
-    r'|install\s+.*test'
-    r'|create\s+.*config'
     r'|modify\s+.*package\.json'
     r'|add\s+.*to\s+.*package\.json'
-    r'|edit\s+.*package\.json)',
+    r'|edit\s+.*package\.json'
+    # Setup / config language
+    r'|configure\s+.*test'
+    r'|(?:setup|set\s+up)\s+.*test'
+    r'|install\s+.*test'
+    r'|ensure\s+.*(?:configured|enabled|set\s*up|installed)'
+    r'|import\s+.*(?:jest-dom|@testing-library)'
+    # File creation/update targeting config or source files (not test execution)
+    r'|create\s+.*(?:config|file|\.js|\.ts|\.jsx|\.tsx)'
+    r'|(?:update|modify|edit|change)\s+.*\.config\.'
+    r'|(?:update|modify|edit|change)\s+.*(?:vite|vitest|jest|webpack|babel|tsconfig|eslint)\.'
+    r')',
     re.IGNORECASE,
 )
 

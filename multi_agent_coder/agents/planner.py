@@ -240,6 +240,10 @@ class PlannerAgent(Agent):
                         top_k=15,
                         api_client=kb_context_builder._api_client,
                     )
+                    _logger.info(
+                        "[PreAnalysis] Global KB search returned %d docs",
+                        len(docs) if docs else 0,
+                    )
                     if docs:
                         # Filter out docs about conflicting frameworks
                         # (e.g. Angular docs for a React task)
@@ -270,11 +274,19 @@ class PlannerAgent(Agent):
                             content = doc.content or doc.title
                             if content:
                                 doc_hints.append(f"### {doc.title}\n{content}")
+                                _logger.info(
+                                    "[PreAnalysis] Loaded doc: '%s'",
+                                    doc.title,
+                                )
                         if doc_hints:
                             parts.append("\n[Framework/Library Documentation]")
                             parts.append(
                                 "IMPORTANT: Follow these guides when generating steps:")
                             parts.extend(doc_hints)
+                        _logger.info(
+                            "[PreAnalysis] %d doc(s) injected into planner context",
+                            len(doc_hints),
+                        )
             except Exception as e:
                 _logger.debug(f"[PreAnalysis] Global KB doc search failed: {e}")
 

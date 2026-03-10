@@ -582,6 +582,26 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="props,undefined,component,react,render,testing,javascript,typescript",
     ),
     ErrorFix(
+        error_type="ViteFailedToResolveImport",
+        language="javascript",
+        pattern=r"Failed to resolve import\s+\"[^\"]+\"",
+        cause="Vite/Vitest cannot resolve an npm package import because the package "
+              "is not installed in node_modules. This commonly happens with "
+              "@testing-library/user-event, @testing-library/jest-dom, or other "
+              "test utility packages that the LLM imports but weren't installed.",
+        fix_template="FIX: Install the missing package as a dev dependency:\n"
+                     "  npm install --save-dev <package-name>\n\n"
+                     "Common missing test packages:\n"
+                     "  npm install --save-dev @testing-library/user-event\n"
+                     "  npm install --save-dev @testing-library/jest-dom\n"
+                     "  npm install --save-dev @testing-library/react\n"
+                     "  npm install --save-dev react-router-dom\n\n"
+                     "Do NOT try to fix the import path or remove the import — "
+                     "the package genuinely needs to be installed.",
+        severity="error",
+        tags="vite,vitest,import,resolve,module,not,found,install,npm,javascript,typescript",
+    ),
+    ErrorFix(
         error_type="NoTestSuiteFound",
         language="javascript",
         pattern=r"No test suite found in file",

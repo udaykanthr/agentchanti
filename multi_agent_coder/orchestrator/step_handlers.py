@@ -1269,6 +1269,119 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
     return fixed_files
 
 
+# ---------------------------------------------------------------------------
+# Pre-install: scan imports and install missing npm packages before running
+# ---------------------------------------------------------------------------
+
+# Regex to extract npm package names from JS/TS import statements.
+# Matches: import ... from 'pkg'  |  import 'pkg'  |  require('pkg')
+_JS_IMPORT_PKG_RE = re.compile(
+    r'(?:'
+    r'import\s+.*?\s+from\s+["\']([^"\'./][^"\']*)["\']'
+    r'|import\s+["\']([^"\'./][^"\']*)["\']'
+    r'|require\s*\(\s*["\']([^"\'./][^"\']*)["\']'
+    r')',
+)
+
+
+def _extract_npm_packages(files: dict[str, str]) -> set[str]:
+    """Extract npm package names from import statements in JS/TS files.
+
+    Returns the set of top-level package names (e.g. ``@testing-library/react``,
+    ``react-router-dom``) referenced in the given file contents.
+    Skips relative imports (starting with ``.`` or ``/``).
+    """
+    packages: set[str] = set()
+    for content in files.values():
+        for m in _JS_IMPORT_PKG_RE.finditer(content):
+            raw = m.group(1) or m.group(2) or m.group(3)
+            if not raw:
+                continue
+            # Normalize scoped packages: '@scope/pkg/subpath' → '@scope/pkg'
+            if raw.startswith("@"):
+                parts = raw.split("/")
+                pkg = "/".join(parts[:2]) if len(parts) >= 2 else raw
+            else:
+                # Unscoped: 'react-router-dom/something' → 'react-router-dom'
+                pkg = raw.split("/")[0]
+            packages.add(pkg)
+    return packages
+
+
+def _get_installed_packages(subproject_cwd: str | None) -> set[str]:
+    """Read package.json and return the set of declared dependency names."""
+    import json as _json
+    pkg_path = os.path.join(subproject_cwd, "package.json") if subproject_cwd else "package.json"
+    if not os.path.isfile(pkg_path):
+        return set()
+    try:
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        installed = set()
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            installed.update(data.get(key, {}).keys())
+        return installed
+    except Exception:
+        return set()
+
+
+def _preinstall_missing_packages(
+    test_files: dict[str, str],
+    memory,
+    executor,
+    display,
+    step_idx: int,
+    language: str | None,
+    subproject_cwd: str | None,
+) -> None:
+    """Scan test files and their imported source files for npm package
+    imports, then install any that aren't in package.json.
+
+    This prevents "Failed to resolve import" / "Cannot find package"
+    errors from wasting a test run + LLM fix cycle.
+    """
+    if language not in ("javascript", "typescript"):
+        return
+
+    # 1. Collect all imports from test files
+    all_imported = _extract_npm_packages(test_files)
+
+    # 2. Also scan source files that tests import (transitive deps)
+    source_imports = _extract_imported_sources(test_files, memory)
+    if source_imports:
+        all_imported |= _extract_npm_packages(source_imports)
+
+    if not all_imported:
+        return
+
+    # 3. Compare against package.json
+    installed = _get_installed_packages(subproject_cwd)
+
+    # Built-in modules and test runner internals that don't need install
+    builtins = {"vitest", "jest", "react", "react-dom", "path", "fs",
+                "url", "util", "os", "child_process", "stream", "events",
+                "crypto", "http", "https", "assert", "buffer", "net"}
+    missing = all_imported - installed - builtins
+
+    if not missing:
+        return
+
+    log.info(f"Step {step_idx+1}: Pre-install scan found missing packages: "
+             f"{sorted(missing)}")
+    display.step_info(
+        step_idx,
+        f"Pre-installing {len(missing)} missing packages: "
+        f"{', '.join(sorted(missing))}...")
+
+    ok, out = executor.install_packages(
+        sorted(missing), tool="npm install --save-dev",
+        cwd=subproject_cwd)
+    if ok:
+        display.step_info(step_idx, "Packages installed ✔")
+    else:
+        log.warning(f"Step {step_idx+1}: Pre-install failed: {out[:300]}")
+
+
 # Regex to detect at least one test block in JS/TS/Python test files.
 # Matches: describe(, it(, test(, def test_, @pytest, @Test
 _HAS_TEST_BLOCK_RE = re.compile(
@@ -1889,6 +2002,121 @@ def _count_test_failures(output: str) -> int:
             count += 1
 
     return max(count, 1) if 'FAIL' in clean.upper() else 0
+
+
+# ---------------------------------------------------------------------------
+# Per-file failure identification (for focused, per-file test fixing)
+# ---------------------------------------------------------------------------
+
+def _identify_failed_test_files(
+    output: str,
+    test_files: dict[str, str],
+) -> list[str]:
+    """Identify which test files from *test_files* had failures.
+
+    Parses test runner output (Vitest, Jest, pytest) to find file-level
+    failures.  Returns a list of memory paths from *test_files* that
+    failed.  Empty list means we couldn't determine (caller should
+    fallback to all-at-once fixing).
+    """
+    if not output or not test_files:
+        return []
+
+    clean = _ANSI_RE.sub('', output)
+    failed_basenames: set[str] = set()
+
+    # Vitest: "❯ path/file.test.jsx (N tests | M failed)"
+    for m in re.finditer(r'[❯]\s+(\S+)\s+\(.*?failed\)', clean):
+        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        failed_basenames.add(fname)
+
+    # Jest: "FAIL path/file.test.jsx" or "FAIL  path/file.spec.js"
+    for m in re.finditer(
+        r'FAIL\s+(\S+\.(?:test|spec)\.\w+)', clean
+    ):
+        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        failed_basenames.add(fname)
+
+    # pytest: "FAILED path/test_file.py::test_name"
+    for m in re.finditer(r'FAILED\s+(\S+\.py)::', clean):
+        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        failed_basenames.add(fname)
+
+    if not failed_basenames:
+        return []
+
+    # Match basenames against actual paths in test_files
+    result: list[str] = []
+    for test_path in test_files:
+        basename = test_path.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        if basename in failed_basenames:
+            result.append(test_path)
+
+    return result
+
+
+def _extract_file_specific_errors(
+    output: str,
+    test_file_path: str,
+    max_chars: int = 3000,
+) -> str:
+    """Extract error output specific to a single test file.
+
+    Scans test runner output for error blocks that mention the given
+    file and captures only the relevant error context.  Falls back to
+    the generic ``_extract_test_error`` if file-specific extraction
+    yields nothing.
+    """
+    if not output:
+        return ""
+
+    clean = _ANSI_RE.sub('', output)
+    basename = test_file_path.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+
+    lines = clean.splitlines()
+    relevant: list[str] = []
+    in_file_block = False
+    blank_count = 0
+
+    # Pattern to detect another test file's summary block starting
+    _other_file_re = re.compile(
+        r'^\s*[✓❯]\s+\S+\.(?:test|spec)\.'
+        r'|^\s*(?:FAIL|PASS)\s+\S+\.(?:test|spec)\.'
+    )
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Start/continue capturing when we see the failing file referenced
+        if basename in line:
+            in_file_block = True
+            blank_count = 0
+            relevant.append(line)
+            continue
+
+        if in_file_block:
+            if not stripped:
+                blank_count += 1
+                if blank_count >= 3:
+                    in_file_block = False
+                else:
+                    relevant.append(line)
+                continue
+
+            # Another test file's block starting — stop capturing
+            if _other_file_re.match(stripped) and basename not in stripped:
+                in_file_block = False
+                continue
+
+            blank_count = 0
+            relevant.append(line)
+
+    result = '\n'.join(relevant).strip()
+
+    if len(result) > max_chars:
+        result = result[:max_chars] + '\n... [truncated]'
+
+    return result if result else _extract_test_error(output, max_chars)
 
 
 def _build_batch_error_summary(output: str, max_chars: int = 6000) -> str:
@@ -2976,88 +3204,57 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                          f"'{test_cmd}' — test files import from 'vitest'")
                 display.step_info(step_idx, "Detected vitest imports → using vitest runner")
 
-        # Scope the test command to only run files from THIS step.
-        # This prevents failures in unrelated test files from blocking
-        # the current step's fix loop.
-        scoped_test_cmd = _build_scoped_test_cmd(
-            test_cmd, test_files, subproject_cwd)
-        if scoped_test_cmd != test_cmd:
-            log.info(f"Step {step_idx+1}: Scoped test command: {scoped_test_cmd}")
+        # ── Pre-install: scan imports and install missing packages ──
+        # Avoids wasting a test run + LLM fix cycle on missing packages.
+        _preinstall_missing_packages(
+            test_files, memory, executor, display, step_idx,
+            language, subproject_cwd)
 
-        prev_output = None
-        prev_fail_count = None
-        for run_attempt in range(1, MAX_STEP_RETRIES + 1):
-            display.step_info(step_idx, f"Running: {scoped_test_cmd} (attempt {run_attempt})...")
-            log.info(f"Step {step_idx+1}: Running test command: {scoped_test_cmd}" + (f" in {subproject_cwd}" if subproject_cwd else ""))
-            success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
-            log.info(f"Step {step_idx+1}: Test run output:\n{output or '(no output)'}")
+        # ── Per-file test execution and fix loop ──
+        # Run each test file individually so failures in one file don't
+        # block or pollute the fix loop of another.  The coder sees only
+        # the errors and source imports for the single file it's fixing.
 
+        jsx_hint = ""
+        if test_runner == "vitest" and language in ("javascript", "typescript"):
+            jsx_ext = ".jsx" if language == "javascript" else ".tsx"
+            js_ext = ".js" if language == "javascript" else ".ts"
+            jsx_hint = (
+                f"IMPORTANT: Vite/Rollup CANNOT parse JSX in {js_ext} files. "
+                f"If a test file contains JSX (e.g. <Component />, render(<App />)), "
+                f"it MUST use the .test{jsx_ext} extension, NOT .test{js_ext}. "
+                f"If you need to rename a file from .test{js_ext} to .test{jsx_ext}, "
+                f"output the corrected content under the new .test{jsx_ext} path. "
+            )
+
+        failed_files: list[str] = []
+        file_count = len(test_files)
+
+        for file_idx, (test_path, test_content) in enumerate(
+                list(test_files.items()), 1):
+            f_basename = os.path.basename(test_path)
+            display.step_info(
+                step_idx,
+                f"Testing {f_basename} ({file_idx}/{file_count})...")
+
+            # Build a single-file test command
+            single_cmd = _build_scoped_test_cmd(
+                test_cmd, {test_path: test_content}, subproject_cwd)
+            log.info(f"Step {step_idx+1}: Running: {single_cmd}"
+                     + (f" in {subproject_cwd}" if subproject_cwd else ""))
+
+            success, output = executor.run_tests(
+                single_cmd, cwd=subproject_cwd)
+            log.info(f"Step {step_idx+1}: [{f_basename}] output:\n"
+                     f"{output or '(no output)'}")
             last_test_output = output
 
             if success:
-                display.step_info(step_idx, "Tests passed ✔")
-                return True, ""
+                display.step_info(
+                    step_idx, f"{f_basename} passed ✔ ({file_idx}/{file_count})")
+                continue
 
-            # Extract error classes and their messages for smarter deduplication
-            import re as _re
-            _error_classes = set(line.strip() for line in _re.findall(
-                r'((?:ModuleNotFoundError|ImportError|SyntaxError|NameError|'
-                r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
-                r'AssertionError|KeyError|ValueError|ReferenceError)[^\n]*)',
-                output or ""
-            ))
-
-            # Detect stuck loop: compare error classes, not just exact output
-            if prev_output and run_attempt > 1:
-                prev_error_classes = set(line.strip() for line in _re.findall(
-                    r'((?:ModuleNotFoundError|ImportError|SyntaxError|NameError|'
-                    r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
-                    r'AssertionError|KeyError|ValueError|ReferenceError)[^\n]*)',
-                    prev_output or ""
-                ))
-                if _error_classes and _error_classes == prev_error_classes:
-                    display.step_info(step_idx,
-                                      "Same error types repeating — fix not working, stopping.")
-                    log.warning(f"Step {step_idx+1}: Same error classes on attempt "
-                                f"{run_attempt}: {_error_classes}, breaking retry loop.")
-                    break
-                if output == prev_output:
-                    display.step_info(step_idx,
-                                      "Same error repeating — not a code issue, stopping retry loop.")
-                    log.warning(f"Step {step_idx+1}: Identical test output on attempt "
-                                f"{run_attempt}, breaking retry loop.")
-                    break
-            prev_output = output
-
-            # Early exit on no progress: if failure count is not decreasing,
-            # the fix attempts aren't helping — stop wasting LLM calls
-            current_fail_count = _count_test_failures(output or "")
-            if (prev_fail_count is not None
-                    and current_fail_count > 0
-                    and current_fail_count >= prev_fail_count
-                    and run_attempt > 1):
-                display.step_info(step_idx,
-                                  f"No progress ({current_fail_count} failures, "
-                                  f"was {prev_fail_count}) — stopping retry loop.")
-                log.warning(f"Step {step_idx+1}: Failure count not decreasing "
-                            f"({prev_fail_count} → {current_fail_count}), "
-                            f"breaking retry loop at attempt {run_attempt}.")
-                break
-            prev_fail_count = current_fail_count
-
-            # Early exit for unfixable error types
-            _unfixable = {e for e in _error_classes if e.startswith(('SyntaxError', 'IndentationError'))}
-            if _unfixable and run_attempt > 1:
-                _unfixable_names = {e.split(':')[0] for e in _unfixable}
-                display.step_info(step_idx,
-                                  f"Persistent {', '.join(_unfixable_names)} — likely unfixable, stopping.")
-                log.warning(f"Step {step_idx+1}: Unfixable errors after "
-                            f"{run_attempt} attempts: {_unfixable}")
-                break
-
-            # Detect system-level / environment failures early — these
-            # can't be fixed by editing code (e.g. missing Gemfile,
-            # missing runtime, missing package manager).
+            # ── System / env checks (shared across files, run once) ──
             from .pipeline import _detect_system_level_failure
             sys_issue = _detect_system_level_failure(output)
             if sys_issue:
@@ -3067,252 +3264,204 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 log.error(f"Step {step_idx+1}: {msg}")
                 return False, msg
 
-            # If test runner itself is not installed, try to install it
-            if "not installed" in output or "not on PATH" in output:
-                runner_parts = test_cmd.split()
-                actual_tool = runner_parts[1] if runner_parts[0] == "npx" and len(runner_parts) > 1 else runner_parts[0]
-                install_cmd = _get_runner_install_cmd(actual_tool)
-                if install_cmd is None:
-                    # System-level tool — can't auto-install, stop retrying
-                    display.step_info(step_idx,
-                                      f"`{actual_tool}` must be installed manually.")
-                    log.error(f"Step {step_idx+1}: `{actual_tool}` is not installed "
-                              f"and cannot be auto-installed.")
-                    break
-                display.step_info(step_idx, f"Installing `{actual_tool}`...")
-                log.info(f"Step {step_idx+1}: Installing test runner: {install_cmd}")
-                ok, out = executor.run_command(install_cmd, cwd=subproject_cwd)
-                if ok:
-                    display.step_info(step_idx, f"Installed `{actual_tool}`, re-running...")
-                    success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
-                    last_test_output = output
-                    if success:
-                        display.step_info(step_idx, "Tests passed after runner install ✔")
-                        return True, ""
-                continue  # retry with coder fix if runner install + rerun still failed
-
-            # Auto-install missing packages before asking coder to fix
+            # Auto-install missing packages (applies to all subsequent files)
             missing_pkgs = executor.detect_missing_packages(output)
             if missing_pkgs:
-                install_tool = "npm install --save-dev" if language in ("javascript", "typescript") else ("pip install")
-                
-                display.step_info(step_idx, f"Installing missing packages: {', '.join(missing_pkgs)}")
-                log.info(f"Step {step_idx+1}: Auto-installing: {missing_pkgs} with {install_tool}")
-                install_ok, install_out = executor.install_packages(missing_pkgs, tool=install_tool, cwd=subproject_cwd)
+                install_tool = ("npm install --save-dev"
+                                if language in ("javascript", "typescript")
+                                else "pip install")
+                display.step_info(
+                    step_idx,
+                    f"Installing missing packages: {', '.join(missing_pkgs)}")
+                install_ok, _ = executor.install_packages(
+                    missing_pkgs, tool=install_tool, cwd=subproject_cwd)
                 if install_ok:
-                    display.step_info(step_idx, "Packages installed, re-running tests...")
-                    log.info(f"Step {step_idx+1}: Re-running test command: {scoped_test_cmd}")
-                    success, output = executor.run_tests(scoped_test_cmd, cwd=subproject_cwd)
-                    log.info(f"Step {step_idx+1}: Test re-run after install:\n{output or '(no output)'}")
+                    # Re-run this single file after install
+                    success, output = executor.run_tests(
+                        single_cmd, cwd=subproject_cwd)
                     last_test_output = output
                     if success:
-                        display.step_info(step_idx, "Tests passed after package install ✔")
-                        return True, ""
-                else:
-                    log.warning(f"Step {step_idx+1}: Package install failed: {install_out}")
+                        display.step_info(
+                            step_idx,
+                            f"{f_basename} passed after install ✔ "
+                            f"({file_idx}/{file_count})")
+                        continue
 
-            # Early exit: if the same error type repeats across gen attempts,
-            # the fix isn't working — break to avoid wasting LLM calls
-            if prev_gen_error:
-                prev_gen_classes = set(_re.findall(
-                    r'(ModuleNotFoundError|ImportError|SyntaxError|NameError|'
-                    r'TypeError|AttributeError|IndentationError|FileNotFoundError|'
-                    r'AssertionError|KeyError|ValueError)',
-                    prev_gen_error or ""
-                ))
-                if (output == prev_gen_error or
-                        (_error_classes and _error_classes == prev_gen_classes)):
-                    display.step_info(step_idx,
-                                      "Same test error repeating across attempts — stopping.")
-                    log.warning(f"Step {step_idx+1}: Same error types across gen "
-                                f"attempts: {_error_classes}, breaking retry loop.")
-                    break
-            prev_gen_error = output
+            # ── Per-file fix loop ──
+            file_fixed = False
+            prev_output = output
+            for fix_attempt in range(1, MAX_STEP_RETRIES + 1):
+                display.step_info(
+                    step_idx,
+                    f"Fixing {f_basename} (attempt {fix_attempt}/{MAX_STEP_RETRIES})...")
 
-            display.step_info(step_idx, "Tests failed, analyzing failure origin...")
+                # Get the latest content from memory (may have been updated)
+                current_content = (memory.all_files().get(test_path)
+                                   or test_files.get(test_path, ""))
 
-            # ── Enhancement #6: import-trace context injection ──
-            imported_sources = _extract_imported_sources(test_files, memory)
-            source_context = ""
-            for fpath, content in imported_sources.items():
-                source_context += f"#### [FILE]: {fpath}\n```{lang_tag}\n{content}\n```\n\n"
+                # Focused source context: only files this test imports
+                single_imports = _extract_imported_sources(
+                    {test_path: current_content}, memory)
+                source_ctx = ""
+                for fp, cnt in single_imports.items():
+                    source_ctx += (
+                        f"#### [FILE]: {fp}\n"
+                        f"```{lang_tag}\n{cnt}\n```\n\n")
 
-            # Use batch error summary for structured, grouped view of ALL failures
-            batch_summary = _build_batch_error_summary(output) if output else ""
-            error_detail = batch_summary or (
-                f"(command `{test_cmd}` produced no output — it may have "
-                f"crashed or the test framework may not be installed)"
-            )
+                # Build error detail from this file's output only
+                error_detail = _build_batch_error_summary(output) if output else ""
+                if not error_detail:
+                    error_detail = (
+                        f"(command `{single_cmd}` produced no output)")
 
-            # ── Enhancement #5: bidirectional bug detection ──
-            # Determine whether the bug is in the test or the source code.
-            test_summary_for_triage = ""
-            for fpath, content in test_files.items():
-                test_summary_for_triage += f"{fpath}:\n{content[:1000]}\n\n"
-            bug_origin = _triage_test_failure(
-                error_detail, source_context, test_summary_for_triage,
-                coder.llm_client, display, step_idx)
+                # Triage: test bug or source bug?
+                bug_origin = _triage_test_failure(
+                    error_detail, source_ctx,
+                    f"{test_path}:\n{current_content[:1000]}\n",
+                    coder.llm_client, display, step_idx)
+                is_source_bug = (bug_origin == "SOURCE_BUG")
 
-            is_source_bug = (bug_origin == "SOURCE_BUG")
-            if is_source_bug:
-                display.step_info(step_idx,
-                                  "Bug detected in SOURCE code, asking coder to fix source...")
+                # KB error-fix lookup
+                kb_fix_context = ""
+                if kb_context_builder is not None:
+                    try:
+                        kb_ctx = kb_context_builder.build_context(
+                            task_description=step_text,
+                            error_output=output,
+                            max_tokens=2000,
+                        )
+                        if kb_ctx.error_fixes:
+                            kb_fix_context = (
+                                kb_context_builder
+                                .format_context_for_prompt(kb_ctx))
+                    except Exception:
+                        pass
 
-            # ── KB error-fix lookup for test failures ──
-            # Consult the global KB for known error patterns (e.g.
-            # TestingLibraryElementError, assertion count mismatches,
-            # mock callback issues) to give the coder concrete guidance.
-            kb_fix_context = ""
-            if kb_context_builder is not None:
-                try:
-                    kb_ctx = kb_context_builder.build_context(
-                        task_description=step_text,
-                        error_output=output,
-                        max_tokens=2000,
-                    )
-                    if kb_ctx.error_fixes:
-                        kb_fix_context = kb_context_builder.format_context_for_prompt(kb_ctx)
-                        log.info(f"Step {step_idx+1}: KB matched "
-                                 f"{len(kb_ctx.error_fixes)} error fix patterns "
-                                 f"for test fix loop")
-                except Exception as exc:
-                    log.debug(f"Step {step_idx+1}: KB error lookup in test "
-                              f"fix loop failed: {exc}")
-
-            # Search the web for error documentation to help the coder fix
-            search_context = ""
-            if search_agent is not None:
-                display.step_info(step_idx, "Searching web for test error fix...")
-                try:
-                    search_context = search_agent.search_for_error(
-                        error_detail, step_text, language=language,
-                        kb_context=getattr(memory, '_kb_context', ''))
-                    if search_context:
-                        log.info(f"Step {step_idx+1}: Search agent found "
-                                 f"test error documentation")
-                except Exception as exc:
-                    log.warning(f"Step {step_idx+1}: Search agent error "
-                                f"during test fix: {exc}")
-
-            # Build fix context with the batch error summary
-            test_file_list = ", ".join(test_files.keys())
-            fix_context = (
-                f"Test command: `{test_cmd}`\n\n"
-                f"{error_detail}\n\n"
-            )
-            if is_source_bug:
-                # Include imported source files for source bug fixes
-                fix_context += (
-                    f"Source files under test:\n{source_context}\n\n"
-                    f"Test files (for reference): {test_file_list}\n"
-                )
-            else:
-                fix_context += (
-                    f"Test files that need fixing: {test_file_list}\n"
-                )
-            fix_context += f"Project files:\n{code_summary}"
-            if kb_fix_context:
-                fix_context += (
-                    f"\n\n{kb_fix_context}"
-                )
-            if search_context:
-                fix_context += (
-                    f"\n\nThe following web search results contain relevant "
-                    f"documentation and solutions for this error. Use them "
-                    f"to inform your fix:\n\n{search_context}"
-                )
-            jsx_hint = ""
-            if test_runner == "vitest" and language in ("javascript", "typescript"):
-                jsx_ext = ".jsx" if language == "javascript" else ".tsx"
-                js_ext = ".js" if language == "javascript" else ".ts"
-                jsx_hint = (
-                    f"IMPORTANT: Vite/Rollup CANNOT parse JSX in {js_ext} files. "
-                    f"If a test file contains JSX (e.g. <Component />, render(<App />)), "
-                    f"it MUST use the .test{jsx_ext} extension, NOT .test{js_ext}. "
-                    f"If you need to rename a file from .test{js_ext} to .test{jsx_ext}, "
-                    f"output the corrected content under the new .test{jsx_ext} path. "
-                )
-
-            # ── Enhancement #8: targeted patching + #5: bidirectional fix ──
-            if is_source_bug:
-                fix_prompt = (
-                    "The tests have revealed a BUG IN THE SOURCE CODE, not in the tests.\n"
-                    "Analyze the test failures and fix the SOURCE files to make the tests pass.\n"
-                    "Do NOT modify test files. Fix ONLY the source implementation files.\n"
-                    f"{jsx_hint}"
-                    "Return ALL corrected source file(s) using #### [FILE]: format."
-                )
-            else:
-                fix_prompt = (
-                    "Below is a structured summary of ALL test failures grouped by error type. "
-                    "Analyze the patterns — if multiple failures share a root cause "
-                    "(e.g. wrong import path, missing mock, incorrect API usage), "
-                    "fix the root cause once rather than patching each test individually.\n"
-                    "Focus on fixing ONLY the failing tests. Do NOT rewrite passing tests.\n"
-                    f"{jsx_hint}"
-                    "Fix ONLY the test files. "
-                    "Do NOT modify source files, package.json, or any config files. "
-                    "Do NOT add new dependencies. "
-                    "Return ALL corrected test file(s) using #### [FILE]: format."
-                )
-
-            display.step_info(step_idx, "Generating fix from LLM...")
-            sent_before, recv_before = token_tracker.snapshot()
-
-            fix_response = coder.process(
-                fix_prompt, context=fix_context, language=language)
-
-            sent_after, recv_after = token_tracker.snapshot()
-            sent_delta = sent_after - sent_before
-            recv_delta = recv_after - recv_before
-            display.step_tokens(step_idx, sent_delta, recv_delta)
-
-            display.step_info(step_idx, "Processing fix response...")
-            explanation = CLIDisplay.extract_explanation(fix_response)
-            if explanation:
-                display.add_llm_log(explanation, source="Coder")
-
-            fix_files = executor.parse_code_blocks(fix_response)
-            if not fix_files:
-                fix_files = executor.parse_code_blocks_fuzzy(fix_response)
-            if fix_files:
-                # Strip protected manifest files
-                fix_files = _strip_protected_files(fix_files)
-                # Normalize paths
-                fix_files = _normalize_fix_paths(fix_files, memory)
-
+                # Build focused fix context
                 if is_source_bug:
-                    # For source bugs: write source fixes directly, skip test-only filter
-                    show_diffs(fix_files, log_only=True)
-                    executor.write_files(fix_files)
-                    memory.update(fix_files)
-                    log.info(f"Step {step_idx+1}: Applied SOURCE fix to: "
-                             f"{', '.join(fix_files.keys())}")
+                    display.step_info(
+                        step_idx,
+                        f"Bug in SOURCE for {f_basename}, fixing source...")
+                    fix_ctx = (
+                        f"Test command: `{single_cmd}`\n\n"
+                        f"{error_detail}\n\n"
+                        f"Source files under test:\n{source_ctx}\n\n"
+                        f"Test file (for reference):\n"
+                        f"#### [FILE]: {test_path}\n"
+                        f"```{lang_tag}\n{current_content}\n```\n\n")
+                    fix_prompt = (
+                        "The test has revealed a BUG IN THE SOURCE CODE.\n"
+                        "Fix the SOURCE files to make the test pass.\n"
+                        "Do NOT modify the test file.\n"
+                        f"{jsx_hint}"
+                        "Return corrected source file(s) using "
+                        "#### [FILE]: format.")
                 else:
-                    # For test bugs: filter to test-only files
-                    fix_files = _filter_test_only_files(
-                        fix_files, test_files, memory)
+                    fix_ctx = (
+                        f"Test command: `{single_cmd}`\n\n"
+                        f"ERRORS for {test_path}:\n{error_detail}\n\n"
+                        f"Test file to fix:\n"
+                        f"#### [FILE]: {test_path}\n"
+                        f"```{lang_tag}\n{current_content}\n```\n\n")
+                    if source_ctx:
+                        fix_ctx += (
+                            f"Source files imported by this test:\n"
+                            f"{source_ctx}\n")
+                    fix_prompt = (
+                        f"Fix ONLY the test file '{test_path}'.\n"
+                        "Do NOT output any other test files or source files.\n"
+                        "Focus on fixing ONLY the failing tests.\n"
+                        f"{jsx_hint}"
+                        "Do NOT modify source files, package.json, or "
+                        "config files. Do NOT add new dependencies.\n"
+                        "Return the corrected file using #### [FILE]: format.")
+
+                if kb_fix_context:
+                    fix_ctx += f"\n\n{kb_fix_context}"
+
+                sent_before, recv_before = token_tracker.snapshot()
+                fix_response = coder.process(
+                    fix_prompt, context=fix_ctx, language=language)
+                sent_after, recv_after = token_tracker.snapshot()
+                display.step_tokens(
+                    step_idx,
+                    sent_after - sent_before,
+                    recv_after - recv_before)
+
+                explanation = CLIDisplay.extract_explanation(fix_response)
+                if explanation:
+                    display.add_llm_log(explanation, source="Coder")
+
+                fix_files = executor.parse_code_blocks(fix_response)
+                if not fix_files:
+                    fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                if fix_files:
+                    fix_files = _strip_protected_files(fix_files)
+                    fix_files = _normalize_fix_paths(fix_files, memory)
+                    if not is_source_bug:
+                        fix_files = _filter_test_only_files(
+                            fix_files, test_files, memory)
                     if fix_files:
                         show_diffs(fix_files, log_only=True)
                         executor.write_files(fix_files)
                         memory.update(fix_files)
-                        # Clean up stale .js files if fix produced .jsx
                         _cleanup_stale_js_test_files(
-                            fix_files, memory, display, step_idx,
-                            subproject_cwd)
-                        # Update scoped command if fix introduced new test files
-                        merged_test_files = {**test_files, **fix_files}
-                        scoped_test_cmd = _build_scoped_test_cmd(
-                            test_cmd, merged_test_files, subproject_cwd)
-                    else:
-                        log.warning(f"Step {step_idx+1}: All fix files were "
-                                    f"blocked by test-only filter")
-                code_summary = ""
-                for fname, content in memory.all_files().items():
-                    code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
+                            fix_files, memory, display,
+                            step_idx, subproject_cwd)
+                        # Update test_files if the fix changed the test
+                        test_files.update(fix_files)
+                        # Rebuild single command in case path changed
+                        if test_path in fix_files:
+                            single_cmd = _build_scoped_test_cmd(
+                                test_cmd,
+                                {test_path: fix_files[test_path]},
+                                subproject_cwd)
 
-        log.error(f"Step {step_idx+1}: Tests still failing after {MAX_STEP_RETRIES} fixes.")
-        return False, f"Tests still failing after {MAX_STEP_RETRIES} fix attempts.\nLast test output:\n{last_test_output}"
+                # Re-run the single file after fix
+                success, output = executor.run_tests(
+                    single_cmd, cwd=subproject_cwd)
+                last_test_output = output
+
+                if success:
+                    display.step_info(
+                        step_idx,
+                        f"{f_basename} passed after fix ✔ "
+                        f"({file_idx}/{file_count})")
+                    file_fixed = True
+                    break
+
+                # Stuck detection: same errors after fix
+                if output == prev_output:
+                    log.warning(
+                        f"Step {step_idx+1}: [{f_basename}] identical "
+                        f"output after fix attempt {fix_attempt}, stopping.")
+                    display.step_info(
+                        step_idx,
+                        f"{f_basename}: same error after fix — skipping.")
+                    break
+                prev_output = output
+
+            if not file_fixed:
+                failed_files.append(test_path)
+                log.warning(
+                    f"Step {step_idx+1}: [{f_basename}] still failing "
+                    f"after {MAX_STEP_RETRIES} fixes.")
+
+        # ── Summary ──
+        if not failed_files:
+            display.step_info(
+                step_idx, f"All {file_count} test files passed ✔")
+            return True, ""
+        else:
+            passed = file_count - len(failed_files)
+            failed_names = [os.path.basename(f) for f in failed_files]
+            msg = (f"{passed}/{file_count} test files passed. "
+                   f"Failed: {', '.join(failed_names)}")
+            display.step_info(step_idx, msg)
+            log.error(f"Step {step_idx+1}: {msg}")
+            return False, (
+                f"Tests partially failing: {msg}\n"
+                f"Last output:\n{last_test_output}")
 
     log.error(f"Step {step_idx+1}: Could not generate valid tests after {MAX_TEST_GEN_RETRIES} attempts.")
     return False, f"Could not generate valid tests after {MAX_TEST_GEN_RETRIES} attempts.\nLast feedback:\n{feedback}"

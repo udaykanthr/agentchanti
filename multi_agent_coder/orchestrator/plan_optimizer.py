@@ -84,6 +84,7 @@ def optimize_plan(
     knowledge_base=None,
     kb_context_builder=None,
     dependencies: dict[int, set[int]] | None = None,
+    language: str | None = None,
 ) -> tuple[list[str], dict[int, set[int]]]:
     """Optimize a raw plan by merging, deduplicating, and pruning steps.
 
@@ -111,7 +112,7 @@ def optimize_plan(
     # (e.g. install commands, config setup), use those INSTEAD of what the
     # LLM generated.  The LLM's training data is often outdated; KB docs
     # are curated and current.
-    clean_steps = _apply_kb_command_overrides(clean_steps, kb_context_builder)
+    clean_steps = _apply_kb_command_overrides(clean_steps, kb_context_builder, language=language)
 
     # Pass 1: Remove meta/no-op steps
     clean_steps, deps = _remove_noop_steps(clean_steps, deps)
@@ -234,11 +235,16 @@ def _extract_commands_from_kb_doc(content: str) -> list[str]:
     return commands
 
 
-def _find_kb_commands_for_step(step_text: str, kb_context_builder) -> list[str]:
-    """Search KB docs for commands relevant to a plan step.
+def _find_kb_commands_for_step(step_text: str, kb_context_builder, language: str | None = None) -> list[str]:
+    """Search KB docs and error dict for commands relevant to a plan step.
 
     Returns a list of bash commands that the KB prescribes for this
     kind of step, or empty list if no KB match.
+
+    Sources (in order):
+    1. KB doc registry (``categories=["doc"]``)
+    2. Error dict ``fix_template`` fields — catches peer dependency info
+       stored as error fixes (e.g. tailwindcss needing postcss).
     """
     if kb_context_builder is None:
         return []
@@ -248,22 +254,23 @@ def _find_kb_commands_for_step(step_text: str, kb_context_builder) -> list[str]:
         if kb_context_builder._global_store is None:
             return []
 
-        results = kb_context_builder._global_store.search(
-            query=step_text,
-            categories=["doc"],
-            top_k=2,
-            api_client=kb_context_builder._api_client,
-        )
-        if not results:
-            return []
-
         # Only use results that share tech keywords with the step
         step_techs = set(w.lower() for w in _TECH_KEYWORDS.findall(step_text))
         if not step_techs:
             return []
 
         commands: list[str] = []
-        for result in results:
+
+        # ── Source 1: KB doc registry ──
+        results = kb_context_builder._global_store.search(
+            query=step_text,
+            categories=["doc"],
+            language=language,
+            top_k=2,
+            api_client=kb_context_builder._api_client,
+        )
+
+        for result in (results or []):
             doc_content = result.content or ""
             doc_title = (result.title or "").lower()
             doc_tags = " ".join(result.tags) if result.tags else ""
@@ -292,6 +299,39 @@ def _find_kb_commands_for_step(step_text: str, kb_context_builder) -> list[str]:
                     f"(overlap: {overlap}), found {len(doc_cmds)} commands"
                 )
                 commands.extend(doc_cmds)
+
+        # ── Source 2: Error dict fix_template ──
+        # Error fixes often contain the correct install commands with
+        # peer dependencies (e.g. TailwindCSSDeprecatedInit has
+        # "npm install tailwindcss @tailwindcss/postcss postcss").
+        if not commands:
+            try:
+                error_fixes = kb_context_builder._global_store.search_errors(
+                    step_text, language=language)
+                for fix in error_fixes:
+                    if not fix.fix_template:
+                        continue
+                    # Check tag overlap with step tech keywords
+                    fix_tags = {t.strip().lower()
+                                for t in (fix.tags or "").split(",")}
+                    if not (step_techs & fix_tags):
+                        continue
+                    # Extract install commands from fix_template text
+                    for m in re.finditer(
+                        r'((?:npm|pip3?|yarn|pnpm)\s+install\s+'
+                        r'[\w@/\-. ]+)',
+                        fix.fix_template,
+                    ):
+                        cmd = m.group(1).strip()
+                        if cmd and cmd not in commands:
+                            commands.append(cmd)
+                            _logger.info(
+                                f"[PlanOptimizer] Error dict "
+                                f"'{fix.error_type}' has install "
+                                f"command: `{cmd}`")
+            except Exception as exc:
+                _logger.debug(
+                    f"[PlanOptimizer] Error dict lookup failed: {exc}")
 
         return commands
 
@@ -332,6 +372,42 @@ def _classify_cmd_operation(cmd: str) -> str | None:
     return None
 
 
+def _extract_cmd_packages(cmd: str) -> set[str]:
+    """Extract package names from an install command.
+
+    Returns a set of lowered package names (without version specifiers
+    or flag arguments).  For scoped packages like ``@tailwindcss/postcss``
+    the full scoped name is kept.
+    """
+    # Strip "cd ... &&" prefix if present (e.g. "cd project && npm install X")
+    effective_cmd = cmd
+    if re.match(r'cd\s+\S+\s*&&\s*', cmd, re.I):
+        effective_cmd = re.sub(r'^cd\s+\S+\s*&&\s*', '', cmd).strip()
+
+    m = _PKG_MANAGER_RE.match(effective_cmd)
+    if not m:
+        return set()
+
+    pkg_str = effective_cmd[m.end():]
+    packages: set[str] = set()
+    for token in pkg_str.split():
+        token = token.strip()
+        if not token or token.startswith("-"):
+            continue
+        # Strip trailing version specifier: lodash@4.17 → lodash
+        # But keep scoped packages: @scope/pkg@ver → @scope/pkg
+        if token.startswith("@"):
+            # @scope/pkg or @scope/pkg@version
+            at_parts = token.split("@")
+            # ['', 'scope/pkg'] or ['', 'scope/pkg', 'version']
+            name = f"@{at_parts[1]}" if len(at_parts) >= 2 else token
+        else:
+            name = token.split("@")[0]
+        if name:
+            packages.add(name.lower())
+    return packages
+
+
 def _is_deprecated_command(cmd: str, kb_context_builder) -> bool:
     """Check if a command matches a deprecated error pattern in the KB.
 
@@ -364,7 +440,7 @@ def _is_deprecated_command(cmd: str, kb_context_builder) -> bool:
 
 
 def _apply_kb_command_overrides(
-    steps: list[str], kb_context_builder
+    steps: list[str], kb_context_builder, language: str | None = None,
 ) -> list[str]:
     """Replace LLM-generated commands with KB-known correct commands.
 
@@ -372,21 +448,31 @@ def _apply_kb_command_overrides(
     for matching documentation.  If the KB has concrete bash commands for
     the same operation, the LLM's command is REPLACED with the KB command.
 
+    When a step mentions install/setup + a technology but has no backtick
+    command at all, the KB command is INJECTED into the step text so that
+    downstream package extraction picks up all required packages
+    (including peer dependencies like postcss for tailwindcss).
+
     Only replaces actual shell commands (not file paths or folder names),
     and only when the KB command matches the same operation type
     (install→install, create→create, etc.).
     """
     if kb_context_builder is None:
+        _logger.debug("[PlanOptimizer] KB command overrides skipped: "
+                      "no kb_context_builder")
         return steps
 
     result = list(steps)
+    override_count = 0
+
     for i, step in enumerate(steps):
         # Only override CMD-like steps (installs, setup, config)
         if not _SETUP_KEYWORDS.search(step):
             continue
 
         # Must mention a specific technology
-        if not _TECH_KEYWORDS.search(step):
+        step_techs = set(w.lower() for w in _TECH_KEYWORDS.findall(step))
+        if not step_techs:
             continue
 
         # Find all backtick segments that are actual shell commands
@@ -397,50 +483,135 @@ def _apply_kb_command_overrides(
                 llm_cmd_match = m
                 break  # use the first shell command found
 
+        # Search KB for the correct command
+        kb_commands = _find_kb_commands_for_step(step, kb_context_builder, language=language)
+
+        if not kb_commands:
+            _logger.debug(
+                f"[PlanOptimizer] Step {i+1}: no KB commands found for "
+                f"{step_techs} step: {step[:60]}...")
+            continue
+
         if not llm_cmd_match:
+            # Step has no backtick command (e.g. "Install tailwindcss").
+            # Only inject for steps explicitly about installing packages —
+            # NOT for "Create folder structure" or "Configure routing" steps
+            # that happen to mention a technology name.
+            if not re.search(r'\binstall\b', step, re.I):
+                _logger.debug(
+                    f"[PlanOptimizer] Step {i+1}: no backtick command and "
+                    f"not an install step, skipping: {step[:60]}...")
+                continue
+            # Inject the first matching install command from KB so that
+            # downstream package extraction sees the full package list.
+            # Verify the KB command's packages relate to the step's tech.
+            for kb_cmd in kb_commands:
+                kb_op = _classify_cmd_operation(kb_cmd)
+                if kb_op != "install":
+                    continue
+                if _is_deprecated_command(kb_cmd, kb_context_builder):
+                    _logger.info(
+                        f"[PlanOptimizer] Skipping deprecated KB cmd: "
+                        f"`{kb_cmd}`")
+                    continue
+                # Verify package relevance: at least one package name
+                # should contain the step's technology as a whole word.
+                # Uses _TECH_KEYWORDS to avoid substring false positives
+                # (e.g. "react" matching inside "react-router-dom").
+                kb_pkgs = _extract_cmd_packages(kb_cmd)
+                if kb_pkgs:
+                    kb_pkg_techs = set(
+                        w.lower()
+                        for w in _TECH_KEYWORDS.findall(
+                            " ".join(kb_pkgs))
+                    )
+                    if not (step_techs & kb_pkg_techs):
+                        _logger.debug(
+                            f"[PlanOptimizer] Step {i+1}: KB cmd "
+                            f"packages {kb_pkgs} unrelated to step "
+                            f"tech {step_techs}, skipping")
+                        continue
+                result[i] = f"{step} with `{kb_cmd}`"
+                override_count += 1
+                _logger.info(
+                    f"[PlanOptimizer] KB inject step {i+1}: "
+                    f"added `{kb_cmd}` (no command in step)")
+                break
             continue
 
         llm_cmd = llm_cmd_match.group(1)
         llm_op = _classify_cmd_operation(llm_cmd)
 
-        # Search KB for the correct command
-        kb_commands = _find_kb_commands_for_step(step, kb_context_builder)
-        if not kb_commands:
-            continue
-
         # Find the best matching KB command by operation type.
-        # Only replace when the operation types match exactly.
-        # Also skip commands flagged as deprecated in the error dict.
+        # Only replace when the operation types match exactly AND the
+        # KB command's packages are relevant to the step (prevents
+        # replacing e.g. tailwindcss packages with react-router-dom).
+        llm_pkgs = _extract_cmd_packages(llm_cmd)
         best_kb_cmd = None
         if llm_op is not None:
             for kb_cmd in kb_commands:
                 kb_op = _classify_cmd_operation(kb_cmd)
-                if kb_op == llm_op:
-                    # Check if this command is deprecated per error dict
-                    if _is_deprecated_command(kb_cmd, kb_context_builder):
-                        _logger.info(
-                            f"[PlanOptimizer] Skipping deprecated KB cmd: "
-                            f"`{kb_cmd}`"
-                        )
+                if kb_op != llm_op:
+                    continue
+                # Check if this command is deprecated per error dict
+                if _is_deprecated_command(kb_cmd, kb_context_builder):
+                    _logger.info(
+                        f"[PlanOptimizer] Skipping deprecated KB cmd: "
+                        f"`{kb_cmd}`"
+                    )
+                    continue
+                # Package relevance check for install commands:
+                if llm_op == "install":
+                    kb_pkgs = _extract_cmd_packages(kb_cmd)
+                    if not llm_pkgs and kb_pkgs:
+                        # Bare "npm install" (installs from package.json)
+                        # should NOT be replaced with "npm install X Y Z"
+                        # — they serve completely different purposes.
+                        _logger.debug(
+                            f"[PlanOptimizer] Step {i+1}: bare install "
+                            f"command, not replacing with "
+                            f"package-specific {kb_pkgs}")
                         continue
-                    best_kb_cmd = kb_cmd
-                    break
+                    if llm_pkgs and kb_pkgs and not (llm_pkgs & kb_pkgs):
+                        # Both have packages but zero overlap — different
+                        # technology (e.g. tailwindcss vs react-router-dom)
+                        _logger.debug(
+                            f"[PlanOptimizer] Step {i+1}: KB packages "
+                            f"{kb_pkgs} have no overlap with LLM packages "
+                            f"{llm_pkgs}, skipping")
+                        continue
+                best_kb_cmd = kb_cmd
+                break
 
         # No match — do NOT fallback to an unrelated command
         if not best_kb_cmd:
+            _logger.debug(
+                f"[PlanOptimizer] Step {i+1}: KB has commands but none "
+                f"match operation type '{llm_op}': {step[:60]}...")
             continue
 
         # Only replace if the commands are actually different
         if best_kb_cmd.strip() == llm_cmd.strip():
+            _logger.debug(
+                f"[PlanOptimizer] Step {i+1}: KB command identical to "
+                f"LLM command, skipping")
             continue
 
         # Replace the command in the step text
         new_step = step.replace(f'`{llm_cmd}`', f'`{best_kb_cmd}`')
         result[i] = new_step
+        override_count += 1
         _logger.info(
             f"[PlanOptimizer] KB override step {i+1}: "
             f"`{llm_cmd}` → `{best_kb_cmd}`"
         )
+
+    if override_count > 0:
+        _logger.info(
+            f"[PlanOptimizer] Applied {override_count} KB command override(s)")
+    else:
+        _logger.info(
+            "[PlanOptimizer] No KB command overrides applied")
 
     return result
 
@@ -520,6 +691,10 @@ def _skip_redundant_installs(
             keep_indices.append(i)
             continue
 
+        # Hybrid steps (install + config/code) should never be fully
+        # skipped — they contain non-install content that must survive.
+        is_hybrid = _is_hybrid_install_step(step)
+
         # Extract the full install command
         cmd = next(g for g in m.groups() if g is not None)
         # Extract packages from the command
@@ -544,8 +719,10 @@ def _skip_redundant_installs(
             else:
                 _logger.debug(f"[PlanOptimizer] Skipping installed: {pkg_name}")
 
-        if not new_packages:
+        if not new_packages and not is_hybrid:
             # All packages already installed — skip entire step
+            # (only for pure install steps; hybrid steps are kept for
+            # their config/code content)
             _logger.info(f"[PlanOptimizer] Skipping redundant install: {step[:60]}")
             continue
 
@@ -562,6 +739,26 @@ def _skip_redundant_installs(
     return _filter_steps(steps, deps, keep_indices)
 
 
+def _is_hybrid_install_step(step: str) -> bool:
+    """Check if a step has substantial non-install content.
+
+    Returns True for "hybrid" steps that contain an install command AND
+    code blocks or multiple file paths (e.g. "Install tailwindcss and
+    create postcss.config.mjs with: ```js ...```").  These steps should
+    NOT be merged into a single install command because the config/code
+    content would be lost.
+    """
+    # Code fences (```) indicate code generation / configuration content
+    if '```' in step:
+        return True
+    # Multiple file paths suggest file creation/modification instructions
+    paths = _FILE_PATH_RE.findall(step)
+    real_paths = [p for p in paths if _is_likely_filepath(p)]
+    if len(real_paths) > 1:
+        return True
+    return False
+
+
 def _merge_install_steps(
     steps: list[str], deps: dict[int, set[int]]
 ) -> tuple[list[str], dict[int, set[int]]]:
@@ -573,6 +770,18 @@ def _merge_install_steps(
     for i, step in enumerate(steps):
         m = _INSTALL_CMD_RE.search(step)
         if not m:
+            non_install_indices.append(i)
+            continue
+
+        # Hybrid steps: contain an install command BUT ALSO have substantial
+        # non-install content (code fences, multiple file paths, config
+        # instructions).  These are CODE/config steps that happen to include
+        # an install sub-command — merging them would lose the config content.
+        if _is_hybrid_install_step(step):
+            _logger.debug(
+                f"[PlanOptimizer] Step {i+1}: hybrid install+config step, "
+                f"not merging: {step[:60]}..."
+            )
             non_install_indices.append(i)
             continue
 

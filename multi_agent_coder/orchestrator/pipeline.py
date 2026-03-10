@@ -201,6 +201,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                     task_description=step_text,
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 4000) if cfg else 4000,
+                    language=getattr(project_context, "language", None) if project_context else None,
                 )
                 if kb_ctx.kb_available or kb_ctx.behavioral_instructions:
                     kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
