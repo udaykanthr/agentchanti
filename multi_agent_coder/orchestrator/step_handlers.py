@@ -3043,9 +3043,86 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 except OSError as e:
                     log.warning(f"Step {step_idx+1}: Failed to create jest.config.js: {e}")
 
-    code_summary = ""
-    for fname, content in memory.all_files().items():
-        code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
+    # ── Scoped context: only include files relevant to this test step ──
+    # Instead of dumping ALL memory files (which wastes tokens on unrelated
+    # components), we include:
+    #   1. The target test file itself (full content)
+    #   2. Source files imported by that test (full content)
+    #   3. Test setup/config files (full content)
+    #   4. Slim skeletons for remaining source files (imports + signatures)
+    all_files = memory.all_files()
+    target_test_files = _detect_target_files(step_text, memory, max_files=5)
+
+    # Identify source files imported by the target test(s)
+    target_contents: dict[str, str] = {}
+    for tf in target_test_files:
+        if tf in all_files:
+            target_contents[tf] = all_files[tf]
+    imported_sources = _extract_imported_sources(target_contents, memory) if target_contents else {}
+
+    # When targets are detected, use scoped context; otherwise fall back to
+    # semantic search (e.g. "write tests for the whole project")
+    if target_test_files:
+        # Setup/config files that test runners need (always include full content)
+        _SETUP_FILE_NAMES = frozenset({
+            'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
+            'vitest.setup.js', 'vitest.setup.ts',
+            'jest.config.js', 'jest.config.ts', 'jest.config.mjs', 'jest.config.cjs',
+            'setupTests.js', 'setupTests.ts', 'setup.js', 'setup.ts',
+            'conftest.py', 'pytest.ini', 'setup.cfg',
+            'vite.config.js', 'vite.config.ts',
+        })
+
+        # Build full-content set (target + imports + setup)
+        full_content_files: dict[str, str] = {}
+        for fpath, content in all_files.items():
+            basename = os.path.basename(fpath)
+            if fpath in target_contents:
+                full_content_files[fpath] = content
+            elif fpath in imported_sources:
+                full_content_files[fpath] = content
+            elif basename in _SETUP_FILE_NAMES:
+                full_content_files[fpath] = content
+
+        # Build code_summary: full content for relevant files, skeletons for rest
+        code_summary = ""
+        included_full: set[str] = set()
+        for fname, content in full_content_files.items():
+            code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
+            included_full.add(fname)
+
+        # Add slim skeletons for remaining source files
+        from .memory import _extract_file_skeleton
+        slim_parts: list[str] = []
+        for fname, content in all_files.items():
+            if fname in included_full:
+                continue
+            # Skip internal tracking files
+            if fname.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
+                continue
+            # Include structural skeleton (imports + function/class signatures)
+            skeleton = _extract_file_skeleton(content, fname)
+            if skeleton:
+                slim_parts.append(skeleton)
+            else:
+                slim_parts.append(f"- {fname}")
+
+        if slim_parts:
+            code_summary += "Other project files (signatures only):\n" + "\n".join(slim_parts) + "\n\n"
+
+        log.info(f"Step {step_idx+1}: Test context scoped to {len(full_content_files)} "
+                 f"full file(s) + {len(slim_parts)} skeleton(s) "
+                 f"(from {len(all_files)} total in memory)")
+    else:
+        # No specific target detected — use semantic search for relevant context
+        code_summary = memory.related_context(step_text)
+        if not code_summary:
+            # Last resort: include everything (original behavior)
+            code_summary = ""
+            for fname, content in all_files.items():
+                code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
+        log.info(f"Step {step_idx+1}: No target test files detected, using "
+                 f"semantic search context (from {len(all_files)} files)")
 
     feedback = ""
     last_test_output = ""

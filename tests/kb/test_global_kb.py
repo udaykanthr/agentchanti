@@ -266,7 +266,7 @@ class TestSeeder(unittest.TestCase):
         summary = seed(embed=False)
 
         # Check errors.db was populated (40 errors: 5 * 7 languages + 5 tooling)
-        self.assertEqual(summary["errors_seeded"], 48)
+        self.assertEqual(summary["errors_seeded"], 52)
         self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
         self.assertEqual(summary["docs_seeded"], 9)  # 3+3+2+3
         self.assertEqual(summary["chunks_embedded"], 0)
@@ -276,7 +276,7 @@ class TestSeeder(unittest.TestCase):
         edict = ErrorDict(db_path)
         counts = edict.count_by_language()
         expected_per_lang = {
-            "python": 5, "javascript": 15,  # 5 base + 2 npm + 4 react-testing + 2 vitest + 1 no-suite + 1 vite-resolve
+            "python": 5, "javascript": 19,  # 5 base + 2 npm + 4 react-testing + 1 queryByRole-null + 1 rerender-memoryrouter + 2 vitest + 1 no-suite + 1 vite-resolve
             "typescript": 5, "java": 5, "go": 5, "rust": 5, "csharp": 5,
         }
         for lang, expected in expected_per_lang.items():
@@ -565,7 +565,7 @@ class TestUpdaterClean(unittest.TestCase):
 
         clean()
         summary = seed(embed=False)
-        self.assertEqual(summary["errors_seeded"], 48)
+        self.assertEqual(summary["errors_seeded"], 52)
         self.assertGreaterEqual(summary["docs_seeded"], 1)
 
 

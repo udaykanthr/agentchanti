@@ -223,8 +223,13 @@ def _execute_step(step_idx: int, step_text: str, *,
         # --- Load KB content fixes once per pipeline run ---
         if not hasattr(memory, '_content_fixes') or memory._content_fixes is None:
             try:
-                from ..kb.global_kb.store import GlobalKBStore
-                _gkb = GlobalKBStore()
+                # Reuse the global store from kb_context_builder if available,
+                # avoiding a redundant GlobalKBStore instantiation.
+                _gkb = (getattr(kb_context_builder, '_global_store', None)
+                        if kb_context_builder is not None else None)
+                if _gkb is None:
+                    from ..kb.global_kb.store import GlobalKBStore
+                    _gkb = GlobalKBStore()
                 memory._content_fixes = _gkb.get_content_fixes(language=language)
                 if memory._content_fixes:
                     _logger.debug(

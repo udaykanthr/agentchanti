@@ -90,6 +90,9 @@ class ContextBuilder:
         self._graph = None
         self._global_store = None
         self._initialised = False
+        # Cache: avoid duplicate local semantic searches within the same step
+        self._cached_local_query: Optional[str] = None
+        self._cached_local_results: Optional[list] = None
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -248,6 +251,10 @@ class ContextBuilder:
                     query=task_description, filters=filters, top_k=8,
                 )
                 ctx.local_symbols = results
+                # Cache for reuse by get_relevant_files() (same step)
+                if not filters:
+                    self._cached_local_query = task_description
+                    self._cached_local_results = results
                 if results:
                     ctx.sources_used.append("local_semantic")
             except Exception as exc:
@@ -531,17 +538,27 @@ class ContextBuilder:
         relevant: dict[str, float] = {}  # path → relevance score
 
         # 1. Semantic search → extract file paths
-        try:
-            local_available = self._ensure_local()
-        except Exception:
-            local_available = False
-
-        if local_available and self._searcher is not None:
+        # Reuse cached results from build_context() if available for same query
+        if (self._cached_local_query == task_description
+                and self._cached_local_results is not None):
+            search_results = self._cached_local_results
+        else:
+            search_results = None
             try:
-                results = self._searcher.search(
-                    query=task_description, top_k=10,
-                )
-                for result in results:
+                local_available = self._ensure_local()
+            except Exception:
+                local_available = False
+            if local_available and self._searcher is not None:
+                try:
+                    search_results = self._searcher.search(
+                        query=task_description, top_k=10,
+                    )
+                except Exception as exc:
+                    logger.debug("[KB] get_relevant_files search failed: %s", exc)
+
+        if search_results:
+            try:
+                for result in search_results:
                     file_path = getattr(result, "file", "")
                     score = getattr(result, "score", 0.5)
                     if file_path:

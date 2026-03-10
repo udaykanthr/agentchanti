@@ -500,7 +500,7 @@ _ERROR_SEEDS: list[ErrorFix] = [
     ErrorFix(
         error_type="TestingLibraryElementNotFound",
         language="javascript",
-        pattern=r"TestingLibraryElementError:\s*Unable to find an element",
+        pattern=r"TestingLibraryElementError:\s*Unable to find an (accessible )?element",
         cause="The test asserts text, role, or label that does not exist in the component's "
               "actual rendered output. Common causes: (1) the test hardcodes text content the "
               "component doesn't render, (2) text is split across multiple DOM elements so "
@@ -519,6 +519,61 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "6. Use { exact: false } for partial text matching: screen.getByText('partial', { exact: false })",
         severity="error",
         tags="testing-library,react,getByText,getByRole,element,not,found,query,dom,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="TestingLibraryMultipleElementsFound",
+        language="javascript",
+        pattern=r"TestingLibraryElementError:\s*Found multiple elements with the role",
+        cause="The test uses getByRole/getByText which expects exactly ONE matching element, "
+              "but the component renders multiple elements with the same role and accessible name. "
+              "Common causes: (1) a navigation bar and page content both have a 'Home' link, "
+              "(2) header/footer duplicate links, (3) nested components render the same elements.",
+        fix_template="FIX STEPS:\n"
+                     "1. Use getAllByRole() instead of getByRole() when multiple matches are expected, "
+                     "then assert on the array:\n"
+                     "   const links = screen.getAllByRole('link', { name: /home/i })\n"
+                     "   expect(links).toHaveLength(2)\n"
+                     "   expect(links[0]).toBeInTheDocument()\n"
+                     "2. Or scope the query to a specific container using within():\n"
+                     "   import { within } from '@testing-library/react'\n"
+                     "   const nav = screen.getByRole('navigation')\n"
+                     "   within(nav).getByRole('link', { name: /home/i })\n"
+                     "3. Use a more specific name pattern to narrow matches:\n"
+                     "   screen.getByRole('link', { name: /^home$/i })  // exact match\n"
+                     "4. READ the actual component source to understand how many instances exist "
+                     "and which container to scope your query to.",
+        severity="error",
+        tags="testing-library,react,multiple,elements,getByRole,getAllByRole,within,query,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="ReactRouterContextMissing",
+        language="javascript",
+        pattern=r"(useLocation|useNavigate|useParams|useMatch|useHref)\(\) may be used only in the context of a <Router> component",
+        cause="The component uses React Router hooks (useLocation, useNavigate, useParams, etc.) "
+              "or components (Link, NavLink, Outlet) but the test renders it without a Router wrapper. "
+              "React Router hooks MUST be called inside a Router context.",
+        fix_template="FIX: Wrap the component in <MemoryRouter> in your test:\n\n"
+                     "import { MemoryRouter } from 'react-router-dom'\n\n"
+                     "render(\n"
+                     "  <MemoryRouter initialEntries={['/current-path']}>\n"
+                     "    <YourComponent />\n"
+                     "  </MemoryRouter>\n"
+                     ")\n\n"
+                     "KEY RULES:\n"
+                     "1. ALWAYS use MemoryRouter (not BrowserRouter) in tests — it doesn't need a real DOM.\n"
+                     "2. Set initialEntries to control the starting route:\n"
+                     "   <MemoryRouter initialEntries={['/dashboard']}>\n"
+                     "3. If testing components that use <Outlet>, provide matching <Routes>:\n"
+                     "   <MemoryRouter initialEntries={['/dashboard']}>\n"
+                     "     <Routes>\n"
+                     "       <Route path='/dashboard' element={<Dashboard />} />\n"
+                     "     </Routes>\n"
+                     "   </MemoryRouter>\n"
+                     "4. If mocking useNavigate, use vi.mock('react-router-dom') BEFORE the render.\n"
+                     "5. Check ALL child components too — if ANY nested component uses Link/NavLink/useNavigate, "
+                     "the entire tree needs the Router wrapper.",
+        severity="error",
+        tags="react-router,useLocation,useNavigate,useParams,MemoryRouter,Router,context,testing,react,javascript,typescript",
     ),
     ErrorFix(
         error_type="TestAssertionLengthMismatch",
@@ -543,12 +598,14 @@ _ERROR_SEEDS: list[ErrorFix] = [
     ErrorFix(
         error_type="MockCallbackNotCalled",
         language="javascript",
-        pattern=r'expected "(vi\.fn|jest\.fn)\(\)" to be called \d+ times?, but got 0',
+        pattern=r'expected "(vi\.fn|jest\.fn)\(\)" to (be called|have been called)',
         cause="The test expects a mock callback (vi.fn()/jest.fn()) to be called when an "
               "element is clicked, but the component does not call it. Common causes: "
               "(1) the prop name in the test doesn't match the component's prop name, "
               "(2) the component doesn't wire the callback to an onClick handler, "
-              "(3) the event target element isn't the one with the handler (event delegation).",
+              "(3) the event target element isn't the one with the handler (event delegation), "
+              "(4) the component uses a <Link to='...'> instead of useNavigate() so the "
+              "mocked navigate function is never called.",
         fix_template="FIX STEPS:\n"
                      "1. READ the actual component source to verify the EXACT prop names for callbacks.\n"
                      "   Common mismatches: onCtaClick vs onClick, handleSubmit vs onSubmit\n"
@@ -559,7 +616,10 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "5. Check if the handler is conditional (e.g. only fires after form validation).\n"
                      "6. For event delegation, click the actual target element, not a parent container.\n"
                      "7. If the component uses a link (<a>) instead of <button>, the callback may be "
-                     "on navigation, not onClick.",
+                     "on navigation, not onClick.\n"
+                     "8. If mocking useNavigate but the component uses <Link to='...'>, the mock won't "
+                     "be called — <Link> uses internal router navigation, not the useNavigate hook. "
+                     "Instead, assert the link's href: expect(screen.getByRole('link')).toHaveAttribute('href', '/path')",
         severity="error",
         tags="mock,callback,vi.fn,jest.fn,click,called,event,handler,react,javascript,typescript",
     ),
@@ -665,6 +725,77 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "'/vitest' subpath import, not the bare import.",
         severity="error",
         tags="vitest,expect,globals,undefined,testing,ReferenceError,javascript,typescript",
+    ),
+    # ── queryByRole/queryByText returns null → toBeInTheDocument fails ──
+    ErrorFix(
+        error_type="QueryByRoleReturnedNull",
+        language="javascript",
+        pattern=r"(received value must be an HTMLElement or an SVGElement|Received has (type|value):\s*[Nn]ull)",
+        cause="The test uses queryByRole/queryByText which returns null when no match is found, "
+              "then asserts .toBeInTheDocument() on the null value. This means the queried element "
+              "does NOT exist in the rendered DOM. The most common cause is the test assuming an "
+              "element's role or accessible name based on the route path or page name rather than "
+              "reading the actual component source. For example: a page at route '/dashboard' may "
+              "NOT have a link with text 'Dashboard' — the heading might say 'Dashboard' (role=heading, "
+              "not role=link), or sidebar links may use different labels like 'Home', 'Stats', etc.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. READ the actual component source for the route being tested. The DOM output "
+                     "in the error shows exactly what is rendered.\n"
+                     "2. Do NOT assume element roles from route names:\n"
+                     "   - A page at '/dashboard' does NOT necessarily have a <a>Dashboard</a> link.\n"
+                     "   - The text 'Dashboard' might be in an <h1> (role=heading), not a link.\n"
+                     "   - Navigation links may use labels different from the route path.\n"
+                     "3. Use the CORRECT role for the actual element:\n"
+                     "   - <h1>Dashboard</h1> → getByRole('heading', { name: /dashboard/i })\n"
+                     "   - <a href='/dashboard'>Go to Dashboard</a> → getByRole('link', { name: /dashboard/i })\n"
+                     "   - <button>Dashboard</button> → getByRole('button', { name: /dashboard/i })\n"
+                     "4. If the element genuinely doesn't exist on this page/route, remove the assertion "
+                     "or replace it with an assertion for an element that DOES exist.\n"
+                     "5. Check if the element is in a DIFFERENT component that only renders on another route "
+                     "(e.g., a Header with nav links only rendered by HomePage, not Dashboard).\n"
+                     "6. Use screen.debug() or read the error's 'prettyDOM' output to see the actual DOM.",
+        severity="error",
+        tags="queryByRole,queryByText,null,toBeInTheDocument,role,heading,link,route,testing-library,react,javascript,typescript",
+    ),
+    # ── rerender() with new MemoryRouter does NOT navigate ─────────────
+    ErrorFix(
+        error_type="MemoryRouterRerenderNoNavigation",
+        language="javascript",
+        pattern=r"(route.*rerender|rerender.*route|rerender.*MemoryRouter|MemoryRouter.*rerender)",
+        cause="Using rerender() with a NEW MemoryRouter does NOT navigate to a different route. "
+              "React reconciliation keeps the old component tree because the Router is a new instance "
+              "but React does not unmount/remount the children. The DOM still shows the PREVIOUS route's "
+              "content. This is the #1 most common React Router testing mistake when LLMs generate tests.",
+        fix_template="FIX: Do NOT use rerender() with a new MemoryRouter to test route changes.\n\n"
+                     "WRONG (does not navigate — old route content persists):\n"
+                     "  const { rerender } = render(\n"
+                     "    <MemoryRouter initialEntries={['/']}><App /></MemoryRouter>\n"
+                     "  )\n"
+                     "  rerender(\n"
+                     "    <MemoryRouter initialEntries={['/dashboard']}><App /></MemoryRouter>\n"
+                     "  )\n"
+                     "  // BUG: DOM still shows '/' content, NOT '/dashboard'\n\n"
+                     "CORRECT — Option 1: Separate render calls (simplest):\n"
+                     "  const { unmount } = render(\n"
+                     "    <MemoryRouter initialEntries={['/']}><App /></MemoryRouter>\n"
+                     "  )\n"
+                     "  // Assert home page content...\n"
+                     "  unmount()\n"
+                     "  render(\n"
+                     "    <MemoryRouter initialEntries={['/dashboard']}><App /></MemoryRouter>\n"
+                     "  )\n"
+                     "  // Now assert dashboard content — this is a fresh render\n\n"
+                     "CORRECT — Option 2: Click a navigation link within the same router:\n"
+                     "  render(\n"
+                     "    <MemoryRouter initialEntries={['/']}><App /></MemoryRouter>\n"
+                     "  )\n"
+                     "  await userEvent.click(screen.getByRole('link', { name: /dashboard/i }))\n"
+                     "  // Route changed within the same router — DOM updates correctly\n\n"
+                     "KEY RULE: Each MemoryRouter is a separate routing context. rerender() swaps the "
+                     "React tree but the new MemoryRouter's internal state does not carry over. "
+                     "Always use unmount()+render() or navigate within the same router instance.",
+        severity="error",
+        tags="rerender,MemoryRouter,route,navigate,change,initialEntries,testing-library,react,react-router,javascript,typescript",
     ),
 ]
 
