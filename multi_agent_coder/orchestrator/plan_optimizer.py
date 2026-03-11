@@ -76,6 +76,29 @@ _FRAGMENT_PATTERNS = [
 # very short single-clause sentences.
 _MIN_REAL_STEP_LENGTH = 30
 
+# ── Test infrastructure vs test writing patterns ─────────────────
+# Test infra steps (config, setup files, scripts) must come BEFORE
+# test writing/execution steps.
+
+_TEST_INFRA_PATTERNS = [
+    # Setup files: vitest.setup.js, setupTests.js, jest.setup.ts, etc.
+    re.compile(r'\b(setup\s*(?:Tests?|Files?)|vitest\.setup|jest\.setup)\b', re.I),
+    # Config files: vitest.config, jest.config, vite.config with test settings
+    re.compile(r'\b(vitest\.config|jest\.config|vite\.config)\b.*\b(test|jsdom|environment|globals|setupFiles)\b', re.I),
+    re.compile(r'\b(jsdom|environment|globals|setupFiles)\b.*\b(vitest\.config|jest\.config|vite\.config)\b', re.I),
+    # Adding test scripts to package.json
+    re.compile(r'\bpackage\.json\b.*\b(test|vitest|jest)\b.*\bscript', re.I),
+    re.compile(r'\b(test\s+scripts?|scripts?)\b.*\bpackage\.json\b', re.I),
+]
+
+_TEST_WRITE_PATTERNS = [
+    # Creating/writing test files
+    re.compile(r'\b(create|write|add|generate)\b.*\b(unit|integration|component|e2e)?\s*tests?\b', re.I),
+    # Running tests
+    re.compile(r'\b(run|execute)\s+tests?\b', re.I),
+    re.compile(r'`.*\b(vitest|jest|pytest|npm\s+(?:run\s+)?test)\b.*`', re.I),
+]
+
 
 def optimize_plan(
     steps: list[str],
@@ -118,7 +141,10 @@ def optimize_plan(
     # Pass 4: Merge same-file CODE steps
     clean_steps, deps = _merge_same_file_steps(clean_steps, deps)
 
-    # Pass 5: Re-index and fix dependencies
+    # Pass 5: Reorder test infrastructure before test writing/execution
+    clean_steps, deps = _reorder_test_infra(clean_steps, deps)
+
+    # Pass 6: Re-index and fix dependencies
     clean_steps, deps = _reindex_steps(clean_steps, deps)
 
     optimized_count = len(clean_steps)
@@ -533,6 +559,79 @@ def _merge_same_file_steps(
             remapped_deps[new_i] = remapped
 
     return new_steps, remapped_deps
+
+
+def _reorder_test_infra(
+    steps: list[str], deps: dict[int, set[int]]
+) -> tuple[list[str], dict[int, set[int]]]:
+    """Move test infrastructure steps before test writing/execution steps.
+
+    LLMs frequently generate plans where test writing (step 10) comes before
+    test config/setup (steps 11-13).  This pass detects that pattern and
+    moves infra steps (setup files, vitest.config, test scripts) to just
+    before the first test-writing step, preserving relative order of all
+    other steps.
+
+    Only moves infra steps that appear AFTER the first test-write step.
+    """
+    # Classify each step
+    infra_indices: list[int] = []
+    write_indices: list[int] = []
+
+    for i, step in enumerate(steps):
+        if any(p.search(step) for p in _TEST_INFRA_PATTERNS):
+            infra_indices.append(i)
+        elif any(p.search(step) for p in _TEST_WRITE_PATTERNS):
+            write_indices.append(i)
+
+    if not infra_indices or not write_indices:
+        return steps, deps
+
+    first_write = min(write_indices)
+
+    # Find infra steps that come AFTER the first test-write step
+    late_infra = [i for i in infra_indices if i > first_write]
+    if not late_infra:
+        return steps, deps  # infra already before test writing
+
+    _logger.info(
+        f"[PlanOptimizer] Reordering {len(late_infra)} test-infra step(s) "
+        f"before test-writing step {first_write + 1}"
+    )
+
+    # Build new ordering: everything before first_write, then late infra,
+    # then first_write and everything after (minus the moved infra steps)
+    late_infra_set = set(late_infra)
+    new_order: list[int] = []
+
+    # Steps before the first test-write step (unchanged)
+    for i in range(first_write):
+        if i not in late_infra_set:
+            new_order.append(i)
+
+    # Insert the late infra steps here
+    for i in late_infra:
+        new_order.append(i)
+
+    # The first test-write step and everything after, minus moved infra
+    for i in range(first_write, len(steps)):
+        if i not in late_infra_set:
+            new_order.append(i)
+
+    # Build remapped steps and deps
+    idx_map = {old: new for new, old in enumerate(new_order)}
+    new_steps = [steps[old] for old in new_order]
+    new_deps: dict[int, set[int]] = {}
+
+    for old_i in new_order:
+        new_i = idx_map[old_i]
+        if old_i in deps:
+            remapped = {idx_map[d] for d in deps[old_i] if d in idx_map}
+            remapped.discard(new_i)  # no self-deps
+            if remapped:
+                new_deps[new_i] = remapped
+
+    return new_steps, new_deps
 
 
 def _reindex_steps(

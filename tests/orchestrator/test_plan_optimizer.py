@@ -52,6 +52,75 @@ class TestOptimizePlan(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
 
+class TestReorderTestInfra(unittest.TestCase):
+    """Tests for test infrastructure reordering."""
+
+    def test_moves_late_infra_before_test_writing(self):
+        """Setup file and config steps after test-writing should be moved before it."""
+        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        steps = [
+            "Create React components in `src/components/`",
+            "Create unit and integration tests in `__tests__/` using vitest",
+            "Add test setup file `src/setupTests.js` to import jest-dom",
+            "Update `vitest.config.js` to configure Vitest with jsdom environment",
+            "Add test scripts to `package.json`: `\"test\": \"vitest\"`",
+        ]
+        result, _ = optimize_plan(steps)
+
+        # Find indices of key steps in result
+        test_write_idx = None
+        setup_idx = None
+        config_idx = None
+        scripts_idx = None
+        for i, s in enumerate(result):
+            if "unit and integration tests" in s.lower():
+                test_write_idx = i
+            if "setupTests" in s or "setup file" in s.lower():
+                setup_idx = i
+            if "vitest.config" in s.lower() and "jsdom" in s.lower():
+                config_idx = i
+            if "test scripts" in s.lower() and "package.json" in s.lower():
+                scripts_idx = i
+
+        self.assertIsNotNone(test_write_idx, "test-writing step not found")
+        self.assertIsNotNone(setup_idx, "setup step not found")
+        self.assertIsNotNone(config_idx, "config step not found")
+        self.assertIsNotNone(scripts_idx, "scripts step not found")
+
+        # All infra steps should come before the test-writing step
+        self.assertLess(setup_idx, test_write_idx,
+                        "setup file should come before test writing")
+        self.assertLess(config_idx, test_write_idx,
+                        "vitest config should come before test writing")
+        self.assertLess(scripts_idx, test_write_idx,
+                        "test scripts should come before test writing")
+
+    def test_no_reorder_when_infra_already_first(self):
+        """No reordering needed when infra is already before test writing."""
+        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        steps = [
+            "Create `vitest.config.js` with jsdom environment and globals",
+            "Add test setup file `vitest.setup.js`",
+            "Create tests in `__tests__/` using vitest and testing-library",
+        ]
+        result, _ = optimize_plan(steps)
+        # Order should be preserved
+        self.assertEqual(len(result), 3)
+        self.assertIn("vitest.config", result[0])
+        self.assertIn("setup", result[1].lower())
+        self.assertIn("tests", result[2].lower())
+
+    def test_no_reorder_when_no_test_steps(self):
+        """No reordering when there are no test steps."""
+        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        steps = [
+            "Create `src/App.jsx` with routing",
+            "Create `src/components/Header.jsx`",
+        ]
+        result, _ = optimize_plan(steps)
+        self.assertEqual(len(result), 2)
+
+
 class TestHasFrameworkConflict(unittest.TestCase):
     """Tests for framework conflict detection."""
 

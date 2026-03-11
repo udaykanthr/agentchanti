@@ -634,6 +634,43 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="react-router,useLocation,useNavigate,useParams,MemoryRouter,Router,context,testing,react,javascript,typescript",
     ),
+    # ── Nested Router: test wraps App that already has its own Router ─────
+    ErrorFix(
+        error_type="ReactRouterNestedRouter",
+        language="javascript",
+        pattern=r"You cannot render a <Router> inside another <Router>",
+        cause="The test wraps the component in <MemoryRouter> but the component (usually App) "
+              "already contains its own <BrowserRouter> or <HashRouter>. React Router does not "
+              "allow nested Router providers. This typically happens when testing an App component "
+              "that defines its own Router internally — the test adds a second one around it.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. READ the App/component source to check if it already includes a Router "
+                     "(BrowserRouter, HashRouter, or Router).\n"
+                     "2. If the App ALREADY has a Router:\n"
+                     "   Option A — Render App directly WITHOUT MemoryRouter wrapper:\n"
+                     "     render(<App />)\n"
+                     "     // But this uses BrowserRouter which is hard to test.\n\n"
+                     "   Option B (PREFERRED) — Mock react-router-dom to replace BrowserRouter "
+                     "with MemoryRouter so the test controls routing:\n"
+                     "     vi.mock('react-router-dom', async () => {\n"
+                     "       const actual = await vi.importActual('react-router-dom')\n"
+                     "       return { ...actual, BrowserRouter: ({ children }) => (\n"
+                     "         <actual.MemoryRouter initialEntries={['/']}>{children}</actual.MemoryRouter>\n"
+                     "       )}\n"
+                     "     })\n"
+                     "     render(<App />)  // No extra MemoryRouter wrapper needed\n\n"
+                     "   Option C — Test individual page components instead of App:\n"
+                     "     render(\n"
+                     "       <MemoryRouter initialEntries={['/']}>\n"
+                     "         <Homepage />\n"
+                     "       </MemoryRouter>\n"
+                     "     )\n\n"
+                     "3. If the App does NOT have a Router (just exports Routes), "
+                     "then wrapping in MemoryRouter is correct — the error is elsewhere.\n"
+                     "4. NEVER nest two Routers. One Router per render tree.",
+        severity="error",
+        tags="react-router,BrowserRouter,MemoryRouter,nested,Router,inside,another,testing,react,App,javascript,typescript",
+    ),
     ErrorFix(
         error_type="TestAssertionLengthMismatch",
         language="javascript",
@@ -710,11 +747,16 @@ _ERROR_SEEDS: list[ErrorFix] = [
               "test utility packages that the LLM imports but weren't installed.",
         fix_template="FIX: Install the missing package as a dev dependency:\n"
                      "  npm install --save-dev <package-name>\n\n"
-                     "Common missing test packages:\n"
-                     "  npm install --save-dev @testing-library/user-event\n"
-                     "  npm install --save-dev @testing-library/jest-dom\n"
-                     "  npm install --save-dev @testing-library/react\n"
+                     "Common missing packages for Vitest + React + Testing Library:\n"
+                     "  npm install --save-dev vitest jsdom\n"
+                     "  npm install --save-dev @testing-library/react @testing-library/dom\n"
+                     "  npm install --save-dev @testing-library/jest-dom @testing-library/user-event\n"
+                     "  npm install --save-dev @vitejs/plugin-react\n"
                      "  npm install --save-dev react-router-dom\n\n"
+                     "CRITICAL packages often missed:\n"
+                     "  - jsdom: Required for Vitest DOM environment (environment: 'jsdom' in config)\n"
+                     "  - @testing-library/dom: Peer dep of @testing-library/react\n"
+                     "  - @vitejs/plugin-react: Required for JSX transform in Vite/Vitest\n\n"
                      "Do NOT try to fix the import path or remove the import — "
                      "the package genuinely needs to be installed.",
         severity="error",
@@ -855,6 +897,89 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "Always use unmount()+render() or navigate within the same router instance.",
         severity="error",
         tags="rerender,MemoryRouter,route,navigate,change,initialEntries,testing-library,react,react-router,javascript,typescript",
+    ),
+    # ── waitFor timeout — test assumes content the component never renders ──
+    ErrorFix(
+        error_type="WaitForAssumedContentNotRendered",
+        language="javascript",
+        pattern=r"Unable to find an element with the text:.*\(content,\s*element\)\s*=>",
+        cause="The test uses waitFor() with a custom function matcher that asserts specific "
+              "text content (e.g. 'No records found.', 'Loading...') that the component never "
+              "actually renders. The LLM assumed what the component would display after async "
+              "loading without reading the source. The waitFor() call times out because the "
+              "expected DOM element never appears. This is a TEST_BUG, not a source bug.",
+        fix_template="CRITICAL — THIS IS A TEST BUG, NOT A SOURCE BUG.\n"
+                     "The test assumes the component renders text that it does not.\n\n"
+                     "FIX STEPS:\n"
+                     "1. READ the actual source component file to see what it REALLY renders "
+                     "after loading completes (look for return statements, JSX output, "
+                     "conditional rendering, empty states, loading states).\n"
+                     "2. READ the DOM output shown in the error — it dumps the actual rendered "
+                     "HTML. Find the real text/elements the component produces.\n"
+                     "3. Rewrite the waitFor() assertion to match ACTUAL rendered content:\n"
+                     "   // WRONG — assumed text:\n"
+                     "   await waitFor(() => {\n"
+                     "     screen.getByText((c, el) => el.tagName === 'P' && c === 'No records found.')\n"
+                     "   })\n"
+                     "   // CORRECT — use actual rendered text from source:\n"
+                     "   await waitFor(() => {\n"
+                     "     screen.getByText(/actual text from component/i)\n"
+                     "   })\n"
+                     "4. For loading → loaded transitions, verify the component's actual loading "
+                     "indicator and post-load content by reading the source.\n"
+                     "5. If the component renders a table or list, query by role instead:\n"
+                     "   await waitFor(() => screen.getByRole('table'))\n"
+                     "6. NEVER invent expected text content — always derive it from the "
+                     "component source code.",
+        severity="error",
+        tags="waitFor,timeout,testing-library,react,async,loading,assumed,content,function,matcher,getByText,TEST_BUG,javascript,typescript",
+    ),
+    # ── Lazy-loaded component: sync query hits Suspense fallback ────────
+    ErrorFix(
+        error_type="SuspenseFallbackSyncQuery",
+        language="javascript",
+        pattern=r"Unable to find an accessible element with the role .*(Loading|Suspense|loading)",
+        cause="The component under test is lazy-loaded with React.lazy() and wrapped in "
+              "<Suspense fallback={...}>. The test uses a SYNCHRONOUS query (getByRole, getByText) "
+              "which runs immediately and finds only the Suspense fallback (e.g. 'Loading dashboard...') "
+              "instead of the actual component content. The lazy chunk has not finished loading yet "
+              "when the sync query executes, so elements like headings, tables, navigation, etc. "
+              "do not exist in the DOM at query time. This is common when App.jsx uses React.lazy() "
+              "for route-level code splitting.",
+        fix_template="CRITICAL FIX: Use ASYNC queries (findByRole, findByText) instead of sync queries "
+                     "(getByRole, getByText) when testing lazy-loaded components.\n\n"
+                     "The component is loaded via React.lazy() + Suspense. The Suspense fallback "
+                     "renders first, then the lazy chunk loads asynchronously.\n\n"
+                     "WRONG — sync query fails because lazy component hasn't loaded:\n"
+                     "  render(<App />)\n"
+                     "  screen.getByRole('heading', { name: /dashboard/i })  // FAILS — sees fallback\n\n"
+                     "CORRECT — async query waits for lazy component to load:\n"
+                     "  render(<App />)\n"
+                     "  await screen.findByRole('heading', { name: /dashboard/i })  // WAITS for load\n\n"
+                     "FIX STEPS:\n"
+                     "1. READ the App/router source — check if the component is imported with React.lazy().\n"
+                     "2. If lazy-loaded, ALL queries for that component's content MUST be async:\n"
+                     "   - getByRole → findByRole\n"
+                     "   - getByText → findByText\n"
+                     "   - getByLabelText → findByLabelText\n"
+                     "   - getAllByRole → findAllByRole\n"
+                     "3. Make the test function async: it('...', async () => { ... })\n"
+                     "4. Await every findBy* call: const heading = await screen.findByRole('heading')\n"
+                     "5. For multiple queries on the same lazy component, await the FIRST one to confirm "
+                     "the component has loaded, then subsequent getBy* queries are safe:\n"
+                     "   await screen.findByRole('heading', { name: /dashboard/i })  // wait for load\n"
+                     "   const nav = screen.getByRole('navigation')  // safe — component is loaded\n"
+                     "   const table = screen.getByRole('table')  // safe — component is loaded\n"
+                     "6. Alternatively, wrap assertions in waitFor():\n"
+                     "   await waitFor(() => {\n"
+                     "     expect(screen.getByRole('heading', { name: /dashboard/i })).toBeInTheDocument()\n"
+                     "   })\n\n"
+                     "SIGNS THAT A COMPONENT IS LAZY-LOADED:\n"
+                     "- App.jsx has: const Dashboard = React.lazy(() => import('./pages/Dashboard'))\n"
+                     "- Route element is wrapped in <Suspense>: <Suspense fallback={...}><Dashboard /></Suspense>\n"
+                     "- DOM output shows only a loading message like 'Loading...' or a spinner",
+        severity="error",
+        tags="React.lazy,Suspense,lazy,loading,fallback,getByRole,findByRole,async,sync,query,testing-library,react,code-splitting,javascript,typescript",
     ),
     # ── Default vs Named import mismatch (Element type is invalid) ─────
     ErrorFix(
@@ -1349,6 +1474,69 @@ Ensure you've run indexing first: `agentchanti kb index && agentchanti kb embed`
 Install NumPy for optimized vector operations: `pip install numpy`
 """,
     },
+    "vitest-react-testing-setup.md": {
+        "title": "Vitest React Testing Library Setup — Required Packages",
+        "tags": "vitest, react, testing-library, jsdom, setup, packages, npm, install, required, jest-dom",
+        "content": """## Overview
+
+When setting up a React project with Vitest and @testing-library/react, the following
+packages are ALL required. Missing any of these causes hard-to-debug import/runtime errors.
+
+## Required Dev Packages (complete list)
+
+```bash
+npm install --save-dev vitest jsdom @testing-library/react @testing-library/dom @testing-library/jest-dom @testing-library/user-event @vitejs/plugin-react
+```
+
+### Package purposes:
+| Package | Purpose | Error if missing |
+|---------|---------|-----------------|
+| `vitest` | Test runner | `vitest: command not found` |
+| `jsdom` | DOM environment for tests | `Error: Failed to find a valid JSDOM implementation` or `ReferenceError: document is not defined` |
+| `@testing-library/react` | `render()`, `screen` queries | `Cannot find module '@testing-library/react'` |
+| `@testing-library/dom` | Core DOM queries (peer dep of @testing-library/react) | `Cannot find module '@testing-library/dom'` |
+| `@testing-library/jest-dom` | Custom matchers: `toBeInTheDocument()`, `toHaveClass()` | `TypeError: expect(...).toBeInTheDocument is not a function` |
+| `@testing-library/user-event` | Realistic user interactions: `userEvent.click()` | `Cannot find module '@testing-library/user-event'` |
+| `@vitejs/plugin-react` | JSX transform for Vite | `[plugin:vite:esbuild] Failed to parse source for import analysis` |
+
+## Required vitest.config.js
+
+```js
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: './vitest.setup.js',
+  },
+})
+```
+
+## Required vitest.setup.js
+
+```js
+import '@testing-library/jest-dom/vitest'
+```
+
+**CRITICAL**: Use `@testing-library/jest-dom/vitest` (NOT `@testing-library/jest-dom`).
+The base import only works with Jest. The `/vitest` subpath registers matchers correctly
+with Vitest's `expect`.
+
+## Common mistakes
+
+1. **Missing `jsdom`**: Vitest defaults to `node` environment. Without `jsdom`, there is
+   no `document`, `window`, or DOM — all component renders fail silently or crash.
+2. **Missing `@testing-library/dom`**: This is a peer dependency of `@testing-library/react`.
+   npm v7+ auto-installs peer deps, but older versions or CI environments may not.
+3. **Wrong jest-dom import**: `import '@testing-library/jest-dom'` in Vitest causes
+   `expect.extend is not a function` or matchers not being registered.
+4. **Missing `@vitejs/plugin-react`**: Without the React plugin, Vite cannot transform
+   JSX in `.jsx`/`.tsx` files, causing parse errors in tests.
+""",
+    },
 }
 
 _BEHAVIORAL_DOCS = {
@@ -1681,6 +1869,118 @@ expect(within(main).getByText(/total users/i)).toBeInTheDocument()
 4. Is the section inside `<main>`? → Use `within(screen.getByRole('main')).getByText(...)`
 5. Does the source have `data-testid`? → Use `getByTestId(...)`
 6. None of the above? → Assert on the specific content the section renders
+
+## Rule 12: NEVER assume async/loading content inside `waitFor`
+
+`waitFor` re-runs its callback until it passes or times out. If you assert on text
+the component NEVER renders, `waitFor` hangs until timeout and the test fails.
+
+**WRONG — assumes component renders "No records found." after loading:**
+```js
+await waitFor(() => {
+  screen.getByText((c, el) => el.tagName === 'P' && c === 'No records found.')
+})
+```
+
+**CORRECT — read the source to find what ACTUALLY renders after loading:**
+```js
+// 1. Read the source component to find its actual loading/loaded/empty states
+// 2. Assert ONLY on text or elements you verified exist in the source
+await waitFor(() => {
+  // Use actual text from the component's return/render JSX
+  screen.getByRole('table')  // if it renders a table after loading
+})
+```
+
+**Steps for async component tests:**
+1. READ the source component to find:
+   - What renders during loading (spinner, skeleton, "Loading..." text)
+   - What renders after loading completes (tables, cards, lists)
+   - What renders for empty/error states — look for actual JSX like `<p>No data</p>`
+2. First assert the loading indicator appears (if any)
+3. Then `waitFor` the ACTUAL post-loading content
+4. NEVER invent text content for empty states — the component may not have one
+5. If unsure what renders, use `screen.debug()` in development to inspect
+
+## Rule 13: NEVER wrap App in MemoryRouter if App has its own Router
+
+If the App component already contains `<BrowserRouter>` or `<HashRouter>`, wrapping
+it in `<MemoryRouter>` causes: "You cannot render a <Router> inside another <Router>"
+
+**READ the App source first.** Check if it imports and uses BrowserRouter/HashRouter.
+
+```js
+// WRONG — App already has BrowserRouter internally
+render(
+  <MemoryRouter initialEntries={['/']}>
+    <App />
+  </MemoryRouter>
+)
+
+// CORRECT Option A — Mock BrowserRouter to become MemoryRouter
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual('react-router-dom')
+  return {
+    ...actual,
+    BrowserRouter: ({ children }) => (
+      <actual.MemoryRouter initialEntries={['/']}>{children}</actual.MemoryRouter>
+    ),
+  }
+})
+render(<App />)
+
+// CORRECT Option B — Test page components individually, not App
+render(
+  <MemoryRouter initialEntries={['/dashboard']}>
+    <Routes>
+      <Route path="/dashboard" element={<Dashboard />} />
+    </Routes>
+  </MemoryRouter>
+)
+```
+
+## Rule 14: Use ASYNC queries for lazy-loaded (React.lazy) components
+
+When a component is loaded via `React.lazy()` + `<Suspense>`, it does NOT render
+immediately. The Suspense fallback renders first (e.g. "Loading dashboard..."), then
+the lazy chunk loads asynchronously. **Sync queries (`getByRole`, `getByText`) will
+only see the fallback and FAIL.**
+
+**How to detect lazy loading:**
+- App.jsx has: `const Dashboard = React.lazy(() => import('./pages/Dashboard'))`
+- Route uses `<Suspense fallback={<p>Loading...</p>}><Dashboard /></Suspense>`
+- DOM output in test error shows only a loading message, not the real content
+
+**WRONG — sync query runs before lazy component loads:**
+```js
+render(<App />)
+screen.getByRole('heading', { name: /dashboard/i })  // FAILS — DOM has "Loading..."
+screen.getByRole('navigation')  // FAILS — DOM has "Loading..."
+screen.getByRole('table')  // FAILS — DOM has "Loading..."
+```
+
+**CORRECT — use findBy* (async) to wait for lazy component:**
+```js
+render(<App />)
+// findBy* returns a Promise that resolves when the element appears
+await screen.findByRole('heading', { name: /dashboard/i })  // waits for load
+
+// After the first findBy* resolves, the component is loaded.
+// Subsequent queries can be sync:
+const nav = screen.getByRole('navigation')
+const table = screen.getByRole('table')
+```
+
+**Conversion rules:**
+| Sync (WRONG for lazy) | Async (CORRECT for lazy) |
+|---|---|
+| `getByRole(...)` | `await findByRole(...)` |
+| `getByText(...)` | `await findByText(...)` |
+| `getByLabelText(...)` | `await findByLabelText(...)` |
+| `getAllByRole(...)` | `await findAllByRole(...)` |
+
+**Key pattern:** Await the FIRST query to confirm the lazy component loaded,
+then use sync queries for the rest of the component's elements.
 """,
     },
 }

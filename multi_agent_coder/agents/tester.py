@@ -8,7 +8,8 @@ from ..language import (
 class TesterAgent(Agent):
     def process(self, task: str, context: str = "",
                 language: str | None = None,
-                env_info: dict | None = None) -> str:
+                env_info: dict | None = None,
+                test_root: str | None = None) -> str:
         # Infer language from context file paths when not explicitly provided
         if language is None:
             file_paths = self._extract_file_paths(context)
@@ -29,7 +30,9 @@ class TesterAgent(Agent):
         fw = get_test_framework(language, test_runner=test_runner)
         lang_tag = get_code_block_lang(language)
         lang_name = get_language_name(language)
-        test_dir = fw.get("dir", "tests")
+        # Use detected test_root from project analysis when available,
+        # otherwise fall back to the framework default.
+        test_dir = test_root if test_root else fw.get("dir", "tests")
         test_ext = fw.get("ext", ".py")
 
         # Override extension for JS/TS projects with JSX — Vite cannot parse
@@ -51,7 +54,7 @@ Language: {lang_name}
 """
         # Language-aware import path rules
         if language in ("javascript", "typescript"):
-            prompt += self._js_import_path_rules()
+            prompt += self._js_import_path_rules(test_dir)
         else:
             prompt += self._python_import_path_rules()
 
@@ -121,22 +124,45 @@ WRONG (do NOT do this):
 """
 
     @staticmethod
-    def _js_import_path_rules() -> str:
+    def _js_import_path_rules(test_dir: str = "__tests__") -> str:
         """Import path rules specific to JavaScript/TypeScript projects."""
-        return """CRITICAL PATH RULES — violations cause import failures:
+        # When tests are inside src/ (e.g. src/__tests__), relative imports
+        # go UP one level to reach sibling dirs like src/components/.
+        if test_dir.replace("\\", "/").startswith("src/"):
+            return f"""CRITICAL PATH RULES — violations cause import failures:
+1. Use RELATIVE paths from the test file to the source file.
+   Do NOT use absolute paths or module aliases unless the project defines them.
+2. Keep the original file extension (.ts, .tsx, .js, .jsx) when required by the bundler/runner.
+3. NEVER drop directory prefixes.
+4. Test directory is `{test_dir}` — tests are INSIDE the src/ tree.
+   Relative imports go UP one level to reach sibling directories.
+
+Examples:
+  Source at `src/components/Button.tsx`, test at `{test_dir}/Button.test.tsx`
+    → `import {{ Button }} from '../components/Button';`
+  Source at `src/utils/helpers.ts`, test at `{test_dir}/helpers.test.ts`
+    → `import {{ helperFn }} from '../utils/helpers';`
+  Source at `src/App.jsx`, test at `{test_dir}/App.test.jsx`
+    → `import App from '../App';`
+
+WRONG (do NOT do this):
+  Source at `src/components/Button.tsx` → `import {{ Button }} from '../../src/components/Button';`  ← WRONG! Double src/
+  Source at `src/components/Button.tsx` → `import {{ Button }} from './Button';`  ← WRONG! Missing relative path
+"""
+        return f"""CRITICAL PATH RULES — violations cause import failures:
 1. Use RELATIVE paths from the test file to the source file.
    Do NOT use absolute paths or module aliases unless the project defines them.
 2. Keep the original file extension (.ts, .tsx, .js, .jsx) when required by the bundler/runner.
 3. NEVER drop directory prefixes.
 
 Examples:
-  Source at `src/components/Button.tsx`, test at `__tests__/Button.test.tsx`
-    → `import { Button } from '../src/components/Button';`
-  Source at `src/utils/helpers.ts`, test at `__tests__/helpers.test.ts`
-    → `import { helperFn } from '../src/utils/helpers';`
+  Source at `src/components/Button.tsx`, test at `{test_dir}/Button.test.tsx`
+    → `import {{ Button }} from '../src/components/Button';`
+  Source at `src/utils/helpers.ts`, test at `{test_dir}/helpers.test.ts`
+    → `import {{ helperFn }} from '../src/utils/helpers';`
 
 WRONG (do NOT do this):
-  Source at `src/components/Button.tsx` → `import { Button } from './Button';`  ← WRONG! Missing relative path to src/
+  Source at `src/components/Button.tsx` → `import {{ Button }} from './Button';`  ← WRONG! Missing relative path to src/
 """
 
     @staticmethod

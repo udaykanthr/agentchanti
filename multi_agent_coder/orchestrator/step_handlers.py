@@ -2914,6 +2914,15 @@ def _extract_source_specs(code_summary: str) -> str:
 
 
 # ── Enhancement #5: Bidirectional bug detection ──────────────────
+_TEST_BUG_PATTERNS = re.compile(
+    r"Unable to find an element with the text:.*\(content,\s*element\)\s*=>"
+    r"|You cannot render a <Router> inside another <Router>"
+    r"|TestingLibraryElementError:.*Unable to find (a label|an accessible element|a[n]? element) with the (text|role|label)"
+    r"|Unable to find role",
+    re.DOTALL,
+)
+
+
 def _triage_test_failure(error_detail: str, source_summary: str,
                          test_summary: str, llm_client,
                          display: CLIDisplay, step_idx: int) -> str:
@@ -2921,6 +2930,11 @@ def _triage_test_failure(error_detail: str, source_summary: str,
 
     Returns 'TEST_BUG' or 'SOURCE_BUG'.
     """
+    # Fast-path: known patterns that are always test bugs — skip LLM call
+    if _TEST_BUG_PATTERNS.search(error_detail):
+        log.info(f"Step {step_idx+1}: Triage result: TEST_BUG (pattern match)")
+        return "TEST_BUG"
+
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
         "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
@@ -3140,6 +3154,31 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     prev_gen_error = None  # Track errors across gen attempts for early exit
     prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
+    # Pre-fetch behavioral instructions for JS/TS test generation.
+    # Vector search may miss these, so fetch them explicitly once.
+    _behavioral_ctx = ""
+    if language in ("javascript", "typescript") and kb_context_builder is not None:
+        try:
+            _gstore = getattr(kb_context_builder, '_global_store', None)
+            if _gstore is not None:
+                _beh_results = _gstore.get_behavioral_instructions(
+                    "react component test generation testing-library",
+                    api_client=getattr(kb_context_builder, '_api_client', None),
+                )
+                if _beh_results:
+                    _beh_parts = []
+                    for item in _beh_results:
+                        content = getattr(item, "content", "") or getattr(item, "title", "")
+                        if content:
+                            _beh_parts.append(content)
+                    if _beh_parts:
+                        _behavioral_ctx = (
+                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            + "\n".join(_beh_parts) + "\n"
+                        )
+        except Exception:
+            pass
+
     for gen_attempt in range(1, MAX_TEST_GEN_RETRIES + 1):
         display.step_info(step_idx, f"Generating tests (attempt {gen_attempt}/{MAX_TEST_GEN_RETRIES})...")
         kb_ctx = getattr(memory, '_kb_context', '')
@@ -3153,6 +3192,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 gen_context += analysis_block + "\n\n"
         if kb_ctx:
             gen_context += kb_ctx + "\n\n"
+        # Inject behavioral instructions for JS/TS test generation
+        # (ensures react test rules are always in context, not relying
+        # on vector search relevance)
+        if _behavioral_ctx and _behavioral_ctx not in gen_context:
+            gen_context += _behavioral_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"
 
         # ── Enhancement #9: spec-driven test generation ──
@@ -3177,9 +3221,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
         sent_before, recv_before = token_tracker.snapshot()
 
+        # Resolve test_root from project_context so TesterAgent writes
+        # tests to the correct directory (e.g. src/__tests__ vs __tests__).
+        _test_root = None
+        if project_context is not None:
+            _test_root = getattr(project_context, "test_root", None) or None
+
         test_response = tester.process(
             step_text, context=gen_context, language=language,
-            env_info=js_env)
+            env_info=js_env, test_root=_test_root)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before

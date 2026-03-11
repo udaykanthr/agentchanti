@@ -291,8 +291,24 @@ def _detect_source_root(source_files: dict[str, str]) -> str:
 
 
 def _detect_test_root(source_files: dict[str, str]) -> str:
-    """Detect the test directory from file paths."""
-    for candidate in ("__tests__", "tests", "test", "spec"):
+    """Detect the test directory from file paths.
+
+    Checks both root-level (``__tests__/``) and nested (``src/__tests__/``)
+    test directories.  Prefers more-specific (nested) matches so that the
+    LLM writes tests to the correct location.
+    """
+    candidates = ("__tests__", "tests", "test", "spec")
+    # First pass: look for nested test dirs (e.g. src/__tests__)
+    for fpath in source_files:
+        norm = fpath.replace("\\", "/")
+        for candidate in candidates:
+            needle = "/" + candidate + "/"
+            idx = norm.find(needle)
+            if idx != -1:
+                # Return path up to and including the test dir
+                return norm[: idx + len(needle) - 1]  # e.g. "src/__tests__"
+    # Second pass: root-level test dirs
+    for candidate in candidates:
         for fpath in source_files:
             if fpath.replace("\\", "/").startswith(candidate + "/"):
                 return candidate

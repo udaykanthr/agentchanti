@@ -370,11 +370,12 @@ class ProjectOrientation:
                     self._root, profile.source_root,
                 )
 
-        # Detect test directories
+        # Detect test directories — prefer nested (src/__tests__) over root
+        # (__tests__) so the LLM writes tests in the correct location.
         test_candidates = [
-            "__tests__", "tests", "test", "spec",
             f"{profile.source_root}/__tests__",
             f"{profile.source_root}/tests",
+            "__tests__", "tests", "test", "spec",
         ]
         for candidate in test_candidates:
             if os.path.isdir(os.path.join(self._root, candidate)):
