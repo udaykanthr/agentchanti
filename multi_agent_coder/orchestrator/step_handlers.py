@@ -1495,6 +1495,7 @@ _JS_IMPORT_EXTENSIONS = (
 _JS_IMPORT_RE = re.compile(
     r'''(?:import|export)\s+.*?from\s+['"](\.\.?/[^'"]+)['"]'''
     r'''|import\s+['"](\.\.?/[^'"]+)['"]''',
+    re.DOTALL,
 )
 
 # Python relative imports: from .foo import bar, from ..pkg import baz
@@ -1624,6 +1625,7 @@ _JS_ALL_IMPORT_RE = re.compile(
     r'''(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]'''
     r'''|import\s+['"]([^'"]+)['"]'''
     r'''|import\(\s*['"]([^'"]+)['"]\s*\)''',
+    re.DOTALL,
 )
 
 # Node built-in modules — never need npm install
@@ -2966,6 +2968,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             project_context, executor, memory, display, step_idx,
             subproject_cwd=subproject_cwd, language=language,
         )
+
+    # ── Scan ALL memory files for missing package imports ──
+    # Code steps only scan their own generated files, but tests
+    # transitively import other components that may reference
+    # packages not yet installed (e.g. @heroicons/react).
+    # Scan the full memory to catch these before the test runs.
+    _auto_install_code_imports(
+        memory.all_files(), executor, memory, display, step_idx,
+    )
 
     # Infer language from memory file paths when not explicitly provided
     if language is None:

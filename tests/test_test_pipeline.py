@@ -230,6 +230,29 @@ def test_detect_missing_packages_mixed_errors():
     assert "@jest/globals" in packages
 
 
+def test_detect_missing_packages_vite_resolve_scoped():
+    """Failed to resolve scoped import should normalize subpath to package root."""
+    output = 'Failed to resolve import "@heroicons/react/outline" from "src/components/SidebarMenu.jsx".'
+    packages = Executor.detect_missing_packages(output)
+    assert "@heroicons/react" in packages
+    # Should NOT contain the full subpath
+    assert "@heroicons/react/outline" not in packages
+
+
+def test_detect_missing_packages_vite_resolve_unscoped():
+    """Failed to resolve unscoped import should keep package name as-is."""
+    output = 'Failed to resolve import "lodash" from "src/utils.js".'
+    packages = Executor.detect_missing_packages(output)
+    assert "lodash" in packages
+
+
+def test_detect_missing_packages_vite_resolve_skip_relative():
+    """Failed to resolve relative import should be skipped."""
+    output = 'Failed to resolve import "./missing" from "src/App.jsx".'
+    packages = Executor.detect_missing_packages(output)
+    assert len(packages) == 0
+
+
 # ── JS project environment detection tests ───────────────────
 
 from multi_agent_coder.orchestrator.step_handlers import _read_js_project_env

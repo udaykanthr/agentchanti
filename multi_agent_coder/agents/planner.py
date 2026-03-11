@@ -281,7 +281,15 @@ class PlannerAgent(Agent):
                         if doc_hints:
                             parts.append("\n[Framework/Library Documentation]")
                             parts.append(
-                                "IMPORTANT: Follow these guides when generating steps:")
+                                "CRITICAL: These KB docs are curated and up-to-date. "
+                                "You MUST follow them exactly:\n"
+                                "- Use the EXACT install commands from these docs "
+                                "(including all peer dependencies like postcss, jsdom, etc.)\n"
+                                "- If a doc says a command is deprecated/removed, "
+                                "do NOT use that command\n"
+                                "- If a doc shows specific packages to install together, "
+                                "install ALL of them in one step — do not omit any\n"
+                                "- Your training data may be outdated — these docs override it")
                             parts.extend(doc_hints)
                         _logger.info(
                             "[PreAnalysis] %d doc(s) injected into planner context",
@@ -386,6 +394,16 @@ Write a numbered list. Each step MUST be a single, concrete action:
 13. **SKIP already-installed packages**: If the project knowledge above lists
     packages as already installed, do NOT add install steps for them.
     Only install NEW packages that are not yet present.
+
+14. **KB documentation overrides your training data**: When Framework/Library
+    Documentation is provided above, you MUST use the exact commands shown
+    there — including ALL packages and peer dependencies. Your training data
+    may be outdated. Examples:
+    - If a KB doc shows `npm install tailwindcss @tailwindcss/postcss postcss`,
+      install ALL THREE packages, not just `tailwindcss`
+    - If a KB doc marks a command as deprecated (e.g. `tailwindcss init`),
+      do NOT include that command in your plan
+    - If a KB doc shows a specific config file format, use that format
 
 ═══════ QUALITY CHECKLIST (verify before outputting) ═══════
 - [ ] Every file path in the plan matches an existing project file OR is

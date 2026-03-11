@@ -1004,6 +1004,12 @@ class Executor:
             test_output,
         ):
             pkg = m.group(1)
+            # Skip relative imports
+            if pkg.startswith("."):
+                continue
+            # Normalize scoped package subpaths: '@heroicons/react/outline' → '@heroicons/react'
+            if pkg.startswith("@") and pkg.count("/") >= 2:
+                pkg = "/".join(pkg.split("/")[:2])
             if pkg not in seen:
                 packages.append(pkg)
                 seen.add(pkg)

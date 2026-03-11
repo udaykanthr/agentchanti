@@ -523,27 +523,86 @@ _ERROR_SEEDS: list[ErrorFix] = [
     ErrorFix(
         error_type="TestingLibraryMultipleElementsFound",
         language="javascript",
-        pattern=r"TestingLibraryElementError:\s*Found multiple elements with the role",
-        cause="The test uses getByRole/getByText which expects exactly ONE matching element, "
-              "but the component renders multiple elements with the same role and accessible name. "
-              "Common causes: (1) a navigation bar and page content both have a 'Home' link, "
-              "(2) header/footer duplicate links, (3) nested components render the same elements.",
+        pattern=r"TestingLibraryElementError:\s*Found multiple elements with the (role|text)",
+        cause="The test uses getByRole/getByText/getByText(fn) which expects exactly ONE matching "
+              "element, but multiple elements match. Common causes: (1) a navigation bar and page "
+              "content both have a link with the same name, (2) header/footer duplicate links, "
+              "(3) nested components render the same elements, (4) using a getByText() function "
+              "matcher with element.textContent.includes() — parent elements also match because "
+              "textContent includes ALL descendant text, so every ancestor of the target element "
+              "matches the predicate too.",
         fix_template="FIX STEPS:\n"
-                     "1. Use getAllByRole() instead of getByRole() when multiple matches are expected, "
+                     "1. **Function matcher matching parents (most common with getByText)**: "
+                     "When using getByText((content, element) => element?.textContent?.includes('...')) "
+                     "every ancestor element also matches because textContent includes all descendant "
+                     "text. FIX: use getAllByText() and pick the innermost (last/first) match, OR "
+                     "add a tag filter to select only leaf/specific elements:\n"
+                     "   screen.getByText((content, element) => {\n"
+                     "     return element?.tagName === 'SPAN' && element?.textContent?.includes('Jane Doe')\n"
+                     "   })\n"
+                     "   // OR use getAllByText and take first:\n"
+                     "   const matches = screen.getAllByText((content, element) => {\n"
+                     "     return element?.textContent?.includes('Jane Doe')\n"
+                     "   })\n"
+                     "   expect(matches[0]).toBeInTheDocument()\n"
+                     "2. Use getAllByRole()/getAllByText() when multiple matches are expected, "
                      "then assert on the array:\n"
                      "   const links = screen.getAllByRole('link', { name: /home/i })\n"
                      "   expect(links).toHaveLength(2)\n"
                      "   expect(links[0]).toBeInTheDocument()\n"
-                     "2. Or scope the query to a specific container using within():\n"
+                     "3. Scope the query to a specific container using within():\n"
                      "   import { within } from '@testing-library/react'\n"
                      "   const nav = screen.getByRole('navigation')\n"
                      "   within(nav).getByRole('link', { name: /home/i })\n"
-                     "3. Use a more specific name pattern to narrow matches:\n"
+                     "4. Use a more specific name pattern to narrow matches:\n"
                      "   screen.getByRole('link', { name: /^home$/i })  // exact match\n"
-                     "4. READ the actual component source to understand how many instances exist "
+                     "5. READ the actual component source to understand how many instances exist "
                      "and which container to scope your query to.",
         severity="error",
-        tags="testing-library,react,multiple,elements,getByRole,getAllByRole,within,query,javascript,typescript",
+        tags="testing-library,react,multiple,elements,getByRole,getAllByRole,getByText,getAllByText,textContent,function,matcher,within,query,javascript,typescript",
+    ),
+    # ── Assumed ARIA roles / labels that don't exist in the source ─────
+    ErrorFix(
+        error_type="TestingLibraryAssumedAriaNotFound",
+        language="javascript",
+        pattern=r"TestingLibraryElementError:\s*Unable to find (a label|an accessible element|a[n]? element) with the (text|role|label)",
+        cause="The test assumes the component uses ARIA roles or labels (aria-label, role='region', "
+              "aria-labelledby) that do NOT exist in the actual source code. This is the #1 cause of "
+              "test failures in component testing: the LLM invents ARIA attributes that were never added "
+              "to the component. Common cases:\n"
+              "  (1) <section> without aria-label does NOT expose the 'region' role — "
+              "getByRole('region', { name: /stats/i }) will fail.\n"
+              "  (2) <div> has no implicit ARIA role — getByRole('region') won't find it.\n"
+              "  (3) getByLabelText(/stats/i) fails because no element has aria-label='stats'.\n"
+              "  (4) Plain HTML elements (div, section, span) rarely have ARIA attributes "
+              "unless the developer explicitly added them.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. READ the actual component source code — check which HTML elements are used "
+                     "and whether they have aria-label, role, or aria-labelledby attributes.\n"
+                     "2. NEVER assume ARIA attributes exist. Most components use plain HTML without "
+                     "explicit ARIA roles or labels.\n"
+                     "3. HTML implicit roles ONLY apply when an accessible name is present:\n"
+                     "   - <section aria-label='stats'> → role='region', findable by getByRole('region', { name: /stats/i })\n"
+                     "   - <section> (no aria-label) → NO implicit role, NOT findable by getByRole('region')\n"
+                     "   - <nav> → always role='navigation' (no label required)\n"
+                     "   - <main> → always role='main'\n"
+                     "   - <header> → role='banner' (when not nested in sectioning content)\n"
+                     "   - <footer> → role='contentinfo' (when not nested in sectioning content)\n"
+                     "   - <div> → NO implicit role ever\n"
+                     "4. Instead of querying by assumed ARIA role, use alternatives:\n"
+                     "   - Query by actual text content: screen.getByText(/total users/i)\n"
+                     "   - Query by heading: screen.getByRole('heading', { name: /stats/i })\n"
+                     "   - Query by test-id if present: screen.getByTestId('stats-section')\n"
+                     "   - Query the container structure: check what's inside <main> or look for \n"
+                     "     specific child content that proves the section rendered.\n"
+                     "5. If the component truly renders a <section> without aria-label, do NOT use \n"
+                     "   getByRole('region'). Instead, verify the section's CONTENT exists:\n"
+                     "   // Instead of: screen.getByRole('region', { name: /stats/i })\n"
+                     "   // Do: verify actual stats content is rendered\n"
+                     "   expect(screen.getByText(/total users/i)).toBeInTheDocument()\n"
+                     "   expect(screen.getByText(/revenue/i)).toBeInTheDocument()",
+        severity="error",
+        tags="testing-library,react,aria,role,region,label,section,getByRole,getByLabelText,accessible,name,assumed,not,found,javascript,typescript",
     ),
     ErrorFix(
         error_type="ReactRouterContextMissing",
@@ -796,6 +855,38 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "Always use unmount()+render() or navigate within the same router instance.",
         severity="error",
         tags="rerender,MemoryRouter,route,navigate,change,initialEntries,testing-library,react,react-router,javascript,typescript",
+    ),
+    # ── Default vs Named import mismatch (Element type is invalid) ─────
+    ErrorFix(
+        error_type="ReactDefaultNamedImportMismatch",
+        language="javascript",
+        pattern=r"Element type is invalid:\s*expected a string.*but got:\s*undefined.*forgot to export.*mixed up default and named imports",
+        cause="The test file uses a default import (`import Foo from './Foo'`) but the "
+              "component file uses a named export (`export function Foo` or `export const Foo`), "
+              "or vice versa. When the import style does not match the export style, the imported "
+              "value is `undefined`, causing React to throw 'Element type is invalid'. "
+              "This is the #1 most common import mistake LLMs make when generating test files — "
+              "they assume a default export without reading the component source.",
+        fix_template="FIX: Match the import style to the component's actual export style.\n\n"
+                     "If the component uses a NAMED export:\n"
+                     "  // Component: export function Charts() { ... }\n"
+                     "  // or:        export const Charts = () => { ... }\n\n"
+                     "  WRONG:   import Charts from '../components/Charts'\n"
+                     "  CORRECT: import { Charts } from '../components/Charts'\n\n"
+                     "If the component uses a DEFAULT export:\n"
+                     "  // Component: export default function Charts() { ... }\n"
+                     "  // or:        const Charts = () => { ... }; export default Charts\n\n"
+                     "  WRONG:   import { Charts } from '../components/Charts'\n"
+                     "  CORRECT: import Charts from '../components/Charts'\n\n"
+                     "HOW TO DETERMINE THE EXPORT STYLE:\n"
+                     "1. Read the component source file.\n"
+                     "2. Look for 'export default' (default export) vs 'export function/const' (named export).\n"
+                     "3. A file can have BOTH — one default export and multiple named exports.\n"
+                     "4. If unsure, check how OTHER files in the project import the same component.\n\n"
+                     "CRITICAL: ALWAYS read the component source before writing the import in a test file. "
+                     "Never assume the export style.",
+        severity="error",
+        tags="element,type,invalid,undefined,import,export,default,named,mixed,react,component,testing,javascript,typescript",
     ),
 ]
 
@@ -1362,6 +1453,234 @@ A good fix suggestion includes:
 - Add type annotations/guards at the boundary
 - Improve error messages for faster future diagnosis
 - Consider if similar bugs could exist elsewhere
+""",
+    },
+    "react-component-test-generation-instructions.md": {
+        "title": "React Component Test Generation Instructions",
+        "tags": "react, testing, vitest, jest, component, test-generation, behavioral, testing-library, getByText, getByRole, within, render, instructions",
+        "content": """## Overview
+
+When generating tests for React components, you MUST follow these rules to avoid
+the most common test failures. These rules apply to both Vitest and Jest projects
+using @testing-library/react.
+
+## Rule 1: READ the source component BEFORE writing any assertion
+
+NEVER assume what a component renders. Before writing any `getByText`, `getByRole`,
+or any query, read the actual component source to determine:
+- Exact text content rendered (including text from props/state)
+- Element types used (button, a, span, div, h1, etc.)
+- ARIA roles and accessible names
+- How many instances of each element exist
+- Whether text is split across multiple DOM elements
+
+## Rule 2: Avoid `getByText` with `textContent.includes()` function matchers
+
+This is the #1 source of "Found multiple elements" errors.
+
+**WHY IT FAILS**: `element.textContent` includes ALL descendant text. When you write:
+```js
+screen.getByText((content, element) => element?.textContent?.includes('Jane Doe'))
+```
+Every ancestor of the element containing "Jane Doe" ALSO matches, because parent
+elements' textContent includes their children's text. This causes `getByText` to
+find multiple matches and throw.
+
+**CORRECT APPROACHES** (in order of preference):
+```js
+// 1. BEST: Use getByRole with accessible name — no ambiguity
+screen.getByRole('heading', { name: /jane doe/i })
+
+// 2. Use getByText with plain string or regex (matches direct text content)
+screen.getByText(/Jane Doe/)
+
+// 3. If you MUST use a function matcher, filter by tag to avoid parent matches
+screen.getByText((content, element) => {
+  return element?.tagName === 'SPAN' && element?.textContent?.includes('Jane Doe')
+})
+
+// 4. Use getAllByText and take the first match
+const matches = screen.getAllByText((content, element) => {
+  return element?.textContent?.includes('Jane Doe')
+})
+expect(matches[0]).toBeInTheDocument()
+
+// 5. Scope with within() to a specific container
+import { within } from '@testing-library/react'
+const header = screen.getByRole('banner')
+within(header).getByText(/Jane Doe/)
+```
+
+## Rule 3: Prefer `getByRole` over `getByText`
+
+`getByRole` is more robust because it queries by ARIA role + accessible name, not
+raw text. It avoids issues with split text, duplicate text, and structural changes.
+
+```js
+// BAD — fragile, breaks when text content changes slightly
+screen.getByText('Submit Order')
+
+// GOOD — resilient to text changes, tests accessibility too
+screen.getByRole('button', { name: /submit/i })
+
+// BAD — matches all links on the page
+screen.getByText('Home')
+
+// GOOD — scoped to navigation
+const nav = screen.getByRole('navigation')
+within(nav).getByRole('link', { name: /home/i })
+```
+
+## Rule 4: Use `within()` when the page has duplicate elements
+
+Dashboards, layouts, and pages with headers/footers/sidebars commonly have multiple
+elements with the same text or role (e.g., "Home" link in both nav and footer).
+
+```js
+import { within } from '@testing-library/react'
+
+// Scope queries to a specific section
+const sidebar = screen.getByRole('navigation')
+within(sidebar).getByRole('link', { name: /dashboard/i })
+
+const main = screen.getByRole('main')
+within(main).getByRole('heading', { name: /welcome/i })
+```
+
+## Rule 5: Use `getAllBy*` when multiple matches are expected
+
+If the component intentionally renders multiple matching elements (e.g., a list of
+cards, table rows, repeated links), use `getAllBy*` and assert on the array:
+
+```js
+const cards = screen.getAllByRole('article')
+expect(cards).toHaveLength(3)
+
+const links = screen.getAllByRole('link', { name: /details/i })
+expect(links.length).toBeGreaterThanOrEqual(1)
+```
+
+## Rule 6: Always wrap routed components in MemoryRouter
+
+Any component that uses React Router hooks (useLocation, useNavigate, useParams)
+or components (Link, NavLink, Outlet) MUST be wrapped in MemoryRouter:
+
+```js
+import { MemoryRouter } from 'react-router-dom'
+
+render(
+  <MemoryRouter initialEntries={['/dashboard']}>
+    <Dashboard />
+  </MemoryRouter>
+)
+```
+
+## Rule 7: Never hardcode expected values from assumption
+
+- Count elements in the source data/props to determine expected `.toHaveLength()`
+- Read the component to find exact text, class names, and roles
+- If the component uses props/context for text, mock those values and assert on
+  the mocked values — not on values you invented
+
+## Rule 8: Use `queryBy*` for elements that may not exist
+
+`getBy*` throws if the element is not found. Use `queryBy*` when testing that
+something is NOT rendered, or when the element is conditionally rendered:
+
+```js
+// Testing absence
+expect(screen.queryByText(/error/i)).not.toBeInTheDocument()
+
+// Conditionally rendered elements
+const modal = screen.queryByRole('dialog')
+if (modal) {
+  expect(within(modal).getByText(/confirm/i)).toBeInTheDocument()
+}
+```
+
+## Rule 9: Import jest-dom correctly for Vitest
+
+```js
+// WRONG — crashes in Vitest
+import '@testing-library/jest-dom'
+
+// CORRECT — Vitest-compatible subpath
+import '@testing-library/jest-dom/vitest'
+```
+
+## Rule 10: Use correct file extensions for JSX
+
+Vite CANNOT parse JSX in `.js` or `.ts` files. If your test contains JSX
+(`<Component />`, `render(<App />)`), the test file MUST use:
+- `.test.jsx` (for JavaScript)
+- `.test.tsx` (for TypeScript)
+
+## Rule 11: NEVER assume ARIA roles or labels — check the source
+
+This is the #1 cause of "Unable to find an accessible element" errors. Most
+components use plain HTML elements WITHOUT explicit ARIA attributes. You MUST
+check the source code before using `getByRole('region')`, `getByLabelText()`,
+or any role-based query with an accessible name.
+
+### HTML Implicit Roles Reference
+
+These elements have implicit ARIA roles ONLY under certain conditions:
+
+| HTML Element | ARIA Role | Condition |
+|-------------|-----------|-----------|
+| `<section aria-label="...">` | `region` | **ONLY when it has an accessible name** (aria-label or aria-labelledby) |
+| `<section>` (no label) | **NO role** | Not findable by `getByRole('region')` |
+| `<div>` | **NO role** | Never has an implicit role |
+| `<span>` | **NO role** | Never has an implicit role |
+| `<nav>` | `navigation` | Always (no label required) |
+| `<main>` | `main` | Always |
+| `<header>` | `banner` | When not nested in `<article>`, `<section>`, etc. |
+| `<footer>` | `contentinfo` | When not nested in `<article>`, `<section>`, etc. |
+| `<form aria-label="...">` | `form` | **ONLY when it has an accessible name** |
+| `<form>` (no label) | **NO role** | Not findable by `getByRole('form')` |
+| `<table>` | `table` | Always |
+| `<button>` | `button` | Always |
+| `<a href="...">` | `link` | Only when it has an `href` attribute |
+| `<input type="text">` | `textbox` | Always |
+| `<h1>`-`<h6>` | `heading` | Always |
+| `<ul>`, `<ol>` | `list` | Always |
+| `<li>` | `listitem` | Always |
+| `<img alt="...">` | `img` | When it has a non-empty `alt` |
+
+### What to do instead of assuming ARIA roles
+
+```js
+// BAD: assumes <section> has aria-label="stats" — will fail if it doesn't
+screen.getByRole('region', { name: /stats/i })
+
+// BAD: assumes any element has aria-label="stats"
+screen.getByLabelText(/stats/i)
+
+// GOOD: verify the section's CONTENT is rendered instead
+expect(screen.getByText(/total users/i)).toBeInTheDocument()
+expect(screen.getByText(/revenue/i)).toBeInTheDocument()
+
+// GOOD: use heading if the section has one
+screen.getByRole('heading', { name: /statistics/i })
+
+// GOOD: use elements that ALWAYS have roles (nav, main, header, footer, table)
+screen.getByRole('navigation')
+screen.getByRole('main')
+screen.getByRole('table')
+
+// GOOD: scope to <main> then check content inside
+const main = screen.getByRole('main')
+expect(within(main).getByText(/total users/i)).toBeInTheDocument()
+```
+
+### Decision Tree for querying a section
+
+1. Does the source have `<section aria-label="...">` or `role="region"`? → Use `getByRole('region', { name: ... })`
+2. Does the section have a heading (`<h2>`, `<h3>`, etc.)? → Use `getByRole('heading', { name: ... })`
+3. Does the section have unique text content? → Use `getByText(...)` on the content
+4. Is the section inside `<main>`? → Use `within(screen.getByRole('main')).getByText(...)`
+5. Does the source have `data-testid`? → Use `getByTestId(...)`
+6. None of the above? → Assert on the specific content the section renders
 """,
     },
 }
