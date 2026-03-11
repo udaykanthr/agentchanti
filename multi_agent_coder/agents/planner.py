@@ -405,6 +405,35 @@ Write a numbered list. Each step MUST be a single, concrete action:
       do NOT include that command in your plan
     - If a KB doc shows a specific config file format, use that format
 
+15. **Configuration and tooling BEFORE code that depends on it**: All setup,
+    configuration, and tooling steps MUST come before code that relies on them.
+    This applies to ALL config — not just package installs:
+    - Test framework setup (install + config files) BEFORE writing any test files
+    - CSS framework config (postcss.config, tailwind config) BEFORE components using those styles
+    - Build tool config (vite.config, tsconfig) BEFORE source code relying on those settings
+    - Linter/formatter config BEFORE running lint/format commands
+    WRONG order: Write tests (step 10) → Install Vitest (step 12)
+    CORRECT order: Install Vitest + create config (step 3) → Write tests (step 10)
+
+16. **Scaffold blank projects FIRST**: When the project context says BLANK or
+    EMPTY (no package.json, no framework), the VERY FIRST steps must scaffold
+    the project before any code or config steps:
+    - For React+Vite: `npm create vite@latest <name> -- --template react`
+    - For Next.js: `npx create-next-app <name> --yes`
+    - For Python: `pip install <framework>` or `python -m venv venv`
+    - Then install all required dependencies (Tailwind, router, etc.)
+    - Then create config files (postcss, vite.config, etc.)
+    - Only THEN start writing source code files
+    If KB documentation provides specific scaffold commands, use those exactly.
+
+17. **Leaf components BEFORE parent/composing components**: When building a UI
+    with a component hierarchy, create child/leaf components FIRST, then create
+    the parent components that import and compose them:
+    - WRONG: Create `App.jsx` (step 5) → Create `Header.jsx` (step 6) → Create `Footer.jsx` (step 7)
+    - CORRECT: Create `Header.jsx` (step 5) → Create `Footer.jsx` (step 6) → Create `App.jsx` that imports Header + Footer (step 7, depends: 5, 6)
+    Apply this recursively: if a page component composes smaller widgets,
+    create the widgets first, then the page, then the top-level router/app.
+
 ═══════ QUALITY CHECKLIST (verify before outputting) ═══════
 - [ ] Every file path in the plan matches an existing project file OR is
       clearly marked as a new file to create
@@ -418,5 +447,10 @@ Write a numbered list. Each step MUST be a single, concrete action:
       asking questions
 - [ ] Total steps are between 2-15 (break large tasks down, but don't over-split)
 - [ ] No install steps for packages already listed in project knowledge
+- [ ] If project is blank: scaffold/init steps come first (create project,
+      install deps, create configs) before any source code
+- [ ] All config/tooling steps (test framework, CSS framework, build config)
+      come BEFORE any code that depends on them
+- [ ] Child/leaf components are created BEFORE parent components that import them
 """
         return self.llm_client.generate_response(prompt)

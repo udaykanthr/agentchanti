@@ -416,9 +416,20 @@ def main():
         display.show_status("Analyzing task and mapping relevant files...")
         log.info("Planning...")
 
-        planner_context = ""
-        if project_context:
+        # Detect blank projects (no package manager / build config files)
+        _has_project_config = bool(scan_result.get("key_files"))
+        if _has_project_config:
             planner_context = f"Existing project:\n{project_context}"
+        else:
+            planner_context = (
+                "PROJECT STATE: BLANK / EMPTY directory — no package.json, "
+                "no pyproject.toml, no build config files found.\n"
+                "The plan MUST start with project scaffolding / initialization steps "
+                "(e.g. `npm create vite@latest`, `npm install`, framework setup) "
+                "before writing any source code.\n"
+            )
+            if project_context:
+                planner_context += f"\nCurrent directory contents:\n{project_context}"
 
         # Inject knowledge base context
         if knowledge_base and knowledge_base.size > 0:
