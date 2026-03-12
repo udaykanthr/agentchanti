@@ -36,6 +36,64 @@ from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
 from ..agents.analyser import build_project_context, AnalyseAgent
 
 
+def _rematch_plan_steps(new_steps, old_plan_steps, dependencies):
+    """Re-match edited step descriptions to original PlanStep objects.
+
+    Preserves structured metadata (step_type, target_files, exports,
+    imports_from, command, inline_code) when the description is similar
+    enough. Falls back to UNCLASSIFIED for steps that can't be matched.
+    """
+    from .plan_step import PlanStep, from_legacy_steps
+    from difflib import SequenceMatcher
+
+    result: list[PlanStep] = []
+    used: set[int] = set()  # indices into old_plan_steps already matched
+
+    for new_idx, desc in enumerate(new_steps):
+        desc_clean = desc.strip().lower()
+        best_score = 0.0
+        best_old_idx = -1
+
+        for old_idx, old_ps in enumerate(old_plan_steps):
+            if old_idx in used:
+                continue
+            old_clean = old_ps.description.strip().lower()
+            score = SequenceMatcher(None, desc_clean, old_clean).ratio()
+            if score > best_score:
+                best_score = score
+                best_old_idx = old_idx
+
+        if best_score >= 0.6 and best_old_idx >= 0:
+            # Re-use the old PlanStep with updated description and index
+            old = old_plan_steps[best_old_idx]
+            ps = PlanStep(
+                id=old.id,
+                step_type=old.step_type,
+                description=desc,
+                depends_on=list(old.depends_on),
+                command=old.command,
+                target_files=list(old.target_files),
+                exports=list(old.exports),
+                imports_from={k: list(v) for k, v in old.imports_from.items()},
+                inline_code=dict(old.inline_code),
+                index=new_idx,
+            )
+            result.append(ps)
+            used.add(best_old_idx)
+        else:
+            # Can't match — create UNCLASSIFIED placeholder
+            dep_ids = [str(d + 1) for d in dependencies.get(new_idx, set())]
+            result.append(PlanStep(
+                id=str(new_idx + 1),
+                step_type="UNCLASSIFIED",
+                description=desc,
+                depends_on=dep_ids,
+                index=new_idx,
+            ))
+
+    return result
+
+
 def main():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -230,7 +288,7 @@ def main():
         log.info(f"Knowledge base loaded ({knowledge_base.size} entries)")
 
     # ── 4c-bis. Import plan optimizer ──
-    from .plan_optimizer import optimize_plan
+    from .plan_optimizer import optimize_plan, optimize_structured_plan
 
     # ── 4d. Init plugin registry ──
     plugin_registry = PluginRegistry()
@@ -378,14 +436,23 @@ def main():
         steps = checkpoint_state["steps"]
         step_results = checkpoint_state.get("step_results", {})
         start_from = checkpoint_state.get("completed_step", -1) + 1
-        
+
         # Load dependencies if saved, else parse them out of saved strings as a fallback
         loaded_deps = checkpoint_state.get("dependencies")
         if loaded_deps is not None:
             dependencies = {int(k): set(v) for k, v in loaded_deps.items()}
         else:
             _, dependencies = executor.parse_step_dependencies(steps)
-            
+
+        # Restore structured PlanStep objects if checkpoint has them
+        saved_plan_steps = checkpoint_state.get("plan_steps")
+        if saved_plan_steps:
+            plan_steps_parsed = [PlanStep.from_dict(d) for d in saved_plan_steps]
+            log.info(f"Restored {len(plan_steps_parsed)} structured PlanSteps from checkpoint")
+        else:
+            # Legacy checkpoint without plan_steps — create wrappers
+            plan_steps_parsed = from_legacy_steps(steps, dependencies)
+
         language = checkpoint_state.get("language", language)
         display.set_steps(steps)
         # Mark completed steps
@@ -416,9 +483,20 @@ def main():
         display.show_status("Analyzing task and mapping relevant files...")
         log.info("Planning...")
 
-        planner_context = ""
-        if project_context:
+        # Detect blank projects (no package manager / build config files)
+        _has_project_config = bool(scan_result.get("key_files"))
+        if _has_project_config:
             planner_context = f"Existing project:\n{project_context}"
+        else:
+            planner_context = (
+                "PROJECT STATE: BLANK / EMPTY directory — no package.json, "
+                "no pyproject.toml, no build config files found.\n"
+                "The plan MUST start with project scaffolding / initialization steps "
+                "(e.g. `npm create vite@latest`, `npm install`, framework setup) "
+                "before writing any source code.\n"
+            )
+            if project_context:
+                planner_context += f"\nCurrent directory contents:\n{project_context}"
 
         # Inject knowledge base context
         if knowledge_base and knowledge_base.size > 0:
@@ -450,7 +528,37 @@ def main():
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
             # ── 10. Parse steps + dependencies ──
-            raw_steps = executor.parse_plan_steps(plan)
+            from .plan_step import (
+                parse_structured_plan, is_structured_plan, validate_plan,
+                fix_import_dependencies,
+                steps_as_text_list, steps_dependencies_dict,
+                from_legacy_steps, PlanStep,
+            )
+            plan_steps_parsed: list[PlanStep] | None = None
+
+            _is_structured = is_structured_plan(plan)
+            log.info(f"[Plan] Structured plan detected: {_is_structured}")
+            if _is_structured:
+                plan_steps_parsed = parse_structured_plan(plan)
+                if plan_steps_parsed:
+                    log.info(
+                        f"[Plan] Parsed {len(plan_steps_parsed)} structured steps: "
+                        f"{[(s.id, s.step_type, s.index) for s in plan_steps_parsed]}"
+                    )
+                    errors = validate_plan(plan_steps_parsed)
+                    if errors:
+                        log.warning(f"[Plan] Validation warnings: {errors}")
+                    dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                    if dep_fixes:
+                        log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
+                    raw_steps = steps_as_text_list(plan_steps_parsed)
+                else:
+                    log.warning("[Plan] Structured parse returned 0 steps, falling back")
+
+            if plan_steps_parsed is None:
+                log.info("[Plan] Using legacy step parser (no structured plan)")
+                raw_steps = executor.parse_plan_steps(plan)
+
             if not raw_steps:
                 log.warning(f"Plan attempt {plan_attempt}: no steps parsed")
                 if plan_attempt < MAX_PLAN_RETRIES:
@@ -471,14 +579,30 @@ def main():
                 log.warning(f"Proceeding with low-quality plan after {MAX_PLAN_RETRIES} attempts")
                 print(f"\n  [WARN] Plan quality is low ({reason}). You may want to replan or edit.\n")
 
-        steps, dependencies = executor.parse_step_dependencies(raw_steps)
+        if plan_steps_parsed is not None:
+            steps = steps_as_text_list(plan_steps_parsed)
+            dependencies = steps_dependencies_dict(plan_steps_parsed)
+        else:
+            steps, dependencies = executor.parse_step_dependencies(raw_steps)
 
         # ── 10b. Post-plan optimization ──
         pre_opt_count = len(steps)
-        steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
-                                            kb_context_builder=kb_context_builder,
-                                            dependencies=dependencies,
-                                            language=language)
+        if plan_steps_parsed is not None:
+            # Structured path: optimize directly on PlanStep objects
+            plan_steps_parsed = optimize_structured_plan(
+                plan_steps_parsed, knowledge_base=knowledge_base,
+                kb_context_builder=kb_context_builder,
+                language=language)
+            steps = steps_as_text_list(plan_steps_parsed)
+            dependencies = steps_dependencies_dict(plan_steps_parsed)
+        else:
+            # Legacy path
+            steps, dependencies = optimize_plan(
+                steps, knowledge_base=knowledge_base,
+                kb_context_builder=kb_context_builder,
+                dependencies=dependencies,
+                language=language)
+            plan_steps_parsed = from_legacy_steps(steps, dependencies)
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
 
@@ -505,18 +629,69 @@ def main():
                 display.show_status("Re-planning...")
                 plan = planner.process(args.task, context=planner_context)
                 log.info(f"Re-plan:\n{plan}")
-                raw_steps = executor.parse_plan_steps(plan)
+
+                if is_structured_plan(plan):
+                    plan_steps_parsed = parse_structured_plan(plan)
+                    if plan_steps_parsed:
+                        dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                        if dep_fixes:
+                            log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
+                        raw_steps = steps_as_text_list(plan_steps_parsed)
+                    else:
+                        raw_steps = executor.parse_plan_steps(plan)
+                        plan_steps_parsed = None
+                else:
+                    raw_steps = executor.parse_plan_steps(plan)
+                    plan_steps_parsed = None
+
                 if not raw_steps:
                     log.error("Could not parse any steps from re-plan.")
                     print("\n  [ERROR] Could not parse re-plan steps.\n")
                     return
-                steps, dependencies = executor.parse_step_dependencies(raw_steps)
-                steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
-                                            kb_context_builder=kb_context_builder,
-                                            dependencies=dependencies,
-                                            language=language)
+
+                if plan_steps_parsed is not None:
+                    steps = steps_as_text_list(plan_steps_parsed)
+                    dependencies = steps_dependencies_dict(plan_steps_parsed)
+                else:
+                    steps, dependencies = executor.parse_step_dependencies(raw_steps)
+
+                if plan_steps_parsed is not None:
+                    plan_steps_parsed = optimize_structured_plan(
+                        plan_steps_parsed, knowledge_base=knowledge_base,
+                        kb_context_builder=kb_context_builder,
+                        language=language)
+                    steps = steps_as_text_list(plan_steps_parsed)
+                    dependencies = steps_dependencies_dict(plan_steps_parsed)
+                else:
+                    steps, dependencies = optimize_plan(
+                        steps, knowledge_base=knowledge_base,
+                        kb_context_builder=kb_context_builder,
+                        dependencies=dependencies,
+                        language=language)
+                    plan_steps_parsed = from_legacy_steps(steps, dependencies)
             elif action == "edit" and edited_steps:
-                steps, dependencies = executor.parse_step_dependencies(edited_steps)
+                new_steps, new_deps = executor.parse_step_dependencies(edited_steps)
+                # Preserve structured PlanStep metadata when possible
+                if plan_steps_parsed and len(new_steps) == len(steps):
+                    # Same number of steps — check if descriptions match
+                    _old = [s.strip() for s in steps]
+                    _new = [s.strip() for s in new_steps]
+                    if _old == _new:
+                        # No actual changes — keep structured metadata intact
+                        log.info("[Plan] Edit returned unchanged steps, preserving structured metadata")
+                        steps = new_steps
+                        dependencies = new_deps
+                    else:
+                        # Steps changed — try to re-match by description overlap
+                        steps = new_steps
+                        dependencies = new_deps
+                        plan_steps_parsed = _rematch_plan_steps(
+                            steps, plan_steps_parsed, dependencies)
+                else:
+                    # Step count changed — can't preserve metadata
+                    steps = new_steps
+                    dependencies = new_deps
+                    plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
         display.set_steps(steps)
         display.render()
@@ -582,6 +757,13 @@ def main():
             # Single step — execute directly
             idx = pending[0]
             step_text = steps[idx]
+            _ps = next((s for s in plan_steps_parsed if s.index == idx), None) if plan_steps_parsed else None
+            if _ps is None and plan_steps_parsed:
+                log.warning(
+                    "[PlanStep] No PlanStep found for idx=%d. "
+                    "Available indices: %s",
+                    idx, [s.index for s in plan_steps_parsed],
+                )
             idx, success, error_info = _execute_step(
                 idx, step_text,
                 steps=steps,
@@ -593,6 +775,8 @@ def main():
                 kb_context_builder=kb_context_builder,
                 knowledge_base=knowledge_base,
                 project_context=project_context,
+                plan_step=_ps,
+                all_plan_steps=plan_steps_parsed,
             )
 
             if success:
@@ -600,7 +784,8 @@ def main():
                 ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                 save_checkpoint(checkpoint_file, args.task, steps, idx,
                                 memory.as_dict(), step_results, language,
-                                display_state=ds)
+                                display_state=ds,
+                                plan_steps=plan_steps_parsed)
 
                 # Budget check after step
                 if display.budget_check(cfg.BUDGET_LIMIT):
@@ -620,14 +805,17 @@ def main():
                     kb_context_builder=kb_context_builder,
                     knowledge_base=knowledge_base,
                     project_context=project_context,
+                    plan_step=_ps,
+                    all_plan_steps=plan_steps_parsed,
                 )
                 if fixed:
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
                                     memory.as_dict(), step_results, language,
-                                    display_state=ds)
-                    
+                                    display_state=ds,
+                                    plan_steps=plan_steps_parsed)
+
                     # Budget check after fix
                     if display.budget_check(cfg.BUDGET_LIMIT):
                         log.error(f"Budget exceeded (${token_tracker.total_cost:.4f}). Halting.")
@@ -644,6 +832,13 @@ def main():
             with ThreadPoolExecutor(max_workers=min(len(pending), 4)) as pool:
                 futures = {}
                 for idx in pending:
+                    _ps = next((s for s in plan_steps_parsed if s.index == idx), None) if plan_steps_parsed else None
+                    if _ps is None and plan_steps_parsed:
+                        log.warning(
+                            "[PlanStep] No PlanStep found for idx=%d. "
+                            "Available indices: %s",
+                            idx, [s.index for s in plan_steps_parsed],
+                        )
                     f = pool.submit(
                         _execute_step, idx, steps[idx],
                         steps=steps,
@@ -655,6 +850,8 @@ def main():
                         kb_context_builder=kb_context_builder,
                         knowledge_base=knowledge_base,
                         project_context=project_context,
+                        plan_step=_ps,
+                        all_plan_steps=plan_steps_parsed,
                     )
                     futures[f] = idx
 
@@ -678,11 +875,13 @@ def main():
             ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
             save_checkpoint(checkpoint_file, args.task, steps, max_completed,
                             memory.as_dict(), step_results, language,
-                            display_state=ds)
+                            display_state=ds,
+                            plan_steps=plan_steps_parsed)
 
             # Handle failures
             for idx, error_info in failed_steps:
                 step_text = steps[idx]
+                _ps = next((s for s in plan_steps_parsed if s.index == idx), None) if plan_steps_parsed else None
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
                     steps=steps,
@@ -694,13 +893,16 @@ def main():
                     kb_context_builder=kb_context_builder,
                     knowledge_base=knowledge_base,
                     project_context=project_context,
+                    plan_step=_ps,
+                    all_plan_steps=plan_steps_parsed,
                 )
                 if fixed:
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
                                     memory.as_dict(), step_results, language,
-                                    display_state=ds)
+                                    display_state=ds,
+                                    plan_steps=plan_steps_parsed)
 
                     # Budget check after fix
                     if display.budget_check(cfg.BUDGET_LIMIT):

@@ -237,7 +237,7 @@ class PlannerAgent(Agent):
                     docs = kb_context_builder._global_store.search(
                         query=task,
                         categories=["doc", "pattern"],
-                        top_k=15,
+                        top_k=10,
                         api_client=kb_context_builder._api_client,
                     )
                     _logger.info(
@@ -245,32 +245,77 @@ class PlannerAgent(Agent):
                         len(docs) if docs else 0,
                     )
                     if docs:
-                        # Filter out docs about conflicting frameworks
-                        # (e.g. Angular docs for a React task)
+                        # Filter docs to only include relevant ones.
+                        # Three filters applied in order:
+                        # 1. Framework conflict: reject docs about a
+                        #    conflicting framework (e.g. Angular for React)
+                        # 2. Tech relevance: if the task mentions specific
+                        #    techs, only include docs that mention at least
+                        #    one of those techs (or are generic/untagged)
+                        # 3. Generic cap: limit generic docs (no tech
+                        #    keywords) to avoid flooding with Clean Code,
+                        #    JWT, OAuth etc. that aren't task-specific
                         from ..orchestrator.plan_optimizer import (
                             _TECH_KEYWORDS as _TK,
                             has_framework_conflict,
+                            normalize_tech_keywords,
                         )
-                        task_techs = set(
+                        task_techs = normalize_tech_keywords(set(
                             w.lower() for w in _TK.findall(task)
-                        )
+                        ))
                         doc_hints: list[str] = []
+                        _MAX_GENERIC_DOCS = 2  # cap for docs with no tech overlap
+                        _generic_count = 0
                         for doc in docs:
+                            doc_text = (
+                                (doc.title or "") + " "
+                                + " ".join(doc.tags or [])
+                                + " " + ((doc.content or "")[:500])
+                            )
+                            doc_techs = normalize_tech_keywords(set(
+                                w.lower() for w in _TK.findall(doc_text)
+                            ))
+
+                            # Filter 1: framework conflict
+                            if task_techs and has_framework_conflict(task_techs, doc_techs):
+                                _logger.debug(
+                                    "[PreAnalysis] Skipping '%s' — "
+                                    "framework conflict",
+                                    doc.title,
+                                )
+                                continue
+
+                            # Filter 2+3: relevance check
                             if task_techs:
-                                doc_text = (
-                                    (doc.title or "") + " "
-                                    + " ".join(doc.tags or [])
-                                )
-                                doc_techs = set(
-                                    w.lower() for w in _TK.findall(doc_text)
-                                )
-                                if has_framework_conflict(task_techs, doc_techs):
+                                has_overlap = bool(task_techs & doc_techs)
+                                if not has_overlap:
+                                    if doc_techs:
+                                        # Doc is about a DIFFERENT tech
+                                        # stack — skip entirely
+                                        _logger.debug(
+                                            "[PreAnalysis] Skipping '%s' — "
+                                            "tech mismatch (%s vs task %s)",
+                                            doc.title, doc_techs, task_techs,
+                                        )
+                                        continue
+                                    # Truly generic doc (no tech keywords)
+                                    # — allow a few through
+                                    _generic_count += 1
+                                    if _generic_count > _MAX_GENERIC_DOCS:
+                                        _logger.debug(
+                                            "[PreAnalysis] Skipping '%s' — "
+                                            "generic cap reached (%d/%d)",
+                                            doc.title, _generic_count,
+                                            _MAX_GENERIC_DOCS,
+                                        )
+                                        continue
                                     _logger.debug(
-                                        "[PreAnalysis] Skipping '%s' — "
-                                        "framework conflict",
-                                        doc.title,
+                                        "[PreAnalysis] Including generic "
+                                        "doc '%s' (%d/%d)",
+                                        doc.title, _generic_count,
+                                        _MAX_GENERIC_DOCS,
                                     )
-                                    continue
+
                             content = doc.content or doc.title
                             if content:
                                 doc_hints.append(f"### {doc.title}\n{content}")
@@ -313,110 +358,124 @@ these agents to succeed on the first attempt.
 
 ═══════ HOST ENVIRONMENT ═══════
 """ + _os_context_for_prompt() + """
-═══════ STEP FORMAT ═══════
-Write a numbered list. Each step MUST be a single, concrete action:
+═══════ OUTPUT FORMAT ═══════
+Output your plan using this EXACT line-based format. Each step starts with
+a --STEP header line followed by metadata lines and a description.
 
-  1. Install dependencies with `npm install express cors` (depends: none)
-  2. Create the Express server in `src/server.js` with GET /api/health endpoint (depends: 1)
-  3. Add input validation utility in `src/utils/validate.js` (depends: 1)
-  4. Search for the latest Express.js middleware best practices (depends: none)
-  5. Update `src/server.js` to use validation from `src/utils/validate.js` (depends: 2, 3, 4)
+==PLAN==
+
+--STEP 1.1 [CMD] depends:none
+Install Express and CORS
+> npm install express cors
+produces: package.json
+
+--STEP 2.1 [CODE] depends:1.1
+Create the Express server with GET /api/health endpoint
+target: src/server.js
+exports: app, startServer
+imports: none
+
+--STEP 2.2 [CODE] depends:1.1
+Create input validation utility
+target: src/utils/validate.js
+exports: validateInput, sanitize
+imports: none
+
+--STEP 3.1 [CODE] depends:2.1, 2.2
+Update server to use validation middleware
+target: src/server.js
+imports: src/utils/validate.js:validateInput, src/utils/validate.js:sanitize
+
+--STEP 4.1 [TEST] depends:3.1
+Write and run tests for the server and validation
+target: src/__tests__/server.test.js
+imports: src/server.js:app, src/utils/validate.js:validateInput
+
+==END==
+
+═══════ LINE REFERENCE ═══════
+--STEP <id> [<TYPE>] depends:<deps>   ← REQUIRED. id=wave.seq, TYPE=CMD|CODE|TEST, deps=comma-separated step ids or "none"
+<description text>                     ← REQUIRED. One-line description of what this step does.
+> <shell command>                      ← CMD steps only. The exact command to run.
+target: <file1>, <file2>               ← CODE/TEST steps. Files to create or modify.
+exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
+imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
+produces: <file1>, <file2>             ← CMD steps. Files created by the command.
+
+═══════ STEP ID FORMAT ═══════
+Use wave.sequence numbering:
+  - Wave 1 (no deps): 1.1, 1.2, 1.3
+  - Wave 2 (depends on wave 1): 2.1, 2.2
+  - Wave 3 (depends on wave 2): 3.1, 3.2, 3.3
+Steps in the same wave can run in parallel. Each wave runs after the previous.
 
 ═══════ STEP RULES (CRITICAL) ═══════
 
 1. **Reference EXACT file paths**: Every CODE step must name the specific
-   file(s) to create or modify. Use the paths from the project context above.
-   Say "Update `src/index.js`" NOT "Update the main file".
+   file(s) in the target: line. Use the paths from the project context above.
+   Say "target: src/index.js" NOT "target: the main file".
 
 2. **One action per step**: Each step should do ONE thing. Don't combine
    "create file AND install package" in one step. Split them.
    Exception: ALL modifications to the SAME file MUST be combined into a single CODE step.
 
 3. **CMD steps for shell commands**: Installing packages, running scripts,
-   creating directories — put the exact command in backticks.
-   Examples: `npm install express`, `pip install flask`, `mkdir -p src/utils`
+   creating directories. Put the exact command on a line starting with "> ".
 
 4. **CODE steps for file changes**: Creating or modifying source files.
-   Always specify the file path. For modifications, say "Update `path/to/file`"
-   and describe WHAT to change.
+   Always specify target: with the file path.
    CRITICAL: You MUST combine ALL changes for a single file into exactly ONE CODE step.
-   DO NOT create multiple steps for the same file under any circumstances. If a file needs
-   multiple changes (e.g., updating a function and adding imports), describe ALL of them in the same step's context.
 
-5. **SEARCH steps for web lookups**: When you need up-to-date documentation,
-   API references, error solutions, or latest framework CLI flags, add a
-   SEARCH step. The result will be available to subsequent steps.
-   Example: "Search for the latest Next.js 15 app router migration guide"
+5. **SEARCH steps for web lookups**: When you need up-to-date documentation.
+   Use [SEARCH] type. No target: line needed.
 
 6. **Existing files = MODIFY, not recreate**: When files already exist in the
-   project (shown in context above), plan to UPDATE them. Reference their
-   exact paths. Do NOT plan to create a file that already exists.
+   project, plan to UPDATE them. Reference their exact paths.
 
-7. **Dependencies between steps**: Add `(depends: N)` or `(depends: N, M)` at
-   the end of steps that need prior steps completed first. Steps without
-   dependencies can run in parallel.
+7. **Declare imports explicitly**: For every CODE step, list all file:symbol
+   pairs it will import on the imports: line. This ensures correct dependency
+   tracking and context injection.
 
-8. **Logical ordering**: Dependencies first, then dependents:
-   - Install packages → Write code that uses them
-   - Create utility files → Write code that imports them
-   - Write source code → Write tests for it
+8. **Declare exports explicitly**: For every CODE step, list the main symbols
+   (functions, classes, constants) the file will export on the exports: line.
 
 9. **NO meta-steps**: Do NOT include steps like "Analyze the project",
-   "Review the code", "Identify the bug", or "Plan the implementation".
-   Jump straight to actionable steps.
+   "Review the code". Jump straight to actionable steps.
 
-10. **ALWAYS include a test step**: Every plan MUST include at least one TEST
-    step that writes and runs tests for the code created or modified in prior
-    CODE steps. Place the TEST step AFTER all CODE steps it validates.
-    Test execution is the primary quality gate — it catches real bugs that
-    static review cannot.
+10. **TEST steps only when explicitly requested**: Do NOT include TEST steps
+    unless the user's task explicitly asks for tests. Tests consume significant
+    tokens and time. When tests ARE requested, place them AFTER all CODE steps.
 
 11. **Shell commands are non-interactive**: Always include --yes, -y, or
-    --defaults flags for tools that prompt for input:
-    - `npx create-next-app . --yes`
-    - `npm init -y`
-    - `ng new myapp --defaults`
+    --defaults flags for tools that prompt for input.
 
-12. **Sub-project paths and naming**: When a step creates a new project in a
-    subdirectory, you MUST derive the project folder name from the user's task
-    description. Do NOT invent a creative name — use what the user asked for.
-    If the task says "create a SPA" or "build a React app" without a specific
-    name, use a simple descriptive slug (e.g. `spa-app` or `react-app`).
-    CRITICAL: Use the EXACT SAME folder name in ALL steps. Never change it.
-    - If step 1 creates `my-app/`, ALL subsequent steps use `my-app/`.
-    - CORRECT: "Create dashboard page in `my-app/src/pages/Dashboard.js`"
-    - WRONG: "Create dashboard page in `src/pages/Dashboard.js`"
-    - CMD steps that operate on the sub-project must include `cd my-app &&`
-      before the command (e.g. `cd my-app && npm install axios`)
-    - If KB documentation uses placeholder names like `<project-name>`,
-      replace them with the consistent project name you chose above.
+12. **Sub-project paths**: Use the EXACT SAME folder name in ALL steps.
+    CMD steps must include `cd <name> &&` before the command.
 
-13. **SKIP already-installed packages**: If the project knowledge above lists
+13. **SKIP already-installed packages**: If the project knowledge lists
     packages as already installed, do NOT add install steps for them.
-    Only install NEW packages that are not yet present.
 
-14. **KB documentation overrides your training data**: When Framework/Library
-    Documentation is provided above, you MUST use the exact commands shown
-    there — including ALL packages and peer dependencies. Your training data
-    may be outdated. Examples:
-    - If a KB doc shows `npm install tailwindcss @tailwindcss/postcss postcss`,
-      install ALL THREE packages, not just `tailwindcss`
-    - If a KB doc marks a command as deprecated (e.g. `tailwindcss init`),
-      do NOT include that command in your plan
-    - If a KB doc shows a specific config file format, use that format
+14. **KB documentation overrides your training data**: Use exact commands
+    from KB docs — including ALL packages and peer dependencies.
 
-═══════ QUALITY CHECKLIST (verify before outputting) ═══════
-- [ ] Every file path in the plan matches an existing project file OR is
-      clearly marked as a new file to create
-- [ ] No two steps create/modify the same file (consolidate into one step)
-- [ ] Import dependencies: if step N creates a module that step M imports,
-      M depends on N
-- [ ] Package dependencies: if step N installs a package that step M uses,
-      M depends on N
-- [ ] No vague steps ("improve the code", "fix issues", "update as needed")
-- [ ] Each step is specific enough that a developer could execute it without
-      asking questions
-- [ ] Total steps are between 2-15 (break large tasks down, but don't over-split)
-- [ ] No install steps for packages already listed in project knowledge
+15. **Configuration BEFORE code**: All setup/config steps MUST come before
+    code that relies on them (test framework, CSS config, build tools).
+
+16. **Scaffold blank projects FIRST**: When project is BLANK/EMPTY, scaffold
+    first (npm create vite, create-next-app, etc.) before any code steps.
+
+17. **Leaf components BEFORE parents**: Create child components first, then
+    parents that import them. Declare imports: to enforce correct ordering.
+
+═══════ QUALITY CHECKLIST ═══════
+- [ ] Every CODE step has a target: line with exact file paths
+- [ ] Every CODE step has exports: and imports: lines
+- [ ] No two steps have the same target: file (consolidate into one step)
+- [ ] If step B imports from step A's target file, B depends on A
+- [ ] No vague steps — each step is specific and actionable
+- [ ] Total steps between 2-15
+- [ ] No install steps for already-installed packages
+- [ ] Config/tooling steps come BEFORE code that depends on them
+- [ ] Leaf components created BEFORE parent components
 """
         return self.llm_client.generate_response(prompt)

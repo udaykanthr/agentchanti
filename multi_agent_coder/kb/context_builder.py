@@ -356,10 +356,10 @@ class ContextBuilder:
         Trim context to fit within *max_tokens*.
 
         Priority (highest first — last to be trimmed):
-        1. behavioral_instructions
-        2. error_fixes
+        1. error_fixes
+        2. global_patterns (docs / setup guides — critical for code correctness)
         3. local_symbols top 3
-        4. global_patterns
+        4. behavioral_instructions (large, generic — trimmed before docs)
         5. related_symbols
         6. local_symbols remaining
         """
@@ -406,6 +406,16 @@ class ContextBuilder:
             total -= popped_tokens
             related_tokens -= popped_tokens
 
+        # Trim behavioral instructions before docs — docs contain
+        # framework-specific setup guidance (e.g. Tailwind v4 config)
+        # that directly impacts code correctness, while behavioral
+        # instructions are generic rules the LLM mostly already knows.
+        while total > max_tokens and behavioral_tokens > 0 and ctx.behavioral_instructions:
+            popped = ctx.behavioral_instructions.pop()
+            popped_tokens = _list_tokens([popped])
+            total -= popped_tokens
+            behavioral_tokens -= popped_tokens
+
         while total > max_tokens and pattern_tokens > 0 and ctx.global_patterns:
             popped = ctx.global_patterns.pop()
             popped_tokens = _list_tokens([popped])
@@ -416,7 +426,7 @@ class ContextBuilder:
             popped = ctx.local_symbols.pop()
             total -= _list_tokens([popped])
 
-        # behavioral_instructions and error_fixes are never trimmed
+        # error_fixes are never trimmed
 
         ctx.token_count = total
         return ctx

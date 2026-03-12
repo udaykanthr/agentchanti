@@ -258,12 +258,18 @@ class TestContentFix(unittest.TestCase):
 class TestSeeder(unittest.TestCase):
     """Tests for ``kb.global.seeder``."""
 
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
     def test_seed_no_embed(self):
         """seed(embed=False) populates errors.db and writes .md files."""
-        from multi_agent_coder.kb.global_kb.seeder import seed, _GLOBAL_DIR, _REGISTRY_DIR
+        from multi_agent_coder.kb.global_kb.seeder import seed
         from multi_agent_coder.kb.global_kb.error_dict import ErrorDict
 
-        summary = seed(embed=False)
+        summary = seed(embed=False, base_dir=self.tmpdir)
 
         # Check errors.db was populated (40 errors: 5 * 7 languages + 5 tooling)
         self.assertEqual(summary["errors_seeded"], 57)
@@ -272,7 +278,7 @@ class TestSeeder(unittest.TestCase):
         self.assertEqual(summary["chunks_embedded"], 0)
 
         # Verify error counts per language
-        db_path = os.path.join(_GLOBAL_DIR, "core", "errors.db")
+        db_path = os.path.join(self.tmpdir, "core", "errors.db")
         edict = ErrorDict(db_path)
         counts = edict.count_by_language()
         expected_per_lang = {
@@ -285,11 +291,12 @@ class TestSeeder(unittest.TestCase):
 
     def test_md_files_have_frontmatter(self):
         """All seeded .md files contain valid frontmatter."""
-        from multi_agent_coder.kb.global_kb.seeder import seed, _REGISTRY_DIR
+        from multi_agent_coder.kb.global_kb.seeder import seed
 
-        seed(embed=False)
+        seed(embed=False, base_dir=self.tmpdir)
+        registry_dir = os.path.join(self.tmpdir, "registry")
 
-        for dirpath, _, filenames in os.walk(_REGISTRY_DIR):
+        for dirpath, _, filenames in os.walk(registry_dir):
             for fname in filenames:
                 if not fname.endswith(".md"):
                     continue
@@ -342,14 +349,22 @@ class TestGlobalKBStore(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Seed the DB once for all store tests."""
+        """Seed the DB once for all store tests in a temp dir."""
+        cls._tmpdir = tempfile.mkdtemp()
         from multi_agent_coder.kb.global_kb.seeder import seed
-        seed(embed=False)
+        seed(embed=False, base_dir=cls._tmpdir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _store(self):
+        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
+        return GlobalKBStore(base_dir=self._tmpdir)
 
     def test_search_errors_exact(self):
         """search_errors finds NullPointerException for Java."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         results = store.search_errors("NullPointerException", language="java")
         self.assertGreater(len(results), 0)
         self.assertEqual(results[0].error_type, "NullPointerException")
@@ -357,8 +372,7 @@ class TestGlobalKBStore(unittest.TestCase):
 
     def test_search_errors_regex(self):
         """search_errors finds Python AttributeError via regex."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         results = store.search_errors(
             "AttributeError: 'NoneType' object has no attribute 'foo'",
             language="python",
@@ -368,15 +382,13 @@ class TestGlobalKBStore(unittest.TestCase):
 
     def test_search_errors_no_match(self):
         """search_errors returns empty for unknown error."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         results = store.search_errors("SomeCompletelyUnknownError12345")
         self.assertEqual(len(results), 0)
 
     def test_fallback_file_search(self):
         """search() falls back to file search when Qdrant is unavailable."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         # This will fail Qdrant and use fallback
         results = store.search("error handling best practices")
         # Should find the error-handling-best-practices.md doc
@@ -389,16 +401,14 @@ class TestGlobalKBStore(unittest.TestCase):
 
     def test_fallback_search_category_filter(self):
         """Fallback search respects category filter."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         results = store.search("qdrant", categories=["adr"])
         for r in results:
             self.assertEqual(r.category, "adr")
 
     def test_get_behavioral_instructions(self):
         """get_behavioral_instructions returns behavioral docs."""
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
-        store = GlobalKBStore()
+        store = self._store()
         results = store.get_behavioral_instructions("reviewing code for quality")
         # Should find code-review-instructions
         self.assertGreater(len(results), 0)
@@ -525,36 +535,43 @@ class TestCLIParsing(unittest.TestCase):
 class TestUpdaterClean(unittest.TestCase):
     """Tests for ``kb.global_kb.updater.clean``."""
 
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
     def test_clean_removes_files(self):
         """clean() removes errors.db, global_kb.db, manifest, and registry."""
         from multi_agent_coder.kb.global_kb.seeder import seed
-        from multi_agent_coder.kb.global_kb.updater import (
-            clean, _CORE_DIR, _REGISTRY_DIR,
-        )
+        from multi_agent_coder.kb.global_kb.updater import clean
+
+        core_dir = os.path.join(self.tmpdir, "core")
+        registry_dir = os.path.join(self.tmpdir, "registry")
 
         # Seed first so there's something to clean
-        seed(embed=False)
-        self.assertTrue(os.path.isfile(os.path.join(_CORE_DIR, "errors.db")))
-        self.assertTrue(os.path.isdir(_REGISTRY_DIR))
+        seed(embed=False, base_dir=self.tmpdir)
+        self.assertTrue(os.path.isfile(os.path.join(core_dir, "errors.db")))
+        self.assertTrue(os.path.isdir(registry_dir))
 
-        summary = clean()
+        summary = clean(base_dir=self.tmpdir)
         self.assertGreater(summary["files_removed"], 0)
         self.assertGreater(summary["dbs_removed"], 0)
         # Registry dir may still exist (with .gitignore), but no .md files
         md_count = 0
-        if os.path.isdir(_REGISTRY_DIR):
-            for _, _, fnames in os.walk(_REGISTRY_DIR):
+        if os.path.isdir(registry_dir):
+            for _, _, fnames in os.walk(registry_dir):
                 md_count += sum(1 for f in fnames if f.endswith(".md"))
         self.assertEqual(md_count, 0)
-        self.assertFalse(os.path.isfile(os.path.join(_CORE_DIR, "errors.db")))
+        self.assertFalse(os.path.isfile(os.path.join(core_dir, "errors.db")))
 
     def test_clean_idempotent(self):
         """clean() on already-clean state does not crash."""
         from multi_agent_coder.kb.global_kb.updater import clean
 
         # Clean twice — second call should succeed silently
-        clean()
-        summary = clean()
+        clean(base_dir=self.tmpdir)
+        summary = clean(base_dir=self.tmpdir)
         self.assertEqual(summary["files_removed"], 0)
         self.assertEqual(summary["dbs_removed"], 0)
 
@@ -563,8 +580,8 @@ class TestUpdaterClean(unittest.TestCase):
         from multi_agent_coder.kb.global_kb.seeder import seed
         from multi_agent_coder.kb.global_kb.updater import clean
 
-        clean()
-        summary = seed(embed=False)
+        clean(base_dir=self.tmpdir)
+        summary = seed(embed=False, base_dir=self.tmpdir)
         self.assertEqual(summary["errors_seeded"], 57)
         self.assertGreaterEqual(summary["docs_seeded"], 1)
 
@@ -578,15 +595,12 @@ class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
     """Tests that _apply_update returns the list of copied md files."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = tempfile.mkdtemp()       # source dir for update
+        self.kb_dir = tempfile.mkdtemp()        # isolated KB base dir
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
-        # Clean up any files copied into the real registry by _apply_update
-        from multi_agent_coder.kb.global_kb.updater import _REGISTRY_DIR
-        test_file = os.path.join(_REGISTRY_DIR, "docs", "test-guide.md")
-        if os.path.isfile(test_file):
-            os.remove(test_file)
+        shutil.rmtree(self.kb_dir, ignore_errors=True)
 
     def test_apply_update_returns_md_files(self):
         """_apply_update returns (count, md_files) with correct metadata."""
@@ -607,7 +621,9 @@ class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
         with open(os.path.join(docs_dir, "test-guide.md"), "w") as fh:
             fh.write(md_content)
 
-        count, md_files = _apply_update(self.tmpdir, categories=["docs"])
+        count, md_files = _apply_update(
+            self.tmpdir, categories=["docs"], base_dir=self.kb_dir,
+        )
         self.assertEqual(count, 1)
         self.assertEqual(len(md_files), 1)
 
@@ -626,9 +642,9 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
     """Verify that kb seed preserves and re-embeds files from kb update."""
 
     def setUp(self):
-        # Place a fake "kb update" file in registry/docs
-        from multi_agent_coder.kb.global_kb.seeder import _REGISTRY_DIR
-        self.docs_dir = os.path.join(_REGISTRY_DIR, "docs")
+        self.tmpdir = tempfile.mkdtemp()
+        # Place a fake "kb update" file in registry/docs inside temp dir
+        self.docs_dir = os.path.join(self.tmpdir, "registry", "docs")
         os.makedirs(self.docs_dir, exist_ok=True)
         self.test_file = os.path.join(self.docs_dir, "tailwindcss-v4-setup-guide.md")
         md_content = (
@@ -645,14 +661,13 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
             fh.write(md_content)
 
     def tearDown(self):
-        if os.path.isfile(self.test_file):
-            os.remove(self.test_file)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_seed_preserves_update_file(self):
         """seed(embed=False) does not delete files from kb update."""
         from multi_agent_coder.kb.global_kb.seeder import seed
 
-        seed(embed=False)
+        seed(embed=False, base_dir=self.tmpdir)
         self.assertTrue(
             os.path.isfile(self.test_file),
             "kb seed deleted a file from kb update",
@@ -664,10 +679,11 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
             seed, collect_all_registry_md_files,
         )
 
-        seed(embed=False)
+        seed(embed=False, base_dir=self.tmpdir)
+        registry_dir = os.path.join(self.tmpdir, "registry")
 
         # collect_all_registry_md_files with no exclusions returns everything
-        all_files = collect_all_registry_md_files()
+        all_files = collect_all_registry_md_files(registry_dir=registry_dir)
         filenames = [os.path.basename(p) for p, _, _ in all_files]
         self.assertIn(
             "tailwindcss-v4-setup-guide.md", filenames,
@@ -680,11 +696,13 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
             seed, collect_all_registry_md_files,
         )
 
-        seed(embed=False)
+        seed(embed=False, base_dir=self.tmpdir)
+        registry_dir = os.path.join(self.tmpdir, "registry")
 
         # Exclude the test file
         excluded = collect_all_registry_md_files(
             exclude_paths={self.test_file},
+            registry_dir=registry_dir,
         )
         filenames = [os.path.basename(p) for p, _, _ in excluded]
         self.assertNotIn("tailwindcss-v4-setup-guide.md", filenames)

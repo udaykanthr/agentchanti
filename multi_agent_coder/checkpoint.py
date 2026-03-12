@@ -13,8 +13,15 @@ def save_checkpoint(filepath: str, task: str, steps: list[str],
                     completed_step: int, file_memory_dict: dict[str, str],
                     step_results: dict[int, str], language: str,
                     display_state: dict | None = None,
-                    dependencies: dict[int, set[int]] | None = None) -> None:
-    """Persist current pipeline state to *filepath* as JSON."""
+                    dependencies: dict[int, set[int]] | None = None,
+                    plan_steps: list | None = None) -> None:
+    """Persist current pipeline state to *filepath* as JSON.
+
+    *plan_steps*, if provided, should be a list of PlanStep objects (or
+    anything with a ``.to_dict()`` method).  They are serialised so that
+    on resume the full structured metadata (step_type, target_files,
+    exports, imports_from, command, status) is preserved.
+    """
     state = {
         "task": task,
         "steps": steps,
@@ -27,6 +34,8 @@ def save_checkpoint(filepath: str, task: str, steps: list[str],
         state["dependencies"] = {str(k): list(v) for k, v in dependencies.items()}
     if display_state is not None:
         state["display_state"] = display_state
+    if plan_steps is not None:
+        state["plan_steps"] = [s.to_dict() for s in plan_steps]
     tmp = filepath + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -40,6 +49,10 @@ def load_checkpoint(filepath: str) -> dict | None:
     """Load checkpoint state from *filepath*.
 
     Returns the state dict, or ``None`` if the file is missing or invalid.
+
+    If the checkpoint contains ``plan_steps`` (list of PlanStep dicts),
+    they are left as raw dicts — the caller should reconstruct PlanStep
+    objects via ``PlanStep.from_dict()``.
     """
     if not os.path.isfile(filepath):
         return None

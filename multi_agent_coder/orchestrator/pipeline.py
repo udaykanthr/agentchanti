@@ -11,6 +11,7 @@ from ..cli_display import CLIDisplay, log
 
 from .memory import FileMemory
 from .classification import _classify_step
+from .plan_step import PlanStep, build_step_context, update_step_after_execution
 from .step_handlers import (
     _handle_cmd_step, _handle_code_step, _handle_test_step,
     _handle_search_step,
@@ -157,8 +158,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                   code_graph=None,
                   project_profile=None,
                   knowledge_base=None,
-                  project_context=None) -> tuple[int, bool, str]:
+                  project_context=None,
+                  plan_step: PlanStep | None = None,
+                  all_plan_steps: list[PlanStep] | None = None,
+                  ) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
+
+    When *plan_step* is provided (structured plan), step type and
+    dependencies are taken from the object — no LLM classification call.
 
     Catches all exceptions so that a crash inside any handler never
     kills the whole pipeline — the step is marked as failed instead.
@@ -264,11 +271,53 @@ def _execute_step(step_idx: int, step_text: str, *,
                  f"Memory: {memory.summary()}\n{'='*60}")
 
         display.start_step(step_idx)
-        display.step_info(step_idx, "Loading context and classifying...")
-        step_type = _classify_step(step_text, llm_client, display, step_idx)
+
+        # --- Structured plan: use declared type (skip LLM classification) ---
+        if plan_step is not None and plan_step.step_type != "UNCLASSIFIED":
+            step_type = plan_step.step_type
+            display.step_info(step_idx, f"Type: [{step_type}] (from plan)")
+            display.step_tokens(step_idx, 0, 0)
+            plan_step.status = "in_progress"
+        else:
+            if plan_step is None:
+                _logger.warning(
+                    "[PlanStep] plan_step is None for step %d — "
+                    "falling back to LLM classification (tokens wasted). "
+                    "Check if plan_steps_parsed is intact at execution time.",
+                    step_idx,
+                )
+            else:
+                _logger.warning(
+                    "[PlanStep] step %d has type UNCLASSIFIED — "
+                    "falling back to LLM classification. "
+                    "This happens when structured metadata is lost "
+                    "(e.g. plan was edited in TUI).",
+                    step_idx,
+                )
+            display.step_info(step_idx, "Loading context and classifying...")
+            step_type = _classify_step(step_text, llm_client, display, step_idx)
+
         display.steps[step_idx]["type"] = step_type
         display.render()
         log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
+
+        # --- Structured plan: inject plan-aware context into memory ---
+        if plan_step is not None and all_plan_steps is not None:
+            try:
+                plan_ctx_files = build_step_context(
+                    plan_step, all_plan_steps, memory,
+                    read_from_disk=lambda p: executor.read_file(p)
+                    if hasattr(executor, 'read_file') else None,
+                )
+                if plan_ctx_files:
+                    # Store plan-declared context for step handlers to use
+                    memory._plan_context_files = plan_ctx_files
+                    _logger.debug(
+                        "[PlanStep] Injected %d plan-context files for step %s",
+                        len(plan_ctx_files), plan_step.id,
+                    )
+            except Exception as pctx_exc:
+                _logger.debug("[PlanStep] Context build failed: %s", pctx_exc)
 
         success, error_info = True, ""
 
@@ -283,32 +332,57 @@ def _execute_step(step_idx: int, step_text: str, *,
         elif step_type == "CMD":
             success, error_info = _handle_cmd_step(
                 step_text, executor, llm_client, memory, display, step_idx,
-                language=language, project_context=project_context)
+                language=language, project_context=project_context,
+                plan_step=plan_step)
 
         elif step_type == "CODE":
-            # Extract code graph from kb_context_builder if available
-            _graph = code_graph
-            if _graph is None and kb_context_builder is not None:
-                _graph = getattr(kb_context_builder, "_graph", None)
+            # ── Inline code fast path ──
+            # If the planner already provided complete code in the plan,
+            # write it directly — zero Coder LLM calls needed.
+            if (plan_step is not None
+                    and plan_step.inline_code
+                    and len(plan_step.inline_code) > 0):
+                display.step_info(step_idx, "Writing inline code from plan (0 LLM calls)")
+                _inline_files = plan_step.inline_code
+                executor.write_files(_inline_files)
+                memory.update(_inline_files)
+                display.step_tokens(step_idx, 0, 0)
+                _logger.info(
+                    "[PlanStep] Inline code: wrote %d file(s) for step %s: %s",
+                    len(_inline_files), plan_step.id,
+                    list(_inline_files.keys()),
+                )
+            else:
+                # Extract code graph from kb_context_builder if available
+                _graph = code_graph
+                if _graph is None and kb_context_builder is not None:
+                    _graph = getattr(kb_context_builder, "_graph", None)
 
-            # Look ahead: skip LLM review if a TEST step follows in the plan
-            # (test execution will catch real bugs more reliably)
-            _test_keywords = re.compile(
-                r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
-                re.IGNORECASE,
-            )
-            _has_test_after = any(
-                _test_keywords.search(steps[j])
-                for j in range(step_idx + 1, len(steps))
-            )
+                # Look ahead: skip LLM review if a TEST step follows
+                if all_plan_steps is not None:
+                    _has_test_after = any(
+                        s.step_type == "TEST" for s in all_plan_steps
+                        if s.index > step_idx
+                    )
+                else:
+                    _test_keywords = re.compile(
+                        r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
+                        re.IGNORECASE,
+                    )
+                    _has_test_after = any(
+                        _test_keywords.search(steps[j])
+                        for j in range(step_idx + 1, len(steps))
+                    )
 
-            success, error_info = _handle_code_step(
-                step_text, coder, reviewer, executor,
-                task, memory, display, step_idx, language=language, cfg=cfg,
-                auto=auto, code_graph=_graph,
-                project_profile=project_profile,
-                skip_review=_has_test_after,
-                project_context=project_context)
+                success, error_info = _handle_code_step(
+                    step_text, coder, reviewer, executor,
+                    task, memory, display, step_idx, language=language, cfg=cfg,
+                    auto=auto, code_graph=_graph,
+                    project_profile=project_profile,
+                    skip_review=_has_test_after,
+                    project_context=project_context,
+                    plan_step=plan_step,
+                    all_plan_steps=all_plan_steps)
 
         elif step_type == "TEST":
             success, error_info = _handle_test_step(
@@ -316,7 +390,9 @@ def _execute_step(step_idx: int, step_text: str, *,
                 task, memory, display, step_idx, language=language,
                 auto=auto, search_agent=search_agent,
                 project_context=project_context,
-                kb_context_builder=kb_context_builder)
+                kb_context_builder=kb_context_builder,
+                plan_step=plan_step,
+                all_plan_steps=all_plan_steps)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
@@ -326,6 +402,10 @@ def _execute_step(step_idx: int, step_text: str, *,
         else:
             display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
             display.complete_step(step_idx, "skipped")
+
+        # Clear plan context so it doesn't leak into the next step
+        if hasattr(memory, '_plan_context_files'):
+            memory._plan_context_files = None
 
         # ── Dependency check: after-snapshot + fix ─────────────────
         # Runs BEFORE complete_step so the spinner stays active during
@@ -367,6 +447,26 @@ def _execute_step(step_idx: int, step_text: str, *,
         if step_type in ("CMD", "CODE", "TEST", "SEARCH"):
             display.complete_step(step_idx, "done" if success else "failed")
 
+        # --- Structured plan: update step status + actual exports ---
+        if plan_step is not None:
+            if success:
+                try:
+                    # Collect files generated in this step
+                    after_all = memory.all_files()
+                    new_files = {
+                        f: c for f, c in after_all.items()
+                        if f not in (_before_files or {})
+                        or (_before_files or {}).get(f) != c
+                    }
+                    if new_files:
+                        update_step_after_execution(plan_step, new_files)
+                    else:
+                        plan_step.status = "completed"
+                except Exception:
+                    plan_step.status = "completed"
+            else:
+                plan_step.status = "failed"
+
         # Per-step knowledge upsert (lightweight, no LLM calls)
         # Runs on both success and failure — CMD packages only on success,
         # but CODE/TEST file purposes are recorded regardless.
@@ -397,7 +497,10 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         kb_context_builder=None,
                         project_profile=None,
                         knowledge_base=None,
-                        project_context=None) -> bool:
+                        project_context=None,
+                        plan_step: PlanStep | None = None,
+                        all_plan_steps: list[PlanStep] | None = None,
+                        ) -> bool:
     """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
 
     All exceptions are caught so that a crash during diagnosis (e.g. an
@@ -495,6 +598,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 project_profile=project_profile,
                 knowledge_base=knowledge_base,
                 project_context=project_context,
+                plan_step=plan_step,
+                all_plan_steps=all_plan_steps,
             )
 
             if success:

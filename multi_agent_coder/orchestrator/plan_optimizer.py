@@ -157,15 +157,91 @@ def optimize_plan(
     return clean_steps, deps
 
 
+# ── Structured PlanStep optimizer ─────────────────────────────────
+
+def optimize_structured_plan(
+    plan_steps: list,
+    knowledge_base=None,
+    kb_context_builder=None,
+    language: str | None = None,
+) -> list:
+    """Optimize a structured plan (list[PlanStep]) preserving all metadata.
+
+    Unlike ``optimize_plan`` (which operates on legacy ``list[str]``),
+    this works directly on PlanStep objects so step_type, target_files,
+    exports, imports_from, and command are preserved through optimization.
+
+    Passes skipped for structured plans:
+    - Pass 1 (remove no-ops): step_type already classifies intent — IGNORE
+      steps are explicitly typed by the LLM.
+    - Pass 5 (reorder test infra): depends_on already encodes execution
+      order constraints.
+
+    Passes applied:
+    - Pass 2: Skip redundant installs (checks KB for installed packages)
+    - Pass 3: Merge install CMD steps by package manager
+    - Pass 4: Merge CODE steps targeting the same file
+    - Pass 6: Re-index and validate dependencies
+    """
+    if not plan_steps:
+        return plan_steps
+
+    original_count = len(plan_steps)
+    result = list(plan_steps)
+
+    # Pass 2: Skip redundant installs
+    if knowledge_base is not None:
+        result = _skip_redundant_installs_structured(result, knowledge_base)
+
+    # Pass 3: Merge install CMD steps by package manager
+    result = _merge_install_steps_structured(result)
+
+    # Pass 4: Merge CODE steps targeting the same file
+    result = _merge_same_file_steps_structured(result)
+
+    # Pass 6: Re-index and validate dependencies
+    result = _reindex_structured(result)
+
+    optimized_count = len(result)
+    if optimized_count < original_count:
+        _logger.info(
+            f"[PlanOptimizer] Structured: {original_count} → {optimized_count} steps "
+            f"({original_count - optimized_count} removed/merged)"
+        )
+
+    return result
+
+
 # ── Tech keyword matching (used by planner pre-analysis) ─────────
 
-# Keywords to match KB docs against plan steps
+# Keywords to match KB docs against plan steps.
+# Compound variants (tailwindcss, reactjs, nextjs, …) are captured by the
+# regex and then normalized to their canonical short form via _TECH_ALIASES.
 _TECH_KEYWORDS = re.compile(
-    r'\b(vite|vitest|jest|react|angular|vue|next|nuxt|django|flask|fastapi|'
-    r'express|tailwind|pytest|mocha|webpack|rollup|svelte|solid|astro|'
+    r'\b(vitejs?|vitest|jest|reactjs?|react|angular|vuejs?|vue|'
+    r'nextjs?|next|nuxtjs?|nuxt|django|flask|fastapi|'
+    r'expressjs?|express|tailwindcss|tailwind|pytest|mocha|'
+    r'webpack|rollup|svelte|solid|astro|'
     r'spring|rails|laravel|gin|echo|fiber)\b',
     re.IGNORECASE,
 )
+
+# Normalize compound tech names to their canonical short form so that
+# "tailwindcss" matches docs tagged "tailwind", "nextjs" matches "next", etc.
+_TECH_ALIASES: dict[str, str] = {
+    "tailwindcss": "tailwind",
+    "reactjs": "react",
+    "vuejs": "vue",
+    "nextjs": "next",
+    "nuxtjs": "nuxt",
+    "vitejs": "vite",
+    "expressjs": "express",
+}
+
+
+def normalize_tech_keywords(techs: set[str]) -> set[str]:
+    """Normalize extracted tech keywords using canonical aliases."""
+    return {_TECH_ALIASES.get(t, t) for t in techs}
 
 # Mutually exclusive framework groups — if a step/task mentions one
 # framework from a group, KB docs about a DIFFERENT framework in the
@@ -648,6 +724,243 @@ def _reindex_steps(
                 clean_deps[i] = valid
 
     return steps, clean_deps
+
+
+# ── Structured PlanStep passes ────────────────────────────────────
+
+# Bare install-command regex (no backtick wrappers — PlanStep.command is raw)
+_BARE_INSTALL_RE = re.compile(
+    r'^(pip3?(?:\s+-m\s+pip)?|npm|yarn|pnpm|gem|cargo|go)\s+'
+    r'(install|i|add|get)\s+',
+    re.IGNORECASE,
+)
+
+
+def _skip_redundant_installs_structured(
+    steps: list, knowledge_base
+) -> list:
+    """Remove install CMD steps whose packages are all in the KB."""
+    keep: list = []
+    for step in steps:
+        if step.step_type != "CMD" or not step.command:
+            keep.append(step)
+            continue
+
+        m = _BARE_INSTALL_RE.match(step.command)
+        if not m:
+            keep.append(step)
+            continue
+
+        pkg_str = step.command[m.end():]
+        packages = [t.strip() for t in pkg_str.split()
+                     if t.strip() and not t.startswith("-")]
+
+        new_packages = []
+        for pkg in packages:
+            pkg_name = re.split(r'[=<>~!@]', pkg)[0].lower()
+            if not knowledge_base.is_package_installed(pkg_name):
+                new_packages.append(pkg)
+            else:
+                _logger.debug(f"[PlanOptimizer] Skipping installed: {pkg_name}")
+
+        if not new_packages:
+            _logger.info(f"[PlanOptimizer] Skipping redundant install: {step.description[:60]}")
+            # Rewire: anything that depends on this step now depends on its deps
+            _bypass_step_deps(step, steps)
+            continue
+
+        if len(new_packages) < len(packages):
+            pm = m.group(1)
+            action = m.group(2)
+            step.command = f"{pm} {action} {' '.join(new_packages)}"
+
+        keep.append(step)
+
+    return keep
+
+
+def _merge_install_steps_structured(steps: list) -> list:
+    """Merge CMD steps that install packages with the same package manager."""
+    # Group CMD install steps by package manager
+    install_groups: dict[str, list] = {}  # pm_key -> [step, ...]
+    non_install: list = []
+
+    for step in steps:
+        if step.step_type != "CMD" or not step.command:
+            non_install.append(step)
+            continue
+
+        m = _BARE_INSTALL_RE.match(step.command)
+        if not m:
+            non_install.append(step)
+            continue
+
+        pm_key = m.group(1).lower().replace(" ", "")
+        if "pip" in pm_key:
+            pm_key = "pip"
+
+        install_groups.setdefault(pm_key, []).append(step)
+
+    # Nothing to merge?
+    if all(len(g) <= 1 for g in install_groups.values()):
+        return steps
+
+    merged: list = []
+
+    for pm_key, group in sorted(install_groups.items()):
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+
+        # Merge all packages into one CMD step
+        all_packages: list[str] = []
+        all_deps: list[str] = []
+        all_produces: list[str] = []
+        seen_pkgs: set[str] = set()
+        seen_dep_ids: set[str] = set()
+
+        for s in group:
+            m = _BARE_INSTALL_RE.match(s.command or "")
+            if m:
+                pkg_str = (s.command or "")[m.end():]
+                for pkg in pkg_str.split():
+                    pkg = pkg.strip()
+                    if pkg and not pkg.startswith("-") and pkg.lower() not in seen_pkgs:
+                        all_packages.append(pkg)
+                        seen_pkgs.add(pkg.lower())
+            for d in s.depends_on:
+                if d not in seen_dep_ids:
+                    all_deps.append(d)
+                    seen_dep_ids.add(d)
+            all_produces.extend(s.target_files)
+
+        pm_cmd = {"pip": "pip install", "npm": "npm install",
+                  "yarn": "yarn add", "pnpm": "pnpm add",
+                  "gem": "gem install", "cargo": "cargo add",
+                  "go": "go get"}.get(pm_key, f"{pm_key} install")
+
+        # Use the first step as the merged step, update its fields
+        merged_step = group[0]
+        merged_step.command = f"{pm_cmd} {' '.join(all_packages)}"
+        merged_step.description = f"Install all {pm_key} dependencies"
+        merged_step.depends_on = all_deps
+        # Remove self-references from deps
+        merged_step.depends_on = [d for d in merged_step.depends_on
+                                   if d != merged_step.id]
+        merged_step.target_files = list(dict.fromkeys(all_produces))  # dedup
+
+        # Rewire: anything depending on merged-away steps now depends on the merged step
+        merged_ids = {s.id for s in group[1:]}
+        for s in steps:
+            s.depends_on = [
+                merged_step.id if d in merged_ids else d
+                for d in s.depends_on
+            ]
+            # Deduplicate
+            seen = set()
+            s.depends_on = [d for d in s.depends_on
+                            if d not in seen and not seen.add(d)]
+
+        merged.append(merged_step)
+        _logger.info(
+            f"[PlanOptimizer] Merged {len(group)} {pm_key} install steps "
+            f"→ {len(all_packages)} packages"
+        )
+
+    # Add non-install steps after merged install steps
+    merged.extend(non_install)
+    return merged
+
+
+def _merge_same_file_steps_structured(steps: list) -> list:
+    """Merge CODE steps that target the same single file."""
+    # Group CODE steps by their single target file
+    file_to_steps: dict[str, list] = {}
+
+    for step in steps:
+        if step.step_type != "CODE":
+            continue
+        if len(step.target_files) == 1:
+            fpath = step.target_files[0]
+            file_to_steps.setdefault(fpath, []).append(step)
+
+    merge_groups = {f: ss for f, ss in file_to_steps.items() if len(ss) > 1}
+    if not merge_groups:
+        return steps
+
+    merged_away: set[str] = set()  # step IDs that were merged into another
+
+    for fpath, group in merge_groups.items():
+        primary = group[0]
+        all_deps: list[str] = list(primary.depends_on)
+        seen_dep_ids = set(primary.depends_on)
+        all_exports: list[str] = list(primary.exports)
+        all_imports: dict[str, list[str]] = dict(primary.imports_from)
+        descriptions = [primary.description]
+
+        for secondary in group[1:]:
+            merged_away.add(secondary.id)
+            descriptions.append(secondary.description)
+
+            for d in secondary.depends_on:
+                if d not in seen_dep_ids and d != primary.id:
+                    all_deps.append(d)
+                    seen_dep_ids.add(d)
+
+            for exp in secondary.exports:
+                if exp not in all_exports:
+                    all_exports.append(exp)
+
+            for imp_file, symbols in secondary.imports_from.items():
+                existing = all_imports.get(imp_file, [])
+                for sym in symbols:
+                    if sym not in existing:
+                        existing.append(sym)
+                all_imports[imp_file] = existing
+
+        primary.description = " AND ".join(descriptions)
+        primary.depends_on = [d for d in all_deps if d not in merged_away]
+        primary.exports = all_exports
+        primary.imports_from = all_imports
+
+        # Rewire: anything depending on merged-away steps → depends on primary
+        for s in steps:
+            s.depends_on = [
+                primary.id if d in merged_away else d
+                for d in s.depends_on
+            ]
+            seen = set()
+            s.depends_on = [d for d in s.depends_on
+                            if d not in seen and not seen.add(d)]
+
+        _logger.info(f"[PlanOptimizer] Merged {len(group)} steps for `{fpath}`")
+
+    return [s for s in steps if s.id not in merged_away]
+
+
+def _reindex_structured(steps: list) -> list:
+    """Re-assign 0-based indices and validate dependency references."""
+    all_ids = {s.id for s in steps}
+    for idx, step in enumerate(steps):
+        step.index = idx
+        # Drop references to steps that no longer exist
+        step.depends_on = [d for d in step.depends_on if d in all_ids and d != step.id]
+    return steps
+
+
+def _bypass_step_deps(removed_step, all_steps: list) -> None:
+    """Rewire dependencies when a step is removed.
+
+    Anything that depended on *removed_step* now inherits its dependencies.
+    """
+    removed_id = removed_step.id
+    upstream = removed_step.depends_on
+
+    for step in all_steps:
+        if removed_id in step.depends_on:
+            step.depends_on = [
+                d for d in step.depends_on if d != removed_id
+            ] + [u for u in upstream if u not in step.depends_on and u != step.id]
 
 
 # ── Utilities ────────────────────────────────────────────────────
