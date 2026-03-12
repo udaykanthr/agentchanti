@@ -1030,8 +1030,11 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
                      language: str | None = None,
-                     project_context=None) -> tuple[bool, str]:
-    cmd = _extract_command_from_step(step_text)
+                     project_context=None,
+                     plan_step=None) -> tuple[bool, str]:
+    # Prefer the structured plan's explicit command field
+    cmd = (plan_step.command if plan_step is not None and plan_step.command
+           else _extract_command_from_step(step_text))
 
     if cmd:
         pass  # use extracted command
@@ -2353,7 +2356,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       code_graph=None,
                       project_profile=None,
                       skip_review: bool = False,
-                      project_context=None) -> tuple[bool, str]:
+                      project_context=None,
+                      plan_step=None,
+                      all_plan_steps=None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -2412,21 +2417,51 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             context_prefix += kb_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
-        # Use slim context for non-target files when enabled
-        use_slim = cfg and getattr(cfg, "EDITING_SLIM_CONTEXT", True)
-        targets = _detect_target_files(step_text, memory) if use_slim else []
-        if use_slim and targets:
-            slim = memory.related_context_slim(step_text, max_tokens=ctx_budget)
-            if slim:
-                context += f"\nProject file structures:\n{slim}"
-            for tf in targets:
-                tf_content = memory.get(tf)
-                if tf_content:
-                    context += f"\n\n#### [FILE]: {tf}\n```\n{tf_content}\n```"
+
+        # ── Plan-aware context injection ──
+        # When a structured plan step is available, use plan-declared
+        # imports/targets for precise context (fewer tokens, better relevance).
+        # Falls back to legacy related_context / slim context otherwise.
+        plan_ctx = getattr(memory, '_plan_context_files', None)
+        if plan_ctx and plan_step is not None:
+            # Full content for plan-declared files (imports + targets)
+            for fpath, content in plan_ctx.items():
+                context += f"\n\n#### [FILE]: {fpath}\n```\n{content}\n```"
+            # Slim skeletons for other files in memory (so LLM knows what exists)
+            from .memory import _extract_file_skeleton
+            slim_parts: list[str] = []
+            for fpath, content in memory.all_files().items():
+                if fpath in plan_ctx:
+                    continue
+                if fpath.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
+                    continue
+                skeleton = _extract_file_skeleton(content, fpath)
+                if skeleton:
+                    slim_parts.append(skeleton)
+                else:
+                    slim_parts.append(f"- {fpath}")
+            if slim_parts:
+                context += "\n\nOther project files (signatures only):\n" + "\n".join(slim_parts)
+            log.info(
+                f"Step {step_idx+1}: Plan-aware context: {len(plan_ctx)} full "
+                f"+ {len(slim_parts)} skeleton(s)"
+            )
         else:
-            related = memory.related_context(step_text, max_tokens=ctx_budget)
-            if related:
-                context += f"\nExisting files (overwrite as needed):\n{related}"
+            # Legacy context: semantic search or slim + targets
+            use_slim = cfg and getattr(cfg, "EDITING_SLIM_CONTEXT", True)
+            targets = _detect_target_files(step_text, memory) if use_slim else []
+            if use_slim and targets:
+                slim = memory.related_context_slim(step_text, max_tokens=ctx_budget)
+                if slim:
+                    context += f"\nProject file structures:\n{slim}"
+                for tf in targets:
+                    tf_content = memory.get(tf)
+                    if tf_content:
+                        context += f"\n\n#### [FILE]: {tf}\n```\n{tf_content}\n```"
+            else:
+                related = memory.related_context(step_text, max_tokens=ctx_budget)
+                if related:
+                    context += f"\nExisting files (overwrite as needed):\n{related}"
         if memory.summary() != "(no files yet)":
             context += f"\nAll project files: {memory.summary()}"
         if feedback:
@@ -2970,7 +3005,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       auto: bool = False,
                       search_agent=None,
                       project_context=None,
-                      kb_context_builder=None) -> tuple[bool, str]:
+                      kb_context_builder=None,
+                      plan_step=None,
+                      all_plan_steps=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -3069,26 +3106,16 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     log.warning(f"Step {step_idx+1}: Failed to create jest.config.js: {e}")
 
     # ── Scoped context: only include files relevant to this test step ──
-    # Instead of dumping ALL memory files (which wastes tokens on unrelated
-    # components), we include:
-    #   1. The target test file itself (full content)
-    #   2. Source files imported by that test (full content)
-    #   3. Test setup/config files (full content)
-    #   4. Slim skeletons for remaining source files (imports + signatures)
+    # Priority order:
+    #   A. Plan-aware context (structured plan imports/targets — most precise)
+    #   B. Scoped context (target test file → parse imports → setup files)
+    #   C. Semantic search fallback
     all_files = memory.all_files()
-    target_test_files = _detect_target_files(step_text, memory, max_files=5)
+    plan_ctx = getattr(memory, '_plan_context_files', None)
 
-    # Identify source files imported by the target test(s)
-    target_contents: dict[str, str] = {}
-    for tf in target_test_files:
-        if tf in all_files:
-            target_contents[tf] = all_files[tf]
-    imported_sources = _extract_imported_sources(target_contents, memory) if target_contents else {}
-
-    # When targets are detected, use scoped context; otherwise fall back to
-    # semantic search (e.g. "write tests for the whole project")
-    if target_test_files:
-        # Setup/config files that test runners need (always include full content)
+    if plan_ctx and plan_step is not None:
+        # ── Plan-aware context: use plan-declared imports + targets ──
+        # Merge plan context with setup/config files the test runner needs
         _SETUP_FILE_NAMES = frozenset({
             'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
             'vitest.setup.js', 'vitest.setup.ts',
@@ -3097,57 +3124,100 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             'conftest.py', 'pytest.ini', 'setup.cfg',
             'vite.config.js', 'vite.config.ts',
         })
-
-        # Build full-content set (target + imports + setup)
-        full_content_files: dict[str, str] = {}
+        full_content_files: dict[str, str] = dict(plan_ctx)
+        # Also include setup files from memory that plan may not declare
         for fpath, content in all_files.items():
-            basename = os.path.basename(fpath)
-            if fpath in target_contents:
-                full_content_files[fpath] = content
-            elif fpath in imported_sources:
-                full_content_files[fpath] = content
-            elif basename in _SETUP_FILE_NAMES:
+            if fpath not in full_content_files and os.path.basename(fpath) in _SETUP_FILE_NAMES:
                 full_content_files[fpath] = content
 
-        # Build code_summary: full content for relevant files, skeletons for rest
         code_summary = ""
         included_full: set[str] = set()
         for fname, content in full_content_files.items():
             code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
             included_full.add(fname)
 
-        # Add slim skeletons for remaining source files
+        # Slim skeletons for remaining files
         from .memory import _extract_file_skeleton
         slim_parts: list[str] = []
         for fname, content in all_files.items():
             if fname in included_full:
                 continue
-            # Skip internal tracking files
             if fname.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
                 continue
-            # Include structural skeleton (imports + function/class signatures)
             skeleton = _extract_file_skeleton(content, fname)
             if skeleton:
                 slim_parts.append(skeleton)
             else:
                 slim_parts.append(f"- {fname}")
-
         if slim_parts:
             code_summary += "Other project files (signatures only):\n" + "\n".join(slim_parts) + "\n\n"
 
-        log.info(f"Step {step_idx+1}: Test context scoped to {len(full_content_files)} "
-                 f"full file(s) + {len(slim_parts)} skeleton(s) "
-                 f"(from {len(all_files)} total in memory)")
+        log.info(f"Step {step_idx+1}: Plan-aware test context: {len(full_content_files)} full "
+                 f"+ {len(slim_parts)} skeleton(s)")
     else:
-        # No specific target detected — use semantic search for relevant context
-        code_summary = memory.related_context(step_text)
-        if not code_summary:
-            # Last resort: include everything (original behavior)
+        # ── Legacy scoped context ──
+        target_test_files = _detect_target_files(step_text, memory, max_files=5)
+
+        # Identify source files imported by the target test(s)
+        target_contents: dict[str, str] = {}
+        for tf in target_test_files:
+            if tf in all_files:
+                target_contents[tf] = all_files[tf]
+        imported_sources = _extract_imported_sources(target_contents, memory) if target_contents else {}
+
+        if target_test_files:
+            _SETUP_FILE_NAMES = frozenset({
+                'vitest.config.ts', 'vitest.config.js', 'vitest.config.mts',
+                'vitest.setup.js', 'vitest.setup.ts',
+                'jest.config.js', 'jest.config.ts', 'jest.config.mjs', 'jest.config.cjs',
+                'setupTests.js', 'setupTests.ts', 'setup.js', 'setup.ts',
+                'conftest.py', 'pytest.ini', 'setup.cfg',
+                'vite.config.js', 'vite.config.ts',
+            })
+
+            full_content_files: dict[str, str] = {}
+            for fpath, content in all_files.items():
+                basename = os.path.basename(fpath)
+                if fpath in target_contents:
+                    full_content_files[fpath] = content
+                elif fpath in imported_sources:
+                    full_content_files[fpath] = content
+                elif basename in _SETUP_FILE_NAMES:
+                    full_content_files[fpath] = content
+
             code_summary = ""
-            for fname, content in all_files.items():
+            included_full: set[str] = set()
+            for fname, content in full_content_files.items():
                 code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
-        log.info(f"Step {step_idx+1}: No target test files detected, using "
-                 f"semantic search context (from {len(all_files)} files)")
+                included_full.add(fname)
+
+            from .memory import _extract_file_skeleton
+            slim_parts: list[str] = []
+            for fname, content in all_files.items():
+                if fname in included_full:
+                    continue
+                if fname.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
+                    continue
+                skeleton = _extract_file_skeleton(content, fname)
+                if skeleton:
+                    slim_parts.append(skeleton)
+                else:
+                    slim_parts.append(f"- {fname}")
+
+            if slim_parts:
+                code_summary += "Other project files (signatures only):\n" + "\n".join(slim_parts) + "\n\n"
+
+            log.info(f"Step {step_idx+1}: Test context scoped to {len(full_content_files)} "
+                     f"full file(s) + {len(slim_parts)} skeleton(s) "
+                     f"(from {len(all_files)} total in memory)")
+        else:
+            code_summary = memory.related_context(step_text)
+            if not code_summary:
+                code_summary = ""
+                for fname, content in all_files.items():
+                    code_summary += f"#### [FILE]: {fname}\n```{lang_tag}\n{content}\n```\n\n"
+            log.info(f"Step {step_idx+1}: No target test files detected, using "
+                     f"semantic search context (from {len(all_files)} files)")
 
     feedback = ""
     last_test_output = ""
@@ -3437,9 +3507,17 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 current_content = (memory.all_files().get(test_path)
                                    or test_files.get(test_path, ""))
 
-                # Focused source context: only files this test imports
-                single_imports = _extract_imported_sources(
-                    {test_path: current_content}, memory)
+                # Focused source context: prefer plan-declared imports,
+                # fall back to parsing test file imports from memory
+                _fix_plan_ctx = getattr(memory, '_plan_context_files', None)
+                if _fix_plan_ctx and plan_step is not None:
+                    single_imports = {
+                        fp: cnt for fp, cnt in _fix_plan_ctx.items()
+                        if fp != test_path
+                    }
+                else:
+                    single_imports = _extract_imported_sources(
+                        {test_path: current_content}, memory)
                 source_ctx = ""
                 for fp, cnt in single_imports.items():
                     source_ctx += (
@@ -3999,7 +4077,24 @@ def _try_chunk_edit(
     formatted = chunk_editor.format_chunks_for_prompt(all_chunks, all_target_ids)
 
     slim_ctx = ""
-    if getattr(cfg, "EDITING_SLIM_CONTEXT", True):
+    plan_ctx = getattr(memory, '_plan_context_files', None)
+    if plan_ctx:
+        # Plan-aware: include plan-declared files that aren't chunk targets
+        from .memory import _extract_file_skeleton
+        parts_slim: list[str] = []
+        for fpath, content in plan_ctx.items():
+            if fpath not in target_files:
+                parts_slim.append(f"#### [FILE]: {fpath}\n```\n{content}\n```")
+        for fpath, content in memory.all_files().items():
+            if fpath in plan_ctx or fpath in target_files:
+                continue
+            if fpath.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
+                continue
+            skeleton = _extract_file_skeleton(content, fpath)
+            if skeleton:
+                parts_slim.append(skeleton)
+        slim_ctx = "\n\n".join(parts_slim) if parts_slim else ""
+    elif getattr(cfg, "EDITING_SLIM_CONTEXT", True):
         slim_ctx = memory.related_context_slim(
             step_text,
             max_tokens=int((cfg.CONTEXT_WINDOW if cfg else 8192) * 0.3),

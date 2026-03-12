@@ -57,10 +57,18 @@ class GlobalKBStore:
         ``kb/global/core/errors.db``.
     """
 
-    def __init__(self, errors_db_path: Optional[str] = None) -> None:
-        self._errors_db_path = errors_db_path or os.path.join(
-            _CORE_DIR, "errors.db"
-        )
+    def __init__(
+        self,
+        errors_db_path: Optional[str] = None,
+        base_dir: Optional[str] = None,
+    ) -> None:
+        self._base_dir = base_dir
+        if errors_db_path:
+            self._errors_db_path = errors_db_path
+        elif base_dir:
+            self._errors_db_path = os.path.join(base_dir, "core", "errors.db")
+        else:
+            self._errors_db_path = os.path.join(_CORE_DIR, "errors.db")
         self._error_dict: Optional[ErrorDict] = None
         self._vector_store = None
 
@@ -522,6 +530,12 @@ class GlobalKBStore:
         """
         from .seeder import _REGISTRY_DIR, _parse_frontmatter
 
+        registry_dir = (
+            os.path.join(self._base_dir, "registry")
+            if self._base_dir else _REGISTRY_DIR
+        )
+        global_dir = self._base_dir or _GLOBAL_DIR
+
         import re as _re
         # Strip punctuation so "React," → "react", "vite:" → "vite"
         query_words = set(
@@ -544,7 +558,7 @@ class GlobalKBStore:
             if categories and cat not in categories:
                 continue
 
-            cat_dir = os.path.join(_REGISTRY_DIR, dirname)
+            cat_dir = os.path.join(registry_dir, dirname)
             if not os.path.isdir(cat_dir):
                 continue
 
@@ -596,7 +610,7 @@ class GlobalKBStore:
                 if score > 0:
                     tags_str = meta.get("tags", "")
                     tags = [t.strip() for t in tags_str.split(",") if t.strip()]
-                    rel_path = os.path.relpath(filepath, _GLOBAL_DIR).replace("\\", "/")
+                    rel_path = os.path.relpath(filepath, global_dir).replace("\\", "/")
 
                     results.append((score, GlobalKBResult(
                         title=meta.get("title", fname),

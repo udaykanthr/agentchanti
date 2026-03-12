@@ -2097,6 +2097,7 @@ def seed(
     embed: bool = True,
     project_root: Optional[str] = None,
     api_client=None,
+    base_dir: Optional[str] = None,
 ) -> dict:
     """
     Seed the global knowledge base with sample data.
@@ -2116,6 +2117,11 @@ def seed(
         Summary with keys: errors_seeded, docs_seeded, chunks_embedded.
     """
     project_root = project_root or os.getcwd()
+    # Allow callers (tests) to redirect all I/O to an isolated directory.
+    core_dir = os.path.join(base_dir, "core") if base_dir else _CORE_DIR
+    registry_dir = os.path.join(base_dir, "registry") if base_dir else _REGISTRY_DIR
+    if base_dir:
+        os.makedirs(core_dir, exist_ok=True)
     summary = {
         "errors_seeded": 0,
         "content_fixes_seeded": 0,
@@ -2124,7 +2130,7 @@ def seed(
     }
 
     # ── 1a. Seed errors.db ──────────────────────────────────────────────
-    db_path = _errors_db_path()
+    db_path = os.path.join(core_dir, "errors.db")
     edict = ErrorDict(db_path)
     # Re-seed when the seed list has grown (new entries added to code).
     # This ensures new KB error fixes are picked up without requiring
@@ -2167,7 +2173,7 @@ def seed(
 
     for filename, meta in _PATTERN_DOCS.items():
         path = _write_md_file(
-            os.path.join(_REGISTRY_DIR, "patterns"),
+            os.path.join(registry_dir, "patterns"),
             filename,
             meta["title"],
             "pattern",
@@ -2179,7 +2185,7 @@ def seed(
 
     for filename, meta in _ADR_DOCS.items():
         path = _write_md_file(
-            os.path.join(_REGISTRY_DIR, "adrs"),
+            os.path.join(registry_dir, "adrs"),
             filename,
             meta["title"],
             "adr",
@@ -2191,7 +2197,7 @@ def seed(
 
     for filename, meta in _DOC_DOCS.items():
         path = _write_md_file(
-            os.path.join(_REGISTRY_DIR, "docs"),
+            os.path.join(registry_dir, "docs"),
             filename,
             meta["title"],
             "doc",
@@ -2203,7 +2209,7 @@ def seed(
 
     for filename, meta in _BEHAVIORAL_DOCS.items():
         path = _write_md_file(
-            os.path.join(_REGISTRY_DIR, "behavioral"),
+            os.path.join(registry_dir, "behavioral"),
             filename,
             meta["title"],
             "behavioral",
@@ -2229,7 +2235,7 @@ def seed(
         "behavioral": set(_BEHAVIORAL_DOCS.keys()),
     }
     for subdir, expected in _seed_filenames.items():
-        cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+        cat_dir = os.path.join(registry_dir, subdir)
         if not os.path.isdir(cat_dir):
             continue
         for fname in os.listdir(cat_dir):
@@ -2255,7 +2261,10 @@ def seed(
             if api_client is None:
                 raise ValueError("api_client required for embedding")
 
-            all_md_files = collect_all_registry_md_files(exclude_paths={p for p, _, _ in md_files})
+            all_md_files = collect_all_registry_md_files(
+                exclude_paths={p for p, _, _ in md_files},
+                registry_dir=registry_dir,
+            )
             all_md_files = list(md_files) + all_md_files
 
             if len(all_md_files) > len(md_files):
@@ -2274,7 +2283,7 @@ def seed(
     # Persistent marker so _global_kb_exists() can answer True without
     # touching the SQLite database.  This prevents spurious re-seeds
     # caused by transient DB lock errors during concurrent access.
-    marker_path = os.path.join(_CORE_DIR, ".seeded")
+    marker_path = os.path.join(core_dir, ".seeded")
     try:
         os.makedirs(os.path.dirname(marker_path), exist_ok=True)
         with open(marker_path, "w", encoding="utf-8") as fh:
@@ -2295,6 +2304,7 @@ _DIR_TO_CATEGORY = {
 
 def collect_all_registry_md_files(
     exclude_paths: Optional[set[str]] = None,
+    registry_dir: Optional[str] = None,
 ) -> list[tuple[str, str, str]]:
     """Scan the registry for all ``.md`` files and return metadata tuples.
 
@@ -2306,6 +2316,9 @@ def collect_all_registry_md_files(
     ----------
     exclude_paths:
         Absolute file paths to skip (already collected by the caller).
+    registry_dir:
+        Override for the registry directory.  Defaults to the package
+        ``_REGISTRY_DIR``.
 
     Returns
     -------
@@ -2313,11 +2326,12 @@ def collect_all_registry_md_files(
         A list of ``(absolute_path, category, title)`` tuples suitable
         for passing to :func:`_embed_md_files`.
     """
+    _reg_dir = registry_dir or _REGISTRY_DIR
     exclude = exclude_paths or set()
     md_files: list[tuple[str, str, str]] = []
 
     for subdir, category in _DIR_TO_CATEGORY.items():
-        cat_dir = os.path.join(_REGISTRY_DIR, subdir)
+        cat_dir = os.path.join(_reg_dir, subdir)
         if not os.path.isdir(cat_dir):
             continue
         for fname in os.listdir(cat_dir):

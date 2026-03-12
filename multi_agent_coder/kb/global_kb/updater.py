@@ -124,7 +124,7 @@ def _http_get(url: str, headers: Optional[dict] = None) -> bytes:
 # Public API
 # ---------------------------------------------------------------------------
 
-def clean() -> dict:
+def clean(base_dir: Optional[str] = None) -> dict:
     """
     Remove all global KB data: vector store, errors DB, registry files,
     and manifest.
@@ -132,16 +132,25 @@ def clean() -> dict:
     After running this, ``kb seed`` and ``kb update`` can repopulate the
     KB from scratch.
 
+    Parameters
+    ----------
+    base_dir:
+        Override for the global KB root directory.  When set, operates on
+        ``base_dir/core`` and ``base_dir/registry`` instead of the
+        package directory.  Used by tests to avoid touching real data.
+
     Returns
     -------
     dict
         Summary with keys: files_removed, dbs_removed.
     """
+    core_dir = os.path.join(base_dir, "core") if base_dir else _CORE_DIR
+    registry_dir = os.path.join(base_dir, "registry") if base_dir else _REGISTRY_DIR
     summary = {"files_removed": 0, "dbs_removed": 0}
 
     # Remove registry markdown files (preserve .gitignore)
-    if os.path.isdir(_REGISTRY_DIR):
-        for dirpath, _, filenames in os.walk(_REGISTRY_DIR):
+    if os.path.isdir(registry_dir):
+        for dirpath, _, filenames in os.walk(registry_dir):
             for fname in filenames:
                 if fname == ".gitignore":
                     continue
@@ -151,8 +160,8 @@ def clean() -> dict:
                 except OSError as exc:
                     logger.warning("Failed to remove %s: %s", fname, exc)
         # Remove empty subdirectories but keep registry/ itself
-        for dirpath, dirnames, filenames in os.walk(_REGISTRY_DIR, topdown=False):
-            if dirpath == _REGISTRY_DIR:
+        for dirpath, dirnames, filenames in os.walk(registry_dir, topdown=False):
+            if dirpath == registry_dir:
                 continue
             try:
                 os.rmdir(dirpath)  # only removes if empty
@@ -161,7 +170,7 @@ def clean() -> dict:
 
     # Remove SQLite databases and manifest
     for db_name in ("errors.db", "global_kb.db", "manifest.json", ".seeded"):
-        db_path = os.path.join(_CORE_DIR, db_name)
+        db_path = os.path.join(core_dir, db_name)
         if os.path.isfile(db_path):
             try:
                 os.remove(db_path)
@@ -359,6 +368,7 @@ _CATEGORY_DIRS = {
 def _apply_update(
     source_dir: str,
     categories: Optional[list[str]] = None,
+    base_dir: Optional[str] = None,
 ) -> tuple[int, list[tuple[str, str, str]]]:
     """
     Copy files from extracted update into registry/.
@@ -369,6 +379,8 @@ def _apply_update(
         Path to the extracted update directory.
     categories:
         Optional filter.
+    base_dir:
+        Override for the global KB root directory.  Used by tests.
 
     Returns
     -------
@@ -379,6 +391,8 @@ def _apply_update(
         newly downloaded documents.
     """
     from .seeder import _parse_frontmatter
+
+    registry_dir = os.path.join(base_dir, "registry") if base_dir else _REGISTRY_DIR
 
     # Map directory names to the KB category names used in the vector store
     _DIR_TO_CATEGORY = {
@@ -405,7 +419,7 @@ def _apply_update(
             files_copied += 1
             continue
 
-        dest_path = os.path.join(_REGISTRY_DIR, dest_name)
+        dest_path = os.path.join(registry_dir, dest_name)
         os.makedirs(dest_path, exist_ok=True)
 
         # Walk recursively — the registry zip may have nested

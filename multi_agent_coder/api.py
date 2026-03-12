@@ -300,18 +300,62 @@ def _run_task_impl(
 
     # Plan
     plan = planner.process(task, context=planner_context)
-    raw_steps = executor.parse_plan_steps(plan)
-    if not raw_steps:
-        return TaskResult(success=False, error="Could not parse any steps from the plan.")
 
-    steps, dependencies = executor.parse_step_dependencies(raw_steps)
+    # ── Parse plan: try structured format first, fall back to legacy ──
+    from .orchestrator.plan_step import (
+        parse_structured_plan, is_structured_plan, validate_plan,
+        steps_as_text_list, steps_dependencies_dict,
+        from_legacy_steps, PlanStep,
+    )
+    plan_steps: list[PlanStep] | None = None
+
+    _is_structured = is_structured_plan(plan)
+    _logger.info("[Plan] Structured plan detected: %s", _is_structured)
+    if _is_structured:
+        plan_steps = parse_structured_plan(plan)
+        if plan_steps:
+            _logger.info(
+                "[Plan] Parsed %d structured steps: %s",
+                len(plan_steps),
+                [(s.id, s.step_type, s.index) for s in plan_steps],
+            )
+            errors = validate_plan(plan_steps)
+            if errors:
+                _logger.warning("[Plan] Validation warnings: %s", errors)
+            steps = steps_as_text_list(plan_steps)
+            dependencies = steps_dependencies_dict(plan_steps)
+        else:
+            _logger.warning("[Plan] Structured parse returned 0 steps, falling back to legacy")
+
+    if plan_steps is None:
+        _logger.info("[Plan] Using legacy step parser (no structured plan)")
+        # Legacy numbered-list parsing
+        raw_steps = executor.parse_plan_steps(plan)
+        if not raw_steps:
+            return TaskResult(success=False, error="Could not parse any steps from the plan.")
+        steps, dependencies = executor.parse_step_dependencies(raw_steps)
 
     # Post-plan optimization
-    from .orchestrator.plan_optimizer import optimize_plan
-    steps, dependencies = optimize_plan(steps, knowledge_base=knowledge_base,
-                                        kb_context_builder=kb_context_builder,
-                                        dependencies=dependencies,
-                                        language=language)
+    from .orchestrator.plan_optimizer import optimize_plan, optimize_structured_plan
+
+    if plan_steps is not None:
+        # Structured path: optimize directly on PlanStep objects,
+        # preserving step_type, target_files, exports, imports_from, command
+        plan_steps = optimize_structured_plan(
+            plan_steps, knowledge_base=knowledge_base,
+            kb_context_builder=kb_context_builder,
+            language=language)
+        # Rebuild legacy views for downstream display/compat
+        steps = steps_as_text_list(plan_steps)
+        dependencies = steps_dependencies_dict(plan_steps)
+    else:
+        # Legacy path: optimize on list[str]
+        steps, dependencies = optimize_plan(
+            steps, knowledge_base=knowledge_base,
+            kb_context_builder=kb_context_builder,
+            dependencies=dependencies,
+            language=language)
+        plan_steps = from_legacy_steps(steps, dependencies)
 
     # ── Project analysis phase ──────────────────────────────────
     # Build structured ProjectContext from static analysis (zero LLM cost).
@@ -358,6 +402,15 @@ def _run_task_impl(
     for wave_idx, wave in enumerate(waves):
         for idx in wave:
             step_text = steps[idx]
+            # Find matching PlanStep for this index
+            _ps = next((s for s in plan_steps if s.index == idx), None) if plan_steps else None
+            if _ps is None and plan_steps:
+                log.warning(
+                    "[PlanStep] No PlanStep found for idx=%d. "
+                    "Available indices: %s",
+                    idx, [s.index for s in plan_steps],
+                )
+
             idx, success, error_info = _execute_step(
                 idx, step_text,
                 steps=steps,
@@ -369,6 +422,8 @@ def _run_task_impl(
                 project_profile=project_profile,
                 knowledge_base=knowledge_base,
                 project_context=project_context_obj,
+                plan_step=_ps,
+                all_plan_steps=plan_steps,
             )
 
             if success:
@@ -376,7 +431,8 @@ def _run_task_impl(
                 ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                 save_checkpoint(checkpoint_file, task, steps, idx,
                                 memory.as_dict(), step_results, language,
-                                display_state=ds)
+                                display_state=ds,
+                                plan_steps=plan_steps)
             else:
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
@@ -390,13 +446,16 @@ def _run_task_impl(
                     project_profile=project_profile,
                     knowledge_base=knowledge_base,
                     project_context=project_context_obj,
+                    plan_step=_ps,
+                    all_plan_steps=plan_steps,
                 )
                 if fixed:
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, task, steps, idx,
                                     memory.as_dict(), step_results, language,
-                                    display_state=ds)
+                                    display_state=ds,
+                                    plan_steps=plan_steps)
                 else:
                     pipeline_success = False
                     break
