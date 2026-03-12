@@ -36,6 +36,64 @@ from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
 from ..agents.analyser import build_project_context, AnalyseAgent
 
 
+def _rematch_plan_steps(new_steps, old_plan_steps, dependencies):
+    """Re-match edited step descriptions to original PlanStep objects.
+
+    Preserves structured metadata (step_type, target_files, exports,
+    imports_from, command, inline_code) when the description is similar
+    enough. Falls back to UNCLASSIFIED for steps that can't be matched.
+    """
+    from .plan_step import PlanStep, from_legacy_steps
+    from difflib import SequenceMatcher
+
+    result: list[PlanStep] = []
+    used: set[int] = set()  # indices into old_plan_steps already matched
+
+    for new_idx, desc in enumerate(new_steps):
+        desc_clean = desc.strip().lower()
+        best_score = 0.0
+        best_old_idx = -1
+
+        for old_idx, old_ps in enumerate(old_plan_steps):
+            if old_idx in used:
+                continue
+            old_clean = old_ps.description.strip().lower()
+            score = SequenceMatcher(None, desc_clean, old_clean).ratio()
+            if score > best_score:
+                best_score = score
+                best_old_idx = old_idx
+
+        if best_score >= 0.6 and best_old_idx >= 0:
+            # Re-use the old PlanStep with updated description and index
+            old = old_plan_steps[best_old_idx]
+            ps = PlanStep(
+                id=old.id,
+                step_type=old.step_type,
+                description=desc,
+                depends_on=list(old.depends_on),
+                command=old.command,
+                target_files=list(old.target_files),
+                exports=list(old.exports),
+                imports_from={k: list(v) for k, v in old.imports_from.items()},
+                inline_code=dict(old.inline_code),
+                index=new_idx,
+            )
+            result.append(ps)
+            used.add(best_old_idx)
+        else:
+            # Can't match — create UNCLASSIFIED placeholder
+            dep_ids = [str(d + 1) for d in dependencies.get(new_idx, set())]
+            result.append(PlanStep(
+                id=str(new_idx + 1),
+                step_type="UNCLASSIFIED",
+                description=desc,
+                depends_on=dep_ids,
+                index=new_idx,
+            ))
+
+    return result
+
+
 def main():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -472,6 +530,7 @@ def main():
             # ── 10. Parse steps + dependencies ──
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
+                fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, PlanStep,
             )
@@ -489,6 +548,9 @@ def main():
                     errors = validate_plan(plan_steps_parsed)
                     if errors:
                         log.warning(f"[Plan] Validation warnings: {errors}")
+                    dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                    if dep_fixes:
+                        log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")
@@ -571,6 +633,9 @@ def main():
                 if is_structured_plan(plan):
                     plan_steps_parsed = parse_structured_plan(plan)
                     if plan_steps_parsed:
+                        dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                        if dep_fixes:
+                            log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                         raw_steps = steps_as_text_list(plan_steps_parsed)
                     else:
                         raw_steps = executor.parse_plan_steps(plan)
@@ -605,8 +670,28 @@ def main():
                         language=language)
                     plan_steps_parsed = from_legacy_steps(steps, dependencies)
             elif action == "edit" and edited_steps:
-                steps, dependencies = executor.parse_step_dependencies(edited_steps)
-                plan_steps_parsed = from_legacy_steps(steps, dependencies)
+                new_steps, new_deps = executor.parse_step_dependencies(edited_steps)
+                # Preserve structured PlanStep metadata when possible
+                if plan_steps_parsed and len(new_steps) == len(steps):
+                    # Same number of steps — check if descriptions match
+                    _old = [s.strip() for s in steps]
+                    _new = [s.strip() for s in new_steps]
+                    if _old == _new:
+                        # No actual changes — keep structured metadata intact
+                        log.info("[Plan] Edit returned unchanged steps, preserving structured metadata")
+                        steps = new_steps
+                        dependencies = new_deps
+                    else:
+                        # Steps changed — try to re-match by description overlap
+                        steps = new_steps
+                        dependencies = new_deps
+                        plan_steps_parsed = _rematch_plan_steps(
+                            steps, plan_steps_parsed, dependencies)
+                else:
+                    # Step count changed — can't preserve metadata
+                    steps = new_steps
+                    dependencies = new_deps
+                    plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
         display.set_steps(steps)
         display.render()

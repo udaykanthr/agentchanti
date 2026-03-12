@@ -2531,6 +2531,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         # Show diffs and wait for approval before writing
         display.stop_spinner()
         approved = prompt_diff_approval(files, auto=auto)
+        display.step_info(step_idx, "Processing...")
         if not approved:
             feedback = "User rejected the changes. Try a different approach."
             display.step_info(step_idx, "Changes rejected by user, retrying...")
@@ -3361,6 +3362,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # Show diffs and wait for approval before writing test files
         display.stop_spinner()
         approved = prompt_diff_approval(test_files, auto=auto)
+        display.step_info(step_idx, "Processing...")
         if not approved:
             feedback = "User rejected the test changes. Try a different approach."
             display.step_info(step_idx, "Test changes rejected by user, retrying...")
@@ -4190,6 +4192,7 @@ def _try_chunk_edit(
 
     display.stop_spinner()
     approved = prompt_diff_approval(result_files, auto=auto)
+    display.step_info(step_idx, "Processing...")
     if not approved:
         display.step_info(step_idx, "Changes rejected by user")
         return False, "User rejected chunk edits."

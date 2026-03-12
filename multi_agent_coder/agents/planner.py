@@ -442,8 +442,9 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 9. **NO meta-steps**: Do NOT include steps like "Analyze the project",
    "Review the code". Jump straight to actionable steps.
 
-10. **ALWAYS include a test step**: Every plan MUST include at least one TEST
-    step. Place TEST steps AFTER all CODE steps they validate.
+10. **TEST steps only when explicitly requested**: Do NOT include TEST steps
+    unless the user's task explicitly asks for tests. Tests consume significant
+    tokens and time. When tests ARE requested, place them AFTER all CODE steps.
 
 11. **Shell commands are non-interactive**: Always include --yes, -y, or
     --defaults flags for tools that prompt for input.

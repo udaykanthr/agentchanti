@@ -6,6 +6,7 @@ import unittest
 
 from multi_agent_coder.orchestrator.plan_step import (
     parse_structured_plan, PlanStep, validate_plan,
+    fix_import_dependencies,
     is_structured_plan, build_waves,
 )
 
@@ -97,6 +98,51 @@ export function Footer() {
         self.assertIn("src/Footer.jsx", step.inline_code)
         self.assertIn("export function Header", step.inline_code["src/Header.jsx"])
         self.assertIn("export function Footer", step.inline_code["src/Footer.jsx"])
+
+    def test_content_marker_with_markdown_fence(self):
+        """LLMs often use --- content --- with ```js fences instead of
+        ---file-content-start--- / ---file-content-end---."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Configure vite.config.js
+target: responsive-webapp/vite.config.js
+exports: none
+imports: none
+--- content ---
+```js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+})
+```
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("responsive-webapp/vite.config.js", steps[0].inline_code)
+        code = steps[0].inline_code["responsive-webapp/vite.config.js"]
+        self.assertIn("defineConfig", code)
+        self.assertIn("plugins: [react()]", code)
+        # Markdown fences should NOT appear in captured code
+        self.assertNotIn("```", code)
+
+    def test_content_marker_without_fence(self):
+        """--- content --- marker without markdown fences."""
+        text = """
+==PLAN==
+--STEP 1.1 [CODE] depends:none
+Create config
+target: config.js
+--- content ---
+module.exports = { key: true };
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIn("config.js", steps[0].inline_code)
+        self.assertIn("module.exports", steps[0].inline_code["config.js"])
 
     def test_no_inline_code(self):
         text = """
@@ -192,6 +238,96 @@ class TestValidation(unittest.TestCase):
         ]
         errors = validate_plan(steps)
         self.assertTrue(any("9.9" in e for e in errors))
+
+
+class TestFixImportDependencies(unittest.TestCase):
+
+    def test_missing_dep_injected(self):
+        """Step 11 creates ErrorBoundary, step 10 imports it but doesn't depend on 11."""
+        steps = [
+            PlanStep(id="10", step_type="CODE", index=0,
+                     target_files=["src/App.jsx"],
+                     imports_from={"src/components/ErrorBoundary.jsx": ["ErrorBoundary"]}),
+            PlanStep(id="11", step_type="CODE", index=1,
+                     target_files=["src/components/ErrorBoundary.jsx"],
+                     exports=["ErrorBoundary"]),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("11", steps[0].depends_on)
+
+    def test_no_fix_when_dep_already_declared(self):
+        steps = [
+            PlanStep(id="10", step_type="CODE", index=0,
+                     target_files=["src/components/ErrorBoundary.jsx"],
+                     exports=["ErrorBoundary"]),
+            PlanStep(id="11", step_type="CODE", index=1,
+                     target_files=["src/App.jsx"],
+                     depends_on=["10"],
+                     imports_from={"src/components/ErrorBoundary.jsx": ["ErrorBoundary"]}),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(fixes, [])
+
+    def test_no_fix_for_external_files(self):
+        """Imports from files not produced by any step (existing project files)."""
+        steps = [
+            PlanStep(id="1", step_type="CODE", index=0,
+                     target_files=["src/App.jsx"],
+                     imports_from={"src/utils/existing.js": ["helper"]}),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(fixes, [])
+
+    def test_self_reference_ignored(self):
+        """A step that imports from its own target file."""
+        steps = [
+            PlanStep(id="1", step_type="CODE", index=0,
+                     target_files=["src/App.jsx"],
+                     imports_from={"src/App.jsx": ["App"]}),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(fixes, [])
+
+    def test_multiple_missing_deps(self):
+        """Multiple import deps missing across steps."""
+        steps = [
+            PlanStep(id="3", step_type="CODE", index=0,
+                     target_files=["src/App.jsx"],
+                     imports_from={
+                         "src/Header.jsx": ["Header"],
+                         "src/Footer.jsx": ["Footer"],
+                     }),
+            PlanStep(id="1", step_type="CODE", index=1,
+                     target_files=["src/Header.jsx"],
+                     exports=["Header"]),
+            PlanStep(id="2", step_type="CODE", index=2,
+                     target_files=["src/Footer.jsx"],
+                     exports=["Footer"]),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(len(fixes), 2)
+        self.assertIn("1", steps[0].depends_on)
+        self.assertIn("2", steps[0].depends_on)
+
+    def test_waves_reordered_after_fix(self):
+        """After fix, wave builder should schedule producer before consumer."""
+        steps = [
+            PlanStep(id="10", step_type="CODE", index=0,
+                     target_files=["src/App.jsx"],
+                     imports_from={"src/components/ErrorBoundary.jsx": ["ErrorBoundary"]}),
+            PlanStep(id="11", step_type="CODE", index=1,
+                     target_files=["src/components/ErrorBoundary.jsx"],
+                     exports=["ErrorBoundary"]),
+        ]
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        # ErrorBoundary (step 11) must be in an earlier wave than App (step 10)
+        wave_of = {}
+        for wi, wave in enumerate(waves):
+            for s in wave:
+                wave_of[s.id] = wi
+        self.assertLess(wave_of["11"], wave_of["10"])
 
 
 class TestBuildWaves(unittest.TestCase):

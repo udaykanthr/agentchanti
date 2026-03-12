@@ -279,6 +279,21 @@ def _execute_step(step_idx: int, step_text: str, *,
             display.step_tokens(step_idx, 0, 0)
             plan_step.status = "in_progress"
         else:
+            if plan_step is None:
+                _logger.warning(
+                    "[PlanStep] plan_step is None for step %d — "
+                    "falling back to LLM classification (tokens wasted). "
+                    "Check if plan_steps_parsed is intact at execution time.",
+                    step_idx,
+                )
+            else:
+                _logger.warning(
+                    "[PlanStep] step %d has type UNCLASSIFIED — "
+                    "falling back to LLM classification. "
+                    "This happens when structured metadata is lost "
+                    "(e.g. plan was edited in TUI).",
+                    step_idx,
+                )
             display.step_info(step_idx, "Loading context and classifying...")
             step_type = _classify_step(step_text, llm_client, display, step_idx)
 

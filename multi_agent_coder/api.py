@@ -304,6 +304,7 @@ def _run_task_impl(
     # ── Parse plan: try structured format first, fall back to legacy ──
     from .orchestrator.plan_step import (
         parse_structured_plan, is_structured_plan, validate_plan,
+        fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, PlanStep,
     )
@@ -322,6 +323,9 @@ def _run_task_impl(
             errors = validate_plan(plan_steps)
             if errors:
                 _logger.warning("[Plan] Validation warnings: %s", errors)
+            dep_fixes = fix_import_dependencies(plan_steps)
+            if dep_fixes:
+                _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)
             steps = steps_as_text_list(plan_steps)
             dependencies = steps_dependencies_dict(plan_steps)
         else:

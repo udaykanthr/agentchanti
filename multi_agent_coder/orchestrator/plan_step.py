@@ -122,23 +122,47 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     in_code_block = False
     code_lines: list[str] = []
 
+    in_markdown_fence = False  # track ```...``` inside inline blocks
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
 
         # ── Inline code block handling ──
-        if line.lower().replace(" ", "").startswith("---file-content-start"):
+        # Accept multiple LLM output variants:
+        #   ---file-content-start---  /  ---file-content-end---
+        #   --- content ---  (followed by markdown fence)
+        _norm = line.lower().replace(" ", "").rstrip("-")
+        if _norm.startswith("---file-content-start") or _norm == "---content":
             in_code_block = True
+            in_markdown_fence = False
             code_lines = []
             continue
-        if line.lower().replace(" ", "").startswith("---file-content-end"):
+        if _norm.startswith("---file-content-end") or (
+            in_code_block and _norm == "---contentend"
+        ):
             in_code_block = False
+            in_markdown_fence = False
             if current is not None and code_lines:
                 _assign_inline_code(current, code_lines)
             code_lines = []
             continue
         if in_code_block:
-            code_lines.append(raw_line)  # preserve original indentation
-            continue
+            # Structural markers end the code block implicitly
+            # (handles LLM omitting ---file-content-end---)
+            if line.upper() in ("==END==",) or _STEP_RE.match(line):
+                in_code_block = False
+                in_markdown_fence = False
+                if current is not None and code_lines:
+                    _assign_inline_code(current, code_lines)
+                code_lines = []
+                # Fall through to process this line normally
+            else:
+                # Strip markdown fences (```js, ```) that wrap inline code
+                if line.startswith("```"):
+                    in_markdown_fence = not in_markdown_fence
+                    continue
+                code_lines.append(raw_line)  # preserve original indentation
+                continue
 
         # Skip plan boundary markers
         if line.upper() in ("==PLAN==", "==END==", ""):
@@ -206,6 +230,10 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Description line (anything else)
         elif not line.startswith("=="):
             desc_lines.append(line)
+
+    # Flush any open inline code block
+    if in_code_block and current is not None and code_lines:
+        _assign_inline_code(current, code_lines)
 
     # Flush last step
     if current is not None:
@@ -331,6 +359,64 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
             )
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix: inject missing import-based dependencies
+# ---------------------------------------------------------------------------
+
+def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
+    """Auto-inject missing ``depends_on`` entries based on import relationships.
+
+    If step B declares ``imports: src/Foo.jsx:Foo`` and step A has
+    ``target: src/Foo.jsx``, then B must depend on A.  When the LLM
+    forgets to declare this dependency the wave builder may schedule B
+    before A, causing an import failure at runtime.
+
+    This function detects such gaps and patches ``step.depends_on``
+    in-place.  Returns a list of human-readable descriptions of fixes
+    applied (empty list = nothing changed).
+
+    Must be called **after** ``validate_plan()`` and **before**
+    ``build_waves()``.
+    """
+    fixes: list[str] = []
+    all_ids = {s.id for s in steps}
+
+    # Build target-file → producer-step-id map
+    file_to_producer: dict[str, str] = {}
+    for s in steps:
+        for fpath in s.target_files:
+            file_to_producer[fpath] = s.id
+
+    for step in steps:
+        for file_path in step.imports_from:
+            producer_id = file_to_producer.get(file_path)
+            if producer_id is None:
+                continue  # existing project file, not produced by plan
+            if producer_id == step.id:
+                continue  # self-reference (step modifies + imports same file)
+            if producer_id in step.depends_on:
+                continue  # already declared
+
+            # Inject the missing dependency
+            step.depends_on.append(producer_id)
+            fixes.append(
+                f"Step {step.id} imports from {file_path} "
+                f"(produced by step {producer_id}) — added depends:{producer_id}"
+            )
+
+    # Safety: verify we didn't introduce a cycle
+    if fixes and _has_cycle(steps):
+        # Roll back all injected deps (unlikely but safe)
+        _rollback = {f.split(" — ")[0]: f.split("depends:")[1] for f in fixes}
+        for step in steps:
+            for desc, dep_id in _rollback.items():
+                if dep_id in step.depends_on and f"Step {step.id}" in desc:
+                    step.depends_on.remove(dep_id)
+        fixes.append("WARNING: rolled back fixes — injecting deps would create a cycle")
+
+    return fixes
 
 
 def _has_cycle(steps: list[PlanStep]) -> bool:
