@@ -445,6 +445,7 @@ def main():
             _, dependencies = executor.parse_step_dependencies(steps)
 
         # Restore structured PlanStep objects if checkpoint has them
+        from .plan_step import PlanStep, from_legacy_steps
         saved_plan_steps = checkpoint_state.get("plan_steps")
         if saved_plan_steps:
             plan_steps_parsed = [PlanStep.from_dict(d) for d in saved_plan_steps]
