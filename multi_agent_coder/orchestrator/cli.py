@@ -455,6 +455,16 @@ def main():
             plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
         language = checkpoint_state.get("language", language)
+
+        # Restore ProjectContext if saved (avoids re-running analysis LLM call)
+        saved_project_context = checkpoint_state.get("project_context")
+        if saved_project_context:
+            from ..agents.analyser import ProjectContext
+            _resumed_project_context = ProjectContext.from_dict(saved_project_context)
+            log.info("[Resume] Restored ProjectContext from checkpoint (0 LLM tokens)")
+        else:
+            _resumed_project_context = None
+
         display.set_steps(steps)
         # Mark completed steps
         for idx in range(start_from):
@@ -689,10 +699,15 @@ def main():
                         plan_steps_parsed = _rematch_plan_steps(
                             steps, plan_steps_parsed, dependencies)
                 else:
-                    # Step count changed — can't preserve metadata
+                    # Step count changed — still try to re-match by description
+                    # to preserve structured metadata (type, command, target_files)
                     steps = new_steps
                     dependencies = new_deps
-                    plan_steps_parsed = from_legacy_steps(steps, dependencies)
+                    if plan_steps_parsed:
+                        plan_steps_parsed = _rematch_plan_steps(
+                            steps, plan_steps_parsed, dependencies)
+                    else:
+                        plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
         display.set_steps(steps)
         display.render()
@@ -710,30 +725,56 @@ def main():
     # Build structured ProjectContext from static analysis + LLM enrichment.
     # Gives Coder and Tester awareness of end-to-end goal, installed packages,
     # import patterns, and test strategy.
-    project_context = build_project_context(
-        args.task, steps,
-        source_files=source_files or {},
-        language=language,
-    )
-    display.show_status("Analysing project...")
-    try:
-        analyser = AnalyseAgent(
-            "Analyser", "Senior Technical Analyst",
-            "Analyse the task and project to guide downstream agents.",
-            _make_llm_for_agent("analyser"))
-        project_context = analyser.enrich_context(
-            project_context, args.task, steps, source_files or {})
+    # On resume, reuse the saved ProjectContext instead of calling LLM again.
+    _resumed_pc = locals().get('_resumed_project_context')
+    if resuming and _resumed_pc is not None:
+        # Checkpoint has full enriched ProjectContext — reuse it
+        project_context = _resumed_pc
         log.info(
-            "[Analysis] ProjectContext: lang=%s, fw=%s, test_fw=%s, "
-            "%d pkgs, %d testable units",
+            "[Analysis] Reusing ProjectContext from checkpoint (0 LLM tokens): "
+            "lang=%s, fw=%s, test_fw=%s, %d pkgs, %d testable units",
             project_context.language, project_context.framework,
             project_context.test_framework,
             len(project_context.installed_packages),
             len(project_context.testable_units),
         )
-    except Exception as analyse_exc:
-        log.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
-                    analyse_exc)
+    elif resuming:
+        # Old checkpoint without ProjectContext — use static analysis only (0 LLM tokens)
+        project_context = build_project_context(
+            args.task, steps,
+            source_files=source_files or {},
+            language=language,
+        )
+        log.info(
+            "[Analysis] Resume: static analysis only, skipping LLM enrichment "
+            "(0 LLM tokens): lang=%s",
+            project_context.language,
+        )
+    else:
+        project_context = build_project_context(
+            args.task, steps,
+            source_files=source_files or {},
+            language=language,
+        )
+        display.show_status("Analysing project...")
+        try:
+            analyser = AnalyseAgent(
+                "Analyser", "Senior Technical Analyst",
+                "Analyse the task and project to guide downstream agents.",
+                _make_llm_for_agent("analyser"))
+            project_context = analyser.enrich_context(
+                project_context, args.task, steps, source_files or {})
+            log.info(
+                "[Analysis] ProjectContext: lang=%s, fw=%s, test_fw=%s, "
+                "%d pkgs, %d testable units",
+                project_context.language, project_context.framework,
+                project_context.test_framework,
+                len(project_context.installed_packages),
+                len(project_context.testable_units),
+            )
+        except Exception as analyse_exc:
+            log.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                        analyse_exc)
 
     # ── 12. Build execution waves ──
     # `dependencies` is already set by optimize_plan() / parse_step_dependencies()
@@ -786,7 +827,8 @@ def main():
                 save_checkpoint(checkpoint_file, args.task, steps, idx,
                                 memory.as_dict(), step_results, language,
                                 display_state=ds,
-                                plan_steps=plan_steps_parsed)
+                                plan_steps=plan_steps_parsed,
+                                project_context=project_context)
 
                 # Budget check after step
                 if display.budget_check(cfg.BUDGET_LIMIT):
@@ -815,7 +857,8 @@ def main():
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
                                     memory.as_dict(), step_results, language,
                                     display_state=ds,
-                                    plan_steps=plan_steps_parsed)
+                                    plan_steps=plan_steps_parsed,
+                                project_context=project_context)
 
                     # Budget check after fix
                     if display.budget_check(cfg.BUDGET_LIMIT):
@@ -903,7 +946,8 @@ def main():
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
                                     memory.as_dict(), step_results, language,
                                     display_state=ds,
-                                    plan_steps=plan_steps_parsed)
+                                    plan_steps=plan_steps_parsed,
+                                project_context=project_context)
 
                     # Budget check after fix
                     if display.budget_check(cfg.BUDGET_LIMIT):

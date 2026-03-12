@@ -14,13 +14,18 @@ def save_checkpoint(filepath: str, task: str, steps: list[str],
                     step_results: dict[int, str], language: str,
                     display_state: dict | None = None,
                     dependencies: dict[int, set[int]] | None = None,
-                    plan_steps: list | None = None) -> None:
+                    plan_steps: list | None = None,
+                    project_context=None) -> None:
     """Persist current pipeline state to *filepath* as JSON.
 
     *plan_steps*, if provided, should be a list of PlanStep objects (or
     anything with a ``.to_dict()`` method).  They are serialised so that
     on resume the full structured metadata (step_type, target_files,
     exports, imports_from, command, status) is preserved.
+
+    *project_context*, if provided, should be a ProjectContext object
+    (or anything with a ``.to_dict()`` method) so that the analysis
+    phase can be skipped on resume.
     """
     state = {
         "task": task,
@@ -36,6 +41,8 @@ def save_checkpoint(filepath: str, task: str, steps: list[str],
         state["display_state"] = display_state
     if plan_steps is not None:
         state["plan_steps"] = [s.to_dict() for s in plan_steps]
+    if project_context is not None and hasattr(project_context, "to_dict"):
+        state["project_context"] = project_context.to_dict()
     tmp = filepath + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)

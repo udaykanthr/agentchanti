@@ -555,17 +555,28 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
                 )
             yield Footer()
 
+        def on_mount(self) -> None:
+            # Focus the approve button so Tab+Enter works immediately
+            # as a keyboard fallback for terminals with poor mouse support.
+            btn = self.query_one("#approve-btn", Button)
+            btn.focus()
+
         def on_button_pressed(self, event: Button.Pressed) -> None:
+            event.stop()
             if event.button.id == "approve-btn":
                 self._approved = True
-                self.exit()
             elif event.button.id == "approve-all-btn":
                 self._approved = True
                 self._approve_all = True
-                self.exit()
             elif event.button.id == "reject-btn":
                 self._approved = False
-                self.exit()
+            else:
+                return
+            # Defer exit so the mouse event finishes processing first —
+            # calling self.exit() directly from a button handler can hang
+            # on Windows terminals (alternate screen clears but event loop
+            # never completes shutdown).
+            self.call_later(self.exit)
 
         def action_approve(self) -> None:
             self._approved = True

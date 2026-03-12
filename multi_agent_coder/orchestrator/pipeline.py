@@ -278,14 +278,18 @@ def _execute_step(step_idx: int, step_text: str, *,
             display.step_info(step_idx, f"Type: [{step_type}] (from plan)")
             display.step_tokens(step_idx, 0, 0)
             plan_step.status = "in_progress"
-        else:
-            if plan_step is None:
-                _logger.warning(
-                    "[PlanStep] plan_step is None for step %d — "
-                    "falling back to LLM classification (tokens wasted). "
-                    "Check if plan_steps_parsed is intact at execution time.",
-                    step_idx,
+        elif plan_step is not None and plan_step.step_type == "UNCLASSIFIED":
+            # Infer type from plan_step fields before falling back to LLM
+            if plan_step.command:
+                step_type = "CMD"
+                plan_step.step_type = "CMD"
+                _logger.info(
+                    "[PlanStep] step %d was UNCLASSIFIED but has command — "
+                    "inferred CMD (0 LLM tokens)", step_idx,
                 )
+                display.step_info(step_idx, f"Type: [{step_type}] (inferred from plan command)")
+                display.step_tokens(step_idx, 0, 0)
+                plan_step.status = "in_progress"
             else:
                 _logger.warning(
                     "[PlanStep] step %d has type UNCLASSIFIED — "
@@ -294,6 +298,17 @@ def _execute_step(step_idx: int, step_text: str, *,
                     "(e.g. plan was edited in TUI).",
                     step_idx,
                 )
+                display.step_info(step_idx, "Loading context and classifying...")
+                step_type = _classify_step(step_text, llm_client, display, step_idx)
+                # Persist classified type back on PlanStep for checkpoint
+                plan_step.step_type = step_type
+        else:
+            _logger.warning(
+                "[PlanStep] plan_step is None for step %d — "
+                "falling back to LLM classification (tokens wasted). "
+                "Check if plan_steps_parsed is intact at execution time.",
+                step_idx,
+            )
             display.step_info(step_idx, "Loading context and classifying...")
             step_type = _classify_step(step_text, llm_client, display, step_idx)
 

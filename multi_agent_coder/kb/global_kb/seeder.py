@@ -609,30 +609,25 @@ _ERROR_SEEDS: list[ErrorFix] = [
         language="javascript",
         pattern=r"(useLocation|useNavigate|useParams|useMatch|useHref)\(\) may be used only in the context of a <Router> component",
         cause="The component uses React Router hooks (useLocation, useNavigate, useParams, etc.) "
-              "or components (Link, NavLink, Outlet) but the test renders it without a Router wrapper. "
+              "or components (Link, NavLink, Outlet) but the component is not wrapped in a Router provider. "
               "React Router hooks MUST be called inside a Router context.",
-        fix_template="FIX: Wrap the component in <MemoryRouter> in your test:\n\n"
-                     "import { MemoryRouter } from 'react-router-dom'\n\n"
-                     "render(\n"
-                     "  <MemoryRouter initialEntries={['/current-path']}>\n"
-                     "    <YourComponent />\n"
-                     "  </MemoryRouter>\n"
-                     ")\n\n"
+        fix_template="FIX DEPENDS ON CONTEXT:\n\n"
+                     "1. IN APPLICATION CODE (main.jsx or App.jsx):\n"
+                     "Ensure your entire app is wrapped in a <BrowserRouter> at the highest level (typically main.jsx/index.jsx):\n"
+                     "import { BrowserRouter } from 'react-router-dom';\n"
+                     "ReactDOM.createRoot(document.getElementById('root')).render(\n"
+                     "  <BrowserRouter><App /></BrowserRouter>\n"
+                     ");\n\n"
+                     "2. IN TESTS (.test.jsx or .spec.jsx):\n"
+                     "Wrap the tested component in <MemoryRouter> (do not use BrowserRouter in tests):\n"
+                     "import { MemoryRouter } from 'react-router-dom';\n"
+                     "render(<MemoryRouter initialEntries={['/']}><YourComponent /></MemoryRouter>);\n\n"
                      "KEY RULES:\n"
-                     "1. ALWAYS use MemoryRouter (not BrowserRouter) in tests — it doesn't need a real DOM.\n"
-                     "2. Set initialEntries to control the starting route:\n"
-                     "   <MemoryRouter initialEntries={['/dashboard']}>\n"
-                     "3. If testing components that use <Outlet>, provide matching <Routes>:\n"
-                     "   <MemoryRouter initialEntries={['/dashboard']}>\n"
-                     "     <Routes>\n"
-                     "       <Route path='/dashboard' element={<Dashboard />} />\n"
-                     "     </Routes>\n"
-                     "   </MemoryRouter>\n"
-                     "4. If mocking useNavigate, use vi.mock('react-router-dom') BEFORE the render.\n"
-                     "5. Check ALL child components too — if ANY nested component uses Link/NavLink/useNavigate, "
-                     "the entire tree needs the Router wrapper.",
+                     "- ALWAYS use MemoryRouter in tests.\n"
+                     "- Ensure <BrowserRouter> is only used ONCE in the runtime app tree.\n"
+                     "- Any component calling useLocation(), useNavigate(), or containing <Routes>/<Route> MUST be a child of a Router.",
         severity="error",
-        tags="react-router,useLocation,useNavigate,useParams,MemoryRouter,Router,context,testing,react,javascript,typescript",
+        tags="react-router,useLocation,useNavigate,useParams,MemoryRouter,BrowserRouter,Router,context,testing,react,javascript,typescript",
     ),
     # ── Nested Router: test wraps App that already has its own Router ─────
     ErrorFix(

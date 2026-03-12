@@ -1066,6 +1066,10 @@ class Executor:
         dep_pattern = re.compile(
             r"\s*\([^)]*?depends?:\s*([\d,\s]+)\)[:\s]*$", re.IGNORECASE
         )
+        # Also strip "(depends: none)" markers that carry no numeric deps
+        none_dep_pattern = re.compile(
+            r"\s*\([^)]*?depends?:\s*none\s*\)[:\s]*$", re.IGNORECASE
+        )
         found_any_marker = False
 
         for idx, step in enumerate(steps):
@@ -1082,7 +1086,13 @@ class Executor:
                 deps[idx] = dep_indices
                 cleaned.append(step[:match.start()].rstrip())
             else:
-                cleaned.append(step)
+                # Strip "(depends: none)" so it doesn't pollute step text
+                none_match = none_dep_pattern.search(step)
+                if none_match:
+                    found_any_marker = True
+                    cleaned.append(step[:none_match.start()].rstrip())
+                else:
+                    cleaned.append(step)
                 deps[idx] = set()
 
         # No markers at all → sequential: each step depends on its predecessor

@@ -436,7 +436,8 @@ def _run_task_impl(
                 save_checkpoint(checkpoint_file, task, steps, idx,
                                 memory.as_dict(), step_results, language,
                                 display_state=ds,
-                                plan_steps=plan_steps)
+                                plan_steps=plan_steps,
+                                project_context=project_context_obj)
             else:
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
@@ -459,7 +460,8 @@ def _run_task_impl(
                     save_checkpoint(checkpoint_file, task, steps, idx,
                                     memory.as_dict(), step_results, language,
                                     display_state=ds,
-                                    plan_steps=plan_steps)
+                                    plan_steps=plan_steps,
+                                project_context=project_context_obj)
                 else:
                     pipeline_success = False
                     break
