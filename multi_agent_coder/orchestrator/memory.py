@@ -163,9 +163,13 @@ class FileMemory:
 
         Protected manifest files (package.json, go.mod, etc.) are skipped
         when they already exist on disk to prevent LLM-generated corruption.
+
+        Embedding is done in a background thread so it never blocks the
+        pipeline (the LLM server may be busy with code generation).
         """
         from ..executor import Executor
 
+        to_embed: list[tuple[str, str]] = []
         with self._lock:
             for fpath, content in files.items():
                 basename = os.path.basename(fpath)
@@ -176,7 +180,20 @@ class FileMemory:
 
                 self._files[fpath] = content
                 if self._store:
-                    self._store.add(fpath, content)
+                    to_embed.append((fpath, content))
+
+        # Embed in background — file is already in _files for substring search
+        if to_embed:
+            def _bg_embed():
+                for fpath, content in to_embed:
+                    try:
+                        self._store.add(fpath, content)
+                    except Exception as exc:
+                        log.debug(f"[FileMemory] Background embed failed for "
+                                  f"{fpath}: {exc}")
+            t = threading.Thread(target=_bg_embed, daemon=True,
+                                 name="memory-embed")
+            t.start()
 
     def get(self, filepath: str) -> str | None:
         with self._lock:

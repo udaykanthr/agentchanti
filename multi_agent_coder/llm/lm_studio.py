@@ -125,7 +125,8 @@ class LMStudioClient(LLMClient):
         payload = {"model": embed_model, "input": text}
         headers = {"Content-Type": "application/json"}
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload,
+                                     timeout=(10, 120))
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])

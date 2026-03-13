@@ -106,7 +106,7 @@ class OllamaClient(LLMClient):
         url = f"{self._api_root}/api/embed"
         payload = {"model": embed_model, "input": text}
         try:
-            response = requests.post(url, json=payload)
+            response = requests.post(url, json=payload, timeout=(10, 120))
             response.raise_for_status()
             data = response.json()
             embeddings = data.get("embeddings", [[]])
