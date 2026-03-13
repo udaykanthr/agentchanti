@@ -587,19 +587,11 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
                 continue
 
-            # For CMD steps, the fix commands ARE the corrected step.
-            # If they all succeeded, the step is done — no need to re-run
-            # the original (which would likely fail again).
-            # ONLY exit if actual shell commands were executed as part of the fix.
-            # If a code-only fix was applied, we MUST re-run the step to verify the fix works.
-            if step_type == "CMD" and cmds_succeeded and has_fix_commands:
-                display.step_info(step_idx, "Fix commands succeeded — step resolved.")
-                log.info(f"Task {step_idx+1}: CMD fix commands succeeded, "
-                         f"treating step as resolved.")
-                display.complete_step(step_idx, "done")
-                return True
-
-            # Re-run the step (for CODE/TEST: re-run with fixed files)
+            # Always re-run the original step after applying fixes.
+            # Fix commands may be prerequisites (e.g. `npm install` for a
+            # missing dependency) rather than replacements for the original
+            # command.  Re-running verifies the original intent is satisfied
+            # (e.g. tests actually pass, build actually succeeds).
             display.step_info(step_idx, "Fix applied — retrying step...")
             _, success, error_info = _execute_step(
                 step_idx, step_text,

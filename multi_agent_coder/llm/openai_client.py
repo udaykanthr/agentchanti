@@ -121,11 +121,11 @@ class OpenAIClient(LLMClient):
         embed_model = model or self.model
         url = f"{self.base_url}/embeddings"
         payload = {"model": embed_model, "input": text}
-        
+
         dimensions = kwargs.get("dimensions")
         if dimensions:
             payload["dimensions"] = dimensions
-            
+
         try:
             response = requests.post(url, headers=self._headers(), json=payload)
             response.raise_for_status()
@@ -140,3 +140,31 @@ class OpenAIClient(LLMClient):
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             log.error(f"[OpenAI] Embedding parse error: {e}")
             return []
+
+    def generate_embeddings_batch(self, texts: list[str], model: Optional[str] = None, **kwargs) -> list[list[float]]:
+        """Embed multiple texts in a single OpenAI /embeddings call."""
+        if not texts:
+            return []
+        embed_model = model or self.model
+        url = f"{self.base_url}/embeddings"
+        payload = {"model": embed_model, "input": texts}
+        dimensions = kwargs.get("dimensions")
+        if dimensions:
+            payload["dimensions"] = dimensions
+        try:
+            response = requests.post(url, headers=self._headers(), json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("data", [])
+            items.sort(key=lambda x: x.get("index", 0))
+            vectors = [item.get("embedding", []) for item in items]
+            if len(vectors) == len(texts):
+                return vectors
+            log.warning("[OpenAI] Batch embed returned %d vectors for %d texts",
+                        len(vectors), len(texts))
+            while len(vectors) < len(texts):
+                vectors.append([])
+            return vectors
+        except Exception as e:
+            log.warning(f"[OpenAI] Batch embedding failed, falling back to sequential: {e}")
+            return [self.generate_embedding(t, model=model, **kwargs) for t in texts]

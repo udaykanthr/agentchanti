@@ -322,6 +322,27 @@ class SQLiteVectorStore:
                     len(to_delete), file_path,
                 )
 
+    def get_metadata_map(self, key_field: str, value_field: str) -> dict[str, str]:
+        """Return a mapping of ``payload[key_field] → payload[value_field]``.
+
+        Useful for building content-hash lookups to skip re-embedding.
+        Scans all rows once — cheap for typical KB sizes (< 10k rows).
+        """
+        result: dict[str, str] = {}
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute("SELECT payload FROM vectors").fetchall()
+        for (payload_json,) in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            k = payload.get(key_field)
+            v = payload.get(value_field)
+            if k is not None and v is not None:
+                result[k] = v
+        return result
+
     def collection_info(self) -> Optional[dict]:
         """Return basic info about the collection.
 

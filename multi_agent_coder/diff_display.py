@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import difflib
+import threading
 from .config import Config
 
 # Hazards that block execution or require explicit confirmation
@@ -267,6 +268,11 @@ def show_diffs(files: dict[str, str], base_dir: str = ".",
 # all subsequent diffs are auto-approved for the rest of the session.
 _approve_all: bool = False
 
+# Serialize interactive approval — only one Textual/console prompt at a time.
+# Without this, parallel wave threads launch competing Textual apps that
+# fight for the terminal, causing blank screens and hangs.
+_approval_lock = threading.Lock()
+
 
 def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
                          auto: bool = False) -> bool:
@@ -274,6 +280,10 @@ def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
 
     Returns ``True`` if the user approves (or if running in auto mode).
     Returns ``False`` if the user rejects.
+
+    Uses ``_approval_lock`` to serialize interactive prompts so that
+    parallel wave threads don't launch competing Textual apps (which
+    causes blank screens, freezes, and unresponsive ESC on Windows).
     """
     global _approve_all
     from .cli_display import log
@@ -285,7 +295,7 @@ def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
     if not diffs and not new_files:
         return True
 
-    # Auto mode or "approve all" — log diffs and approve
+    # Auto mode or "approve all" — log diffs and approve (no lock needed)
     if auto or _approve_all:
         for filepath, diff_text in diffs:
             log.info(f"[auto] Diff for {filepath}:\n{diff_text}")
@@ -293,16 +303,26 @@ def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
             log.info(f"[auto] New files: {', '.join(new_files)}")
         return True
 
-    # Try Textual TUI
-    try:
-        return _textual_diff_approval(diffs, new_files, files, base_dir=base_dir)
-    except ImportError:
-        log.warning("Textual not installed — falling back to console diff approval.")
-    except Exception as e:
-        log.warning(f"Textual diff viewer failed: {e}")
+    # Serialize: only one interactive approval at a time
+    with _approval_lock:
+        # Re-check _approve_all — another thread may have set it while we waited
+        if _approve_all:
+            for filepath, diff_text in diffs:
+                log.info(f"[auto] Diff for {filepath}:\n{diff_text}")
+            if new_files:
+                log.info(f"[auto] New files: {', '.join(new_files)}")
+            return True
 
-    # Fallback: console-based approval
-    return _console_diff_approval(diffs, new_files, files)
+        # Try Textual TUI
+        try:
+            return _textual_diff_approval(diffs, new_files, files, base_dir=base_dir)
+        except ImportError:
+            log.warning("Textual not installed — falling back to console diff approval.")
+        except Exception as e:
+            log.warning(f"Textual diff viewer failed: {e}")
+
+        # Fallback: console-based approval
+        return _console_diff_approval(diffs, new_files, files)
 
 
 def _console_diff_approval(diffs: list[tuple[str, str]],

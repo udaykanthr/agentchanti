@@ -2356,9 +2356,12 @@ def _embed_md_files(
     Embed markdown files into the `global_kb` collection.
 
     Reuses the embedding helpers from kb.local.embedder.
+    Skips files whose content hasn't changed since last embedding
+    (tracked via a content-hash marker in the vector store metadata).
 
     Returns the total number of chunks embedded.
     """
+    import hashlib
     from ..local.embedder import _embed_batch, BATCH_SIZE, make_point_id
     from .store import _get_global_vector_store
     from ...config import Config
@@ -2370,9 +2373,32 @@ def _embed_md_files(
     store = _get_global_vector_store()
     total_chunks = 0
 
+    # Load existing content hashes to skip unchanged files
+    existing_hashes: dict[str, str] = {}
+    try:
+        existing_hashes = store.get_metadata_map("file", "content_hash")
+    except Exception:
+        pass  # store may not support this yet — embed everything
+
+    # Collect all chunks across files, then embed in one big batch
+    all_chunk_data: list[tuple[str, str, str, str, str, list[str], str]] = []
+    # Each entry: (rel_path, category, title, language, version, tags, chunk_text)
+
     for filepath, category, title in md_files:
         with open(filepath, encoding="utf-8") as fh:
             raw = fh.read()
+
+        # Content hash for skip-if-unchanged
+        content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+        # Get relative path within registry (always use forward slashes
+        # so that UUID5 point_ids are OS-independent and dedup works)
+        rel_path = os.path.relpath(filepath, _GLOBAL_DIR).replace("\\", "/")
+
+        # Skip if content unchanged
+        if existing_hashes.get(rel_path) == content_hash:
+            logger.debug("Skipping unchanged file: %s", rel_path)
+            continue
 
         # Strip frontmatter
         body = raw
@@ -2387,42 +2413,53 @@ def _embed_md_files(
         language = meta.get("language", "all")
         version = meta.get("version", "1.0.0")
 
-        # Get relative path within registry (always use forward slashes
-        # so that UUID5 point_ids are OS-independent and dedup works)
-        rel_path = os.path.relpath(filepath, _GLOBAL_DIR).replace("\\", "/")
-
         chunks = _chunk_markdown(body, title)
         if not chunks:
             continue
 
-        # Embed in batches
-        for i in range(0, len(chunks), BATCH_SIZE):
-            batch = chunks[i : i + BATCH_SIZE]
-            try:
-                vectors = _embed_batch(api_client, batch, embed_model)
-            except RuntimeError as exc:
-                logger.warning("Embedding failed for %s: %s", filepath, exc)
-                continue
+        for chunk_text in chunks:
+            all_chunk_data.append(
+                (rel_path, category, title, language, version, tags,
+                 content_hash, chunk_text)
+            )
 
-            points = []
-            for j, (chunk_text, vector) in enumerate(zip(batch, vectors)):
-                point_id = str(uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"global:{rel_path}:{i + j}",
-                ))
-                payload = {
-                    "file": rel_path,
-                    "category": category,
-                    "title": title,
-                    "language": language,
-                    "tags": tags,
-                    "version": version,
-                    "source": "core",
-                }
-                points.append((point_id, vector, payload))
+    if not all_chunk_data:
+        logger.debug("No files need (re-)embedding — all content hashes match")
+        return 0
 
-            store.upsert(points)
-            total_chunks += len(batch)
+    # Embed all chunks in batches
+    all_texts = [cd[-1] for cd in all_chunk_data]
+    for i in range(0, len(all_texts), BATCH_SIZE):
+        batch_texts = all_texts[i : i + BATCH_SIZE]
+        batch_data = all_chunk_data[i : i + BATCH_SIZE]
+        try:
+            vectors = _embed_batch(api_client, batch_texts, embed_model)
+        except RuntimeError as exc:
+            logger.warning("Embedding failed for batch starting at %d: %s", i, exc)
+            continue
+
+        points = []
+        for j, ((rel_path, category, title, language, version, tags,
+                  content_hash, chunk_text), vector) in enumerate(
+                zip(batch_data, vectors)):
+            point_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"global:{rel_path}:{i + j}",
+            ))
+            payload = {
+                "file": rel_path,
+                "category": category,
+                "title": title,
+                "language": language,
+                "tags": tags,
+                "version": version,
+                "source": "core",
+                "content_hash": content_hash,
+            }
+            points.append((point_id, vector, payload))
+
+        store.upsert(points)
+        total_chunks += len(batch_texts)
 
     return total_chunks
 

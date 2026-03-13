@@ -114,3 +114,32 @@ class OllamaClient(LLMClient):
         except requests.exceptions.RequestException as e:
             log.error(f"[Ollama] Embedding error: {e}")
             return []
+
+    def generate_embeddings_batch(self, texts: list[str], model: Optional[str] = None, **kwargs) -> list[list[float]]:
+        """Embed multiple texts in a single Ollama /api/embed call.
+
+        Ollama natively supports ``"input": ["text1", "text2", ...]``
+        and returns all embeddings in one response, which is much faster
+        than N sequential calls (avoids per-request model load overhead).
+        """
+        if not texts:
+            return []
+        embed_model = model or self.model
+        url = f"{self._api_root}/api/embed"
+        payload = {"model": embed_model, "input": texts}
+        try:
+            response = requests.post(url, json=payload, timeout=300)
+            response.raise_for_status()
+            data = response.json()
+            embeddings = data.get("embeddings", [])
+            if len(embeddings) == len(texts):
+                return embeddings
+            # Fallback: pad missing with empty vectors
+            log.warning("[Ollama] Batch embed returned %d vectors for %d texts",
+                        len(embeddings), len(texts))
+            while len(embeddings) < len(texts):
+                embeddings.append([])
+            return embeddings
+        except requests.exceptions.RequestException as e:
+            log.warning(f"[Ollama] Batch embedding failed, falling back to sequential: {e}")
+            return [self.generate_embedding(t, model=model, **kwargs) for t in texts]

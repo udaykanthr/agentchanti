@@ -274,14 +274,20 @@ def _embed_single(client, text: str, embed_model: str | None) -> list[float]:
 
 def _embed_batch(client, texts: list[str], embed_model: str | None) -> list[list[float]]:
     """
-    Embed a batch of texts via the OpenAI Embeddings API.
+    Embed a batch of texts using the client's native batch endpoint.
 
-    Retries up to MAX_RETRIES times with exponential back-off on failure.
+    Uses ``generate_embeddings_batch()`` which sends all texts in a
+    single API call — much faster than N sequential calls, especially
+    for local models (Ollama, LM Studio) where per-request model load
+    overhead dominates.
+
+    Falls back to sequential ``_embed_single()`` calls if the client
+    does not support batch embedding or the batch call fails.
 
     Parameters
     ----------
     client:
-        An LLM client instance.
+        An LLM client instance with ``generate_embeddings_batch()``.
     texts:
         List of text strings to embed.
     embed_model:
@@ -295,40 +301,40 @@ def _embed_batch(client, texts: list[str], embed_model: str | None) -> list[list
     Raises
     ------
     RuntimeError
-        If all retries are exhausted.
+        If embedding fails for any text.
     """
-    import concurrent.futures
-    vectors = []
-    
-    # Local LLMs (Ollama, LM Studio) severely degrade in performance when hit
-    # with concurrent requests due to KV cache thrashing. Cloud APIs can handle it.
-    client_type = type(client).__name__
-    max_workers = 1 if client_type in ("OllamaClient", "LMStudioClient") else 5
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_index = {
-            executor.submit(_embed_single, client, text, embed_model): i 
-            for i, text in enumerate(texts)
-        }
-        
-        # Initialize results list with empty lists
-        vectors = [[] for _ in range(len(texts))]
-        
-        # Collect results as they complete
-        for future in concurrent.futures.as_completed(future_to_index):
-            idx = future_to_index[future]
-            try:
-                vec = future.result()
+    if not texts:
+        return []
+
+    # Try native batch endpoint first (single API call for all texts)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if hasattr(client, 'generate_embeddings_batch'):
+                vectors = client.generate_embeddings_batch(texts, model=embed_model)
+            else:
+                vectors = [_embed_single(client, t, embed_model) for t in texts]
+
+            # Validate all vectors are non-empty
+            for i, vec in enumerate(vectors):
                 if not vec:
-                    raise RuntimeError(f"Failed to generate embedding for text at index {idx}")
-                vectors[idx] = vec
-            except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to generate embedding for text at index {i}")
+            return vectors
+
+        except Exception as exc:
+            if attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Batch embedding error (attempt %d/%d): %s — retrying in %ds",
+                    attempt, MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+            else:
                 raise RuntimeError(
-                    f"Embedding API formatting failed for sequence {idx}: {exc}"
+                    f"Batch embedding failed after {MAX_RETRIES} attempts: {exc}"
                 ) from exc
-                
-    return vectors
+
+    return [[] for _ in texts]  # unreachable, but satisfies type checker
 
 
 # ---------------------------------------------------------------------------

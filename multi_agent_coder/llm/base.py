@@ -97,3 +97,11 @@ class LLMClient(ABC):
     @abstractmethod
     def generate_embedding(self, text: str, model: Optional[str] = None, **kwargs) -> List[float]:
         """Generate an embedding vector for the given text."""
+
+    def generate_embeddings_batch(self, texts: list[str], model: Optional[str] = None, **kwargs) -> list[list[float]]:
+        """Generate embedding vectors for multiple texts in a single API call.
+
+        Subclasses should override this to use native batch endpoints.
+        Default implementation falls back to sequential single calls.
+        """
+        return [self.generate_embedding(t, model=model, **kwargs) for t in texts]
