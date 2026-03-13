@@ -63,6 +63,7 @@ _DEFAULTS = {
     "editing_slim_context": True,
     "editing_reviewer_diff_mode": True,
     "editing_max_chunk_files": 3,
+    "review_mode": "static",
     "dependency_check_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
@@ -356,6 +357,13 @@ class Config:
                                    _DEFAULTS["editing_max_chunk_files"])
         )
 
+        # Review mode: "static" (default) skips LLM reviewer when offline
+        # lint + import checks pass; "full" always runs LLM reviewer.
+        self.REVIEW_MODE = _get(
+            "REVIEW_MODE", "review_mode",
+            editing_section.get("review_mode", _DEFAULTS["review_mode"]),
+        )
+
         # Dependency check (post-step integration validation)
         dep_section = yd.get("dependency_check", {}) if isinstance(yd.get("dependency_check"), dict) else {}
         self.DEPENDENCY_CHECK_ENABLED = _get_bool(
@@ -432,6 +440,7 @@ class Config:
                 "slim_context": self.EDITING_SLIM_CONTEXT,
                 "reviewer_diff_mode": self.EDITING_REVIEWER_DIFF_MODE,
                 "max_chunk_files": self.EDITING_MAX_CHUNK_FILES,
+                "review_mode": self.REVIEW_MODE,
             },
             "dependency_check": {
                 "enabled": self.DEPENDENCY_CHECK_ENABLED,

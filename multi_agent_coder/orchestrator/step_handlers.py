@@ -2562,15 +2562,18 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             return True, ""
 
         # ── Review gate ──────────────────────────────────────────
-        # When a TEST step follows (skip_review=True), skip the LLM
-        # reviewer and rely on test execution to catch real bugs.
-        # Always run the free offline lint + import checks regardless.
+        # Always run free offline lint + import checks first.
         lint_errors = _quick_offline_lint(files)
         import_errors = _validate_import_paths(files, memory)
         lint_errors = lint_errors + import_errors
 
+        # Determine review mode: "static" (default) or "full"
+        review_mode = "static"
+        if cfg:
+            review_mode = getattr(cfg, "REVIEW_MODE", "static")
+
         if skip_review:
-            # Lint-only path: skip LLM review, test step will validate
+            # Test step follows — only lint, skip all review
             if lint_errors:
                 feedback = f"Lint/syntax errors found:\n{lint_errors}\nFix these issues."
                 display.step_info(step_idx, "Lint errors found, retrying...")
@@ -2580,7 +2583,19 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: Skipped LLM review (test step follows)")
             return True, ""
 
-        # Full LLM review path
+        # Static review mode: accept if lint + import checks pass,
+        # only retry on static failures (no LLM reviewer call).
+        if review_mode == "static":
+            if lint_errors:
+                feedback = f"Static checks found issues:\n{lint_errors}\nFix these issues."
+                display.step_info(step_idx, "Static check errors, retrying...")
+                log.warning(f"Step {step_idx+1}: Static errors: {lint_errors[:300]}")
+                continue
+            display.step_info(step_idx, "Static checks passed ✔")
+            log.info(f"Step {step_idx+1}: Static review passed (lint + imports OK)")
+            return True, ""
+
+        # Full LLM review path (review_mode == "full")
         display.step_info(step_idx, "Reviewing code...")
         sent_before, recv_before = token_tracker.snapshot()
 
@@ -4206,12 +4221,44 @@ def _try_chunk_edit(
         display.step_info(step_idx, "Non-code files, skipping review")
         return True, ""
 
+    # Static checks (free — no LLM cost)
+    lint_errors = _quick_offline_lint(result_files)
+    import_errors = _validate_import_paths(result_files, memory)
+    lint_errors = lint_errors + import_errors
+
+    # Determine review mode: "static" (default) or "full"
+    review_mode_cfg = getattr(cfg, "REVIEW_MODE", "static") if cfg else "static"
+
+    if review_mode_cfg == "static":
+        if lint_errors:
+            log.warning("[ChunkEdit] Static check errors, reverting: %s", lint_errors[:300])
+            # Revert and fall back to full-file for retry with error feedback
+            for fpath, orig_content in original_files.items():
+                if orig_content is not None:
+                    memory.update({fpath: orig_content})
+                    try:
+                        with open(fpath, "w", encoding="utf-8") as f:
+                            f.write(orig_content)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        if fpath in memory.all_files():
+                            del memory.all_files()[fpath]
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+            return None  # Fall back to full-file with static errors as feedback
+        display.step_info(step_idx, "Static checks passed ✔")
+        log.info("[ChunkEdit] Static review passed (lint + imports OK)")
+        return True, ""
+
+    # Full LLM review path (review_mode == "full")
     reviewer_mode = "diff" if getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True) else "full"
 
     display.step_info(step_idx, "Reviewing changes...")
     sent_before, recv_before = token_tracker.snapshot()
 
-    lint_errors = _quick_offline_lint(result_files)
     lint_context = f"\n\n{lint_errors}Please fix these errors in your review." if lint_errors else ""
 
     # Inject KB context so the reviewer has up-to-date framework docs

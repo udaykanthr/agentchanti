@@ -15,6 +15,27 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+# Files that should never appear in LLM context — agentchanti internals,
+# tool configs, and common non-project artifacts.
+_CONTEXT_SKIP_FILES = {
+    ".agentchanti.yaml", ".agentchanti.yml", ".agentchanti_checkpoint.json",
+    "prompt.txt", "CLAUDE.md",
+}
+_CONTEXT_SKIP_PREFIXES = (
+    ".agentchanti/", ".claude/", "_cmd_output/", "_fix_output/",
+    "_search_context/",
+)
+
+
+def _should_skip_for_context(fpath: str) -> bool:
+    """Return True if *fpath* should be excluded from LLM context."""
+    basename = fpath.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if basename in _CONTEXT_SKIP_FILES:
+        return True
+    norm = fpath.replace("\\", "/")
+    return norm.startswith(_CONTEXT_SKIP_PREFIXES)
+
+
 # Patterns for extracting function/class signatures across languages
 _SKELETON_PATTERNS = {
     "python": [
@@ -210,6 +231,8 @@ class FileMemory:
         budget = max_tokens or float("inf")
         used = 0
         for fpath, score in results:
+            if _should_skip_for_context(fpath):
+                continue
             content = self._files.get(fpath, "")
             if not content:
                 continue
@@ -248,6 +271,8 @@ class FileMemory:
         step_lower = step_text.lower()
         scored: list[tuple[int, str, str]] = []
         for fpath, content in self._files.items():
+            if _should_skip_for_context(fpath):
+                continue
             score = 0
             basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
             stem, ext = os.path.splitext(basename)
@@ -279,7 +304,10 @@ class FileMemory:
         with self._lock:
             if not self._files:
                 return "(no files yet)"
-            return ", ".join(self._files.keys())
+            visible = [f for f in self._files if not _should_skip_for_context(f)]
+            if not visible:
+                return "(no files yet)"
+            return ", ".join(visible)
 
     def scoped_context(
         self,
@@ -319,6 +347,8 @@ class FileMemory:
             used = 0
 
             for fpath in relevant_files:
+                if _should_skip_for_context(fpath):
+                    continue
                 content = self._files.get(fpath, "")
                 if not content:
                     # Try looking up by basename

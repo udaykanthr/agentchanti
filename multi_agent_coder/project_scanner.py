@@ -4,17 +4,19 @@ so the planner agent has awareness of the current codebase.
 """
 
 import os
+import subprocess
 
 SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", "venv", ".venv", "env",
     "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
     "target", "bin", "obj", ".idea", ".vscode", ".eggs",
     "site-packages", ".next", ".nuxt", "coverage", "htmlcov",
-    ".agentchanti", "logs",
+    ".agentchanti", "logs", ".claude",
 }
 
 SKIP_FILES = {
-    ".agentchanti.yaml",".agentchanti_checkpoint.json", ".agentchanti.yml",
+    ".agentchanti.yaml", ".agentchanti_checkpoint.json", ".agentchanti.yml",
+    "prompt.txt", "CLAUDE.md",
 }
 
 SKIP_EXTENSIONS = {
@@ -55,6 +57,39 @@ _MAX_KEY_FILES = 15
 _MAX_LINES_PER_FILE = 100
 
 
+def _get_git_tracked_files(directory: str) -> set[str] | None:
+    """Return set of git-tracked file paths (relative, forward-slash).
+
+    Returns None if not a git repo or git is unavailable, so callers
+    can fall back to the hardcoded skip lists.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        tracked = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line:
+                tracked.add(line.replace("\\", "/"))
+        return tracked if tracked else None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _is_gitignored(rel_path: str, git_tracked: set[str] | None) -> bool:
+    """Check if a file should be excluded because it's not git-tracked."""
+    if git_tracked is None:
+        return False  # No git info available, rely on skip lists
+    return rel_path.replace("\\", "/") not in git_tracked
+
+
 def scan_project(directory: str = ".") -> dict:
     """Walk *directory* and return project structure info.
 
@@ -73,6 +108,7 @@ def scan_project(directory: str = ".") -> dict:
     lang_counts: dict[str, int] = {}
 
     abs_dir = os.path.abspath(directory)
+    git_tracked = _get_git_tracked_files(abs_dir)
 
     for root, dirs, files in os.walk(abs_dir):
         # Filter out skipped directories (in-place so os.walk respects it)
@@ -91,6 +127,12 @@ def scan_project(directory: str = ".") -> dict:
             if ext in SKIP_EXTENSIONS:
                 continue
 
+            # Skip gitignored files
+            fpath = os.path.join(root, fname)
+            rel_path = os.path.relpath(fpath, abs_dir).replace("\\", "/")
+            if _is_gitignored(rel_path, git_tracked):
+                continue
+
             file_count += 1
             tree_lines.append(f"{indent}  {fname}")
 
@@ -100,8 +142,6 @@ def scan_project(directory: str = ".") -> dict:
 
             # Read key files (up to limit)
             if fname in KEY_FILENAMES and len(key_files) < _MAX_KEY_FILES:
-                fpath = os.path.join(root, fname)
-                rel_path = os.path.relpath(fpath, abs_dir)
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         lines = []
@@ -131,6 +171,7 @@ def collect_source_files(directory: str = ".") -> dict[str, str]:
     abs_dir = os.path.abspath(directory)
     source_files: dict[str, str] = {}
     total_chars = 0
+    git_tracked = _get_git_tracked_files(abs_dir)
 
     for root, dirs, files in os.walk(abs_dir):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
@@ -155,6 +196,10 @@ def collect_source_files(directory: str = ".") -> dict[str, str]:
                 continue
 
             rel_path = os.path.relpath(fpath, abs_dir).replace("\\", "/")
+
+            # Skip gitignored files
+            if _is_gitignored(rel_path, git_tracked):
+                continue
 
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
