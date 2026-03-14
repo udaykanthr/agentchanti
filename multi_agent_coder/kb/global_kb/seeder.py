@@ -466,6 +466,21 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="npm,set-script,deprecated,pkg,scripts,package-json",
     ),
     ErrorFix(
+        error_type="NpmMissingScript",
+        language="javascript",
+        pattern=r'npm error Missing script: "(\w+)"',
+        cause="The requested script is not defined in the 'scripts' section of package.json.",
+        fix_template="The script '{1}' is missing from package.json.\n\n"
+                     "FIX OPTIONS:\n"
+                     "1. IF TESTING WITH VITEST: Run 'npx vitest' or 'npx vitest run {1}' directly.\n"
+                     "2. IF TESTING WITH JEST: Run 'npx jest' directly.\n"
+                     "3. ADD THE SCRIPT: Edit package.json and add \"{1}\": \"<command>\" to the 'scripts' section.\n"
+                     "   Example: npm pkg set scripts.{1}=\"vitest run\"\n\n"
+                     "Check if you are in the correct directory (sub-project root) where package.json resides.",
+        severity="error",
+        tags="npm,script,missing,package-json,test,vitest,jest",
+    ),
+    ErrorFix(
         error_type="TailwindCSSDeprecatedDirectives",
         language="all",
         pattern=r"@tailwind\s+(base|components|utilities)",

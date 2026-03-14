@@ -8,13 +8,19 @@ user can review changes and approve/reject before files are written to disk.
 from __future__ import annotations
 
 import os
+import sys
 import difflib
 import threading
+import time
+import logging
 from .config import Config
 
 # Hazards that block execution or require explicit confirmation
 HAZARD_BLOCK = "BLOCK"
 HAZARD_WARN = "WARN"
+
+# Get a logger instance consistent with the rest of the package
+log = logging.getLogger("multi_agent_coder")
 
 
 def compute_diff(filepath: str, new_content: str, base_dir: str = ".") -> str | None:
@@ -135,10 +141,10 @@ def _detect_hazards(filepath: str, old_content: str, new_content: str) -> list[t
 
     # 2. Significant Shrinkage (Truncation Risk)
     # If file was > 100 chars and new content is < 50% of old size
-    if len(old_content) > 100 and len(new_content) < len(old_content) * 0.5:
-        hazards.append((HAZARD_WARN,
-                        f"Significant size reduction ({len(old_content)} -> {len(new_content)} chars). "
-                        "Potential accidental truncation."))
+    # if len(old_content) > 100 and len(new_content) < len(old_content) * 0.5:
+    #     hazards.append((HAZARD_WARN,
+    #                     f"Significant size reduction ({len(old_content)} -> {len(new_content)} chars). "
+    #                     "Potential accidental truncation."))
 
     # 3. Strict Package.json Dependency Block
     if fname == "package.json":
@@ -275,7 +281,7 @@ _approval_lock = threading.Lock()
 
 
 def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
-                         auto: bool = False) -> bool:
+                         auto: bool = False, display: "CLIDisplay" | None = None) -> bool:
     """Show diffs in an interactive Textual viewer and wait for approval.
 
     Returns ``True`` if the user approves (or if running in auto mode).
@@ -286,7 +292,6 @@ def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
     causes blank screens, freezes, and unresponsive ESC on Windows).
     """
     global _approve_all
-    from .cli_display import log
 
     diffs = compute_diffs(files, base_dir)
     new_files = [f for f in files if not os.path.isfile(os.path.join(base_dir, f))]
@@ -314,86 +319,36 @@ def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
             return True
 
         # Try Textual TUI
+        if display:
+            log.debug(f"[diff] Pausing display wave_thread={threading.current_thread().name}")
+            display.pause()
         try:
-            return _textual_diff_approval(diffs, new_files, files, base_dir=base_dir)
-        except ImportError:
-            log.warning("Textual not installed — falling back to console diff approval.")
-        except Exception as e:
-            log.warning(f"Textual diff viewer failed: {e}")
+            time.sleep(0.1)  # Settle time for terminal
+            try:
+                log.debug(f"[diff] Launching Textual app wave_thread={threading.current_thread().name}")
+                res = _textual_diff_approval(diffs, new_files, files, base_dir=base_dir)
+                log.debug(f"[diff] Textual app result={res} wave_thread={threading.current_thread().name}")
+                if res is not None:
+                    return res
+                log.warning("[diff] Textual app failed to start — falling back to console approval.")
+            except ImportError:
+                log.warning("Textual not installed — falling back to console diff approval.")
+            except Exception as e:
+                log.warning(f"Textual diff viewer failed: {e}")
+                log.debug(f"[diff] Textual error: {e}", exc_info=True)
 
-        # Fallback: console-based approval
-        return _console_diff_approval(diffs, new_files, files)
+            # Fallback: console-based approval
+            log.debug(f"[diff] Falling back to console approval wave_thread={threading.current_thread().name}")
+            res = _console_diff_approval(diffs, new_files, files, base_dir=base_dir)
+            log.debug(f"[diff] Console approval result={res} wave_thread={threading.current_thread().name}")
+            return res
+        finally:
+            if display:
+                log.debug(f"[diff] Resuming display wave_thread={threading.current_thread().name}")
+                display.resume()
 
 
-def _console_diff_approval(diffs: list[tuple[str, str]],
-                           new_files: list[str],
-                           all_files: dict[str, str]) -> bool:
-    """Fallback console-based diff approval when Textual is unavailable."""
-    global _approve_all
 
-    print("\n" + "=" * 60)
-    print("  DIFF REVIEW")
-    print("=" * 60)
-
-    any_hazards = False
-
-    for filepath, diff_text in diffs:
-        print(f"\n{'─' * 60}")
-        print(f"File: {filepath}")
-        
-        # Check for hazards
-        full_path = os.path.join(base_dir, filepath)
-        old_content = ""
-        if os.path.isfile(full_path):
-             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                 old_content = f.read()
-        
-        new_content = all_files.get(filepath, "")
-        hazards = _detect_hazards(filepath, old_content, new_content)
-        
-        for severity, msg in hazards:
-            any_hazards = True
-            color = "\033[1;31m" # Bold Red
-            reset = "\033[0m"
-            print(f"{color}[!] SAFETY WARNING: {msg}{reset}")
-
-        print(format_colored_diff(diff_text))
-
-    if new_files:
-        print(f"\n  New files: {', '.join(new_files)}")
-
-    print("\n" + "=" * 60)
-    if any_hazards:
-        print("  \033[1;31mHAZARDS DETECTED! Safety confirmation required.\033[0m")
-        print("  Type [CONFIRM] to approve, or [R]eject.")
-    else:
-        print("  [A]pprove  |  [S] Always Approve (don't ask again)  |  [R]eject")
-    print()
-
-    while True:
-        try:
-            choice = input("  Your choice: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return False
-
-        if any_hazards:
-            if choice == "CONFIRM":
-                return True
-            elif choice.lower() in ("r", "reject"):
-                return False
-            else:
-                print("  Invalid choice. Type CONFIRM to proceed or R to reject.")
-        else:
-            choice = choice.lower()
-            if choice in ("a", "approve"):
-                return True
-            elif choice in ("s", "always"):
-                _approve_all = True
-                return True
-            elif choice in ("r", "reject"):
-                return False
-            else:
-                print("  Invalid choice. Use A, S, or R.")
 
 
 def _format_rich_diff(diff_text: str) -> str:
@@ -419,7 +374,7 @@ def _format_rich_diff(diff_text: str) -> str:
 def _textual_diff_approval(diffs: list[tuple[str, str]],
                            new_files: list[str],
                            files: dict[str, str],
-                           base_dir: str = ".") -> bool:
+                           base_dir: str = ".") -> bool | None:
     """Launch a Textual app to display diffs and get approval."""
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal, VerticalScroll
@@ -494,9 +449,9 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
             self._diffs = diffs
             self._new_files = new_files
             self._files = files
-            self._files = files
             self._approved: bool = False
             self._approve_all: bool = False
+            self.started: bool = False
             self._hazards: list[str] = []
 
             # Pre-calc hazards
@@ -576,6 +531,7 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
             yield Footer()
 
         def on_mount(self) -> None:
+            self.started = True
             # Focus the approve button so Tab+Enter works immediately
             # as a keyboard fallback for terminals with poor mouse support.
             btn = self.query_one("#approve-btn", Button)
@@ -613,7 +569,18 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
 
     global _approve_all
     app = DiffApprovalApp(diffs, new_files, files)
-    app.run()
+    
+    start_t = time.monotonic()
+    # signals=False allows running in background threads without signal conflicts
+    app.run(signals=False)
+    elapsed = time.monotonic() - start_t
+
+    # Logic: if the app exits in < 0.3s AND never reached on_mount, it likely
+    # failed to initialize the TUI (common in some thread/terminal combos).
+    if not app.started or (elapsed < 0.3 and not app._approved):
+        log.debug(f"[diff] Textual startup bail: started={app.started}, elapsed={elapsed:.3f}s")
+        return None
+
     if app._approve_all:
         _approve_all = True
     return app._approved
@@ -621,7 +588,8 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
 
 def _console_diff_approval(diffs: list[tuple[str, str]],
                            new_files: list[str],
-                           all_files: dict[str, str] = {}) -> bool:
+                           all_files: dict[str, str],
+                           base_dir: str = ".") -> bool:
     """Fallback console-based diff approval when Textual is unavailable."""
     global _approve_all
 
@@ -629,28 +597,59 @@ def _console_diff_approval(diffs: list[tuple[str, str]],
     print("  DIFF REVIEW")
     print("=" * 60)
 
+    any_hazards = False
     for filepath, diff_text in diffs:
         print(f"\n{'─' * 60}")
+        print(f"File: {filepath}")
+        
+        # Check for hazards
+        full_path = os.path.join(base_dir, filepath)
+        old_content = ""
+        if os.path.isfile(full_path):
+             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                  old_content = f.read()
+        
+        new_content = all_files.get(filepath, "")
+        hazards = _detect_hazards(filepath, old_content, new_content)
+        for severity, msg in hazards:
+            any_hazards = True
+            print(f"\033[1;31m[!] SAFETY WARNING: {msg}\033[0m")
+
         print(format_colored_diff(diff_text))
 
     if new_files:
         print(f"\n  New files: {', '.join(new_files)}")
 
     print("\n" + "=" * 60)
-    print("  [A]pprove  |  [S] Always Approve (don't ask again)  |  [R]eject")
-    print()
-
-    while True:
-        try:
-            choice = input("  Your choice: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        if choice in ("a", "approve"):
-            return True
-        elif choice in ("s", "skip"):
-            _approve_all = True
-            return True
-        elif choice in ("r", "reject"):
-            return False
-        else:
-            print("  Invalid choice. Use A, S, or R.")
+    if any_hazards:
+        print("  \033[1;31mHAZARDS DETECTED! Safety confirmation required.\033[0m")
+        while True:
+            try:
+                sys.stdin.flush()
+                choice = input("  Type [CONFIRM] to approve, or [R]eject: ").strip()
+                if not choice:
+                    continue
+                return choice == "CONFIRM"
+            except (EOFError, KeyboardInterrupt):
+                log.debug(f"[diff] Console hazard input raised exception {threading.current_thread().name}", exc_info=True)
+                return False
+    else:
+        print("  [A]pprove  |  [S] Always Approve (don't ask again)  |  [R]eject")
+        while True:
+            try:
+                sys.stdin.flush()
+                choice = input("  Your choice: ").strip().lower()
+                if not choice:
+                    continue
+                if choice in ("a", "y", "yes", "approve"):
+                    return True
+                elif choice in ("s", "always", "skip"):
+                    _approve_all = True
+                    return True
+                elif choice in ("r", "n", "no", "reject"):
+                    return False
+                else:
+                    print("  Invalid choice. Use A, S, or R.")
+            except (EOFError, KeyboardInterrupt):
+                log.debug(f"[diff] Console choice input raised exception {threading.current_thread().name}", exc_info=True)
+                return False

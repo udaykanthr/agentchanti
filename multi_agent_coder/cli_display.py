@@ -121,6 +121,7 @@ class CLIDisplay:
         self._spinner_stop = threading.Event()
         self._spinner_message: str = ""
         self.start_time = _time.monotonic()
+        self.paused = False
 
     def _refresh_size(self):
         size = shutil.get_terminal_size((80, 24))
@@ -324,6 +325,18 @@ class CLIDisplay:
         """Public: stop the spinner before interactive prompts."""
         self._stop_spinner()
 
+    def pause(self):
+        """Pause all rendering. Use this during interactive prompts."""
+        with self._render_lock:  # Wait for any active render to finish
+            self.paused = True
+        self._stop_spinner()
+
+    def resume(self):
+        """Resume all rendering."""
+        with self._render_lock:
+            self.paused = False
+        self.render()
+
     def _spinner_loop(self):
         """Background loop that animates a spinner on the display."""
         C = self.C_CYAN; D = self.C_DIM; Y = self.C_YELLOW; R = self.C_RESET
@@ -331,6 +344,10 @@ class CLIDisplay:
         start_time = _time.monotonic()
 
         while not self._spinner_stop.is_set():
+            if self.paused:
+                self._spinner_stop.wait(0.5)
+                continue
+
             elapsed = _time.monotonic() - start_time
             time_str = self._format_elapsed(elapsed)
 
@@ -485,6 +502,8 @@ class CLIDisplay:
 
     def render(self):
         """Redraw the full CLI display with positioned sections."""
+        if self.paused:
+            return
         with self._render_lock:
             self._render_unlocked()
 
@@ -499,8 +518,12 @@ class CLIDisplay:
         Y = self.C_YELLOW
         R = self.C_RESET
 
-        # Clear screen
-        os.system('cls' if os.name == 'nt' else 'clear')
+        # Clear screen using ANSI escape codes
+        # \033[H: move cursor back to top-left
+        # \033[2J: clear screen
+        # \033[3J: clear scrollback buffer
+        sys.stdout.write("\033[H\033[2J\033[3J")
+        sys.stdout.flush()
 
         # ── TOP: Compact left-aligned brand + task description ──
         brand_text = "Agent Chanti"
