@@ -43,6 +43,7 @@ from .checkpoint import save_checkpoint, load_checkpoint, clear_checkpoint
 
 from .orchestrator.memory import FileMemory
 from .orchestrator.pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .orchestrator.plan_step import build_waves as _build_plan_waves
 
 
 @dataclass
@@ -397,8 +398,12 @@ def _run_task_impl(
 
     display.set_steps(steps)
 
-    # Execute
-    waves = build_step_waves(steps, dependencies)
+    # Execute — use phase-aware wave builder when structured plan steps exist
+    if plan_steps:
+        plan_waves = _build_plan_waves(plan_steps)
+        waves = [[s.index for s in w] for w in plan_waves]
+    else:
+        waves = build_step_waves(steps, dependencies)
     checkpoint_file = cfg.CHECKPOINT_FILE
     step_results: dict[int, str] = {}
     pipeline_success = True

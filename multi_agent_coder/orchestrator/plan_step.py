@@ -94,6 +94,149 @@ class PlanStep:
 
 
 # ---------------------------------------------------------------------------
+# Echo command parser
+# ---------------------------------------------------------------------------
+
+# Regex for redirect operators in echo commands
+_ECHO_REDIR_RE = re.compile(r'\s+(>{1,2})\s+([^>]+)$')
+# Regex for "type nul > file" (Windows) or "touch file" (Unix)
+_NUL_RE = re.compile(r'^(?:type\s+nul|touch)\s+>\s+(.+)$')
+_TOUCH_RE = re.compile(r'^touch\s+(.+)$')
+
+
+def _parse_echo_commands(lines: list[str]) -> dict[str, str]:
+    """Parse shell-style file creation commands from plan step command lines.
+
+    Extracts file paths and contents from patterns like::
+
+        > cd my-app && echo "import React from 'react'" >> src/App.jsx
+        > cd my-app && type nul > src/index.css
+        > echo "export default {}" >> config.js
+
+    Handles:
+    - ``echo "content" >> file`` (append) and ``echo "content" > file`` (overwrite)
+    - ``type nul > file`` / ``touch file`` (empty file creation)
+    - ``cd dir && ...`` chains (strips the cd prefix)
+    - Escaped quotes inside content (``\\"`` → ``"``)
+    - ``\\n`` escape sequences → actual newlines
+    - Common LLM typo ``src.App.jsx`` → ``src/App.jsx``
+
+    Parameters
+    ----------
+    lines : list[str]
+        Raw command lines (with ``> `` prefix already stripped).
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping of file path → assembled content.  Empty dict if no
+        echo commands were found.
+    """
+    files: dict[str, str] = {}
+
+    for raw_line in lines:
+        # Split on ' && ' to handle chained commands
+        parts = raw_line.split(' && ')
+        for part in parts:
+            part = part.strip()
+            # Skip bare 'cd' commands and 'mkdir' commands
+            if not part or part.startswith('cd ') or part.startswith('mkdir '):
+                continue
+
+            # ── Empty file creation: type nul > file / touch file ──
+            m_nul = _NUL_RE.match(part)
+            if not m_nul:
+                m_nul = _TOUCH_RE.match(part)
+            if m_nul:
+                fpath = m_nul.group(1).strip().strip('"\'')
+                fpath = _fix_dot_paths(fpath)
+                if fpath not in files:
+                    files[fpath] = ""
+                continue
+
+            # ── Echo with redirect ──
+            m_redir = _ECHO_REDIR_RE.search(part)
+            if m_redir and part.startswith('echo '):
+                operator = m_redir.group(1)
+                fpath = m_redir.group(2).strip().strip('"\'')
+                fpath = _fix_dot_paths(fpath)
+
+                # Extract the content between 'echo ' and the redirect
+                content_echo = part[5:m_redir.start()].strip()
+                content_echo = _unescape_echo(content_echo)
+
+                if operator == '>':
+                    files[fpath] = content_echo + "\n"
+                else:  # '>>' append
+                    if fpath not in files:
+                        files[fpath] = ""
+                    files[fpath] += content_echo + "\n"
+
+    return files
+
+
+def _fix_dot_paths(fpath: str) -> str:
+    """Fix common LLM typo: ``src.App.jsx`` → ``src/App.jsx``.
+
+    Only fixes when the first segment looks like a directory name
+    (e.g. ``src``, ``lib``, ``app``, ``components``), so legitimate
+    dotted filenames like ``postcss.config.mjs`` or ``vite.config.ts``
+    are preserved.
+    """
+    # If path already has slashes, it's fine
+    if '/' in fpath or '\\' in fpath:
+        return fpath
+    # Split on dots; if >2 parts and last part is an extension, fix
+    parts = fpath.split('.')
+    if len(parts) > 2:
+        ext = parts[-1]
+        first = parts[0].lower()
+        # Common source extensions
+        if ext in ('js', 'jsx', 'ts', 'tsx', 'css', 'mjs', 'cjs',
+                   'py', 'html', 'json', 'yaml', 'yml', 'toml',
+                   'md', 'txt', 'cfg', 'ini', 'xml', 'svg'):
+            # Only fix if the first segment looks like a directory
+            _dir_prefixes = {
+                'src', 'lib', 'app', 'components', 'pages', 'views',
+                'utils', 'helpers', 'hooks', 'services', 'api',
+                'routes', 'middleware', 'models', 'controllers',
+                'public', 'static', 'assets', 'styles', 'tests',
+                '__tests__', 'test', 'spec',
+            }
+            if first in _dir_prefixes:
+                return '/'.join(parts[:-1]) + '.' + ext
+    return fpath
+
+
+def _unescape_echo(content: str) -> str:
+    """Unescape echo content: strip surrounding quotes and decode escapes."""
+    if content.startswith('"') and content.endswith('"'):
+        content = content[1:-1]
+        content = content.replace('\\"', '"')
+    elif content.startswith("'") and content.endswith("'"):
+        content = content[1:-1]
+        content = content.replace("\\'", "'")
+    # Decode \n escape sequences to actual newlines
+    content = content.replace('\\n', '\n')
+    return content
+
+
+def _flush_echo_inline(step: PlanStep, cmd_lines: list[str]) -> None:
+    """Parse echo commands from a step's command lines and populate inline_code.
+
+    Only populates ``inline_code`` if it is currently empty (i.e.
+    ``---file-content-start---`` was not already used).
+    """
+    if step.inline_code:
+        return  # ---file-content-start--- takes priority
+    if not cmd_lines:
+        return
+    echo_files = _parse_echo_commands(cmd_lines)
+    if echo_files:
+        step.inline_code.update(echo_files)
+
+
+# ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
@@ -119,6 +262,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     steps: list[PlanStep] = []
     current: Optional[PlanStep] = None
     desc_lines: list[str] = []
+    cmd_lines: list[str] = []        # all '> ...' lines for echo parsing
     in_code_block = False
     code_lines: list[str] = []
 
@@ -174,6 +318,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             # Flush previous step
             if current is not None:
                 current.description = " ".join(desc_lines).strip()
+                _flush_echo_inline(current, cmd_lines)
                 steps.append(current)
 
             step_id = m.group(1)
@@ -187,6 +332,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
             current = PlanStep(id=step_id, step_type=step_type, depends_on=depends)
             desc_lines = []
+            cmd_lines = []
             continue
 
         if current is None:
@@ -194,7 +340,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
         # Command line (for CMD steps)
         if line.startswith("> "):
-            current.command = line[2:].strip()
+            cmd_text = line[2:].strip()
+            current.command = cmd_text
+            cmd_lines.append(cmd_text)
 
         # Target files
         elif line.lower().startswith("target:"):
@@ -238,6 +386,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     # Flush last step
     if current is not None:
         current.description = " ".join(desc_lines).strip()
+        _flush_echo_inline(current, cmd_lines)
         steps.append(current)
 
     # Assign 0-based indices
@@ -452,28 +601,45 @@ def _has_cycle(steps: list[PlanStep]) -> bool:
 # ---------------------------------------------------------------------------
 
 def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
-    """Topological sort into parallel execution waves.
+    """Topological sort into parallel execution waves, respecting phase order.
 
-    Each wave is a list of steps whose dependencies are all satisfied.
-    Steps within a wave can execute in parallel.
+    Steps are grouped by their **primary step number** (the integer
+    before the dot, e.g. ``1`` in ``1.1``, ``1.2``).  All waves within
+    phase 1 complete before phase 2 starts.  Within each phase, steps
+    are scheduled based on ``depends_on`` — independent sub-steps
+    within the same phase can execute in parallel.
+
+    This ensures that setup phases (CMD scaffolding) finish before
+    code-generation phases begin, even when the planner omits explicit
+    cross-phase dependencies.
     """
-    completed: set[str] = set()
-    remaining = {s.id for s in steps}
     step_map = {s.id: s for s in steps}
-    waves: list[list[PlanStep]] = []
 
-    while remaining:
-        ready = [
-            sid for sid in sorted(remaining)
-            if all(d in completed for d in step_map[sid].depends_on)
-        ]
-        if not ready:
-            # Circular or missing deps — pick the smallest ID to unblock
-            ready = [min(remaining)]
-        wave = [step_map[sid] for sid in ready]
-        waves.append(wave)
-        completed.update(ready)
-        remaining -= set(ready)
+    # ── Group steps by primary number ──
+    from collections import OrderedDict
+    phase_groups: OrderedDict[str, list[PlanStep]] = OrderedDict()
+    for s in steps:
+        primary = s.id.split(".")[0] if "." in s.id else s.id
+        phase_groups.setdefault(primary, []).append(s)
+
+    waves: list[list[PlanStep]] = []
+    completed: set[str] = set()
+
+    for _phase_key, phase_steps in phase_groups.items():
+        remaining = {s.id for s in phase_steps}
+
+        while remaining:
+            ready = [
+                sid for sid in sorted(remaining)
+                if all(d in completed for d in step_map[sid].depends_on)
+            ]
+            if not ready:
+                # Circular or missing deps — pick the smallest ID to unblock
+                ready = [min(remaining)]
+            wave = [step_map[sid] for sid in ready]
+            waves.append(wave)
+            completed.update(ready)
+            remaining -= set(ready)
 
     return waves
 

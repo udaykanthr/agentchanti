@@ -33,6 +33,7 @@ from ..plugins.registry import PluginRegistry
 
 from .memory import FileMemory
 from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .plan_step import build_waves as _build_plan_waves
 from ..agents.analyser import build_project_context, AnalyseAgent
 
 
@@ -777,8 +778,14 @@ def main():
                         analyse_exc)
 
     # ── 12. Build execution waves ──
-    # `dependencies` is already set by optimize_plan() / parse_step_dependencies()
-    waves = build_step_waves(steps, dependencies)
+    # Use phase-aware wave builder when structured plan steps are available.
+    # This ensures all sub-steps of phase N (e.g. 1.1, 1.2) complete before
+    # phase N+1 (e.g. 2.1, 2.2) begins, even when explicit depends: is missing.
+    if plan_steps_parsed:
+        plan_waves = _build_plan_waves(plan_steps_parsed)
+        waves = [[s.index for s in w] for w in plan_waves]
+    else:
+        waves = build_step_waves(steps, dependencies)
     log.info(f"Execution waves: {waves}")
 
     # Build step reports for HTML output

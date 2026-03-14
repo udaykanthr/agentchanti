@@ -314,6 +314,32 @@ def _execute_step(step_idx: int, step_text: str, *,
 
         display.steps[step_idx]["type"] = step_type
         display.render()
+
+        # ── Step Type Auto-Correction ──
+        # Heuristic: If type is CODE/TEST but looks like CMD, verify with LLM.
+        if plan_step is not None and step_type in ("CODE", "TEST"):
+            has_targets = "target:" in step_text.lower()
+            has_inline = plan_step.inline_code and len(plan_step.inline_code) > 0
+            has_cmd_markers = re.search(r'^[ \t]*[>$][ \t]+', step_text, re.MULTILINE)
+
+            if not has_targets and not has_inline and has_cmd_markers:
+                _logger.info("[Pipeline] Step %s misclassification suspected (%s -> CMD). Re-classifying...",
+                             plan_step.id, step_type)
+                display.step_info(step_idx, f"Suspicious {step_type} classification, verifying...")
+
+                try:
+                    # Reuse the same classification flow as fallback
+                    new_type = _classify_step(step_text, llm_client, display, step_idx)
+                    if new_type != step_type:
+                        _logger.info("[Pipeline] Step %s re-classified: %s -> %s",
+                                     plan_step.id, step_type, new_type)
+                        step_type = new_type
+                        plan_step.step_type = step_type
+                        display.steps[step_idx]["type"] = step_type
+                        display.render()
+                except Exception as e:
+                    _logger.warning("[Pipeline] Re-classification failed for %s: %s", plan_step.id, e)
+
         log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
 
         # --- Structured plan: inject plan-aware context into memory ---
@@ -400,14 +426,31 @@ def _execute_step(step_idx: int, step_text: str, *,
                     all_plan_steps=all_plan_steps)
 
         elif step_type == "TEST":
-            success, error_info = _handle_test_step(
-                step_text, tester, coder, reviewer, executor,
-                task, memory, display, step_idx, language=language,
-                auto=auto, search_agent=search_agent,
-                project_context=project_context,
-                kb_context_builder=kb_context_builder,
-                plan_step=plan_step,
-                all_plan_steps=all_plan_steps)
+            # ── Inline test fast path ──
+            # If the planner already provided test code in the plan,
+            # write it directly and run — zero Tester LLM calls needed.
+            if (plan_step is not None
+                    and plan_step.inline_code
+                    and len(plan_step.inline_code) > 0):
+                display.step_info(step_idx, "Writing inline test code from plan (0 LLM calls)")
+                _inline_test_files = plan_step.inline_code
+                executor.write_files(_inline_test_files)
+                memory.update(_inline_test_files)
+                display.step_tokens(step_idx, 0, 0)
+                _logger.info(
+                    "[PlanStep] Inline test code: wrote %d file(s) for step %s: %s",
+                    len(_inline_test_files), plan_step.id,
+                    list(_inline_test_files.keys()),
+                )
+            else:
+                success, error_info = _handle_test_step(
+                    step_text, tester, coder, reviewer, executor,
+                    task, memory, display, step_idx, language=language,
+                    auto=auto, search_agent=search_agent,
+                    project_context=project_context,
+                    kb_context_builder=kb_context_builder,
+                    plan_step=plan_step,
+                    all_plan_steps=all_plan_steps)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(

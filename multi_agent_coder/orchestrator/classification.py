@@ -157,22 +157,51 @@ def _looks_like_command(text: str) -> bool:
     return first_token in known_commands
 
 
+def _cleanup_shell_command(cmd: str) -> str:
+    """Clean up dangling operators and whitespace from a shell command."""
+    cmd = cmd.strip()
+    # Remove dangling bash-style continuation or logic operators
+    # e.g. "npm install && \" or "npm install \"
+    cmd = re.sub(r'(&&|\|\||\\)\s*$', '', cmd).strip()
+    # Second pass in case there were multiple (e.g. "&& \")
+    cmd = re.sub(r'(&&|\|\||\\)\s*$', '', cmd).strip()
+    return cmd
+
+
 def _extract_commands_from_text(text: str, *, code_blocks_only: bool = False) -> list[str]:
     """Extract shell commands from *text*, handling both triple- and single-backtick blocks.
 
     Prefers triple-backtick code blocks (```cmd, ```bash, ```shell, ```)
     over single-backtick inline code.  Filters out file paths and non-commands.
-
-    Parameters
-    ----------
-    code_blocks_only:
-        If True, only extract from triple-backtick code blocks and skip
-        inline backtick commands.  Useful in diagnosis context where inline
-        backticks often reference the *broken* original command rather than
-        the fix.
     """
     commands: list[str] = []
     seen: set[str] = set()
+
+    def process_block(block: str) -> list[str]:
+        """Process a code block, merging bash line continuations."""
+        block_cmds = []
+        # Merge lines ending with '\'
+        merged_lines = []
+        current_merged = ""
+        for line in block.splitlines():
+            line_strip = line.rstrip()
+            if line_strip.endswith("\\"):
+                current_merged += line_strip[:-1].strip() + " "
+            else:
+                current_merged += line.strip()
+                if current_merged.strip():
+                    merged_lines.append(current_merged.strip())
+                current_merged = ""
+        if current_merged.strip():
+            merged_lines.append(current_merged.strip())
+
+        for line in merged_lines:
+            if _looks_like_command(line):
+                cleaned = _cleanup_shell_command(line)
+                if cleaned and cleaned not in seen:
+                    block_cmds.append(cleaned)
+                    seen.add(cleaned)
+        return block_cmds
 
     # 1. Triple-backtick code blocks (```lang\n...\n```)
     for m in re.finditer(r"```(?:\w*)\n(.*?)```", text, re.DOTALL):
@@ -180,23 +209,22 @@ def _extract_commands_from_text(text: str, *, code_blocks_only: bool = False) ->
         # Heredoc blocks (cat << 'EOF' ... EOF) must stay as a single command;
         # splitting them line-by-line destroys the file content.
         if re.search(r'<<-?\s*[\'"]?(\w+)[\'"]?', block):
-            if block not in seen:
-                commands.append(block)
-                seen.add(block)
+            cleaned = _cleanup_shell_command(block)
+            if cleaned and cleaned not in seen:
+                commands.append(cleaned)
+                seen.add(cleaned)
         else:
-            for line in block.splitlines():
-                line = line.strip()
-                if line and _looks_like_command(line) and line not in seen:
-                    commands.append(line)
-                    seen.add(line)
+            commands.extend(process_block(block))
 
     # 2. Single-backtick inline commands (`...`) — skip when code_blocks_only
     if not code_blocks_only:
         for m in re.finditer(r"(?<!`)`([^`\n]+)`(?!`)", text):
             cmd = m.group(1).strip()
-            if cmd and _looks_like_command(cmd) and cmd not in seen:
-                commands.append(cmd)
-                seen.add(cmd)
+            if cmd and _looks_like_command(cmd):
+                cleaned = _cleanup_shell_command(cmd)
+                if cleaned and cleaned not in seen:
+                    commands.append(cleaned)
+                    seen.add(cleaned)
 
     return commands
 

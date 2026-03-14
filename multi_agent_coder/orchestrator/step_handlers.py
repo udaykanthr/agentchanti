@@ -21,7 +21,10 @@ from ..language import (
 )
 
 from .memory import FileMemory
-from .classification import _extract_command_from_step, _extract_commands_from_text, _looks_like_command
+from .classification import (
+    _extract_command_from_step, _extract_commands_from_text,
+    _looks_like_command, _cleanup_shell_command
+)
 
 from ..diff_display import show_diffs, prompt_diff_approval, _detect_hazards
 
@@ -680,6 +683,7 @@ def _shell_instructions() -> str:
             "For activating a virtual environment use: call venv\\Scripts\\activate\n"
             "Do NOT use Unix commands: source, mkdir -p, touch, rm -rf, cat, ls, chmod, export.\n"
             "Do NOT use PowerShell cmdlets like Get-ChildItem, Select-Object, etc.\n"
+            "Do NOT use bash-style line continuation characters (`\\`). Write multiline commands on a single line using `&&`.\n"
         )
     else:
         _sysname = platform.system()
@@ -1101,6 +1105,10 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             log.warning(f"Step {step_idx+1}: LLM returned empty command.")
             return True, ""
 
+    # ── Normalize command ──
+    # Clean up bash-style line continuations and dangling operators
+    cmd = _cleanup_shell_command(cmd)
+
     # Detect sub-project root so commands like `npm install` run in the
     # correct directory instead of the repo root.
     subproject_cwd = None
@@ -1228,7 +1236,11 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
             f"YOUR generated version (has problems):\n"
             f"```\n{new_content}\n```\n\n"
             f"The step was: {step_text}\n\n"
-            f"Produce a CORRECTED version of `{filepath}` that:\n"
+            f"If this change is **intentional** (e.g. you are deliberately overwriting "
+            f"a template or removing code as requested), reply with exactly `[INTENTIONAL]` "
+            f"and nothing else.\n\n"
+            f"Otherwise, if this is an **accidental error** (truncation, missing exports), "
+            f"produce a CORRECTED version of `{filepath}` that:\n"
             f"1. Keeps ALL existing content (dependencies, imports, configs, etc.)\n"
             f"2. Only adds/changes what the step requires\n"
             f"3. Does NOT remove anything that was in the original file\n\n"
@@ -1246,6 +1258,11 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
         sent_delta = sent_after - sent_before
         recv_delta = recv_after - recv_before
         display.step_tokens(step_idx, sent_delta, recv_delta)
+
+        if "[INTENTIONAL]" in fix_response:
+            log.info(f"Step {step_idx+1}: Hazard in {filepath} marked as intentional by LLM.")
+            display.step_info(step_idx, f"Verified intentional change in {filepath}")
+            continue
 
         explanation = CLIDisplay.extract_explanation(fix_response)
         if explanation:
@@ -2347,6 +2364,8 @@ def _build_batch_error_summary(output: str, max_chars: int = 6000) -> str:
     return result
 
 
+
+
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
                       executor: Executor, task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
@@ -2493,6 +2512,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         files = executor.parse_code_blocks(response)
         if not files:
             files = executor.parse_code_blocks_fuzzy(response)
+        if not files:
+            # Fallback: LLM response might contain echo commands
+            from .plan_step import _parse_echo_commands as _parse_echo_resp
+            _echo_lines = [l.strip().lstrip('> ').lstrip('$ ')
+                           for l in response.splitlines()
+                           if l.strip().startswith(('>', '$', 'echo '))]
+            if _echo_lines:
+                files = _parse_echo_resp(_echo_lines)
         if not files:
             feedback = "No file markers found. Use #### [FILE]: path/to/file.py format."
             display.step_info(step_idx, "No files parsed, retrying...")
@@ -3265,6 +3292,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         except Exception:
             pass
 
+
     for gen_attempt in range(1, MAX_TEST_GEN_RETRIES + 1):
         display.step_info(step_idx, f"Generating tests (attempt {gen_attempt}/{MAX_TEST_GEN_RETRIES})...")
         kb_ctx = getattr(memory, '_kb_context', '')
@@ -3329,6 +3357,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         test_files = executor.parse_code_blocks(test_response)
         if not test_files:
             test_files = executor.parse_code_blocks_fuzzy(test_response)
+        if not test_files:
+            # Fallback: LLM response might contain echo commands
+            from .plan_step import _parse_echo_commands as _parse_echo_resp
+            _echo_lines = [l.strip().lstrip('> ').lstrip('$ ')
+                           for l in test_response.splitlines()
+                           if l.strip().startswith(('>', '$', 'echo '))]
+            if _echo_lines:
+                test_files = _parse_echo_resp(_echo_lines)
         if not test_files:
             feedback = "No test files found. Use #### [FILE]: format."
             display.step_info(step_idx, "No test files parsed, retrying...")

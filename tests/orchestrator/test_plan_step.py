@@ -313,21 +313,21 @@ class TestFixImportDependencies(unittest.TestCase):
     def test_waves_reordered_after_fix(self):
         """After fix, wave builder should schedule producer before consumer."""
         steps = [
-            PlanStep(id="10", step_type="CODE", index=0,
+            PlanStep(id="1.1", step_type="CODE", index=0,
                      target_files=["src/App.jsx"],
                      imports_from={"src/components/ErrorBoundary.jsx": ["ErrorBoundary"]}),
-            PlanStep(id="11", step_type="CODE", index=1,
+            PlanStep(id="1.2", step_type="CODE", index=1,
                      target_files=["src/components/ErrorBoundary.jsx"],
                      exports=["ErrorBoundary"]),
         ]
         fix_import_dependencies(steps)
         waves = build_waves(steps)
-        # ErrorBoundary (step 11) must be in an earlier wave than App (step 10)
+        # ErrorBoundary (step 1.2) must be in an earlier wave than App (step 1.1)
         wave_of = {}
         for wi, wave in enumerate(waves):
             for s in wave:
                 wave_of[s.id] = wi
-        self.assertLess(wave_of["11"], wave_of["10"])
+        self.assertLess(wave_of["1.2"], wave_of["1.1"])
 
 
 class TestBuildWaves(unittest.TestCase):
@@ -350,6 +350,195 @@ class TestBuildWaves(unittest.TestCase):
         waves = build_waves(steps)
         self.assertEqual(len(waves), 2)
         self.assertEqual(len(waves[1]), 2)  # 2.1 and 2.2 in parallel
+
+    def test_phase_ordering(self):
+        """Steps 2.x should always execute after all 1.x waves, even with depends:none."""
+        steps = [
+            PlanStep(id="1.1", step_type="CMD", index=0),
+            PlanStep(id="1.2", step_type="CMD", depends_on=["1.1"], index=1),
+            PlanStep(id="2.1", step_type="CODE", index=2),  # depends:none
+            PlanStep(id="2.2", step_type="CODE", index=3),  # depends:none
+            PlanStep(id="2.3", step_type="CODE", depends_on=["2.2"], index=4),
+        ]
+        waves = build_waves(steps)
+        # Phase 1: wave[0]=[1.1], wave[1]=[1.2]
+        # Phase 2: wave[2]=[2.1, 2.2], wave[3]=[2.3]
+        self.assertEqual(len(waves), 4)
+        self.assertEqual([s.id for s in waves[0]], ["1.1"])
+        self.assertEqual([s.id for s in waves[1]], ["1.2"])
+        phase2_ids = {s.id for w in waves[2:] for s in w}
+        self.assertEqual(phase2_ids, {"2.1", "2.2", "2.3"})
+        # 2.1 and 2.2 should be parallel in the same wave
+        self.assertEqual(len(waves[2]), 2)
+
+    def test_phase_ordering_real_world(self):
+        """Real-world plan: CMD setup then CODE generation."""
+        steps = [
+            PlanStep(id="1.1", step_type="CMD", index=0),  # npm create
+            PlanStep(id="1.2", step_type="CMD", depends_on=["1.1"], index=1),  # npm install
+            PlanStep(id="1.3", step_type="CMD", depends_on=["1.2"], index=2),  # npm install tailwind
+            PlanStep(id="2.1", step_type="CODE", index=3),  # index.css - depends:none
+            PlanStep(id="2.2", step_type="CODE", index=4),  # App.jsx - depends:none
+            PlanStep(id="2.3", step_type="CODE", depends_on=["2.2"], index=5),  # App.test.js
+            PlanStep(id="2.4", step_type="CODE", index=6),  # vitest.config.js
+            PlanStep(id="2.5", step_type="CODE", index=7),  # vitest.setup.js
+        ]
+        waves = build_waves(steps)
+        # Phase 1 should be first 3 waves
+        phase1_waves = [w for w in waves if any(s.id.startswith("1.") for s in w)]
+        phase2_waves = [w for w in waves if any(s.id.startswith("2.") for s in w)]
+        # All phase 1 waves come before all phase 2 waves
+        last_phase1_idx = max(waves.index(w) for w in phase1_waves)
+        first_phase2_idx = min(waves.index(w) for w in phase2_waves)
+        self.assertLess(last_phase1_idx, first_phase2_idx)
+
+
+class TestEchoInlineCode(unittest.TestCase):
+    """Tests for echo command parsing into inline_code during plan parsing."""
+
+    def test_echo_single_file(self):
+        """Echo command in CODE step populates inline_code."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create PostCSS config
+target: postcss.config.mjs
+> echo "export default { plugins: {} }" > postcss.config.mjs
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("postcss.config.mjs", steps[0].inline_code)
+        self.assertIn("plugins", steps[0].inline_code["postcss.config.mjs"])
+
+    def test_echo_append_multiple_lines(self):
+        """Multiple echo >> commands build up file content."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create CSS file
+target: src/index.css
+> echo "@import 'tailwindcss';" >> src/index.css
+> echo ".container { max-width: 1200px; }" >> src/index.css
+==END==
+"""
+        steps = parse_structured_plan(text)
+        code = steps[0].inline_code.get("src/index.css", "")
+        self.assertIn("@import 'tailwindcss';", code)
+        self.assertIn(".container", code)
+
+    def test_echo_with_cd_prefix(self):
+        """cd dir && echo ... chains are handled."""
+        text = """
+==PLAN==
+--STEP 3.1 [CODE] depends:1.1
+Create config
+target: config.js
+> cd my-app && echo "module.exports = {};" > config.js
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIn("config.js", steps[0].inline_code)
+        self.assertIn("module.exports", steps[0].inline_code["config.js"])
+
+    def test_dot_path_fixing(self):
+        """src.App.jsx is fixed to src/App.jsx."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create App component
+target: src/App.jsx
+> echo "export default function App() { return null; }" > src.App.jsx
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIn("src/App.jsx", steps[0].inline_code)
+
+    def test_file_content_start_takes_priority(self):
+        """---file-content-start--- blocks take priority over echo commands."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create config
+target: config.js
+---file-content-start---
+module.exports = { priority: true };
+---file-content-end---
+> echo "module.exports = { echo_version: true };" > config.js
+==END==
+"""
+        steps = parse_structured_plan(text)
+        code = steps[0].inline_code.get("config.js", "")
+        # file-content-start takes priority, echo should be ignored
+        self.assertIn("priority", code)
+        self.assertNotIn("echo_version", code)
+
+    def test_touch_creates_empty_file(self):
+        """touch file creates an empty entry in inline_code."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create files
+target: src/index.css
+> touch src/index.css
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIn("src/index.css", steps[0].inline_code)
+        self.assertEqual(steps[0].inline_code["src/index.css"], "")
+
+    def test_cmd_step_echo_populates_inline_code(self):
+        """CMD steps with echo commands also get inline_code."""
+        text = """
+==PLAN==
+--STEP 1.1 [CMD] depends:none
+Scaffold project and create configs
+> npm create vite@latest my-app -- --template react
+> echo "module.exports = { plugins: {} };" > postcss.config.mjs
+produces: package.json, postcss.config.mjs
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIn("postcss.config.mjs", steps[0].inline_code)
+
+    def test_mixed_steps_with_and_without_echo(self):
+        """Some steps have echo, some don't."""
+        text = """
+==PLAN==
+--STEP 1.1 [CMD] depends:none
+Install deps
+> npm install express
+
+--STEP 2.1 [CODE] depends:1.1
+Create config
+target: config.js
+> echo "module.exports = {};" > config.js
+
+--STEP 3.1 [CODE] depends:2.1
+Create server (complex)
+target: src/server.js
+exports: app
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(steps[0].inline_code, {})  # just npm install, no echo
+        self.assertIn("config.js", steps[1].inline_code)  # has echo
+        self.assertEqual(steps[2].inline_code, {})  # no echo
+
+    def test_newline_escape_in_echo(self):
+        """\\n in echo content becomes actual newlines."""
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.1
+Create config
+target: config.js
+> echo "line1\\nline2\\nline3" > config.js
+==END==
+"""
+        steps = parse_structured_plan(text)
+        code = steps[0].inline_code.get("config.js", "")
+        self.assertIn("line1\nline2\nline3", code)
 
 
 if __name__ == "__main__":
