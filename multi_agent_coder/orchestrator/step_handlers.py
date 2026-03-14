@@ -2462,7 +2462,11 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         if kb_ctx:
             context_prefix += kb_ctx + "\n\n"
         # Inject explicitly-fetched behavioral instructions for JS/TS
-        if _code_behavioral_ctx and _code_behavioral_ctx not in context_prefix:
+        # ONLY when batch_search didn't already include them (trimmed or
+        # missed by vector search).  This avoids bloating the prompt and
+        # ensures framework/library docs keep their higher priority.
+        if (_code_behavioral_ctx
+                and "[BEHAVIORAL INSTRUCTIONS]" not in context_prefix):
             context_prefix += _code_behavioral_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
@@ -3337,9 +3341,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         if kb_ctx:
             gen_context += kb_ctx + "\n\n"
         # Inject behavioral instructions for JS/TS test generation
-        # (ensures react test rules are always in context, not relying
-        # on vector search relevance)
-        if _behavioral_ctx and _behavioral_ctx not in gen_context:
+        # only when batch_search didn't already include them (avoids
+        # bloating prompt; framework/library docs keep higher priority).
+        if (_behavioral_ctx
+                and "[BEHAVIORAL INSTRUCTIONS]" not in gen_context):
             gen_context += _behavioral_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"
 
@@ -4202,8 +4207,12 @@ def _try_chunk_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prompt_prefix += kb_ctx + "\n\n"
-    # Explicit behavioral instructions for JS/TS chunk edits
-    if language in ("javascript", "typescript") and kb_context_builder is not None:
+    # Explicit behavioral instructions for JS/TS chunk edits — only when
+    # batch_search didn't already include them (avoids bloating context
+    # and preserves framework/library doc priority).
+    if (language in ("javascript", "typescript")
+            and kb_context_builder is not None
+            and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix):
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
@@ -4215,7 +4224,7 @@ def _try_chunk_edit(
                     _beh_parts = []
                     for item in _beh_results:
                         content = getattr(item, "content", "") or getattr(item, "title", "")
-                        if content and content not in prompt_prefix:
+                        if content:
                             _beh_parts.append(content)
                     if _beh_parts:
                         prompt_prefix += (
