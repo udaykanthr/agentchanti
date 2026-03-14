@@ -86,6 +86,36 @@ class TestExtractFileDeps:
         assert "API_URL" in deps.exports
         assert "fetchData" in deps.exports
 
+    def test_js_has_default_export_true(self):
+        content = "export default function App() { return <div/>; }"
+        deps = extract_file_deps("src/App.jsx", content)
+        assert deps.has_default_export is True
+
+    def test_js_has_default_export_false(self):
+        content = "function App() { return <div/>; }"
+        deps = extract_file_deps("src/App.jsx", content)
+        assert deps.has_default_export is False
+
+    def test_js_module_exports_counts_as_default(self):
+        content = "module.exports = App;"
+        deps = extract_file_deps("src/App.js", content)
+        assert deps.has_default_export is True
+
+    def test_js_default_imports_detected(self):
+        content = (
+            "import React from 'react';\n"
+            "import Header from './components/Header';\n"
+            "import { useState } from 'react';\n"
+        )
+        deps = extract_file_deps("src/App.jsx", content)
+        # Only local default imports tracked (not external like 'react')
+        assert "./components/Header" in deps.default_imports
+
+    def test_named_import_not_in_default_imports(self):
+        content = "import { Header } from './components/Header';\n"
+        deps = extract_file_deps("src/App.jsx", content)
+        assert deps.default_imports == []
+
     def test_js_module_exports(self):
         content = "module.exports = { add, subtract };\n"
         deps = extract_file_deps("math.js", content)
@@ -475,6 +505,75 @@ class TestFindGaps:
         )
         # Should detect either orphaned_export or missing_connection
         assert len(gaps) >= 1
+
+    def test_detects_missing_default_export_when_default_imported(self):
+        """A new component file lacks export default but is default-imported."""
+        before_files = {
+            "src/App.tsx": (
+                "import Dashboard from './pages/Dashboard';\n"
+                "export default function App() { return <Dashboard/>; }"
+            ),
+        }
+        before = build_snapshot(before_files)
+        after_files = dict(before_files)
+        # Dashboard.jsx created WITHOUT export default
+        after_files["src/pages/Dashboard.tsx"] = (
+            "function Dashboard() { return <div>Dashboard</div>; }"
+        )
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["src/pages/Dashboard.tsx"],
+            step_text="Create Dashboard page",
+            memory_files=after_files,
+        )
+        missing_def = [g for g in gaps if g.gap_type == "missing_default_export"]
+        assert len(missing_def) == 1
+        assert missing_def[0].source_file == "src/pages/Dashboard.tsx"
+        assert "Dashboard" in missing_def[0].symbol
+
+    def test_detects_lost_default_export_after_edit(self):
+        """A file that previously had export default loses it after editing."""
+        before_files = {
+            "src/App.tsx": "export default function App() { return <div/>; }",
+            "src/Header.tsx": "export default function Header() { return <h1/>; }",
+        }
+        before = build_snapshot(before_files)
+        after_files = {
+            "src/App.tsx": before_files["src/App.tsx"],
+            # Header was edited and lost its export default
+            "src/Header.tsx": "function Header() { return <h1>Updated</h1>; }",
+        }
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["src/Header.tsx"],
+            step_text="Update Header component",
+            memory_files=after_files,
+        )
+        missing_def = [g for g in gaps if g.gap_type == "missing_default_export"]
+        assert len(missing_def) == 1
+        assert "was removed during editing" in missing_def[0].description
+
+    def test_no_missing_default_export_when_present(self):
+        """No gap when the component file has export default."""
+        before = DependencySnapshot()
+        after_files = {
+            "src/App.tsx": (
+                "import Header from './components/Header';\n"
+                "export default function App() { return <Header/>; }"
+            ),
+            "src/components/Header.tsx": "export default function Header() { return <h1/>; }",
+        }
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["src/components/Header.tsx"],
+            step_text="Create Header",
+            memory_files=after_files,
+        )
+        missing_def = [g for g in gaps if g.gap_type == "missing_default_export"]
+        assert len(missing_def) == 0
 
     def test_no_gaps_when_everything_connected(self):
         before_files = {

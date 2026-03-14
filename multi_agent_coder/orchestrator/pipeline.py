@@ -423,7 +423,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                     skip_review=_has_test_after,
                     project_context=project_context,
                     plan_step=plan_step,
-                    all_plan_steps=all_plan_steps)
+                    all_plan_steps=all_plan_steps,
+                    kb_context_builder=kb_context_builder)
 
         elif step_type == "TEST":
             # ── Inline test fast path ──

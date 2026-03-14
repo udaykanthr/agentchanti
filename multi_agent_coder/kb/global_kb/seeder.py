@@ -988,25 +988,47 @@ _ERROR_SEEDS: list[ErrorFix] = [
               "This is the #1 most common import mistake LLMs make when generating test files — "
               "they assume a default export without reading the component source.",
         fix_template="FIX: Match the import style to the component's actual export style.\n\n"
-                     "If the component uses a NAMED export:\n"
-                     "  // Component: export function Charts() { ... }\n"
-                     "  // or:        export const Charts = () => { ... }\n\n"
-                     "  WRONG:   import Charts from '../components/Charts'\n"
-                     "  CORRECT: import { Charts } from '../components/Charts'\n\n"
-                     "If the component uses a DEFAULT export:\n"
-                     "  // Component: export default function Charts() { ... }\n"
-                     "  // or:        const Charts = () => { ... }; export default Charts\n\n"
-                     "  WRONG:   import { Charts } from '../components/Charts'\n"
-                     "  CORRECT: import Charts from '../components/Charts'\n\n"
-                     "HOW TO DETERMINE THE EXPORT STYLE:\n"
-                     "1. Read the component source file.\n"
-                     "2. Look for 'export default' (default export) vs 'export function/const' (named export).\n"
-                     "3. A file can have BOTH — one default export and multiple named exports.\n"
-                     "4. If unsure, check how OTHER files in the project import the same component.\n\n"
-                     "CRITICAL: ALWAYS read the component source before writing the import in a test file. "
-                     "Never assume the export style.",
+                     "1. CHECK COMPONENT EXPORT: Read the component file being imported.\n"
+                     "   - If it uses NAMED export: export function App() { ... }\n"
+                     "     -> Use NAMED import: import { App } from './App'\n"
+                     "   - If it uses DEFAULT export: export default function App() { ... }\n"
+                     "     -> Use DEFAULT import: import App from './App'\n\n"
+                     "2. ADD MISSING EXPORTS: If the component is not exported at all, add "
+                     "   'export default ComponentName;' at the bottom of the file.\n\n"
+                     "3. PREFER DEFAULT EXPORT: For primary components, always use 'export default' "
+                     "   as per 'React Component Export Instructions' behavioral doc.\n\n"
+                     "CRITICAL: NEVER assume the export style. Always READ the source file "
+                     "before writing an import in a test file.",
         severity="error",
         tags="element,type,invalid,undefined,import,export,default,named,mixed,react,component,testing,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="ThreeJsWebGLContextError",
+        language="javascript",
+        pattern=r"Error: Error creating WebGL context.",
+        cause="Three.js WebGLRenderer requires a WebGL context which is not available in headless "
+              "Node.js/JSDOM environments. Vitest and Jest tests running in JSDOM do not have a GPU.",
+        fix_template="FIX: Mock the THREE.WebGLRenderer in your test or setup file.\n\n"
+                     "Option 1 — Minimal Mock (Recommended):\n"
+                     "  vi.mock('three', async () => {\n"
+                     "    const actual = await vi.importActual('three')\n"
+                     "    return {\n"
+                     "      ...actual,\n"
+                     "      WebGLRenderer: vi.fn().mockImplementation(() => ({\n"
+                     "        setSize: vi.fn(),\n"
+                     "        render: vi.fn(),\n"
+                     "        dispose: vi.fn(),\n"
+                     "        setClearColor: vi.fn(),\n"
+                     "        domElement: document.createElement('canvas'),\n"
+                     "      })),\n"
+                     "    }\n"
+                     "  })\n\n"
+                     "Option 2 — Use vitest-canvas-mock:\n"
+                     "  1. npm install --save-dev vitest-canvas-mock\n"
+                     "  2. Add to vitest.config.ts: test: { setupFiles: ['vitest-canvas-mock'] }\n\n"
+                     "Option 3 — Mock the global HTMLCanvasElement.prototype.getContext to return a dummy context.",
+        severity="error",
+        tags="threejs,webgl,renderer,canvas,mock,vitest,jest,jsdom,context,javascript,typescript",
     ),
 ]
 
@@ -1532,6 +1554,104 @@ with Vitest's `expect`.
    JSX in `.jsx`/`.tsx` files, causing parse errors in tests.
 """,
     },
+    "threejs-webgl-error-fix.md": {
+        "title": "Three.js + Vitest: Fixing WebGL Context Errors",
+        "tags": "threejs, webgl, vitest, jest, jsdom, mock, canvas, renderer, setup",
+        "content": """## Overview
+
+When testing components that use Three.js (like `WebGLRenderer`) in a headless environment 
+(Vitest or Jest with JSDOM), you will often encounter the error:
+`Error: Error creating WebGL context.`
+
+This happens because JSDOM does not implement a WebGL context.
+
+## Solution 1: Mocking WebGLRenderer (Recommended)
+
+The most efficient way to fix this in component tests is to mock the `WebGLRenderer` 
+to prevent it from trying to initialize a real WebGL context.
+
+### Using Vitest
+
+Add this to your test file or `vitest.setup.js`:
+
+```javascript
+import { vi } from 'vitest'
+
+vi.mock('three', async () => {
+  const actual = await vi.importActual('three')
+  return {
+    ...actual,
+    WebGLRenderer: vi.fn().mockImplementation(() => ({
+      setSize: vi.fn(),
+      setPixelRatio: vi.fn(),
+      render: vi.fn(),
+      dispose: vi.fn(),
+      setClearColor: vi.fn(),
+      domElement: document.createElement('canvas'),
+    })),
+  }
+})
+```
+
+## Solution 2: Automated Canvas Mocking
+
+If you have many components using Canvas/WebGL, you can use `vitest-canvas-mock`.
+
+1. **Install**:
+```bash
+npm install --save-dev vitest-canvas-mock
+```
+
+2. **Configure `vitest.config.ts`**:
+```typescript
+export default defineConfig({
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['vitest-canvas-mock'],
+  },
+})
+```
+
+## Solution 3: Manual Context Mocking
+
+If you only need to bypass the context creation check, you can mock `getContext` globally:
+
+```javascript
+HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
+  // Mock minimal context methods if needed
+  fillRect: vi.fn(),
+  clearRect: vi.fn(),
+  getImageData: vi.fn(),
+  putImageData: vi.fn(),
+  createImageData: vi.fn(),
+  setTransform: vi.fn(),
+  drawImage: vi.fn(),
+  save: vi.fn(),
+  restore: vi.fn(),
+  beginPath: vi.fn(),
+  moveTo: vi.fn(),
+  lineTo: vi.fn(),
+  closePath: vi.fn(),
+  stroke: vi.fn(),
+  translate: vi.fn(),
+  scale: vi.fn(),
+  rotate: vi.fn(),
+  arc: vi.fn(),
+  fill: vi.fn(),
+  measureText: vi.fn().mockReturnValue({ width: 0 }),
+  transform: vi.fn(),
+  rect: vi.fn(),
+  clip: vi.fn(),
+})
+```
+
+## Verification
+
+After applying one of these fixes, your Three.js components should render without 
+throwing the WebGL context error, allowing you to test other aspects of the component 
+(props, headings, UI elements).
+""",
+    },
 }
 
 _BEHAVIORAL_DOCS = {
@@ -1976,6 +2096,69 @@ const table = screen.getByRole('table')
 
 **Key pattern:** Await the FIRST query to confirm the lazy component loaded,
 then use sync queries for the rest of the component's elements.
+""",
+    },
+    "react-export-default-instructions.md": {
+        "title": "React Component Export Instructions",
+        "tags": "react, jsx, tsx, export, default, naming, consistency, behavioral, instructions, component, create, modify, edit, generate",
+        "content": """## CRITICAL: React Component Export Rules
+
+When generating or modifying React JSX/TSX component files, you MUST follow these rules.
+Violating these rules WILL break the application at runtime with missing default export errors.
+
+## Rule 1: ALWAYS include `export default` for the primary component
+
+Every React component file (.jsx/.tsx) MUST have exactly one `export default` for its primary component.
+This is MANDATORY — Vite, Next.js, React Router, and most frameworks require default exports for page/route components.
+
+CORRECT examples:
+```jsx
+// Option A: inline default export
+export default function Dashboard() {
+  return <div>Dashboard</div>
+}
+
+// Option B: separate default export
+function Dashboard() {
+  return <div>Dashboard</div>
+}
+export default Dashboard;
+```
+
+WRONG — missing export default (WILL cause runtime error):
+```jsx
+// BAD: no default export — other files importing this will get undefined
+function Dashboard() {
+  return <div>Dashboard</div>
+}
+```
+
+## Rule 2: NEVER remove existing `export default` statements
+
+When editing or modifying a component file, you MUST preserve the `export default` statement.
+If the file already has `export default`, it MUST remain in your output. Removing it breaks
+every file that imports this component. This is the #1 most common LLM mistake when editing
+React components — the LLM rewrites the component but drops the export default line.
+
+## Rule 3: When rewriting a component, put `export default` at the END of the file
+
+If you rewrite the entire component, always include `export default ComponentName;` as the
+last line, or use `export default function ComponentName()` at the function declaration.
+
+## Rule 4: Ensure consistency between component name and export
+
+The default-exported component name should match the filename in PascalCase:
+- `Dashboard.jsx` → `export default function Dashboard()`
+- `UserProfile.jsx` → `export default function UserProfile()`
+
+## Rule 5: Match import style in tests and other files
+
+Default export → default import: `import Dashboard from './Dashboard'`
+Named export → named import: `import { Dashboard } from './Dashboard'`
+
+## Rule 6: Avoid mixed default and named exports for the same component
+
+Use `export default` for the main component. Named exports for helpers/constants only.
 """,
     },
 }

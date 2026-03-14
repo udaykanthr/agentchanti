@@ -57,12 +57,14 @@ class FileDeps:
     file_path: str
     imports: list[str] = field(default_factory=list)
     exports: list[str] = field(default_factory=list)
+    has_default_export: bool = False
+    default_imports: list[str] = field(default_factory=list)
 
 
 @dataclass
 class IntegrationGap:
     """A detected integration problem between files."""
-    gap_type: str               # "orphaned_export" | "broken_import" | "missing_connection"
+    gap_type: str               # "orphaned_export" | "broken_import" | "missing_connection" | "missing_default_export"
     source_file: str            # The file where the problem originates
     target_file: str | None     # The file that should reference/be referenced
     symbol: str                 # The symbol name(s) involved
@@ -140,6 +142,23 @@ _LANG_PATTERNS: dict[str, tuple[list, list]] = {
     "rust":       (_RUST_IMPORT_PATTERNS, _RUST_EXPORT_PATTERNS),
 }
 
+# ── JS/TS default export detection ────────────────────────────────
+# Matches any form of default export: export default function X, export default X,
+# export default class X, module.exports = X
+_JS_DEFAULT_EXPORT_PATTERNS = [
+    re.compile(r"^\s*export\s+default\s+", re.MULTILINE),
+    re.compile(r"^\s*module\.exports\s*=", re.MULTILINE),
+]
+
+# ── JS/TS default import detection ────────────────────────────────
+# Matches: import Foo from '...'  (default import — no braces)
+# Does NOT match: import { Foo } from '...'  (named import)
+# Does NOT match: import '...'  (side-effect import)
+_JS_DEFAULT_IMPORT_PATTERN = re.compile(
+    r"""^\s*import\s+([A-Z]\w*)\s+from\s+['"](\..*?)['"]""",
+    re.MULTILINE,
+)
+
 
 # ── Python stdlib modules (for external import detection) ────────
 
@@ -211,7 +230,23 @@ def extract_file_deps(
     if language == "python":
         exports = [e for e in exports if not e.startswith("_")]
 
-    return FileDeps(file_path=file_path, imports=imports, exports=exports)
+    # Detect JS/TS default exports and default imports
+    has_default_export = False
+    default_imports: list[str] = []
+    if language in ("javascript", "typescript"):
+        has_default_export = any(
+            pat.search(content) for pat in _JS_DEFAULT_EXPORT_PATTERNS
+        )
+        for m in _JS_DEFAULT_IMPORT_PATTERN.finditer(content):
+            imp_path = m.group(2).strip()
+            if imp_path and imp_path not in default_imports:
+                default_imports.append(imp_path)
+
+    return FileDeps(
+        file_path=file_path, imports=imports, exports=exports,
+        has_default_export=has_default_export,
+        default_imports=default_imports,
+    )
 
 
 def build_snapshot(
@@ -529,6 +564,56 @@ def find_gaps(
                             ),
                         ))
 
+    # ── 4. Missing default export ──
+    # A JS/TS file that was created/modified in this step lacks `export default`
+    # but another file imports it with a default import (import Foo from './Foo').
+    # This causes a runtime error: the imported value is undefined.
+    _js_exts = (".js", ".jsx", ".ts", ".tsx", ".mjs")
+    for nf in new_files:
+        ext = os.path.splitext(nf)[1].lower()
+        if ext not in _js_exts:
+            continue
+        nf_deps = after.file_deps.get(nf)
+        if nf_deps is None:
+            continue
+        if nf_deps.has_default_export:
+            continue
+        # Check if the file had a default export before (LLM removed it)
+        before_deps = before.file_deps.get(nf)
+        lost_default = before_deps is not None and before_deps.has_default_export
+        # Check if any other file default-imports this file
+        is_default_imported = False
+        importer_file = None
+        for other_path, other_deps in after.file_deps.items():
+            if other_path == nf:
+                continue
+            for di in other_deps.default_imports:
+                resolved = _normalize_import_path(di, other_path)
+                if _file_matches_import(nf, resolved) or _file_matches_import(nf, di):
+                    is_default_imported = True
+                    importer_file = other_path
+                    break
+            if is_default_imported:
+                break
+        if lost_default or is_default_imported:
+            component_name = os.path.splitext(os.path.basename(nf))[0]
+            reason = (
+                f"was removed during editing (previously had export default)"
+                if lost_default else
+                f"is default-imported by '{importer_file}'"
+            )
+            gaps.append(IntegrationGap(
+                gap_type="missing_default_export",
+                source_file=nf,
+                target_file=importer_file,
+                symbol=component_name,
+                description=(
+                    f"File '{nf}' is a JSX/TSX component but has no "
+                    f"`export default` statement. It {reason}. "
+                    f"Add `export default {component_name};` at the end of the file."
+                ),
+            ))
+
     return gaps
 
 
@@ -559,6 +644,9 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 - Do NOT modify package.json, go.mod, or other config/manifest files.
 - Do NOT add unnecessary imports — only fix the gaps listed above.
 - Preserve ALL existing code, comments, and formatting in modified files.
+- For MISSING DEFAULT EXPORT gaps: add `export default ComponentName;` at the end \
+of the file. The component name should match the filename in PascalCase. \
+NEVER remove the existing component function/class — only add the missing export.
 """
 
 

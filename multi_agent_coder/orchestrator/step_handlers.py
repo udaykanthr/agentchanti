@@ -2377,7 +2377,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       skip_review: bool = False,
                       project_context=None,
                       plan_step=None,
-                      all_plan_steps=None) -> tuple[bool, str]:
+                      all_plan_steps=None,
+                      kb_context_builder=None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -2388,6 +2389,31 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             project_context, executor, memory, display, step_idx,
             subproject_cwd=subproject_cwd, language=language,
         )
+
+    # Pre-fetch behavioral instructions for JS/TS code generation.
+    # Vector search may miss the React export-default doc, so fetch explicitly.
+    _code_behavioral_ctx = ""
+    if language in ("javascript", "typescript") and kb_context_builder is not None:
+        try:
+            _gstore = getattr(kb_context_builder, '_global_store', None)
+            if _gstore is not None:
+                _beh_results = _gstore.get_behavioral_instructions(
+                    "react component export default jsx tsx generate modify",
+                    api_client=getattr(kb_context_builder, '_api_client', None),
+                )
+                if _beh_results:
+                    _beh_parts = []
+                    for item in _beh_results:
+                        content = getattr(item, "content", "") or getattr(item, "title", "")
+                        if content:
+                            _beh_parts.append(content)
+                    if _beh_parts:
+                        _code_behavioral_ctx = (
+                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            + "\n".join(_beh_parts) + "\n"
+                        )
+        except Exception:
+            pass
 
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
@@ -2409,6 +2435,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             language=language, cfg=cfg, auto=auto,
             project_profile=project_profile,
             project_context=project_context,
+            kb_context_builder=kb_context_builder,
         )
         if chunk_result is not None:
             return chunk_result
@@ -2434,6 +2461,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         kb_ctx = getattr(memory, '_kb_context', '')
         if kb_ctx:
             context_prefix += kb_ctx + "\n\n"
+        # Inject explicitly-fetched behavioral instructions for JS/TS
+        if _code_behavioral_ctx and _code_behavioral_ctx not in context_prefix:
+            context_prefix += _code_behavioral_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
 
@@ -4086,6 +4116,7 @@ def _try_chunk_edit(
     auto: bool = False,
     project_profile=None,
     project_context=None,
+    kb_context_builder=None,
 ) -> tuple[bool, str] | None:
     """Attempt chunk-level editing. Returns (success, error) or None for fallback."""
     try:
@@ -4171,6 +4202,28 @@ def _try_chunk_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prompt_prefix += kb_ctx + "\n\n"
+    # Explicit behavioral instructions for JS/TS chunk edits
+    if language in ("javascript", "typescript") and kb_context_builder is not None:
+        try:
+            _gstore = getattr(kb_context_builder, '_global_store', None)
+            if _gstore is not None:
+                _beh_results = _gstore.get_behavioral_instructions(
+                    "react component export default jsx tsx generate modify",
+                    api_client=getattr(kb_context_builder, '_api_client', None),
+                )
+                if _beh_results:
+                    _beh_parts = []
+                    for item in _beh_results:
+                        content = getattr(item, "content", "") or getattr(item, "title", "")
+                        if content and content not in prompt_prefix:
+                            _beh_parts.append(content)
+                    if _beh_parts:
+                        prompt_prefix += (
+                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            + "\n".join(_beh_parts) + "\n\n"
+                        )
+        except Exception:
+            pass
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
         step_text, formatted, slim_ctx, language=language,
