@@ -19,6 +19,7 @@ from ..language import (
     get_code_block_lang, get_test_framework, detect_test_runner,
     detect_language_from_files, EXTENSION_MAP,
 )
+from .test_analyzer import perform_baseline_test_analysis, _count_test_failures, _identify_test_files
 
 from .memory import FileMemory
 from .classification import (
@@ -1897,6 +1898,9 @@ def _extract_test_error(output: str, max_chars: int = 1500) -> str:
     return result if result else output[:max_chars]
 
 
+
+
+
 # ---- Batch error summary for efficient test fixing ----
 
 # Regex to match common error type lines across test runners
@@ -1978,103 +1982,12 @@ def _build_scoped_test_cmd(
     return f"{base_cmd} {path_args}"
 
 
-def _count_test_failures(output: str) -> int:
-    """Count the number of individual test failures in test runner output.
-
-    Counts BOTH file-level failures (compilation/import errors that prevent
-    the file from running) AND individual test assertion failures — whichever
-    is higher — since file-level failures each require a fix.
-
-    Works across pytest, Jest, Vitest, Go test, and RSpec.
-    """
-    if not output:
-        return 0
-
-    clean = _ANSI_RE.sub('', output)
-    file_failures = 0
-    test_failures = 0
-
-    # Vitest/Jest: "Test Files  X failed" and "Tests  Y failed" on separate lines
-    m_files = re.search(r'Test Files?\s+(\d+)\s+failed', clean)
-    if m_files:
-        file_failures = int(m_files.group(1))
-    m_tests = re.search(r'Tests:\s*(\d+)\s+failed', clean)
-    if m_tests:
-        test_failures = int(m_tests.group(1))
-
-    # If we found Vitest/Jest-style summaries, return the larger count
-    if file_failures or test_failures:
-        return max(file_failures, test_failures)
-
-    # pytest summary: "X failed"
-    m = re.search(r'(\d+)\s+failed', clean)
-    if m:
-        return int(m.group(1))
-
-    # Go: count "--- FAIL:" lines
-    count = len(re.findall(r'---\s+FAIL:', clean))
-    if count:
-        return count
-
-    # Fallback: count failure marker lines
-    count = 0
-    for line in clean.splitlines():
-        stripped = line.strip()
-        if re.match(r'(FAILED\s+|×\s+|✕\s+|✗\s+)', stripped):
-            count += 1
-
-    return max(count, 1) if 'FAIL' in clean.upper() else 0
 
 
 # ---------------------------------------------------------------------------
 # Per-file failure identification (for focused, per-file test fixing)
 # ---------------------------------------------------------------------------
 
-def _identify_failed_test_files(
-    output: str,
-    test_files: dict[str, str],
-) -> list[str]:
-    """Identify which test files from *test_files* had failures.
-
-    Parses test runner output (Vitest, Jest, pytest) to find file-level
-    failures.  Returns a list of memory paths from *test_files* that
-    failed.  Empty list means we couldn't determine (caller should
-    fallback to all-at-once fixing).
-    """
-    if not output or not test_files:
-        return []
-
-    clean = _ANSI_RE.sub('', output)
-    failed_basenames: set[str] = set()
-
-    # Vitest: "❯ path/file.test.jsx (N tests | M failed)"
-    for m in re.finditer(r'[❯]\s+(\S+)\s+\(.*?failed\)', clean):
-        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
-        failed_basenames.add(fname)
-
-    # Jest: "FAIL path/file.test.jsx" or "FAIL  path/file.spec.js"
-    for m in re.finditer(
-        r'FAIL\s+(\S+\.(?:test|spec)\.\w+)', clean
-    ):
-        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
-        failed_basenames.add(fname)
-
-    # pytest: "FAILED path/test_file.py::test_name"
-    for m in re.finditer(r'FAILED\s+(\S+\.py)::', clean):
-        fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
-        failed_basenames.add(fname)
-
-    if not failed_basenames:
-        return []
-
-    # Match basenames against actual paths in test_files
-    result: list[str] = []
-    for test_path in test_files:
-        basename = test_path.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
-        if basename in failed_basenames:
-            result.append(test_path)
-
-    return result
 
 
 def _extract_file_specific_errors(
@@ -3085,7 +2998,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       project_context=None,
                       kb_context_builder=None,
                       plan_step=None,
-                      all_plan_steps=None) -> tuple[bool, str]:
+                      all_plan_steps=None,
+                      project_profile=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -3297,6 +3211,16 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             log.info(f"Step {step_idx+1}: No target test files detected, using "
                      f"semantic search context (from {len(all_files)} files)")
 
+    log.info(f"Step {step_idx+1}: JS project env: {js_env}")
+
+    # ── Pre-execution Analysis ──
+    pre_analysis_results = perform_baseline_test_analysis(
+        memory, executor, language,
+        project_profile=project_profile,
+        display=display,
+        step_idx=step_idx,
+    )
+
     feedback = ""
     last_test_output = ""
     prev_gen_error = None  # Track errors across gen attempts for early exit
@@ -3379,7 +3303,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
         test_response = tester.process(
             step_text, context=gen_context, language=language,
-            env_info=js_env, test_root=_test_root)
+            env_info=js_env, test_root=_test_root,
+            pre_analysis_results=pre_analysis_results)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before

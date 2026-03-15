@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..cli_display import CLIDisplay, log
 
 from .memory import FileMemory
-from .classification import _classify_step
+from .classification import _classify_step, _TEST_CMD_RE, _TEST_CONFIG_RE
 from .plan_step import PlanStep, build_step_context, update_step_after_execution
 from .step_handlers import (
     _handle_cmd_step, _handle_code_step, _handle_test_step,
@@ -23,6 +23,37 @@ _logger = logging.getLogger(__name__)
 
 
 MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
+
+# ── Test file detection ───────────────────────────────────────
+# Patterns that indicate a file is a test file (used for CODE→TEST
+# auto-correction when the planner marks a test-editing step as CODE).
+_TEST_FILE_RE = re.compile(
+    r'(?:'
+    # JS/TS: *.test.js, *.spec.tsx, etc.
+    r'\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$'
+    # Python: test_*.py or *_test.py
+    r'|(?:^|[/\\])test_\w+\.py$'
+    r'|\w+_test\.py$'
+    # Go: *_test.go
+    r'|\w+_test\.go$'
+    # Ruby: *_spec.rb
+    r'|\w+_spec\.rb$'
+    r')',
+    re.IGNORECASE,
+)
+# Directories that indicate test files
+_TEST_DIR_RE = re.compile(
+    r'(?:^|[/\\])(?:__tests__|tests?|specs?|test_\w+)[/\\]',
+    re.IGNORECASE,
+)
+
+
+def _is_test_file(file_path: str) -> bool:
+    """Return True if *file_path* looks like a test file."""
+    import os
+    basename = os.path.basename(file_path)
+    return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
+
 
 # ── External service dependency detection ─────────────────────
 # Patterns that indicate the command failed because an external
@@ -340,6 +371,44 @@ def _execute_step(step_idx: int, step_text: str, *,
                 except Exception as e:
                     _logger.warning("[Pipeline] Re-classification failed for %s: %s", plan_step.id, e)
 
+        # ── CMD → TEST Auto-Correction (deterministic, 0 LLM cost) ──
+        # If planner labelled a step as CMD but the description/command
+        # contains a test runner invocation (e.g. "npx vitest run",
+        # "pytest", "npm test"), reclassify to TEST so the test handler
+        # (with retry-and-fix logic) is used instead of the plain CMD handler.
+        if step_type == "CMD":
+            _check_text = step_text
+            if plan_step is not None and plan_step.command:
+                _check_text = f"{step_text} {plan_step.command}"
+            if _TEST_CMD_RE.search(_check_text) and not _TEST_CONFIG_RE.search(_check_text):
+                _logger.info(
+                    "[Pipeline] Step %s reclassified CMD -> TEST "
+                    "(test runner detected in description/command, 0 LLM tokens)",
+                    plan_step.id if plan_step else step_idx,
+                )
+                step_type = "TEST"
+                if plan_step is not None:
+                    plan_step.step_type = "TEST"
+                display.steps[step_idx]["type"] = step_type
+                display.render()
+
+        # ── CODE → TEST Auto-Correction (deterministic, 0 LLM cost) ──
+        # If planner labelled a step as CODE but ALL target files are test
+        # files (e.g. __tests__/App.test.jsx, test_main.py), reclassify to
+        # TEST.  The TEST handler validates the fix by running the tests and
+        # retries on failure, while CODE just writes the file without running.
+        if step_type == "CODE" and plan_step is not None and plan_step.target_files:
+            if all(_is_test_file(f) for f in plan_step.target_files):
+                _logger.info(
+                    "[Pipeline] Step %s reclassified CODE -> TEST "
+                    "(all target files are test files: %s, 0 LLM tokens)",
+                    plan_step.id, plan_step.target_files,
+                )
+                step_type = "TEST"
+                plan_step.step_type = "TEST"
+                display.steps[step_idx]["type"] = step_type
+                display.render()
+
         log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
 
         # --- Structured plan: inject plan-aware context into memory ---
@@ -451,7 +520,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                     project_context=project_context,
                     kb_context_builder=kb_context_builder,
                     plan_step=plan_step,
-                    all_plan_steps=all_plan_steps)
+                    all_plan_steps=all_plan_steps,
+                    project_profile=project_profile)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(

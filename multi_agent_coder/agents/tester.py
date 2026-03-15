@@ -9,7 +9,8 @@ class TesterAgent(Agent):
     def process(self, task: str, context: str = "",
                 language: str | None = None,
                 env_info: dict | None = None,
-                test_root: str | None = None) -> str:
+                test_root: str | None = None,
+                pre_analysis_results: str | None = None) -> str:
         # Infer language from context file paths when not explicitly provided
         if language is None:
             file_paths = self._extract_file_paths(context)
@@ -50,6 +51,7 @@ class TesterAgent(Agent):
 Generate unit tests for the provided code using `{fw['command']}`.
 Language: {lang_name}
 
+{pre_analysis_results + chr(10) if pre_analysis_results else ''}
 {'PROJECT FILE LISTING (use these EXACT paths for imports):' + chr(10) + file_listing + chr(10) if file_listing else ''}
 """
         # Language-aware import path rules

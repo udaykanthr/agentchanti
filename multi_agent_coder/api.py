@@ -43,6 +43,7 @@ from .checkpoint import save_checkpoint, load_checkpoint, clear_checkpoint
 
 from .orchestrator.memory import FileMemory
 from .orchestrator.pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .orchestrator.test_analyzer import perform_baseline_test_analysis
 from .orchestrator.plan_step import build_waves as _build_plan_waves
 
 
@@ -290,11 +291,26 @@ def _run_task_impl(
         if kb_ctx:
             planner_context += f"\n\n{kb_ctx}"
 
+    # Baseline test analysis before planning
+    from .agents.planner import _classify_task_intent
+    _task_intent = _classify_task_intent(task)
+    test_analysis = ""
+    if not no_kb:
+        try:
+            test_analysis = perform_baseline_test_analysis(
+                memory, executor, language,
+                project_profile=project_profile,
+                task_intent=_task_intent,
+            )
+        except Exception as test_exc:
+            _logger.warning("[Analysis] Baseline test analysis failed: %s", test_exc)
+
     analysis_context = planner.pre_analyze(
         task,
         source_files=source_files,
         kb_context_builder=kb_context_builder,
         knowledge_base=knowledge_base,
+        test_analysis=test_analysis,
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context

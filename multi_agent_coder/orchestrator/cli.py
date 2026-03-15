@@ -517,12 +517,37 @@ def main():
                 planner_context += f"\n\n{kb_context}"
                 log.info(f"Injected {knowledge_base.size} knowledge entries into planner")
 
+        # Baseline test analysis before planning — run existing tests to
+        # identify which files pass/fail so the planner only touches broken ones.
+        # The task intent determines directive strictness: test-fix tasks get
+        # strict "don't touch passing files" rules; feature tasks allow updates.
+        from ..agents.planner import _classify_task_intent
+        _task_intent = _classify_task_intent(args.task)
+        test_analysis = ""
+        if _has_project_config:
+            try:
+                from .test_analyzer import perform_baseline_test_analysis
+                from .memory import FileMemory as _PreMemory
+                _pre_memory = _PreMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+                if source_files:
+                    _pre_memory.update(source_files)
+                test_analysis = perform_baseline_test_analysis(
+                    _pre_memory, executor, language,
+                    task_intent=_task_intent,
+                )
+                if test_analysis:
+                    log.info("[Planning] Baseline test analysis (intent=%s):\n%s",
+                             _task_intent, test_analysis)
+            except Exception as _test_exc:
+                log.warning("[Planning] Baseline test analysis failed: %s", _test_exc)
+
         # Pre-analysis: map relevant files, classify intent, enrich context
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
             kb_context_builder=kb_context_builder,
             knowledge_base=knowledge_base,
+            test_analysis=test_analysis,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context

@@ -190,7 +190,8 @@ class PlannerAgent(Agent):
     def pre_analyze(self, task: str, *,
                     source_files: dict[str, str] | None = None,
                     kb_context_builder=None,
-                    knowledge_base=None) -> str:
+                    knowledge_base=None,
+                    test_analysis: str | None = None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -343,6 +344,18 @@ class PlannerAgent(Agent):
             except Exception as e:
                 _logger.debug(f"[PreAnalysis] Global KB doc search failed: {e}")
 
+        # 5. Baseline test analysis results
+        if test_analysis:
+            parts.append(f"\n[Baseline Test Analysis]\n{test_analysis}")
+            parts.append(
+                "\nIMPORTANT: The analysis above was produced by ACTUALLY RUNNING "
+                "the test suite. It is authoritative. Your plan MUST respect it:\n"
+                "- If files are listed as HEALTHY/PASSING, do NOT include steps that modify them.\n"
+                "- If only specific files are BROKEN, plan ONLY code changes to those files.\n"
+                "- If the error is a test assertion failure (not a setup/config error), "
+                "fix the test code — do NOT recreate config or setup files."
+            )
+
         return "\n".join(parts) if parts else ""
 
     def process(self, task: str, context: str = "") -> str:
@@ -445,6 +458,12 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 10. **TEST steps only when explicitly requested**: Do NOT include TEST steps
     unless the user's task explicitly asks for tests. Tests consume significant
     tokens and time. When tests ARE requested, place them AFTER all CODE steps.
+    CRITICAL: If the [Baseline Test Analysis] shows tests are PASSING,
+    do NOT include any steps for "Fixing tests" or "Ensuring test setup".
+    NEVER include steps to modify or "fix" test files that are explicitly
+    marked as PASSING or Healthy in the analysis.
+    Only include global setup/config modification steps if the analysis
+    indicates a global failure (e.g., all tests fail or execution fails to start).
 
 11. **Shell commands are non-interactive**: Always include --yes, -y, or
     --defaults flags for tools that prompt for input.
