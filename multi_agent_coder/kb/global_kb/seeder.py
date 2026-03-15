@@ -519,21 +519,70 @@ _ERROR_SEEDS: list[ErrorFix] = [
         cause="The test asserts text, role, or label that does not exist in the component's "
               "actual rendered output. Common causes: (1) the test hardcodes text content the "
               "component doesn't render, (2) text is split across multiple DOM elements so "
-              "exact string matching fails, (3) the element uses a different role/tag than expected.",
+              "exact string matching fails, (3) the element uses a different role/tag than expected, "
+              "(4) the rendered DOM is EMPTY or only contains <body> </div> </body>.",
         fix_template="CRITICAL FIX STEPS:\n"
-                     "1. READ THE ACTUAL DOM OUTPUT shown in the error message — it shows exactly "
-                     "what the component renders.\n"
-                     "2. Match your query to ACTUAL rendered text, not assumed text.\n"
-                     "3. For text split across elements, use a function matcher:\n"
+                     "1. READ THE ACTUAL DOM OUTPUT shown in the error message — look specifically "
+                     "at the <body> section. If it only shows '<div> </div>' or '<body> </body>', "
+                     "refer to TestingLibraryEmptyRootError.\n"
+                     "2. Ignore the 'text is broken up by multiple elements' generic hint unless "
+                     "you verified the text is actually split in the source.\n"
+                     "3. Match your query to ACTUAL rendered text, not assumed text.\n"
+                     "4. For text split across elements, use a function matcher:\n"
                      "   screen.getByText((content, element) => element?.textContent === 'expected full text')\n"
-                     "4. Prefer getByRole() over getByText() for more robust queries:\n"
+                     "5. Prefer getByRole() over getByText() for more robust queries:\n"
                      "   screen.getByRole('button', { name: /submit/i })\n"
                      "   screen.getByRole('heading', { name: /welcome/i })\n"
-                     "5. NEVER hardcode assumed text content — always derive expected values "
+                     "6. NEVER hardcode assumed text content — always derive expected values "
                      "from the actual source component props or rendered DOM.\n"
-                     "6. Use { exact: false } for partial text matching: screen.getByText('partial', { exact: false })",
+                     "7. Use { exact: false } for partial text matching: screen.getByText('partial', { exact: false })",
         severity="error",
-        tags="testing-library,react,getByText,getByRole,element,not,found,query,dom,javascript,typescript",
+        tags="testing-library,react,getByText,getByRole,element,not,found,query,dom,javascript,typescript,empty-dom",
+    ),
+    ErrorFix(
+        error_type="TestingLibraryEmptyRootError",
+        language="javascript",
+        pattern=r"<body>\s*(<\/div>)?\s*<\/body>",
+        cause="The rendered DOM is empty or contains only the root <body> tag. This means "
+              "the component failed to render any UI. Common causes: (1) missing required "
+              "Context Providers (Router, Theme, Redux) causing the component to return null, "
+              "(2) synchronous queries on a lazy-loaded component (React.lazy), "
+              "(3) a bug in the component's conditional rendering (returning null/undefined), "
+              "(4) incorrect import/export causing an 'undefined' component to be rendered.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. CHECK FOR CONTEXT: Does the component use useNavigate, useLocation, or "
+                     "custom hooks? Wrap it in <MemoryRouter> or the required <Provider>.\n"
+                     "2. CHECK FOR LAZY LOADING: Is the component lazy-loaded? Use findBy* "
+                     "(async) queries instead of getBy* (sync).\n"
+                     "3. CHECK COMPONENT SOURCE: Does the component return null under certain "
+                     "prop/state conditions? Verify you are passing the correct props in render().\n"
+                     "4. CHECK IMPORTS: Ensure you didn't mix up default and named imports. "
+                     "Rendering <undefined /> results in an empty DOM.\n"
+                     "5. USE screen.debug(): In development, use screen.debug() to see why the "
+                     "DOM is empty during the test run.",
+        severity="error",
+        tags="testing-library,react,empty,dom,body,root,null,render,javascript,typescript,lazy-load,context",
+    ),
+    ErrorFix(
+        error_type="TailwindClassRegexBrittle",
+        language="javascript",
+        pattern=r"AssertionError:.*(toMatch|to\s+match).*(/\\b-|md\\\\:)",
+        cause="The test uses brittle regex patterns to assert CSS classes. "
+              "Common failures: (1) `\\b-translate` fails because `\\b` does not match "
+              "the boundary before a hyphen in many environments. (2) Tailwind responsive "
+              "classes (md:) require complex escaping in regex (e.g. `md\\\\:flex`). "
+              "Asserting on `className` directly is highly discouraged.",
+        fix_template="FIX: Use @testing-library/jest-dom's `toHaveClass()` instead of regex.\n\n"
+                     "WRONG (brittle regex):\n"
+                     "  expect(nav.className).toMatch(/\\b-translate-x-full\\b/)\n"
+                     "  expect(nav.className).toMatch(/md\\\\:flex/)\n\n"
+                     "CORRECT (robust matcher):\n"
+                     "  expect(nav).toHaveClass('-translate-x-full')\n"
+                     "  expect(nav).toHaveClass('md:flex')\n\n"
+                     "The `toHaveClass` matcher correctly handles class list parsing and "
+                     "doesn't require complex escaping or word-boundary logic.",
+        severity="error",
+        tags="tailwind,css,className,regex,toHaveClass,brittle,assertion,javascript,typescript",
     ),
     ErrorFix(
         error_type="TestingLibraryMultipleElementsFound",
@@ -2111,6 +2160,45 @@ const table = screen.getByRole('table')
 
 **Key pattern:** Await the FIRST query to confirm the lazy component loaded,
 then use sync queries for the rest of the component's elements.
+
+## Rule 15: Diagnose "Empty Root" symptoms first
+
+If a test fails with "Unable to find an element" and the DOM output in the error message
+shows an empty body (e.g., `<body> <div> </div> </body>` or `<body> </body>`):
+
+**DO NOT** simply try to change the query or add a function matcher. An empty DOM means
+the component is not rendering at all.
+
+**FIX FLOW FOR EMPTY DOM:**
+1. **Check for missing context**: If the component uses Router/Theme hooks, it might
+   return null if not wrapped in a Provider. Wrap in `<MemoryRouter>` or `<ThemeProvider>`.
+2. **Check for lazy loading**: If the component is lazy-loaded, you MUST use `findBy*`
+   (async) queries. The first render of a lazy component is usually empty or fallback.
+3. **Check imports**: If you imported a component as `undefined` (mixed up default/named
+   imports), React might render nothing.
+4. **Check props**: Ensure you are passing mandatory props that, if missing, might
+   cause the component to return null.
+
+## Rule 16: Use `toHaveClass` for CSS assertions
+
+**NEVER** use regex on `className` to assert presence/absence of CSS classes. Tailwind
+classes with hyphens (`-translate-x-full`) or colons (`md:flex`) are notoriously difficult
+to match correctly with regex due to word boundary (`\b`) behavior and escaping requirements.
+
+**WRONG (brittle):**
+```js
+expect(nav.className).toMatch(/\b-translate-x-full\b/)  // Fails: \b doesn't match before hyphen
+expect(nav.className).toMatch(/md\\:flex/)              // Fails: complex escaping needed
+```
+
+**CORRECT (robust):**
+```js
+import '@testing-library/jest-dom/vitest' // ensure matchers are registered
+
+expect(nav).toHaveClass('-translate-x-full')
+expect(nav).toHaveClass('md:flex')
+expect(nav).not.toHaveClass('hidden')
+```
 """,
     },
     "react-export-default-instructions.md": {

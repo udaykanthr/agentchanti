@@ -299,10 +299,16 @@ def _detect_source_root(source_files: dict[str, str]) -> str:
 def _detect_test_root(source_files: dict[str, str]) -> str:
     """Detect the test directory from file paths.
 
-    Checks both root-level (``__tests__/``) and nested (``src/__tests__/``)
-    test directories.  Prefers more-specific (nested) matches so that the
-    LLM writes tests to the correct location.
+    Checks (in priority order):
+    1. Nested test dirs (``src/__tests__/``)
+    2. Root-level test dirs (``__tests__/``, ``tests/``)
+    3. Co-located test files (``src/App.test.jsx`` alongside source)
+
+    Prefers more-specific (nested) matches so that the LLM writes tests
+    to the correct location.
     """
+    import re as _re
+
     candidates = ("__tests__", "tests", "test", "spec")
     # First pass: look for nested test dirs (e.g. src/__tests__)
     for fpath in source_files:
@@ -318,6 +324,20 @@ def _detect_test_root(source_files: dict[str, str]) -> str:
         for fpath in source_files:
             if fpath.replace("\\", "/").startswith(candidate + "/"):
                 return candidate
+    # Third pass: co-located test files (e.g. src/App.test.jsx next to
+    # src/App.jsx).  These projects have no dedicated test directory;
+    # the test root is the directory where the test files live.
+    _test_file_re = _re.compile(r'\.(test|spec)\.\w+$')
+    test_dirs: dict[str, int] = {}
+    for fpath in source_files:
+        norm = fpath.replace("\\", "/")
+        basename = norm.rsplit("/", 1)[-1] if "/" in norm else norm
+        if _test_file_re.search(basename) or basename.startswith("test_"):
+            parent = norm.rsplit("/", 1)[0] if "/" in norm else "."
+            test_dirs[parent] = test_dirs.get(parent, 0) + 1
+    if test_dirs:
+        # Return the directory with the most co-located test files
+        return max(test_dirs, key=test_dirs.get)
     return ""
 
 

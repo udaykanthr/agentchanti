@@ -953,6 +953,10 @@ def _prefix_subproject_paths(files: dict[str, str],
     project lives under ``my-app/``, this function rewrites them to
     ``my-app/components/Header.tsx``.
 
+    Also detects when the LLM embeds the subproject name in the middle
+    of the path (e.g. ``src/my-app/src/Header.jsx``) and reconstructs
+    the correct path (``my-app/src/Header.jsx``).
+
     Files that are already prefixed, already known in memory, or are
     internal tracking paths (``_cmd_output/`` etc.) are left unchanged.
     """
@@ -960,6 +964,7 @@ def _prefix_subproject_paths(files: dict[str, str],
         return files
 
     prefix = subproject.rstrip('/') + '/'
+    proj_name = subproject.rstrip('/')
     known_paths = set(memory.all_files().keys())
     corrected: dict[str, str] = {}
 
@@ -981,6 +986,22 @@ def _prefix_subproject_paths(files: dict[str, str],
         if fpath in known_paths:
             corrected[fpath] = content
             continue
+
+        # Detect embedded subproject name: the LLM sometimes generates
+        # paths like "src/my-app/src/Header.jsx" where the project name
+        # is in the middle.  Extract the suffix after the embedded name
+        # and reconstruct the correct path.
+        norm = fpath.replace("\\", "/")
+        needle = '/' + proj_name + '/'
+        embed_idx = norm.find(needle)
+        if embed_idx != -1:
+            suffix = norm[embed_idx + len(needle):]
+            candidate = prefix + suffix
+            if candidate in known_paths:
+                log.warning(f"[SubProject] Fixed embedded subproject: "
+                            f"'{fpath}' → '{candidate}'")
+                corrected[candidate] = content
+                continue
 
         # Prefix with sub-project root
         new_path = prefix + fpath
@@ -2696,6 +2717,91 @@ def _normalize_fix_paths(fix_files: dict[str, str],
     return corrected
 
 
+def _remap_test_to_existing(test_files: dict[str, str],
+                            memory: FileMemory,
+                            base_dir: str = ".") -> dict[str, str]:
+    """Remap generated test file paths to their existing locations on disk.
+
+    When the LLM generates a test at ``__tests__/App.test.jsx`` but the
+    project already has ``src/App.test.jsx``, the generated path is
+    remapped to the existing location.  New test files (no existing match)
+    are left unchanged — they use the default ``test_root``.
+
+    When multiple test files share the same basename (e.g. both
+    ``src/App.test.jsx`` and ``src/__tests__/App.test.jsx`` exist),
+    the co-located path (not inside a dedicated test directory) is
+    preferred.
+    """
+    import glob as _glob
+    import re as _re
+
+    _TEST_FILE_RE = _re.compile(r'\.(test|spec)\.\w+$')
+    _EXCLUDE_DIRS = {'node_modules', '.git', '__pycache__', 'dist', 'build'}
+    _DEDICATED_TEST_DIRS = {'__tests__', 'tests', 'test', 'spec'}
+
+    def _is_test_name(name: str) -> bool:
+        return bool(_TEST_FILE_RE.search(name)) or name.startswith("test_")
+
+    def _in_dedicated_test_dir(path: str) -> bool:
+        """Return True if *path* contains a dedicated test directory segment."""
+        parts = path.replace("\\", "/").split("/")
+        return any(p in _DEDICATED_TEST_DIRS for p in parts)
+
+    # Build basename → [paths] map (multiple paths possible)
+    all_paths: dict[str, list[str]] = {}
+
+    # 1) Existing test files in memory
+    for fpath in memory.all_files():
+        norm = fpath.replace("\\", "/")
+        basename = os.path.basename(norm)
+        if _is_test_name(basename):
+            all_paths.setdefault(basename, []).append(norm)
+
+    # 2) Scan disk for test files not yet in memory
+    for pattern in ("**/*.test.*", "**/*.spec.*", "**/test_*.py"):
+        try:
+            for match in _glob.glob(pattern, root_dir=base_dir,
+                                    recursive=True):
+                norm = match.replace("\\", "/")
+                parts = norm.split("/")
+                if any(p in _EXCLUDE_DIRS for p in parts):
+                    continue
+                basename = os.path.basename(norm)
+                known = all_paths.get(basename, [])
+                if norm not in known:
+                    all_paths.setdefault(basename, []).append(norm)
+        except Exception:
+            pass
+
+    if not all_paths:
+        return test_files
+
+    # Resolve duplicates: prefer co-located over dedicated test dir
+    existing: dict[str, str] = {}
+    for basename, paths in all_paths.items():
+        if len(paths) == 1:
+            existing[basename] = paths[0]
+        else:
+            # Multiple paths — prefer co-located (not in __tests__/ etc.)
+            colocated = [p for p in paths
+                         if not _in_dedicated_test_dir(p)]
+            existing[basename] = colocated[0] if colocated else paths[0]
+
+    remapped: dict[str, str] = {}
+    for fpath, content in test_files.items():
+        norm = fpath.replace("\\", "/")
+        basename = os.path.basename(norm)
+        if basename in existing and existing[basename] != norm:
+            target = existing[basename]
+            log.warning(f"[TestPathRemap] '{norm}' -> '{target}' "
+                        f"(matched existing test file)")
+            remapped[target] = content
+        else:
+            remapped[fpath] = content
+
+    return remapped
+
+
 def _filter_test_only_files(fix_files: dict[str, str],
                             test_files: dict[str, str],
                             memory: FileMemory) -> dict[str, str]:
@@ -3341,6 +3447,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # Normalize paths: fix LLM-generated paths that are suffixes of known files
         test_files = _normalize_fix_paths(test_files, memory)
 
+        # Remap test paths to existing locations on disk — if a test file
+        # already exists (e.g. src/App.test.jsx), save there instead of
+        # the framework default dir (e.g. __tests__/App.test.jsx).
+        test_files = _remap_test_to_existing(
+            test_files, memory,
+            base_dir=getattr(memory, 'base_dir', "."))
+
         # Filter: only allow test files (block any source/config files)
         test_files = _filter_test_only_files(test_files, test_files, memory)
         if not test_files:
@@ -3629,6 +3742,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 if fix_files:
                     fix_files = _strip_protected_files(fix_files)
                     fix_files = _normalize_fix_paths(fix_files, memory)
+                    fix_files = _remap_test_to_existing(
+                        fix_files, memory,
+                        base_dir=getattr(memory, 'base_dir', "."))
                     if not is_source_bug:
                         fix_files = _filter_test_only_files(
                             fix_files, test_files, memory)
@@ -4226,6 +4342,24 @@ def _try_chunk_edit(
 
     if not result_files:
         return None
+
+    # Detect destructive chunk edits: if the result is dramatically
+    # smaller than the original, the LLM likely wiped the file instead
+    # of making a targeted edit.  Fall back to full-file mode so the
+    # LLM is re-prompted with the full context.
+    for fpath, new_content in result_files.items():
+        original = original_files.get(fpath)
+        if original and len(original) > 200:
+            ratio = len(new_content) / len(original)
+            if ratio < 0.25:
+                log.warning(
+                    "[ChunkEdit] Destructive edit for %s: "
+                    "%.0f%% size reduction (%d → %d chars), "
+                    "falling back to full-file mode",
+                    fpath, (1 - ratio) * 100,
+                    len(original), len(new_content),
+                )
+                return None
 
     # Build review context before updating memory/disk so diffs are captured correctly
     review_ctx = _build_review_context(result_files, memory, step_text)

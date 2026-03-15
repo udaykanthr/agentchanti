@@ -140,11 +140,14 @@ def _detect_hazards(filepath: str, old_content: str, new_content: str) -> list[t
             pass # We'll rely on the size check & general warning for now, plus the specific logic below.
 
     # 2. Significant Shrinkage (Truncation Risk)
-    # If file was > 100 chars and new content is < 50% of old size
-    # if len(old_content) > 100 and len(new_content) < len(old_content) * 0.5:
-    #     hazards.append((HAZARD_WARN,
-    #                     f"Significant size reduction ({len(old_content)} -> {len(new_content)} chars). "
-    #                     "Potential accidental truncation."))
+    # Only flag truly destructive wipes — stricter threshold (< 25% of
+    # original) avoids false positives during first-time project setup
+    # where template files (e.g. App.jsx) are legitimately replaced with
+    # smaller custom versions.
+    if len(old_content) > 200 and len(new_content) < len(old_content) * 0.25:
+        hazards.append((HAZARD_WARN,
+                        f"Significant size reduction ({len(old_content)} -> {len(new_content)} chars). "
+                        "Potential accidental truncation."))
 
     # 3. Strict Package.json Dependency Block
     if fname == "package.json":
