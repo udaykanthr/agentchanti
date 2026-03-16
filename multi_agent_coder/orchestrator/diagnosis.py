@@ -313,13 +313,6 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                      f"{', '.join(written)}")
             applied = True
 
-            # ── Enhancement #4: skip shell commands when code fixes are present ──
-            # For CMD steps, the code fix IS the real fix.  The shell commands
-            # the LLM emits are usually just re-runs of the same failing command.
-            # Let the pipeline re-run the original step to verify the code fix.
-            if step_type == "CMD":
-                return applied, True, False
-
     # Extract and run fix commands.
     # For CMD steps, only extract from triple-backtick code blocks to avoid
     # picking up the *broken* original command or the new file contents.

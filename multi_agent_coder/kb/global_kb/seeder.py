@@ -540,6 +540,23 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="testing-library,react,getByText,getByRole,element,not,found,query,dom,javascript,typescript,empty-dom",
     ),
     ErrorFix(
+        error_type="TestingLibraryRoleNameNotFound",
+        language="javascript",
+        pattern=r"TestingLibraryElementError:\s*Unable to find role=.*?(and name)?",
+        cause="The test asserts an element with a specific role and name that does not exist in the "
+              "component's rendered output. This is often due to the text changing, the element using a "
+              "different role, or the component rendering an empty state.",
+        fix_template="CRITICAL FIX STEPS:\n"
+                     "1. READ THE ACTUAL DOM OUTPUT in the error message to see what was actually rendered.\n"
+                     "2. Match your query to ACTUAL rendered text and roles, not assumed ones.\n"
+                     "3. Check if the element uses a different role (e.g. 'link' instead of 'heading') "
+                     "or if the text is split across multiple elements.\n"
+                     "4. If text is split, use a function matcher: screen.getByText((content, element) => ...)\n"
+                     "5. NEVER hardcode assumed text content — derive expected values from the component.",
+        severity="error",
+        tags="testing-library,react,getByRole,role,name,not,found,query,dom,javascript,typescript",
+    ),
+    ErrorFix(
         error_type="TestingLibraryEmptyRootError",
         language="javascript",
         pattern=r"<body>\s*(<\/div>)?\s*<\/body>",
@@ -1553,6 +1570,50 @@ Ensure you've run indexing first: `agentchanti kb index && agentchanti kb embed`
 
 ### Slow Search
 Install NumPy for optimized vector operations: `pip install numpy`
+""",
+    },
+    "testing-library-errors-guide.md": {
+        "title": "Testing Library Common Errors Guide",
+        "tags": "testing-library, react, errors, testing, guide",
+        "content": """## Overview
+
+React Testing Library helps you test your UI in a user-centric way. However, tests often fail with `TestingLibraryElementError` due to mismatched roles, incorrect assumptions about the rendered DOM, or async timing issues. This guide helps you properly fix these errors.
+
+## 1. Unable to find role="X" and name "Y"
+
+When you encounter:
+`TestingLibraryElementError: Unable to find role="heading" and name /pricing/i`
+
+### Root Cause
+You assume an element exists with a specific HTML Tag role (`h1` -> `heading`, `a` -> `link`, `button`) but the actual component source renders a different tag (e.g. `p` instead of `h2`) or uses slightly different text.
+
+### How to Fix
+- Read the component source code to see what HTML element is used.
+- Check the error's `DOM` output. It gives you the actual rendered tags.
+- Use `screen.debug()` in the test if needed.
+- If it's a `div` or `span`, consider using `screen.getByText(/pricing/i)` instead. `getByRole` usually requires explicit semantic HTML tags.
+
+## 2. Unable to find an accessible element with the role...
+
+This means the test assumed an ARIA attribute exist that doesn't.
+For example, a `<section>` without an `aria-label` does NOT expose the 'region' role. Wait until you have read the actual source component before adding roles to your test queries.
+
+## 3. Empty DOM (`<body><div></div></body>`)
+
+If your query times out with an empty DOM, this usually means the component failed to render.
+- Is it missing a `Provider`? e.g., missing `<MemoryRouter>`?
+- Is it lazy loaded? Use `await screen.findByRole` instead of `screen.getByRole`.
+
+## 4. Function Matchers for complex Strings
+
+For text spread across multiple elements, text matches can be tricky.
+Instead of: `expect(screen.getByText('User Profile: Uday')).toBeInTheDocument()`
+Use:
+```js
+expect(screen.getByText((content, element) => {
+   return element.textContent.includes('User Profile: Uday');
+})).toBeInTheDocument();
+```
 """,
     },
     "vitest-react-testing-setup.md": {

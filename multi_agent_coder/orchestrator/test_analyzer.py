@@ -70,8 +70,8 @@ def _identify_test_files(
     clean = _ANSI_RE.sub('', output)
     failed_basenames: set[str] = set()
 
-    # Vitest: "❯ path/file.test.jsx (N tests | M failed)"
-    for m in re.finditer(r'[❯]\s+(\S+)\s+\(.*?failed\)', clean):
+    # Vitest: "❯ path/file.test.jsx (N tests | M failed)" or "❯ path/file.test.jsx:line:col"
+    for m in re.finditer(r'[❯]\s+([^\s\(\:]+)', clean):
         fname = m.group(1).rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
         failed_basenames.add(fname)
 
@@ -97,10 +97,9 @@ def _identify_test_files(
 
     for fpath in all_files:
         is_test = False
-        # Simple heuristic: in test dir or has test pattern
         if test_dir and (test_dir in fpath or "__tests__" in fpath):
             is_test = True
-        elif test_suffix and fpath.endswith(test_suffix + fw["ext"]):
+        elif test_suffix and any(fpath.endswith(test_suffix + ext) for ext in ['.js', '.jsx', '.ts', '.tsx', fw.get("ext", "")]):
             is_test = True
         elif test_prefix and os.path.basename(fpath).startswith(test_prefix):
             is_test = True
@@ -130,7 +129,7 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
 
     # Patterns that mark the start of a file's error block
     _FILE_HEADER = re.compile(
-        r'(?:FAIL\s+(\S+)|❯\s+(\S+)\s+\(|---\s+FAIL:\s+(\S+))')
+        r'(?:FAIL\s+(\S+)|[❯]\s+([^\s\(\:]+)|---\s+FAIL:\s+(\S+))')
 
     # Patterns for lines we want to keep (error messages, assertions, source pointers)
     _KEEP = re.compile(

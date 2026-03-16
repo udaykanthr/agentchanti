@@ -701,6 +701,29 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
                 continue
 
+            # For CMD steps: if the diagnosis both wrote code fixes AND ran
+            # new commands successfully, AND the diagnosis signals that the
+            # original command is deprecated/removed, treat the step as
+            # resolved.  Re-running a deprecated command will never succeed
+            # regardless of how many fixes are applied.
+            import re as _re_depr
+            _DEPRECATION_RE = _re_depr.compile(
+                r'\b(deprecated|removed|no longer|discontinued|obsolete|'
+                r'replaced by|use instead|not supported|not available)\b',
+                _re_depr.IGNORECASE,
+            )
+            if (step_type == "CMD"
+                    and has_fix_commands and cmds_succeeded and fix_applied
+                    and _DEPRECATION_RE.search(diagnosis)):
+                display.step_info(
+                    step_idx,
+                    "Original command is deprecated — fix applied, step resolved.")
+                log.info(
+                    f"Task {step_idx+1}: CMD step resolved via deprecation-aware fix "
+                    f"(code fixes + replacement commands succeeded). "
+                    f"Skipping re-run of deprecated original command.")
+                return True
+
             # Always re-run the original step after applying fixes.
             # Fix commands may be prerequisites (e.g. `npm install` for a
             # missing dependency) rather than replacements for the original

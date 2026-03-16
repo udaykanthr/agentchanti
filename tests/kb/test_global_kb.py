@@ -271,10 +271,10 @@ class TestSeeder(unittest.TestCase):
 
         summary = seed(embed=False, base_dir=self.tmpdir)
 
-        # Check errors.db was populated (40 errors: 5 * 7 languages + 5 tooling)
-        self.assertEqual(summary["errors_seeded"], 61)
+        # Check errors.db was populated (41 errors: 5 * 7 languages + 6 tooling)
+        self.assertEqual(summary["errors_seeded"], 62)
         self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
-        self.assertEqual(summary["docs_seeded"], 13)  # 3+2+4+4
+        self.assertEqual(summary["docs_seeded"], 14)  # 3+2+5+4
         self.assertEqual(summary["chunks_embedded"], 0)
 
         # Verify error counts per language
@@ -282,7 +282,7 @@ class TestSeeder(unittest.TestCase):
         edict = ErrorDict(db_path)
         counts = edict.count_by_language()
         expected_per_lang = {
-            "python": 5, "javascript": 28,  # 5 base + 2 npm + 4 react-testing + 1 waitFor-assumed-content + 1 nested-router + 1 assumed-aria + 1 queryByRole-null + 1 rerender-memoryrouter + 2 vitest + 1 no-suite + 1 vite-resolve + 1 component-type-invalid + 1 suspense-fallback-sync-query + 1 empty-root + 1 css-brittle
+            "python": 5, "javascript": 29,  # 5 base + 2 npm + 5 react-testing + 1 waitFor-assumed-content + 1 nested-router + 1 assumed-aria + 1 queryByRole-null + 1 rerender-memoryrouter + 2 vitest + 1 no-suite + 1 vite-resolve + 1 component-type-invalid + 1 suspense-fallback-sync-query + 1 empty-root + 1 css-brittle
             "typescript": 5, "java": 5, "go": 5, "rust": 5, "csharp": 5,
         }
         for lang, expected in expected_per_lang.items():
@@ -582,7 +582,7 @@ class TestUpdaterClean(unittest.TestCase):
 
         clean(base_dir=self.tmpdir)
         summary = seed(embed=False, base_dir=self.tmpdir)
-        self.assertEqual(summary["errors_seeded"], 61)
+        self.assertEqual(summary["errors_seeded"], 62)
         self.assertGreaterEqual(summary["docs_seeded"], 1)
 
 
