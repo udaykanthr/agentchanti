@@ -24,6 +24,8 @@
 
 ## What is AgentChanti?
 
+AgentChanti ships with a built-in RAG system. Before any agent writes code, it automatically retrieves the most relevant functions, classes, and docs from your codebase and injects them as context — so even a local 7B model running in Ollama understands your project structure and coding conventions. Teams can add internal docs, architecture decisions, and coding standards to the Global KB, and every agent on every run picks them up automatically.
+
 AgentChanti is a **command-line tool and Python library** that takes a plain English description of a coding task and autonomously builds the software for you using a team of specialized AI agents:
 
 | Agent | Role |
@@ -34,6 +36,42 @@ AgentChanti is a **command-line tool and Python library** that takes a plain Eng
 | **Tester** | Generates and runs unit tests to verify everything works |
 
 Supports local LLMs ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai)) and cloud providers (OpenAI, Google Gemini, Anthropic Claude).
+
+### Beyond the CLI — Use It as a Service
+
+AgentChanti ships as both a CLI and a **Python library**, so it can be embedded directly into any service:
+
+```python
+# Inside a Flask endpoint — trigger the full agent pipeline on a PR event
+from multi_agent_coder import run_task
+
+@app.route("/pr-review", methods=["POST"])
+def on_pull_request():
+    result = run_task(task="Generate unit tests for the changed files", auto=True)
+    return {"status": result.status, "files": result.files_written}
+```
+
+The **plugin system** (`StepPlugin` base class) lets teams extend the pipeline with custom steps beyond code generation:
+
+| Example Plugin | What It Does |
+|----------------|--------------|
+| PR test generator | Auto-generates tests when a PR is opened |
+| Image validator | Validates assets against design specs using a vision model |
+| Deployment gate | Runs lint, security scan, or compliance checks before deploy |
+| Custom linter | Enforces team-specific coding standards as a pipeline step |
+
+Plugins are discovered automatically from your config or via setuptools entry points — no changes to the core pipeline needed.
+
+### Built-in RAG — Any LLM Understands Your Codebase
+
+AgentChanti includes a **4-phase RAG system** that automatically indexes your project and injects relevant context into every agent prompt — so even a small local model running offline has deep awareness of your internal code and docs:
+
+- **Code graph** — tree-sitter parses your codebase into a symbol graph (functions, classes, imports, call edges) across 11 languages
+- **Semantic search** — every function and class is embedded into a local SQLite vector store; agents retrieve the most relevant symbols before writing any code
+- **Global KB** — add your internal docs, ADRs, and coding standards; every agent picks them up automatically
+- **Error dictionary** — maps known error patterns to fixes so agents self-correct without extra LLM calls
+
+All storage is local SQLite — no cloud vector database required. Works fully offline with local LLMs.
 
 ---
 
