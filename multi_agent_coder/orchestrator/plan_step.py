@@ -359,7 +359,20 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Command line (for CMD steps)
         if line.startswith("> "):
             cmd_text = line[2:].strip()
-            current.command = cmd_text
+            # Skip markdown metadata annotations that the LLM sometimes
+            # prefixes with ">" (e.g. "> **produces:** ..." or "> **note:** ...")
+            _bare = cmd_text.lstrip("*_ \t")
+            _meta_prefixes = ("produces:", "note:", "output:", "creates:",
+                              "result:", "generates:", "returns:")
+            if cmd_text.startswith("**") or any(
+                _bare.lower().startswith(p) for p in _meta_prefixes
+            ):
+                continue  # metadata annotation, not a shell command
+            # Join multiple commands per step with && so all run sequentially
+            if current.command:
+                current.command = current.command + " && " + cmd_text
+            else:
+                current.command = cmd_text
             cmd_lines.append(cmd_text)
 
         # Target files

@@ -574,8 +574,7 @@ def _textual_diff_approval(diffs: list[tuple[str, str]],
     app = DiffApprovalApp(diffs, new_files, files)
     
     start_t = time.monotonic()
-    # signals=False allows running in background threads without signal conflicts
-    app.run(signals=False)
+    app.run()
     elapsed = time.monotonic() - start_t
 
     # Logic: if the app exits in < 0.3s AND never reached on_mount, it likely
