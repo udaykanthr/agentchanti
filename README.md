@@ -6,13 +6,13 @@
   / ___ \ (_| |  __/ | | | |_  | |___| | | | (_| | | | | |_| |
  /_/   \_\__, |\___|_| |_|\__|  \____|_| |_|\__,_|_| |_|\__|_|
          |___/
-                    ━━  L o c a l   C o d e r  ━━
+                  ━━  A u t o n o m o u s   C o d e r  ━━
 </pre>
 </p>
 
 <p align="center">
-  <b>A fully offline, multi-agent AI coding system powered by local LLMs.</b><br>
-  Plans. Codes. Reviews. Tests. All on your machine.
+  <b>A multi-agent AI coding system with built-in RAG — local or cloud, CLI or API.</b><br>
+  Plans. Codes. Reviews. Tests. Understands your codebase.
 </p>
 
 <p align="center">
