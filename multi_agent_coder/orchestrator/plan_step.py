@@ -258,7 +258,25 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     the code is mapped to that file.  When multiple targets exist, the
     parser looks for ``// FileName.jsx`` comment headers to split the
     code into per-file blocks.
+
+    When a reasoning model emits multiple draft plans in its thinking
+    output, only the LAST ``==PLAN==...==END==`` block is used so that
+    intermediate drafts don't bloat the step count.
     """
+    # Extract the last ==PLAN== ... ==END== block (handles reasoning models
+    # that include multiple draft plans in their thinking output).
+    # Use rfind so partial/unclosed ==PLAN== blocks in thinking text don't
+    # cause the regex to merge everything into one giant block.
+    _upper = text.upper()
+    _last_plan = _upper.rfind("==PLAN==")
+    if _last_plan >= 0:
+        _end_after = _upper.find("==END==", _last_plan)
+        if _end_after > _last_plan:
+            text = text[_last_plan + len("==PLAN=="):_end_after]
+        else:
+            # No ==END== found after last ==PLAN== — use everything after it
+            text = text[_last_plan + len("==PLAN=="):]
+
     steps: list[PlanStep] = []
     current: Optional[PlanStep] = None
     desc_lines: list[str] = []
