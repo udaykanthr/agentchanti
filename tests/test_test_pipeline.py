@@ -531,6 +531,48 @@ def test_smart_merge_preserves_existing_keys():
     assert merged["dependencies"]["axios"] == "^1.0.0"
 
 
+def test_smart_merge_adds_type_module():
+    """Adding 'type': 'module' to package.json should be allowed (safe top-level key)."""
+    existing = json.dumps({
+        "name": "my-app",
+        "version": "1.0.0",
+        "scripts": {"start": "node index.js"}
+    }, indent=2)
+    llm_output = json.dumps({
+        "name": "my-app",
+        "version": "1.0.0",
+        "type": "module",
+        "scripts": {"start": "node index.js", "test": "vitest run"}
+    }, indent=2)
+
+    result = _smart_merge_json_manifest(existing, llm_output, "package.json")
+    assert result is not None
+    merged = json.loads(result)
+    assert merged["type"] == "module"
+    assert merged["scripts"]["test"] == "vitest run"
+    assert merged["name"] == "my-app"
+
+
+def test_smart_merge_preserves_non_safe_toplevel():
+    """Keys like 'name' and 'version' must NOT be overwritten by LLM output."""
+    existing = json.dumps({
+        "name": "my-app",
+        "version": "1.0.0",
+    }, indent=2)
+    llm_output = json.dumps({
+        "name": "corrupted-name",
+        "version": "9.9.9",
+        "type": "module",
+    }, indent=2)
+
+    result = _smart_merge_json_manifest(existing, llm_output, "package.json")
+    assert result is not None
+    merged = json.loads(result)
+    assert merged["name"] == "my-app"
+    assert merged["version"] == "1.0.0"
+    assert merged["type"] == "module"
+
+
 def test_smart_merge_fallback_on_invalid_json():
     """Invalid JSON from LLM should return None (trigger fallback block)."""
     existing = '{"name": "my-app"}'

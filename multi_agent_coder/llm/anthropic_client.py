@@ -84,6 +84,8 @@ class AnthropicClient(LLMClient):
 
         content_parts: list[str] = []
         tokens_generated = 0
+        prompt_tokens = est_tokens
+        completion_tokens = 0
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
@@ -98,7 +100,13 @@ class AnthropicClient(LLMClient):
                     event = json.loads(data_str)
                     event_type = event.get("type", "")
 
-                    if event_type == "content_block_delta":
+                    if event_type == "message_start":
+                        # First event — contains real input_tokens count
+                        usage = event.get("message", {}).get("usage", {})
+                        if usage.get("input_tokens"):
+                            prompt_tokens = usage["input_tokens"]
+
+                    elif event_type == "content_block_delta":
                         delta = event.get("delta", {})
                         if delta.get("type") == "text_delta":
                             token = delta.get("text", "")
@@ -109,11 +117,10 @@ class AnthropicClient(LLMClient):
                                     self._stream_callback(tokens_generated)
 
                     elif event_type == "message_delta":
-                        # Final usage info
+                        # Final event — contains real output_tokens count
                         usage = event.get("usage", {})
-                        output_tokens = usage.get("output_tokens")
-                        if output_tokens:
-                            tokens_generated = output_tokens
+                        if usage.get("output_tokens"):
+                            completion_tokens = usage["output_tokens"]
 
                     elif event_type == "message_stop":
                         break
@@ -122,8 +129,12 @@ class AnthropicClient(LLMClient):
                     continue
 
         result = "".join(content_parts)
-        token_tracker.record(est_tokens, tokens_generated, model_name=self.model)
-        log.debug(f"[Anthropic] Streamed {tokens_generated} tokens")
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
+            model_name=self.model,
+        )
+        log.debug(f"[Anthropic] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
         log.debug(f"[Anthropic] Response:\n{result}")
 
         if self._stream_callback:

@@ -32,7 +32,7 @@ class GeminiClient(LLMClient):
                 }
             ],
             "generationConfig": {
-                "temperature": 0.7,
+                # "temperature": 0.7,
             },
         }
         url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
@@ -73,7 +73,7 @@ class GeminiClient(LLMClient):
                 }
             ],
             "generationConfig": {
-                "temperature": 0.7,
+                # "temperature": 0.7,
             },
         }
         url = (
@@ -83,6 +83,8 @@ class GeminiClient(LLMClient):
 
         content_parts: list[str] = []
         tokens_generated = 0
+        prompt_tokens = est_tokens
+        completion_tokens = 0
 
         response = requests.post(url, json=payload, stream=True, timeout=(10, 120))
         response.raise_for_status()
@@ -98,6 +100,11 @@ class GeminiClient(LLMClient):
                 try:
                     chunk = json.loads(data_str)
                     log.debug(f"[Gemini] Chunk: {chunk}")
+                    # usageMetadata is present in the final chunk with real counts
+                    usage = chunk.get("usageMetadata", {})
+                    if usage:
+                        prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
+                        completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
                     candidates = chunk.get("candidates", [])
                     if not candidates:
                         continue
@@ -113,8 +120,12 @@ class GeminiClient(LLMClient):
                     continue
 
         result = "".join(content_parts)
-        token_tracker.record(est_tokens, tokens_generated, model_name=self.model)
-        log.debug(f"[Gemini] Streamed {tokens_generated} tokens")
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
+            model_name=self.model,
+        )
+        log.debug(f"[Gemini] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
         log.debug(f"[Gemini] Response:\n{result}")
 
         if self._stream_callback:

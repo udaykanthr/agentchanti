@@ -38,7 +38,6 @@ class OpenAIClient(LLMClient):
                 {"role": "system", "content": "You are a helpful coding assistant."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.7,
             "stream": False,
         }
         url = f"{self.base_url}/chat/completions"
@@ -74,13 +73,15 @@ class OpenAIClient(LLMClient):
                 {"role": "system", "content": "You are a helpful coding assistant."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.7,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         url = f"{self.base_url}/chat/completions"
 
         content_parts: list[str] = []
         tokens_generated = 0
+        prompt_tokens = est_tokens
+        completion_tokens = 0
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
@@ -95,6 +96,11 @@ class OpenAIClient(LLMClient):
                     break
                 try:
                     chunk = json.loads(data_str)
+                    # Final chunk from stream_options.include_usage carries real usage
+                    usage = chunk.get("usage")
+                    if usage:
+                        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                        completion_tokens = usage.get("completion_tokens", completion_tokens)
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     token = delta.get("content", "")
                     if token:
@@ -106,8 +112,12 @@ class OpenAIClient(LLMClient):
                     continue
 
         result = "".join(content_parts)
-        token_tracker.record(est_tokens, tokens_generated, model_name=self.model)
-        log.debug(f"[OpenAI] Streamed {tokens_generated} tokens")
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
+            model_name=self.model,
+        )
+        log.debug(f"[OpenAI] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
         log.debug(f"[OpenAI] Response:\n{result}")
 
         if self._stream_callback:

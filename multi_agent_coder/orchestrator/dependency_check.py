@@ -64,7 +64,7 @@ class FileDeps:
 @dataclass
 class IntegrationGap:
     """A detected integration problem between files."""
-    gap_type: str               # "orphaned_export" | "broken_import" | "missing_connection" | "missing_default_export"
+    gap_type: str               # "orphaned_export" | "broken_import" | "missing_connection" | "missing_default_export" | "stale_caller"
     source_file: str            # The file where the problem originates
     target_file: str | None     # The file that should reference/be referenced
     symbol: str                 # The symbol name(s) involved
@@ -159,6 +159,70 @@ _JS_DEFAULT_IMPORT_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# ── Function / callable signature patterns (per language) ─────────
+
+# JS/TS: components with destructured-object props
+#   function ComponentName({ propA, propB })
+#   const ComponentName = ({ propA }) =>
+_JSX_COMP_DEF_RE = re.compile(
+    r'(?:export\s+(?:default\s+)?)?'
+    r'(?:'
+    r'function\s+([A-Z]\w*)'
+    r'|(?:const|let|var)\s+([A-Z]\w*)\s*=\s*(?:function\s*)?'
+    r')'
+    r'\s*\(\s*\{([^}]*)\}',
+    re.MULTILINE,
+)
+
+# Python: def func_name(param1, param2: Type, param3=default):
+_PY_FUNC_DEF_RE = re.compile(
+    r'^def\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# Go: func FuncName(param1 type1, param2 type2)
+_GO_FUNC_DEF_RE = re.compile(
+    r'^func\s+([A-Z]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# Java / C# / Kotlin: public ReturnType methodName(Type1 p1, Type2 p2)
+_JAVA_FUNC_DEF_RE = re.compile(
+    r'(?:public|protected|private)\s+(?:static\s+)?(?:\w[\w<>\[\],\s]*\s+)'
+    r'([a-zA-Z_]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# Rust: pub fn func_name(param1: type1, param2: type2)
+_RUST_FUNC_DEF_RE = re.compile(
+    r'^pub\s+fn\s+([a-z_]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# Ruby: def method_name(param1, param2 = default)
+_RUBY_FUNC_DEF_RE = re.compile(
+    r'^def\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# PHP: public function methodName(Type $param1, $param2 = default)
+_PHP_FUNC_DEF_RE = re.compile(
+    r'(?:public|protected|private)?\s*function\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)',
+    re.MULTILINE,
+)
+
+# Maps language family → (func_def_pattern, param_style)
+# param_style: "destructured" | "positional" | "typed_prefix" | "typed_suffix"
+_LANG_FUNC_INFO: dict[str, tuple[re.Pattern, str]] = {
+    "python": (_PY_FUNC_DEF_RE,   "python"),
+    "go":     (_GO_FUNC_DEF_RE,   "go"),
+    "java":   (_JAVA_FUNC_DEF_RE, "typed_suffix"),
+    "csharp": (_JAVA_FUNC_DEF_RE, "typed_suffix"),
+    "rust":   (_RUST_FUNC_DEF_RE, "rust"),
+    "ruby":   (_RUBY_FUNC_DEF_RE, "ruby"),
+    "php":    (_PHP_FUNC_DEF_RE,  "php"),
+}
+
 
 # ── Python stdlib modules (for external import detection) ────────
 
@@ -247,6 +311,260 @@ def extract_file_deps(
         has_default_export=has_default_export,
         default_imports=default_imports,
     )
+
+
+# ── Function signature contract helpers ──────────────────────────
+
+def _extract_component_props(content: str) -> dict[str, set[str]]:
+    """JS/TS only: return {ComponentName: required_props} for destructured-prop components."""
+    result: dict[str, set[str]] = {}
+    for m in _JSX_COMP_DEF_RE.finditer(content):
+        name = m.group(1) or m.group(2)
+        if not name:
+            continue
+        props_str = m.group(3)
+        required: set[str] = set()
+        for raw in props_str.split(","):
+            raw = raw.strip()
+            if not raw or raw.startswith("..."):
+                continue
+            if "=" in raw:
+                continue  # has default → optional
+            m2 = re.match(r"^(\w+)", raw)
+            if m2:
+                required.add(m2.group(1))
+        if required:
+            result[name] = required
+    return result
+
+
+def _parse_required_params(params_str: str, style: str) -> set[str]:
+    """Extract required (no-default) param names from a parameter string.
+
+    *style* is one of the values from ``_LANG_FUNC_INFO``.
+    """
+    required: set[str] = set()
+    for raw in params_str.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if style == "python":
+            if raw in ("/", "self", "cls") or raw.startswith("*") or raw.startswith("**"):
+                continue
+            if "=" in raw:
+                continue
+            raw = raw.split(":")[0].strip()
+            m = re.match(r"^(\w+)", raw)
+            if m:
+                required.add(m.group(1))
+        elif style == "go":
+            # "name type" — first token is name if lowercase
+            parts = raw.split()
+            if len(parts) >= 2:
+                name = parts[0]
+                if name and name != "_" and name[0].islower():
+                    required.add(name)
+        elif style == "typed_suffix":
+            # Java/C#: "Type name" or "Type name = default"
+            parts = raw.split()
+            if len(parts) >= 2:
+                name = parts[-1].split("=")[0].strip()
+                m = re.match(r"^(\w+)", name)
+                if m:
+                    if "=" not in raw:
+                        required.add(m.group(1))
+        elif style == "rust":
+            if raw in ("self", "&self", "&mut self"):
+                continue
+            if ":" in raw:
+                name = raw.split(":")[0].strip()
+                if name and name != "_":
+                    m = re.match(r"^(\w+)", name)
+                    if m:
+                        required.add(m.group(1))
+        elif style in ("ruby", "php"):
+            # Ruby: param or param = default; PHP: Type $param or $param = default
+            if "=" in raw:
+                continue
+            # PHP: strip type hint and $ sigil
+            raw = re.sub(r"^\w[\w\[\]|?]*\s+", "", raw).lstrip("$")
+            m = re.match(r"^(\w+)", raw)
+            if m:
+                required.add(m.group(1))
+    return required
+
+
+def _extract_func_sigs(content: str, language: str) -> dict[str, set[str]]:
+    """Return {callable_name: required_params} for *content* in *language*.
+
+    JS/TS uses the detailed destructured-prop pattern (named params).
+    All other languages use their language-specific function def pattern.
+    """
+    if language in ("javascript", "typescript"):
+        return _extract_component_props(content)
+
+    info = _LANG_FUNC_INFO.get(language)
+    if not info:
+        return {}
+    pattern, style = info
+    result: dict[str, set[str]] = {}
+    for m in pattern.finditer(content):
+        name = m.group(1)
+        if language == "python" and name.startswith("_"):
+            continue  # skip private/dunder functions
+        required = _parse_required_params(m.group(2), style)
+        if len(required) >= 2:
+            result[name] = required
+    return result
+
+
+def _extract_jsx_call_props(content: str, comp_name: str) -> list[set[str]]:
+    """Return one set of passed prop names per ``<CompName ...>`` call site.
+
+    Character-level scan with balanced-brace tracking handles multi-line JSX
+    tags and ``{expression}`` values that contain ``>`` characters.
+    Call sites with a spread (``{...x}``) are skipped.
+    """
+    all_sites: list[set[str]] = []
+    search_str = f"<{comp_name}"
+    pos = 0
+    while True:
+        idx = content.find(search_str, pos)
+        if idx == -1:
+            break
+        pos = idx + 1
+        end_of_name = idx + len(search_str)
+        if end_of_name < len(content) and (
+            content[end_of_name].isalnum() or content[end_of_name] == "_"
+        ):
+            continue
+
+        props_found: set[str] = set()
+        has_spread = False
+        i = end_of_name
+        brace_depth = 0
+        limit = min(len(content), end_of_name + 2000)
+        while i < limit:
+            ch = content[i]
+            if brace_depth > 0:
+                if ch == "{":
+                    brace_depth += 1
+                elif ch == "}":
+                    brace_depth -= 1
+                i += 1
+                continue
+            if ch == "{":
+                if i + 1 < limit and content[i + 1] == ".":
+                    has_spread = True
+                brace_depth = 1
+                i += 1
+                continue
+            if ch == "/" and i + 1 < limit and content[i + 1] == ">":
+                break
+            if ch == ">":
+                break
+            if ch.isalpha() or ch == "_":
+                attr_m = re.match(r"([a-zA-Z_]\w*)\s*=", content[i:])
+                if attr_m:
+                    props_found.add(attr_m.group(1))
+                    i += len(attr_m.group(0))
+                    continue
+            i += 1
+
+        if not has_spread:
+            all_sites.append(props_found)
+    return all_sites
+
+
+def _check_zero_arg_call(content: str, func_name: str) -> bool:
+    """Return True if *func_name* is called with empty parentheses somewhere."""
+    pat = re.compile(rf"\b{re.escape(func_name)}\s*\(\s*\)", re.MULTILINE)
+    return bool(pat.search(content))
+
+
+def _find_signature_gaps(
+    new_files: list[str],
+    memory_files: dict[str, str],
+) -> list[IntegrationGap]:
+    """Detect call sites missing required params after a signature change.
+
+    Works for all supported languages:
+    - **JS/TS**: checks named props at JSX call sites (detailed).
+    - **Python / Go / Java / Rust / Ruby / PHP**: checks for zero-arg calls
+      (``func_name()``) to functions that require 2+ params — the most
+      reliable static check for positional-arg languages.
+    """
+    gaps: list[IntegrationGap] = []
+    _code_exts = frozenset({
+        ".js", ".jsx", ".ts", ".tsx",
+        ".py", ".go", ".java", ".rs", ".cs", ".rb", ".php",
+    })
+
+    for nf in new_files:
+        ext = os.path.splitext(nf)[1].lower()
+        if ext not in _code_exts:
+            continue
+        language = _EXT_TO_LANG_FAMILY.get(ext)
+        if not language:
+            continue
+        content = memory_files.get(nf, "")
+        if not content:
+            continue
+
+        callables = _extract_func_sigs(content, language)
+        if not callables:
+            continue
+
+        is_js_ts = language in ("javascript", "typescript")
+
+        for func_name, required_params in callables.items():
+            if len(required_params) < 2:
+                continue
+
+            for other_path, other_content in memory_files.items():
+                if other_path == nf:
+                    continue
+                other_ext = os.path.splitext(other_path)[1].lower()
+                if other_ext not in _code_exts:
+                    continue
+
+                if is_js_ts:
+                    # Named-prop check via JSX attribute scan
+                    if f"<{func_name}" not in other_content:
+                        continue
+                    call_sites = _extract_jsx_call_props(other_content, func_name)
+                    for passed_props in call_sites:
+                        missing = required_params - passed_props
+                        if len(missing) >= 2:
+                            gaps.append(IntegrationGap(
+                                gap_type="stale_caller",
+                                source_file=nf,
+                                target_file=other_path,
+                                symbol=func_name,
+                                description=(
+                                    f"File '{other_path}' calls <{func_name}> but is "
+                                    f"missing required props: {', '.join(sorted(missing))}. "
+                                    f"Component defined in '{nf}' expects: "
+                                    f"{', '.join(sorted(required_params))}."
+                                ),
+                            ))
+                else:
+                    # Zero-arg call check for positional-arg languages
+                    if f"{func_name}(" not in other_content:
+                        continue
+                    if _check_zero_arg_call(other_content, func_name):
+                        gaps.append(IntegrationGap(
+                            gap_type="stale_caller",
+                            source_file=nf,
+                            target_file=other_path,
+                            symbol=func_name,
+                            description=(
+                                f"File '{other_path}' calls {func_name}() with no arguments "
+                                f"but '{nf}' defines it with {len(required_params)} required "
+                                f"parameter(s): {', '.join(sorted(required_params))}."
+                            ),
+                        ))
+    return gaps
 
 
 def build_snapshot(
@@ -614,6 +932,15 @@ def find_gaps(
                 ),
             ))
 
+    # ── 5. Stale callers — signature contract check ──
+    # When a newly written callable gains required params, ensure call sites
+    # in other files are updated.  Works across all supported languages.
+    try:
+        sig_gaps = _find_signature_gaps(new_files, memory_files)
+        gaps.extend(sig_gaps)
+    except Exception as exc:
+        _logger.warning("[DepCheck] Signature contract check failed: %s", exc)
+
     return gaps
 
 
@@ -647,6 +974,9 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 - For MISSING DEFAULT EXPORT gaps: add `export default ComponentName;` at the end \
 of the file. The component name should match the filename in PascalCase. \
 NEVER remove the existing component function/class — only add the missing export.
+- For STALE CALLER gaps: update the call site to pass all listed required \
+arguments/props. Use sensible placeholder values or variables already in scope. \
+Do NOT change the callee's definition — only fix the call site(s).
 """
 
 
