@@ -187,14 +187,169 @@ def _read_package_json(root: str = ".") -> dict:
 
 def _read_requirements(root: str = ".") -> list[str]:
     """Read requirements.txt packages."""
-    path = os.path.join(root, "requirements.txt")
+    packages = []
+    for fname in ("requirements.txt", "requirements-dev.txt", "requirements/base.txt"):
+        path = os.path.join(root, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith(("#", "-r", "--")):
+                        continue
+                    # Strip version specifiers and extras: pkg[extra]>=1.0 -> pkg
+                    pkg = re.split(r'[>=<!;\[\s]', line)[0].strip()
+                    if pkg:
+                        packages.append(pkg)
+        except OSError:
+            pass
+    return packages
+
+
+def _read_pyproject_toml(root: str = ".") -> list[str]:
+    """Read dependencies from pyproject.toml (PEP 517/518/621)."""
+    path = os.path.join(root, "pyproject.toml")
     if not os.path.isfile(path):
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return [line.strip().split("==")[0].split(">=")[0].split("<=")[0]
-                    for line in f if line.strip() and not line.startswith("#")]
+            content = f.read()
+        packages = []
+        # [project] dependencies = ["django>=4", ...]
+        m = re.search(r'\[project\].*?dependencies\s*=\s*\[(.*?)\]', content, re.S)
+        if m:
+            for dep in re.findall(r'"([^"]+)"|\'([^\']+)\'', m.group(1)):
+                raw = (dep[0] or dep[1]).strip()
+                pkg = re.split(r'[>=<!;\[\s]', raw)[0].strip()
+                if pkg:
+                    packages.append(pkg)
+        # [tool.poetry.dependencies] or [tool.poetry.dev-dependencies]
+        for section in re.finditer(
+                r'\[tool\.poetry\.(?:dev-)?dependencies\](.*?)(?=\[|\Z)', content, re.S):
+            for line in section.group(1).splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    pkg = line.split('=')[0].strip().strip('"').strip("'")
+                    if pkg and pkg.lower() != 'python':
+                        packages.append(pkg)
+        return packages
     except OSError:
+        return []
+
+
+def _read_go_mod(root: str = ".") -> list[str]:
+    """Read module dependencies from go.mod."""
+    path = os.path.join(root, "go.mod")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        packages = []
+        in_require = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("require ("):
+                in_require = True
+                continue
+            if in_require:
+                if stripped == ")":
+                    in_require = False
+                    continue
+                # "github.com/gin-gonic/gin v1.9.0"
+                parts = stripped.split()
+                if parts and not stripped.startswith("//"):
+                    # Use last component of module path as readable name
+                    pkg = parts[0].rstrip("/").rsplit("/", 1)[-1]
+                    if pkg:
+                        packages.append(parts[0])  # keep full path for detection
+            elif stripped.startswith("require "):
+                # single-line: require github.com/foo/bar v1.0.0
+                parts = stripped[8:].split()
+                if parts:
+                    packages.append(parts[0])
+        return packages
+    except OSError:
+        return []
+
+
+def _read_cargo_toml(root: str = ".") -> list[str]:
+    """Read dependencies from Cargo.toml."""
+    path = os.path.join(root, "Cargo.toml")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        packages = []
+        in_deps = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if re.match(r'\[(dependencies|dev-dependencies|build-dependencies)\]', stripped):
+                in_deps = True
+                continue
+            if stripped.startswith('[') and in_deps:
+                in_deps = False
+            if in_deps and '=' in stripped and not stripped.startswith('#'):
+                pkg = stripped.split('=')[0].strip()
+                if pkg:
+                    packages.append(pkg)
+        return packages
+    except OSError:
+        return []
+
+
+def _read_pom_xml(root: str = ".") -> list[str]:
+    """Read artifactIds from Maven pom.xml."""
+    path = os.path.join(root, "pom.xml")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # Extract <artifactId> values (skip the first one which is the project itself)
+        artifacts = re.findall(r'<artifactId>([^<]+)</artifactId>', content)
+        return artifacts[1:] if len(artifacts) > 1 else []
+    except OSError:
+        return []
+
+
+def _read_gemfile(root: str = ".") -> list[str]:
+    """Read gem names from Gemfile."""
+    path = os.path.join(root, "Gemfile")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            packages = []
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("gem "):
+                    m = re.match(r"gem\s+['\"]([^'\"]+)['\"]", stripped)
+                    if m:
+                        packages.append(m.group(1))
+            return packages
+    except OSError:
+        return []
+
+
+def _read_composer_json(root: str = ".") -> list[str]:
+    """Read package names from composer.json."""
+    path = os.path.join(root, "composer.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        packages = []
+        for section in ("require", "require-dev"):
+            for pkg in data.get(section, {}):
+                if pkg != "php":
+                    # Use vendor/package -> package
+                    packages.append(pkg.rsplit("/", 1)[-1])
+        return packages
+    except (json.JSONDecodeError, OSError):
         return []
 
 
@@ -241,19 +396,22 @@ def _detect_module_system(pkg: dict, source_files: dict[str, str]) -> str:
 
 
 def _detect_test_framework_from_project(pkg: dict, root: str = ".") -> str:
-    """Detect test framework from package.json and config files."""
+    """Detect test framework from manifests and config files (all languages)."""
     deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
 
+    # JavaScript / TypeScript
     if "vitest" in deps:
         return "vitest"
-    if "jest" in deps:
-        return "jest"
-    if "@jest/globals" in deps:
+    if "jest" in deps or "@jest/globals" in deps:
         return "jest"
     if "mocha" in deps:
         return "mocha"
-
-    # Check for config files
+    if "jasmine" in deps:
+        return "jasmine"
+    if "ava" in deps:
+        return "ava"
+    if "tape" in deps:
+        return "tape"
     for name in ("vitest.config.ts", "vitest.config.js", "vite.config.ts", "vite.config.js"):
         if os.path.isfile(os.path.join(root, name)):
             return "vitest"
@@ -262,26 +420,245 @@ def _detect_test_framework_from_project(pkg: dict, root: str = ".") -> str:
             return "jest"
 
     # Python
-    if os.path.isfile(os.path.join(root, "pytest.ini")) or os.path.isfile(os.path.join(root, "setup.cfg")):
+    all_python_pkgs = _read_requirements(root) + _read_pyproject_toml(root)
+    if "pytest" in all_python_pkgs:
         return "pytest"
-    if os.path.isfile(os.path.join(root, "requirements.txt")):
-        reqs = _read_requirements(root)
-        if "pytest" in reqs:
-            return "pytest"
+    for name in ("pytest.ini", "setup.cfg", "pyproject.toml"):
+        if os.path.isfile(os.path.join(root, name)):
+            try:
+                with open(os.path.join(root, name), encoding="utf-8") as f:
+                    if "pytest" in f.read():
+                        return "pytest"
+            except OSError:
+                pass
+    if "unittest" in all_python_pkgs or os.path.isfile(os.path.join(root, "test_*.py")):
+        return "unittest"
+    if "nose2" in all_python_pkgs:
+        return "nose2"
+
+    # Go — standard library testing package
+    if os.path.isfile(os.path.join(root, "go.mod")):
+        go_pkgs = _read_go_mod(root)
+        if any("testify" in p for p in go_pkgs):
+            return "testify"
+        return "go test"  # built-in
+
+    # Rust — built-in cargo test
+    if os.path.isfile(os.path.join(root, "Cargo.toml")):
+        return "cargo test"
+
+    # Java
+    pom_artifacts = _read_pom_xml(root)
+    if any("junit" in a.lower() for a in pom_artifacts):
+        return "junit"
+    if os.path.isfile(os.path.join(root, "build.gradle")) or \
+            os.path.isfile(os.path.join(root, "build.gradle.kts")):
+        try:
+            with open(os.path.join(root, "build.gradle"), encoding="utf-8") as f:
+                if "junit" in f.read().lower():
+                    return "junit"
+        except OSError:
+            pass
+
+    # Ruby
+    gems = _read_gemfile(root)
+    if "rspec" in gems or "rspec-rails" in gems:
+        return "rspec"
+    if "minitest" in gems:
+        return "minitest"
+
+    # PHP
+    php_pkgs = _read_composer_json(root)
+    if "phpunit" in php_pkgs:
+        return "phpunit"
+    if "pest" in php_pkgs:
+        return "pest"
 
     return ""
 
 
 def _get_installed_packages(pkg: dict, root: str = ".") -> list[str]:
-    """Get list of all installed packages."""
+    """Get list of all installed packages from every supported manifest."""
     packages = []
+    # JavaScript / TypeScript
     if pkg:
         packages.extend(pkg.get("dependencies", {}).keys())
         packages.extend(pkg.get("devDependencies", {}).keys())
-    reqs = _read_requirements(root)
-    if reqs:
-        packages.extend(reqs)
-    return sorted(set(packages))
+        packages.extend(pkg.get("peerDependencies", {}).keys())
+    # Python
+    packages.extend(_read_requirements(root))
+    packages.extend(_read_pyproject_toml(root))
+    # Go
+    packages.extend(_read_go_mod(root))
+    # Rust
+    packages.extend(_read_cargo_toml(root))
+    # Java/Maven
+    packages.extend(_read_pom_xml(root))
+    # Ruby
+    packages.extend(_read_gemfile(root))
+    # PHP
+    packages.extend(_read_composer_json(root))
+    return sorted(set(p for p in packages if p))
+
+
+def _infer_subproject_root(source_files: dict[str, str]) -> str:
+    """Infer the subproject root from file paths when not explicitly provided.
+
+    If all source files share a common first directory component AND that
+    directory contains a package.json or requirements.txt on disk, return it.
+    This handles projects scaffolded into a subdirectory (e.g. responsive-webpage/).
+    """
+    if not source_files:
+        return "."
+    first_components: set[str] = set()
+    for fpath in source_files:
+        norm = fpath.replace("\\", "/")
+        parts = norm.split("/")
+        if len(parts) > 1 and parts[0] not in (".", "src", "lib", "test", "tests"):
+            first_components.add(parts[0])
+    if len(first_components) == 1:
+        candidate = first_components.pop()
+        # Confirm it's a real project root by checking for a manifest
+        for manifest in (
+            "package.json", "requirements.txt", "pyproject.toml",
+            "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
+            "Gemfile", "composer.json", "mix.exs", "build.sbt",
+        ):
+            if os.path.isfile(os.path.join(candidate, manifest)):
+                return candidate
+    return "."
+
+
+def _detect_framework_from_packages(packages: list[str]) -> str:
+    """Detect the primary framework from installed packages (all languages).
+
+    Priority: CSS/UI frameworks first (most specific), then app frameworks,
+    then language runtimes. Returns the most specific match.
+    """
+    pkg_set = {p.lower() for p in packages}
+
+    # ── CSS / UI frameworks (JS) ──────────────────────────────────────────
+    if "tailwindcss" in pkg_set or "@tailwindcss/postcss" in pkg_set:
+        return "tailwindcss"
+    if "bootstrap" in pkg_set or "react-bootstrap" in pkg_set:
+        return "bootstrap"
+    if "@mui/material" in pkg_set or "@material-ui/core" in pkg_set:
+        return "material-ui"
+    if "antd" in pkg_set:
+        return "ant-design"
+    if "@chakra-ui/react" in pkg_set or "chakra-ui" in pkg_set:
+        return "chakra-ui"
+    if "styled-components" in pkg_set:
+        return "styled-components"
+    if "@emotion/react" in pkg_set or "@emotion/styled" in pkg_set:
+        return "emotion"
+    if "@mantine/core" in pkg_set:
+        return "mantine"
+    if "shadcn" in pkg_set or "@shadcn/ui" in pkg_set:
+        return "shadcn-ui"
+
+    # ── JS / TS app frameworks ────────────────────────────────────────────
+    if "next" in pkg_set:
+        return "nextjs"
+    if "nuxt" in pkg_set:
+        return "nuxtjs"
+    if "gatsby" in pkg_set:
+        return "gatsby"
+    if "remix" in pkg_set or "@remix-run/react" in pkg_set:
+        return "remix"
+    if "react" in pkg_set:
+        return "react"
+    if "vue" in pkg_set:
+        return "vue"
+    if "@angular/core" in pkg_set or "angular" in pkg_set:
+        return "angular"
+    if "svelte" in pkg_set:
+        return "svelte"
+    if "solid-js" in pkg_set:
+        return "solidjs"
+    if "express" in pkg_set:
+        return "express"
+    if "fastify" in pkg_set:
+        return "fastify"
+    if "koa" in pkg_set:
+        return "koa"
+    if "hapi" in pkg_set or "@hapi/hapi" in pkg_set:
+        return "hapi"
+    if "nestjs" in pkg_set or "@nestjs/core" in pkg_set:
+        return "nestjs"
+    if "electron" in pkg_set:
+        return "electron"
+
+    # ── Python frameworks ─────────────────────────────────────────────────
+    if "django" in pkg_set or "django-rest-framework" in pkg_set:
+        return "django"
+    if "fastapi" in pkg_set:
+        return "fastapi"
+    if "flask" in pkg_set:
+        return "flask"
+    if "starlette" in pkg_set:
+        return "starlette"
+    if "tornado" in pkg_set:
+        return "tornado"
+    if "aiohttp" in pkg_set:
+        return "aiohttp"
+    if "streamlit" in pkg_set:
+        return "streamlit"
+    if "gradio" in pkg_set:
+        return "gradio"
+
+    # ── Go frameworks ─────────────────────────────────────────────────────
+    if any("gin-gonic/gin" in p for p in packages):
+        return "gin"
+    if any("labstack/echo" in p for p in packages):
+        return "echo"
+    if any("gofiber/fiber" in p for p in packages):
+        return "fiber"
+    if any("gorilla/mux" in p for p in packages):
+        return "gorilla-mux"
+    if any("go-chi/chi" in p for p in packages):
+        return "chi"
+    if any("beego" in p for p in packages):
+        return "beego"
+
+    # ── Rust frameworks ───────────────────────────────────────────────────
+    if "actix-web" in pkg_set or "actix_web" in pkg_set:
+        return "actix-web"
+    if "axum" in pkg_set:
+        return "axum"
+    if "rocket" in pkg_set:
+        return "rocket"
+    if "warp" in pkg_set:
+        return "warp"
+
+    # ── Java / Kotlin frameworks ──────────────────────────────────────────
+    if any("spring-boot" in p.lower() or "spring-core" in p.lower()
+           or p.lower() in ("spring", "springboot") for p in packages):
+        return "spring"
+    if any("quarkus" in p.lower() for p in packages):
+        return "quarkus"
+    if any("micronaut" in p.lower() for p in packages):
+        return "micronaut"
+
+    # ── Ruby frameworks ───────────────────────────────────────────────────
+    if "rails" in pkg_set or "railties" in pkg_set:
+        return "rails"
+    if "sinatra" in pkg_set:
+        return "sinatra"
+    if "hanami" in pkg_set:
+        return "hanami"
+
+    # ── PHP frameworks ────────────────────────────────────────────────────
+    if "laravel" in pkg_set or "laravel-framework" in pkg_set:
+        return "laravel"
+    if "symfony" in pkg_set:
+        return "symfony"
+    if "slim" in pkg_set:
+        return "slim"
+    if "codeigniter" in pkg_set:
+        return "codeigniter"
+
+    return ""
 
 
 def _detect_source_root(source_files: dict[str, str]) -> str:
@@ -358,7 +735,7 @@ def build_project_context(
     This is the primary entry point. For most projects, static analysis
     provides enough information. LLM enrichment is optional and additive.
     """
-    root = subproject_root or "."
+    root = subproject_root or _infer_subproject_root(source_files)
     pkg = _read_package_json(root)
     ctx = ProjectContext()
 
@@ -368,9 +745,13 @@ def build_project_context(
     elif project_profile:
         ctx.language = getattr(project_profile, "language", "") or ""
 
-    # Framework
-    if project_profile:
-        ctx.framework = getattr(project_profile, "framework", "") or ""
+    # Packages — read first so framework detection can use them
+    ctx.installed_packages = _get_installed_packages(pkg, root)
+
+    # Framework — derive from packages, then override with profile if available
+    ctx.framework = _detect_framework_from_packages(ctx.installed_packages)
+    if project_profile and getattr(project_profile, "framework", ""):
+        ctx.framework = project_profile.framework
 
     # Module system (JS/TS only)
     if ctx.language in ("javascript", "typescript"):
@@ -384,9 +765,6 @@ def build_project_context(
         "python": ".py", "go": ".go", "rust": ".rs", "java": ".java",
     }
     ctx.file_extension = ext_map.get(ctx.language, "")
-
-    # Packages
-    ctx.installed_packages = _get_installed_packages(pkg, root)
 
     # Analyze plan steps for required packages
     _pkg_patterns = re.findall(
@@ -469,7 +847,26 @@ def build_project_context(
             "ES Module project — use import/export, include file extensions in paths")
     if ctx.import_examples:
         ctx.test_patterns.append(
-            f"Follow the same import style as existing code")
+            "Follow the same import style as existing code")
+
+    # Framework-specific styling and testing guidance (injected into every
+    # downstream agent so the LLM never switches to inline styles on a
+    # Tailwind project, or switches frameworks without being asked)
+    if ctx.framework == "tailwindcss":
+        ctx.test_patterns.append(
+            "TAILWIND PROJECT: Use Tailwind utility classes for ALL styling. "
+            "Do NOT use inline styles unless the value is truly dynamic at runtime. "
+            "jsdom cannot compute CSS from stylesheets, so tests must assert class "
+            "presence via toHaveClass(), NOT via getComputedStyle() or element.style.*"
+        )
+        ctx.assertion_hints.append(
+            "Assert Tailwind classes with toHaveClass('class-name'), not computed styles"
+        )
+    elif ctx.framework in ("bootstrap", "material-ui", "ant-design", "chakra-ui"):
+        ctx.test_patterns.append(
+            f"{ctx.framework.upper()} PROJECT: Use {ctx.framework} component classes and "
+            "utility classes for styling. Do NOT replace them with inline styles."
+        )
 
     return ctx
 

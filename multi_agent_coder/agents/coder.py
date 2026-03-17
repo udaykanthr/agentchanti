@@ -67,6 +67,11 @@ For EACH file, use EXACTLY this marker (no extra text after the path):
    exported in the source module. Don't import non-existent functions.
 3. **Complete files**: Output the ENTIRE file content, not just the changed
    part. Include all existing functions/classes that should remain.
+   CRITICAL — when MODIFYING an existing file: preserve ALL existing code
+   exactly as-is. Only apply the specific change requested. Do NOT rename
+   variables, restructure JSX/HTML, change existing class names, rewrite
+   logic, alter prop signatures, remove components, or make any improvements
+   beyond what the task explicitly requests.
 4. **Type correctness**: Function arguments, return types, and variable
    types must be consistent. No implicit type coercions that break.
 5. **Error handling**: Handle likely failure cases (file not found, null
@@ -90,6 +95,12 @@ For EACH file, use EXACTLY this marker (no extra text after the path):
 - FORBIDDEN: Using deprecated APIs or functions.
 - FORBIDDEN: Hardcoding environment-specific paths or credentials.
 - FORBIDDEN: Creating files that duplicate existing files at different paths.
+- FORBIDDEN: Outputting code for any file other than the target file(s)
+  specified in the task. Context files shown are READ-ONLY reference — never
+  emit a `#### [FILE]:` block for them.
+- FORBIDDEN: Refactoring, restructuring, or "improving" code that was not
+  explicitly requested. Treat every existing line outside the change scope
+  as immutable.
 
 Think step-by-step before writing: What files exist? What are their exports?
 What imports will the new/modified code need? Will the code pass tests?

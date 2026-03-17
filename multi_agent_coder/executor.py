@@ -167,6 +167,34 @@ class Executor:
 
         return name
 
+    # Binary/media extensions that should never be written by a CODE step.
+    # LLMs sometimes hallucinate image/font placeholders (e.g. SVG inside a
+    # .png path) — block them so they don't corrupt the asset directory.
+    _BINARY_EXTENSIONS: frozenset = frozenset({
+        # Raster images
+        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif',
+        '.avif', '.ico', '.heic', '.heif',
+        # Vector / raw — SVG is text but belongs in static assets, not code gen
+        '.svg',
+        # Fonts
+        '.woff', '.woff2', '.ttf', '.eot', '.otf',
+        # Audio / video
+        '.mp3', '.mp4', '.wav', '.ogg', '.flac', '.aac',
+        '.avi', '.mov', '.mkv', '.webm',
+        # Archives / binaries
+        '.zip', '.tar', '.gz', '.7z', '.rar',
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.wasm',
+        # Documents
+        '.pdf', '.docx', '.xlsx', '.pptx',
+    })
+
+    @staticmethod
+    def _is_binary_path(file_path: str) -> bool:
+        """Return True if *file_path* has a binary/media extension that a CODE
+        step should never generate."""
+        _, ext = os.path.splitext(file_path)
+        return ext.lower() in Executor._BINARY_EXTENSIONS
+
     @staticmethod
     def _looks_like_code(content: str) -> bool:
         """Return True if *content* looks like actual code rather than prose.
@@ -215,6 +243,10 @@ class Executor:
             if '/' not in filename and '.' not in filename:
                 if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
                     continue
+            # Skip binary/media files — LLMs hallucinate text placeholders for images
+            if Executor._is_binary_path(filename):
+                log.warning(f"[Executor] Skipping '{filename}': binary/media extension not writable by CODE step")
+                continue
             # Skip if content looks like prose rather than code
             if not Executor._looks_like_code(content):
                 log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
@@ -225,6 +257,9 @@ class Executor:
     @staticmethod
     def _try_add_file(files: Dict[str, str], filename: str, content: str):
         """Add file to *files* dict only if the content looks like real code."""
+        if Executor._is_binary_path(filename):
+            log.warning(f"[Executor] Skipping '{filename}': binary/media extension not writable by CODE step")
+            return
         if not Executor._looks_like_code(content):
             log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
             return

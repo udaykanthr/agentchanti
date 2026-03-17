@@ -492,7 +492,8 @@ def _smart_merge_json_manifest(existing: str, llm_output: str,
                                 filepath: str) -> str | None:
     """Merge additive changes from LLM output into an existing JSON manifest.
 
-    Merges new keys in ``dependencies``, ``devDependencies``, and ``scripts``.
+    Merges new keys in ``dependencies``, ``devDependencies``, ``scripts``,
+    and safe top-level keys (e.g. ``"type"``, ``"main"``, ``"exports"``).
     Blocks removals and version changes.  Returns merged JSON string, or
     ``None`` on parse failure.
     """
@@ -536,6 +537,32 @@ def _smart_merge_json_manifest(existing: str, llm_output: str,
             if key not in new_section:
                 log.info(f"[SmartMerge] Blocked removal of {section}.{key} "
                          f"from {filepath}")
+
+    # Safe top-level keys: allow adding new ones or overwriting with same type.
+    # These control module system, entry points, and project metadata — not
+    # dependency resolution — so they are safe to update without pkg-manager help.
+    _SAFE_TOPLEVEL_KEYS = {
+        'type', 'main', 'module', 'browser', 'exports', 'imports',
+        'bin', 'man', 'files', 'sideEffects', 'private',
+        'description', 'keywords', 'author', 'license', 'homepage',
+        'repository', 'bugs', 'engines', 'os', 'cpu',
+        'publishConfig', 'workspaces', 'volta',
+    }
+    for key, value in new_data.items():
+        if key in merge_sections:
+            continue  # already handled above
+        if key not in _SAFE_TOPLEVEL_KEYS:
+            continue
+        if key not in old_data:
+            old_data[key] = value
+            changed = True
+            log.info(f"[SmartMerge] Added top-level {key!r} = {value!r} "
+                     f"to {filepath}")
+        elif old_data[key] != value:
+            old_data[key] = value
+            changed = True
+            log.info(f"[SmartMerge] Updated top-level {key!r}: "
+                     f"{old_data[key]!r} → {value!r} in {filepath}")
 
     if not changed:
         return existing
@@ -1540,11 +1567,223 @@ _JS_IMPORT_RE = re.compile(
     re.DOTALL,
 )
 
+# Matches ALL import sources (packages + relative) for duplicate detection.
+# Captures the module string from: import X from 'mod', import 'mod', export from 'mod'
+_JS_ANY_IMPORT_SOURCE_RE = re.compile(
+    r'''(?:^|(?<=\n))\s*(?:import|export)\b[^;'"]*?from\s+['"]([^'"]+)['"]'''
+    r'''|(?:^|(?<=\n))\s*import\s+['"]([^'"]+)['"]''',
+    re.MULTILINE,
+)
+
 # Python relative imports: from .foo import bar, from ..pkg import baz
 _PY_IMPORT_RE = re.compile(
     r'^from\s+(\.+\w[\w.]*)\s+import\b',
     re.MULTILINE,
 )
+
+
+# ── Duplicate-import auto-normalisation (zero LLM cost) ──────────────────────
+
+def _parse_js_import_stmt(stmt: str):
+    """Parse a single JS/TS import statement.
+
+    Returns ``(module, default_name, named_set, namespace_name)`` or ``None``
+    if the statement cannot be parsed (e.g. dynamic imports, re-exports).
+    """
+    # Normalise whitespace (handles multi-line imports)
+    s = re.sub(r'\s+', ' ', stmt.strip().rstrip(';'))
+
+    # Side-effect import: import 'mod'  or  import "mod"
+    m = re.match(r'''import\s+['"]([^'"]+)['"]$''', s)
+    if m:
+        return m.group(1), None, set(), None
+
+    # Must contain 'from'
+    from_m = re.search(r'''\bfrom\s+['"]([^'"]+)['"]''', s)
+    if not from_m:
+        return None
+    module = from_m.group(1)
+
+    # bindings = text between 'import' and 'from ...'
+    bindings = s[len('import '):s.rfind(' from ')].strip()
+
+    default_name = None
+    named_set: set[str] = set()
+    namespace_name = None
+
+    # Namespace: * as X
+    ns_m = re.search(r'\*\s+as\s+(\w+)', bindings)
+    if ns_m:
+        namespace_name = ns_m.group(1)
+        bindings = (bindings[:ns_m.start()] + bindings[ns_m.end():]).strip().strip(',').strip()
+
+    # Named: { X, Y as Z, ... }
+    named_m = re.search(r'\{([^}]*)\}', bindings)
+    if named_m:
+        for part in named_m.group(1).split(','):
+            part = part.strip()
+            if part:
+                named_set.add(part)
+        bindings = (bindings[:named_m.start()] + bindings[named_m.end():]).strip().strip(',').strip()
+
+    # Whatever remains is the default binding (must be a single identifier)
+    if re.match(r'^\w+$', bindings):
+        default_name = bindings
+
+    return module, default_name, named_set, namespace_name
+
+
+def _render_js_import_stmt(module: str, default_name, named_set, namespace_name,
+                            quote: str = '"') -> str:
+    """Render a merged import statement as a string (no trailing newline)."""
+    parts: list[str] = []
+    if default_name:
+        parts.append(default_name)
+    if namespace_name:
+        parts.append(f'* as {namespace_name}')
+    if named_set:
+        parts.append('{ ' + ', '.join(sorted(named_set)) + ' }')
+    if not parts:
+        return f'import {quote}{module}{quote};'
+    return f'import {", ".join(parts)} from {quote}{module}{quote};'
+
+
+def _dedup_js_imports(content: str) -> tuple[str, list[str]]:
+    """Merge duplicate/split ``import`` statements in a JS/TS source file.
+
+    Scans the leading import block (blank lines and ``//`` comments allowed
+    between statements).  For each module imported more than once the
+    bindings are merged into a single statement at the first occurrence;
+    subsequent duplicates are removed.
+
+    Returns ``(new_content, descriptions)`` where *descriptions* is a list
+    of human-readable change summaries (empty when nothing changed).
+    """
+    from collections import OrderedDict
+
+    lines = content.splitlines(keepends=True)
+    n = len(lines)
+
+    # ── Pass 1: collect import statement line-ranges from the top block ──
+    import_ranges: list[tuple[int, int, str]] = []  # (start, end_excl, text)
+    i = 0
+    while i < n:
+        stripped = lines[i].strip()
+        # Allow blank lines and line comments between imports
+        if not stripped or stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
+            i += 1
+            continue
+        if not re.match(r'import\s', stripped):
+            break  # first non-import, non-blank, non-comment line → stop
+
+        start = i
+        stmt_parts = [lines[i]]
+        # Handle multi-line imports: accumulate until braces balance
+        brace_depth = stripped.count('{') - stripped.count('}')
+        i += 1
+        while i < n and brace_depth > 0:
+            stmt_parts.append(lines[i])
+            brace_depth += lines[i].count('{') - lines[i].count('}')
+            i += 1
+        import_ranges.append((start, i, ''.join(stmt_parts)))
+
+    if not import_ranges:
+        return content, []
+
+    # ── Pass 2: group by module ──
+    by_module: dict[str, list] = OrderedDict()
+    for start, end, stmt in import_ranges:
+        parsed = _parse_js_import_stmt(stmt)
+        if parsed is None:
+            continue  # unparseable — leave untouched
+        module = parsed[0]
+        by_module.setdefault(module, []).append((start, end, stmt, parsed))
+
+    if not any(len(v) > 1 for v in by_module.values()):
+        return content, []  # nothing to do
+
+    # ── Pass 3: compute replacements ──
+    replacements: dict[int, tuple[int, str]] = {}  # start → (end, new_text)
+    changes: list[str] = []
+
+    for module, entries in by_module.items():
+        if len(entries) == 1:
+            continue
+
+        # Detect quote style from the first statement
+        first_stmt = entries[0][2]
+        quote = '"' if f'"{module}"' in first_stmt else "'"
+
+        # Merge all bindings
+        merged_default = None
+        merged_named: set[str] = set()
+        merged_namespace = None
+        for _, _, _, (_, default, named, namespace) in entries:
+            if default and merged_default is None:
+                merged_default = default
+            merged_named |= named
+            if namespace and merged_namespace is None:
+                merged_namespace = namespace
+
+        merged_line = _render_js_import_stmt(
+            module, merged_default, merged_named, merged_namespace, quote)
+
+        # Preserve indentation of the first statement
+        raw_first = entries[0][2]
+        indent = raw_first[:len(raw_first) - len(raw_first.lstrip())]
+
+        # First occurrence → merged statement
+        first_start, first_end = entries[0][0], entries[0][1]
+        replacements[first_start] = (first_end, indent + merged_line + '\n')
+        # Subsequent occurrences → delete
+        for start, end, _, _ in entries[1:]:
+            replacements[start] = (end, '')
+
+        changes.append(
+            f"Merged {len(entries)}× import from '{module}' → {merged_line}"
+        )
+
+    # ── Pass 4: reconstruct file ──
+    result: list[str] = []
+    i = 0
+    while i < n:
+        if i in replacements:
+            end_idx, new_text = replacements[i]
+            if new_text:
+                result.append(new_text)
+            i = end_idx
+        else:
+            result.append(lines[i])
+            i += 1
+
+    new_content = ''.join(result)
+    # Clean up extra blank lines left by deletions
+    new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+    return new_content, changes
+
+
+def _auto_dedup_imports(files: dict[str, str], display, step_idx: int) -> dict[str, str]:
+    """Run duplicate-import normalisation on all JS/TS files in *files*.
+
+    Modifies content in-place (returns the same dict with updated values).
+    Logs a step-info message for each file where changes were made.
+    Zero LLM calls.
+    """
+    _JS_TS_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+    result = dict(files)
+    for filepath, content in files.items():
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in _JS_TS_EXTS:
+            continue
+        new_content, changes = _dedup_js_imports(content)
+        if changes:
+            result[filepath] = new_content
+            for desc in changes:
+                log.info("[DedupeImports] %s: %s", filepath, desc)
+            display.step_info(step_idx,
+                              f"[DedupeImports] {os.path.basename(filepath)}: "
+                              f"{len(changes)} import(s) merged")
+    return result
 
 
 def _validate_import_paths(
@@ -1581,10 +1820,18 @@ def _validate_import_paths(
                 if resolved in all_paths_norm:
                     continue
 
+                # Also check disk — scaffold/static files (react.svg, hero.png,
+                # etc.) are created by CMD steps and never tracked in memory.
+                if os.path.isfile(resolved):
+                    continue
+
                 # Try appending standard extensions
                 found = False
                 for try_ext in _JS_IMPORT_EXTENSIONS:
                     if (resolved + try_ext) in all_paths_norm:
+                        found = True
+                        break
+                    if os.path.isfile(resolved + try_ext):
                         found = True
                         break
                 if found:
@@ -1622,6 +1869,22 @@ def _validate_import_paths(
                     errors.append(
                         f"{filepath}: import '{import_path}' does not "
                         f"resolve to any known file."
+                    )
+
+            # ── Duplicate import check ──────────────────────────────
+            # Catch LLM-generated duplicate `import X from 'mod'` lines.
+            # Count how many times each source module appears.
+            from collections import Counter
+            import_sources = [
+                (m.group(1) or m.group(2)).strip()
+                for m in _JS_ANY_IMPORT_SOURCE_RE.finditer(content)
+                if (m.group(1) or m.group(2))
+            ]
+            for module, count in Counter(import_sources).items():
+                if count > 1:
+                    errors.append(
+                        f"{filepath}: duplicate import from '{module}' "
+                        f"({count} times) — merge into a single import statement."
                     )
 
         elif ext == '.py':
@@ -2349,10 +2612,18 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         except Exception:
             pass
 
+    # Enrich step_text with plan-declared target files so _detect_target_files
+    # can locate them even when the step description omits the filename
+    # (e.g. "Modify header component" doesn't mention "Header.jsx").
+    _edit_step_text = step_text
+    if plan_step and getattr(plan_step, 'target_files', None):
+        _targets_hint = " ".join(plan_step.target_files)
+        _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
+
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
-            step_text=step_text, coder=coder, task=task,
+            step_text=_edit_step_text, coder=coder, task=task,
             memory=memory, display=display, step_idx=step_idx,
             language=language, cfg=cfg, code_graph=code_graph,
             project_profile=project_profile,
@@ -2363,7 +2634,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     # --- Tier 2: Chunk edit (regex-based, no KB graph needed) ---
     if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True):
         chunk_result = _try_chunk_edit(
-            step_text=step_text, coder=coder, reviewer=reviewer,
+            step_text=_edit_step_text, coder=coder, reviewer=reviewer,
             executor=executor, task=task, memory=memory,
             display=display, step_idx=step_idx,
             language=language, cfg=cfg, auto=auto,
@@ -2405,11 +2676,23 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         context = context_prefix + f"Task: {task}"
 
+        # ── Target file enforcement (full-file tier) ──
+        # Explicitly tell the LLM which file to modify so it doesn't
+        # accidentally generate code for a different file from context.
+        if plan_step and getattr(plan_step, 'target_files', None):
+            _tf = ", ".join(plan_step.target_files)
+            context += (
+                f"\n\nTARGET FILE(S): {_tf}"
+                f"\nONLY output `#### [FILE]: ...` blocks for the target file(s) above."
+                f"\nAll other files in context are READ-ONLY reference — do NOT output `#### [FILE]:` blocks for them."
+            )
+
         # ── Plan-aware context injection ──
         # When a structured plan step is available, use plan-declared
         # imports/targets for precise context (fewer tokens, better relevance).
         # Falls back to legacy related_context / slim context otherwise.
-        plan_ctx = getattr(memory, '_plan_context_files', None)
+        from .memory import get_plan_context_files as _get_plan_ctx
+        plan_ctx = _get_plan_ctx()
         if plan_ctx and plan_step is not None:
             # Full content for plan-declared files (imports + targets)
             for fpath, content in plan_ctx.items():
@@ -2511,6 +2794,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
         content_fixes = getattr(memory, '_content_fixes', None)
         files = _apply_content_fixes(files, content_fixes)
+
+        # Auto-normalise duplicate imports (zero LLM cost, deterministic)
+        files = _auto_dedup_imports(files, display, step_idx)
 
         # On retry, merge: keep previously approved files that weren't
         # re-generated, so the coder doesn't need to regenerate everything
@@ -3047,10 +3333,13 @@ def _extract_source_specs(code_summary: str) -> str:
 
 # ── Enhancement #5: Bidirectional bug detection ──────────────────
 _TEST_BUG_PATTERNS = re.compile(
-    r"Unable to find an element with the text:.*\(content,\s*element\)\s*=>"
+    r"Unable to find an element with the text:"
     r"|You cannot render a <Router> inside another <Router>"
-    r"|TestingLibraryElementError:.*Unable to find (a label|an accessible element|a[n]? element) with the (text|role|label)"
-    r"|Unable to find role",
+    r"|TestingLibraryElementError:"
+    r"|Unable to find role"
+    r"|Expected.*to have class"
+    r"|Expected.*to have attribute"
+    r"|Expected.*to be in the document",
     re.DOTALL,
 )
 
@@ -3070,9 +3359,14 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
         "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
-        "- TEST_BUG = the test assertion, setup, or import is incorrect\n"
+        "- TEST_BUG = the test assertion, setup, or import is incorrect (e.g. looking for wrong text/classes)\n"
         "- SOURCE_BUG = the source code under test has a logic, syntax, "
         "or implementation error\n\n"
+        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an element "
+        "(text, role, test-id, etc.) or asserts for specific CSS classes/styles that do not "
+        "exist in the provided source code, it is ALMOST ALWAYS a TEST_BUG. The source "
+        "code is the ground truth for content and theme. Do NOT label as SOURCE_BUG just to force "
+        "the source code to match dumb, brittle test assertions or ruin the project aesthetics.\n\n"
         f"Test output:\n{error_detail[:3000]}\n\n"
     )
     if source_summary:
@@ -3444,6 +3738,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         content_fixes = getattr(memory, '_content_fixes', None)
         test_files = _apply_content_fixes(test_files, content_fixes)
 
+        # Auto-normalise duplicate imports (zero LLM cost, deterministic)
+        test_files = _auto_dedup_imports(test_files, display, step_idx)
+
         # Normalize paths: fix LLM-generated paths that are suffixes of known files
         test_files = _normalize_fix_paths(test_files, memory)
 
@@ -3637,7 +3934,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
                 # Focused source context: prefer plan-declared imports,
                 # fall back to parsing test file imports from memory
-                _fix_plan_ctx = getattr(memory, '_plan_context_files', None)
+                from .memory import get_plan_context_files as _get_fix_plan_ctx
+                _fix_plan_ctx = _get_fix_plan_ctx()
                 if _fix_plan_ctx and plan_step is not None:
                     single_imports = {
                         fp: cnt for fp, cnt in _fix_plan_ctx.items()
@@ -4209,7 +4507,8 @@ def _try_chunk_edit(
     formatted = chunk_editor.format_chunks_for_prompt(all_chunks, all_target_ids)
 
     slim_ctx = ""
-    plan_ctx = getattr(memory, '_plan_context_files', None)
+    from .memory import get_plan_context_files as _get_chunk_plan_ctx
+    plan_ctx = _get_chunk_plan_ctx()
     if plan_ctx:
         # Plan-aware: include plan-declared files that aren't chunk targets
         from .memory import _extract_file_skeleton

@@ -411,17 +411,19 @@ def _execute_step(step_idx: int, step_text: str, *,
 
         log.info(f"Task {step_idx+1}: Classified as [{step_type}]")
 
-        # --- Structured plan: inject plan-aware context into memory ---
+        # --- Structured plan: inject plan-aware context (thread-local) ---
+        # Use thread-local storage so parallel wave steps don't overwrite each
+        # other's context on the shared memory object (race condition fix).
         if plan_step is not None and all_plan_steps is not None:
             try:
+                from .memory import set_plan_context_files
                 plan_ctx_files = build_step_context(
                     plan_step, all_plan_steps, memory,
                     read_from_disk=lambda p: executor.read_file(p)
                     if hasattr(executor, 'read_file') else None,
                 )
                 if plan_ctx_files:
-                    # Store plan-declared context for step handlers to use
-                    memory._plan_context_files = plan_ctx_files
+                    set_plan_context_files(plan_ctx_files)
                     _logger.debug(
                         "[PlanStep] Injected %d plan-context files for step %s",
                         len(plan_ctx_files), plan_step.id,
@@ -532,9 +534,9 @@ def _execute_step(step_idx: int, step_text: str, *,
             display.step_info(step_idx, f"Unknown type '{step_type}', skipping.")
             display.complete_step(step_idx, "skipped")
 
-        # Clear plan context so it doesn't leak into the next step
-        if hasattr(memory, '_plan_context_files'):
-            memory._plan_context_files = None
+        # Clear plan context for this thread so it doesn't leak into the next step
+        from .memory import clear_plan_context_files
+        clear_plan_context_files()
 
         # ── Dependency check: after-snapshot + fix ─────────────────
         # Runs BEFORE complete_step so the spinner stays active during
