@@ -572,15 +572,13 @@ def build_snapshot(
 ) -> DependencySnapshot:
     """Build a dependency snapshot from all files currently in memory.
 
-    Skips test files (they import source but are not expected to be imported)
-    and non-code files.
+    Includes test files so their imports are tracked, allowing us to see
+    if an export is only used by tests.
     """
     snapshot = DependencySnapshot()
     for fpath, content in memory_files.items():
         ext = os.path.splitext(fpath)[1].lower()
         if ext not in _EXT_TO_LANG_FAMILY:
-            continue
-        if _is_test_file(fpath):
             continue
         snapshot.file_deps[fpath] = extract_file_deps(fpath, content, language)
     return snapshot
@@ -765,6 +763,8 @@ def find_gaps(
 
     # ── 1. Orphaned exports ──
     for nf in new_files:
+        if _is_test_file(nf):
+            continue
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
             continue
@@ -888,6 +888,8 @@ def find_gaps(
     # This causes a runtime error: the imported value is undefined.
     _js_exts = (".js", ".jsx", ".ts", ".tsx", ".mjs")
     for nf in new_files:
+        if _is_test_file(nf):
+            continue
         ext = os.path.splitext(nf)[1].lower()
         if ext not in _js_exts:
             continue

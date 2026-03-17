@@ -3333,10 +3333,13 @@ def _extract_source_specs(code_summary: str) -> str:
 
 # ── Enhancement #5: Bidirectional bug detection ──────────────────
 _TEST_BUG_PATTERNS = re.compile(
-    r"Unable to find an element with the text:.*\(content,\s*element\)\s*=>"
+    r"Unable to find an element with the text:"
     r"|You cannot render a <Router> inside another <Router>"
-    r"|TestingLibraryElementError:.*Unable to find (a label|an accessible element|a[n]? element) with the (text|role|label)"
-    r"|Unable to find role",
+    r"|TestingLibraryElementError:"
+    r"|Unable to find role"
+    r"|Expected.*to have class"
+    r"|Expected.*to have attribute"
+    r"|Expected.*to be in the document",
     re.DOTALL,
 )
 
@@ -3356,9 +3359,14 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
         "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
-        "- TEST_BUG = the test assertion, setup, or import is incorrect\n"
+        "- TEST_BUG = the test assertion, setup, or import is incorrect (e.g. looking for wrong text/classes)\n"
         "- SOURCE_BUG = the source code under test has a logic, syntax, "
         "or implementation error\n\n"
+        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an element "
+        "(text, role, test-id, etc.) or asserts for specific CSS classes/styles that do not "
+        "exist in the provided source code, it is ALMOST ALWAYS a TEST_BUG. The source "
+        "code is the ground truth for content and theme. Do NOT label as SOURCE_BUG just to force "
+        "the source code to match dumb, brittle test assertions or ruin the project aesthetics.\n\n"
         f"Test output:\n{error_detail[:3000]}\n\n"
     )
     if source_summary:
