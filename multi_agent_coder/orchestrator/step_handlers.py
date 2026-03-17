@@ -2612,10 +2612,18 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         except Exception:
             pass
 
+    # Enrich step_text with plan-declared target files so _detect_target_files
+    # can locate them even when the step description omits the filename
+    # (e.g. "Modify header component" doesn't mention "Header.jsx").
+    _edit_step_text = step_text
+    if plan_step and getattr(plan_step, 'target_files', None):
+        _targets_hint = " ".join(plan_step.target_files)
+        _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
+
     # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
         diff_result = _try_diff_edit(
-            step_text=step_text, coder=coder, task=task,
+            step_text=_edit_step_text, coder=coder, task=task,
             memory=memory, display=display, step_idx=step_idx,
             language=language, cfg=cfg, code_graph=code_graph,
             project_profile=project_profile,
@@ -2626,7 +2634,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     # --- Tier 2: Chunk edit (regex-based, no KB graph needed) ---
     if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True):
         chunk_result = _try_chunk_edit(
-            step_text=step_text, coder=coder, reviewer=reviewer,
+            step_text=_edit_step_text, coder=coder, reviewer=reviewer,
             executor=executor, task=task, memory=memory,
             display=display, step_idx=step_idx,
             language=language, cfg=cfg, auto=auto,
@@ -2668,11 +2676,23 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         context = context_prefix + f"Task: {task}"
 
+        # ── Target file enforcement (full-file tier) ──
+        # Explicitly tell the LLM which file to modify so it doesn't
+        # accidentally generate code for a different file from context.
+        if plan_step and getattr(plan_step, 'target_files', None):
+            _tf = ", ".join(plan_step.target_files)
+            context += (
+                f"\n\nTARGET FILE(S): {_tf}"
+                f"\nONLY output `#### [FILE]: ...` blocks for the target file(s) above."
+                f"\nAll other files in context are READ-ONLY reference — do NOT output `#### [FILE]:` blocks for them."
+            )
+
         # ── Plan-aware context injection ──
         # When a structured plan step is available, use plan-declared
         # imports/targets for precise context (fewer tokens, better relevance).
         # Falls back to legacy related_context / slim context otherwise.
-        plan_ctx = getattr(memory, '_plan_context_files', None)
+        from .memory import get_plan_context_files as _get_plan_ctx
+        plan_ctx = _get_plan_ctx()
         if plan_ctx and plan_step is not None:
             # Full content for plan-declared files (imports + targets)
             for fpath, content in plan_ctx.items():
@@ -3906,7 +3926,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
                 # Focused source context: prefer plan-declared imports,
                 # fall back to parsing test file imports from memory
-                _fix_plan_ctx = getattr(memory, '_plan_context_files', None)
+                from .memory import get_plan_context_files as _get_fix_plan_ctx
+                _fix_plan_ctx = _get_fix_plan_ctx()
                 if _fix_plan_ctx and plan_step is not None:
                     single_imports = {
                         fp: cnt for fp, cnt in _fix_plan_ctx.items()
@@ -4478,7 +4499,8 @@ def _try_chunk_edit(
     formatted = chunk_editor.format_chunks_for_prompt(all_chunks, all_target_ids)
 
     slim_ctx = ""
-    plan_ctx = getattr(memory, '_plan_context_files', None)
+    from .memory import get_plan_context_files as _get_chunk_plan_ctx
+    plan_ctx = _get_chunk_plan_ctx()
     if plan_ctx:
         # Plan-aware: include plan-declared files that aren't chunk targets
         from .memory import _extract_file_skeleton

@@ -9,6 +9,27 @@ import threading
 from ..embedding_store import EmbeddingStore
 from ..cli_display import log
 
+# Thread-local storage for per-step plan context files.
+# Using thread-local prevents the race condition that occurs when multiple
+# parallel wave steps simultaneously write to memory._plan_context_files on
+# the shared FileMemory instance.
+_plan_ctx_local = threading.local()
+
+
+def set_plan_context_files(files: dict | None) -> None:
+    """Store plan context files for the current thread."""
+    _plan_ctx_local.files = files
+
+
+def get_plan_context_files() -> dict | None:
+    """Retrieve plan context files for the current thread."""
+    return getattr(_plan_ctx_local, 'files', None)
+
+
+def clear_plan_context_files() -> None:
+    """Clear plan context files for the current thread."""
+    _plan_ctx_local.files = None
+
 
 def _estimate_tokens(text: str) -> int:
     """Rough token count (~4 chars per token)."""
