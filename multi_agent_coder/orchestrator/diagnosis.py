@@ -10,7 +10,10 @@ from ..cli_display import CLIDisplay, token_tracker, log
 from ..diff_display import show_diffs, _detect_hazards, HAZARD_BLOCK
 
 from .memory import FileMemory
-from .step_handlers import _shell_instructions, _strip_protected_files, _apply_content_fixes, _detect_subproject_root
+from .step_handlers import (
+    _shell_instructions, _strip_protected_files, _apply_content_fixes,
+    _detect_subproject_root, _find_css_conflicts, _detect_target_files,
+)
 from .classification import _extract_commands_from_text, _looks_like_command
 
 
@@ -104,6 +107,30 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += f"{prior_context}\n"
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
+
+    # ── CSS conflict injection ──────────────────────────────────────────────
+    # If the step involves a styling/colour change, inject any global CSS files
+    # whose selectors may override the component-level change.  This is the
+    # same detection used by the Tier-3 code-step path; without it, the
+    # diagnosis LLM fixes the component but leaves the overriding rule intact.
+    _diag_targets = _detect_target_files(step_text, memory)
+    _diag_css_conflicts = _find_css_conflicts(step_text, _diag_targets, memory)
+    if _diag_css_conflicts:
+        _diag_css_injected: list[str] = []
+        for _css_path, _css_content in _diag_css_conflicts.items():
+            if f"#### [FILE]: {_css_path}" not in prompt:
+                prompt += f"\n#### [FILE]: {_css_path}\n```css\n{_css_content}\n```\n"
+            _diag_css_injected.append(_css_path)
+        prompt += (
+            "\nCSS OVERRIDE WARNING: The CSS file(s) shown above contain global "
+            "rules that may override the component-level style change requested. "
+            "For example, `.header, .footer { background-color: var(--bg); }` will "
+            "cascade over a component's own `background-color` declaration. "
+            "Your fix MUST also update those CSS file(s): remove the conflicting "
+            "property from the shared rule, scope it more narrowly, or replace it "
+            "so the user's intended visual change is actually visible.\n"
+            f"CSS files to review and fix: {', '.join(_diag_css_injected)}\n\n"
+        )
 
     # ── Enhancement #3: extract file paths from error output ──────
     # Parse file paths mentioned in the error (e.g. tracebacks, lint output)
