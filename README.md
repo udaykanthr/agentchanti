@@ -134,7 +134,7 @@ All storage is local SQLite -- no external vector database required. See [docume
 
 ### Installation
 
-**Option 1: Automatic Installer**
+**Option 1: Automatic Installer (recommended)**
 
 ```bash
 # Linux / macOS
@@ -144,18 +144,24 @@ chmod +x install.sh && ./install.sh
 ./install.bat
 ```
 
+This creates a `.venv` virtual environment and installs into it. Activate before use:
+
+```bash
+source .venv/bin/activate        # Linux/macOS
+.venv\Scripts\activate           # Windows
+```
+
 **Option 2: Manual Install**
 
 ```bash
 git clone https://github.com/udaykanthr/agentchanti.git
 cd agentchanti
 
-# (Optional) Virtual environment
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate        # Linux/macOS
 .venv\Scripts\activate           # Windows
 
-pip install -e .
+python -m pip install -e .
 ```
 
 **Verify:**

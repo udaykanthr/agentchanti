@@ -8,6 +8,7 @@ setup(
         "requests",
         "pyyaml",
         "textual",
+        "pytest",
         # Phase 1 — Code Graph (Local KB)
         "networkx>=3.0",
         "syntax_checker",
@@ -26,13 +27,7 @@ setup(
         "watchdog>=3.0",
         "tqdm>=4.60",
     ],
-    extras_require={
-        # Phase 2 — Semantic Layer (install separately when needed)
-        "semantic": [
-            "openai>=1.0",
-        ],
-    },
-    entry_points={
+entry_points={
         "console_scripts": [
             "agentchanti=multi_agent_coder.orchestrator.cli:main",
         ],

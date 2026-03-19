@@ -251,6 +251,16 @@ def _read_lines(abs_path: str, line_start: int, line_end: int) -> list[str]:
 # OpenAI embedding helpers
 # ---------------------------------------------------------------------------
 
+# Keywords that indicate a persistent hardware/driver failure — retrying won't help.
+_FATAL_EMBED_KEYWORDS = ("devicelost", "device lost", "errordevice", "gpu", "vulkan", "vk::", "embedding unavailable")
+
+
+def _is_fatal_embedding_error(exc: Exception) -> bool:
+    """Return True if *exc* indicates a hardware/driver failure that won't self-heal."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _FATAL_EMBED_KEYWORDS)
+
+
 def _embed_single(client, text: str, embed_model: str | None) -> list[float]:
     """Embed a single text string with retries."""
     for attempt in range(1, MAX_RETRIES + 1):
@@ -322,6 +332,10 @@ def _embed_batch(client, texts: list[str], embed_model: str | None) -> list[list
             return vectors
 
         except Exception as exc:
+            if _is_fatal_embedding_error(exc):
+                raise RuntimeError(
+                    f"Batch embedding failed (fatal hardware error, not retrying): {exc}"
+                ) from exc
             if attempt < MAX_RETRIES:
                 wait = 2 ** attempt
                 logger.warning(

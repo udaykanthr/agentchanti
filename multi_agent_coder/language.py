@@ -194,8 +194,44 @@ _SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv",
 def detect_language(directory: str = ".") -> str:
     """Scan file extensions in *directory* and return the most common language.
 
+    Checks project manifest files first (package.json → JavaScript, go.mod → Go,
+    etc.) before falling back to extension counting.  This prevents untracked or
+    leftover files of another language from overriding the true project language.
+
     Returns ``"python"`` as default when no recognized files are found.
     """
+    # Ordered list of manifest filenames → language.  First match wins.
+    _MANIFEST_LANGS = [
+        ("package.json", "javascript"),
+        ("go.mod", "go"),
+        ("Cargo.toml", "rust"),
+        ("requirements.txt", "python"),
+        ("setup.py", "python"),
+        ("pyproject.toml", "python"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("Gemfile", "ruby"),
+        ("composer.json", "php"),
+    ]
+
+    # 1. Root-level manifests are the strongest signal.
+    for manifest, lang in _MANIFEST_LANGS:
+        if os.path.isfile(os.path.join(directory, manifest)):
+            return lang
+
+    # 2. One level deep — covers sub-projects (e.g. responsive-app/package.json).
+    try:
+        for entry in sorted(os.listdir(directory)):
+            subdir = os.path.join(directory, entry)
+            if not os.path.isdir(subdir) or entry in _SKIP_DIRS:
+                continue
+            for manifest, lang in _MANIFEST_LANGS:
+                if os.path.isfile(os.path.join(subdir, manifest)):
+                    return lang
+    except OSError:
+        pass
+
+    # 3. Fallback: extension counting (original behaviour).
     ext_counts: Counter = Counter()
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]

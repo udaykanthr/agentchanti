@@ -10,7 +10,10 @@ from ..cli_display import CLIDisplay, token_tracker, log
 from ..diff_display import show_diffs, _detect_hazards, HAZARD_BLOCK
 
 from .memory import FileMemory
-from .step_handlers import _shell_instructions, _strip_protected_files, _apply_content_fixes, _detect_subproject_root
+from .step_handlers import (
+    _shell_instructions, _strip_protected_files, _apply_content_fixes,
+    _detect_subproject_root, _find_css_conflicts, _detect_target_files,
+)
 from .classification import _extract_commands_from_text, _looks_like_command
 
 
@@ -47,14 +50,45 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         except Exception as exc:
             log.debug(f"Step {step_idx+1}: KB error lookup during diagnosis failed: {exc}")
 
+    # ── Build prior step context (CMD outputs) ───────────────────────────────
+    prior_context = ""
+    all_files = memory.all_files()
+    for i in range(step_idx):
+        key = f"_cmd_output/step_{i+1}.txt"
+        if key in all_files:
+            prior_context += f"Step {i+1} output:\n{all_files[key]}\n\n"
+    if prior_context:
+        prior_context = "Previously executed steps:\n" + prior_context
+
+    # Extract installed packages from prior CMD outputs so the search agent
+    # can include them in its query and avoid recommending conflicting versions.
+    _installed_note = ""
+    _PKG_INSTALL_RE = re.compile(
+        r'(?:npm install|pip install|yarn add|pnpm add)\s+(.+)', re.IGNORECASE)
+    _installed_pkgs: list[str] = []
+    for i in range(step_idx):
+        raw = all_files.get(f"_cmd_output/step_{i+1}.txt", "")
+        for line in raw.splitlines():
+            m = _PKG_INSTALL_RE.search(line)
+            if m:
+                # Extract package names (strip flags like --save-dev)
+                pkgs = [p for p in m.group(1).split()
+                        if not p.startswith('-') and p]
+                _installed_pkgs.extend(pkgs)
+    if _installed_pkgs:
+        _installed_note = f"Installed: {', '.join(dict.fromkeys(_installed_pkgs))}"
+
     # ── Optional: search the web for error documentation ────
     search_context = ""
     if search_agent is not None:
         display.step_info(step_idx, "Searching web for error documentation...")
         try:
+            _search_kb = getattr(memory, '_kb_context', '')
+            if _installed_note:
+                _search_kb = f"{_installed_note}\n{_search_kb}" if _search_kb else _installed_note
             search_context = search_agent.search_for_error(
                 error_info, step_text, language=language,
-                kb_context=getattr(memory, '_kb_context', ''))
+                kb_context=_search_kb)
             if search_context:
                 log.info(f"Step {step_idx+1}: Search agent found documentation")
         except Exception as exc:
@@ -64,15 +98,6 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 
     # Detect sub-project root to inform the LLM
     subproject = _detect_subproject_root(memory)
-
-    prior_context = ""
-    all_files = memory.all_files()
-    for i in range(step_idx):
-        key = f"_cmd_output/step_{i+1}.txt"
-        if key in all_files:
-            prior_context += f"Step {i+1} output:\n{all_files[key]}\n\n"
-    if prior_context:
-        prior_context = "Previously executed steps:\n" + prior_context
 
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
@@ -100,10 +125,42 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             "error explanations, or solutions. Use them to inform your fix:\n\n"
             f"{search_context}\n\n"
         )
+    if kb_error_context and search_context:
+        prompt += (
+            "PRIORITY: The KB error-fix patterns above are the authoritative source "
+            "for this project. If web search results suggest a different approach "
+            "(e.g. different package versions, downgrading), prefer the KB guidance. "
+            "Do NOT install different versions of packages that were already installed "
+            "in prior steps — work with what is already installed.\n\n"
+        )
     if prior_context:
         prompt += f"{prior_context}\n"
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
+
+    # ── CSS conflict injection ──────────────────────────────────────────────
+    # If the step involves a styling/colour change, inject any global CSS files
+    # whose selectors may override the component-level change.  This is the
+    # same detection used by the Tier-3 code-step path; without it, the
+    # diagnosis LLM fixes the component but leaves the overriding rule intact.
+    _diag_targets = _detect_target_files(step_text, memory)
+    _diag_css_conflicts = _find_css_conflicts(step_text, _diag_targets, memory)
+    if _diag_css_conflicts:
+        _diag_css_injected: list[str] = []
+        for _css_path, _css_content in _diag_css_conflicts.items():
+            if f"#### [FILE]: {_css_path}" not in prompt:
+                prompt += f"\n#### [FILE]: {_css_path}\n```css\n{_css_content}\n```\n"
+            _diag_css_injected.append(_css_path)
+        prompt += (
+            "\nCSS OVERRIDE WARNING: The CSS file(s) shown above contain global "
+            "rules that may override the component-level style change requested. "
+            "For example, `.header, .footer { background-color: var(--bg); }` will "
+            "cascade over a component's own `background-color` declaration. "
+            "Your fix MUST also update those CSS file(s): remove the conflicting "
+            "property from the shared rule, scope it more narrowly, or replace it "
+            "so the user's intended visual change is actually visible.\n"
+            f"CSS files to review and fix: {', '.join(_diag_css_injected)}\n\n"
+        )
 
     # ── Enhancement #3: extract file paths from error output ──────
     # Parse file paths mentioned in the error (e.g. tracebacks, lint output)

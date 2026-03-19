@@ -247,15 +247,18 @@ class PlannerAgent(Agent):
                     )
                     if docs:
                         # Filter docs to only include relevant ones.
-                        # Three filters applied in order:
+                        # Four filters applied in order:
                         # 1. Framework conflict: reject docs about a
                         #    conflicting framework (e.g. Angular for React)
-                        # 2. Tech relevance: if the task mentions specific
-                        #    techs, only include docs that mention at least
-                        #    one of those techs (or are generic/untagged)
-                        # 3. Generic cap: limit generic docs (no tech
-                        #    keywords) to avoid flooding with Clean Code,
-                        #    JWT, OAuth etc. that aren't task-specific
+                        # 2. Tech mismatch: skip docs whose tech keywords
+                        #    have zero overlap with the task's tech keywords
+                        # 3. Title relevance: skip docs where fewer than
+                        #    _MIN_TITLE_SCORE of their title words appear in
+                        #    the task — catches docs that share one secondary
+                        #    tech (e.g. Vitest) but are primarily about
+                        #    something unrelated (e.g. Three.js, OAuth)
+                        # 4. Generic cap: allow a few topic-relevant generic
+                        #    docs (no tech keywords) through as a backstop
                         from ..orchestrator.plan_optimizer import (
                             _TECH_KEYWORDS as _TK,
                             has_framework_conflict,
@@ -264,8 +267,14 @@ class PlannerAgent(Agent):
                         task_techs = normalize_tech_keywords(set(
                             w.lower() for w in _TK.findall(task)
                         ))
+                        # Precompute task word set (≥4 chars) for title
+                        # relevance scoring (Filter 3)
+                        _task_words_set = set(
+                            re.findall(r'[a-zA-Z]{4,}', task.lower())
+                        )
+                        _MIN_TITLE_SCORE = 0.20  # ≥20% of title words in task
                         doc_hints: list[str] = []
-                        _MAX_GENERIC_DOCS = 2  # cap for docs with no tech overlap
+                        _MAX_GENERIC_DOCS = 2  # cap for topic-relevant generics
                         _generic_count = 0
                         for doc in docs:
                             doc_text = (
@@ -286,21 +295,53 @@ class PlannerAgent(Agent):
                                 )
                                 continue
 
-                            # Filter 2+3: relevance check
-                            if task_techs:
-                                has_overlap = bool(task_techs & doc_techs)
-                                if not has_overlap:
+                            # Filter 2: tech mismatch
+                            if task_techs and doc_techs and not (task_techs & doc_techs):
+                                _logger.debug(
+                                    "[PreAnalysis] Skipping '%s' — "
+                                    "tech mismatch (%s vs task %s)",
+                                    doc.title, doc_techs, task_techs,
+                                )
+                                continue
+
+                            # Filter 3: title relevance
+                            # Compute what fraction of the doc's title words
+                            # (≥4 chars) appear in the task text.  Docs that
+                            # only match the task on one secondary tech but
+                            # whose title focuses on something unrelated score
+                            # below the threshold and are skipped.
+                            title_words = set(
+                                re.findall(r'[a-zA-Z]{4,}',
+                                           (doc.title or "").lower())
+                            )
+                            if title_words and task_techs:
+                                title_score = (
+                                    len(title_words & _task_words_set)
+                                    / len(title_words)
+                                )
+                                if title_score < _MIN_TITLE_SCORE:
                                     if doc_techs:
-                                        # Doc is about a DIFFERENT tech
-                                        # stack — skip entirely
+                                        # Tech-matched but off-topic title
                                         _logger.debug(
                                             "[PreAnalysis] Skipping '%s' — "
-                                            "tech mismatch (%s vs task %s)",
-                                            doc.title, doc_techs, task_techs,
+                                            "low title relevance "
+                                            "(%.0f%% overlap, needs ≥%.0f%%)",
+                                            doc.title,
+                                            title_score * 100,
+                                            _MIN_TITLE_SCORE * 100,
                                         )
                                         continue
-                                    # Truly generic doc (no tech keywords)
-                                    # — allow a few through
+                                    else:
+                                        # Generic doc with irrelevant title
+                                        _logger.debug(
+                                            "[PreAnalysis] Skipping '%s' — "
+                                            "off-topic generic "
+                                            "(%.0f%% title overlap)",
+                                            doc.title, title_score * 100,
+                                        )
+                                        continue
+                                elif not doc_techs:
+                                    # Filter 4: relevant generic doc — cap
                                     _generic_count += 1
                                     if _generic_count > _MAX_GENERIC_DOCS:
                                         _logger.debug(
@@ -316,6 +357,24 @@ class PlannerAgent(Agent):
                                         doc.title, _generic_count,
                                         _MAX_GENERIC_DOCS,
                                     )
+                            elif not doc_techs and task_techs:
+                                # Generic doc with no parseable title words
+                                # — apply cap as fallback
+                                _generic_count += 1
+                                if _generic_count > _MAX_GENERIC_DOCS:
+                                    _logger.debug(
+                                        "[PreAnalysis] Skipping '%s' — "
+                                        "generic cap reached (%d/%d)",
+                                        doc.title, _generic_count,
+                                        _MAX_GENERIC_DOCS,
+                                    )
+                                    continue
+                                _logger.debug(
+                                    "[PreAnalysis] Including generic "
+                                    "doc '%s' (%d/%d)",
+                                    doc.title, _generic_count,
+                                    _MAX_GENERIC_DOCS,
+                                )
 
                             content = doc.content or doc.title
                             if content:

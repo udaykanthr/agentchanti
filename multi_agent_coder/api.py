@@ -323,7 +323,7 @@ def _run_task_impl(
         parse_structured_plan, is_structured_plan, validate_plan,
         fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
-        from_legacy_steps, PlanStep,
+        from_legacy_steps, parse_heuristic_plan, PlanStep,
     )
     plan_steps: list[PlanStep] | None = None
 
@@ -347,6 +347,22 @@ def _run_task_impl(
             dependencies = steps_dependencies_dict(plan_steps)
         else:
             _logger.warning("[Plan] Structured parse returned 0 steps, falling back to legacy")
+
+    if plan_steps is None:
+        # Heuristic fallback: handles weaker LLMs that output markdown headers
+        # with **Key:** value metadata instead of the --STEP format.
+        heuristic_steps = parse_heuristic_plan(plan)
+        if heuristic_steps:
+            _logger.info(
+                "[Plan] Heuristic parser extracted %d steps from non-standard format",
+                len(heuristic_steps),
+            )
+            dep_fixes = fix_import_dependencies(heuristic_steps)
+            if dep_fixes:
+                _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)
+            plan_steps = heuristic_steps
+            steps = steps_as_text_list(plan_steps)
+            dependencies = steps_dependencies_dict(plan_steps)
 
     if plan_steps is None:
         _logger.info("[Plan] Using legacy step parser (no structured plan)")
@@ -476,6 +492,7 @@ def _run_task_impl(
                     all_plan_steps=plan_steps,
                 )
                 if fixed:
+                    display.complete_step(idx, "done")
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, task, steps, idx,

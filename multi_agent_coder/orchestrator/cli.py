@@ -569,7 +569,7 @@ def main():
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
-                from_legacy_steps, PlanStep,
+                from_legacy_steps, parse_heuristic_plan, PlanStep,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -591,6 +591,21 @@ def main():
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")
+
+            if plan_steps_parsed is None:
+                # Heuristic fallback: handles weaker LLMs that output markdown
+                # headers with **Key:** value metadata instead of --STEP format.
+                heuristic_steps = parse_heuristic_plan(plan)
+                if heuristic_steps:
+                    log.info(
+                        f"[Plan] Heuristic parser extracted {len(heuristic_steps)} "
+                        f"steps from non-standard format"
+                    )
+                    dep_fixes = fix_import_dependencies(heuristic_steps)
+                    if dep_fixes:
+                        log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
+                    plan_steps_parsed = heuristic_steps
+                    raw_steps = steps_as_text_list(plan_steps_parsed)
 
             if plan_steps_parsed is None:
                 log.info("[Plan] Using legacy step parser (no structured plan)")
@@ -884,6 +899,7 @@ def main():
                     all_plan_steps=plan_steps_parsed,
                 )
                 if fixed:
+                    display.complete_step(idx, "done")
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, args.task, steps, idx,
@@ -973,6 +989,7 @@ def main():
                     all_plan_steps=plan_steps_parsed,
                 )
                 if fixed:
+                    display.complete_step(idx, "done")
                     step_results[idx] = "done"
                     ds = {"elapsed": time.monotonic() - display.start_time, "steps": display.steps}
                     save_checkpoint(checkpoint_file, args.task, steps, idx,

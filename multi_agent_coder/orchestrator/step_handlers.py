@@ -1234,6 +1234,32 @@ def _handle_cmd_step(step_text: str, executor: Executor,
 
     if success:
         display.step_info(step_idx, "Command succeeded.")
+        # Mark scaffold files: when a project-creation command succeeds, record
+        # the subproject so that _auto_fix_hazards can skip hazard checks for
+        # npm/framework-generated template files on their first modification.
+        if not getattr(memory, '_scaffolded_subproject', None):
+            _SCAFFOLD_PATTERNS = [
+                re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
+                re.compile(r'create-react-app\s+(\S+)'),
+                re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
+                re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+                re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),
+                re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),
+                re.compile(r'vue\s+create\s+(\S+)'),
+                re.compile(r'ng\s+new\s+(\S+)'),
+                re.compile(r'rails\s+new\s+(\S+)'),
+                re.compile(r'cargo\s+new\s+(\S+)'),
+                re.compile(r'django-admin\s+startproject\s+(\S+)'),
+            ]
+            for _pat in _SCAFFOLD_PATTERNS:
+                _m = _pat.search(cmd)
+                if _m:
+                    _candidate = _m.group(1).strip().rstrip('/')
+                    if _candidate not in ('.', './', '') and not _candidate.startswith('./'):
+                        memory._scaffolded_subproject = _candidate
+                        log.info(f"[Scaffold] Marked '{_candidate}' as freshly "
+                                 f"scaffolded — hazard check skipped on first write")
+                    break
         return True, ""
     else:
         display.step_info(step_idx, "Command failed. See log.")
@@ -1245,7 +1271,8 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
                       executor: Executor, display: CLIDisplay,
                       step_idx: int, step_text: str,
                       language: str | None = None,
-                      base_dir: str = ".") -> dict[str, str]:
+                      base_dir: str = ".",
+                      memory: "FileMemory | None" = None) -> dict[str, str]:
     """Scan generated files for hazardous diffs and auto-fix them.
 
     For each file where ``_detect_hazards`` flags problems (e.g. significant
@@ -1257,10 +1284,28 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
     """
     fixed_files = dict(files)
 
+    # Build the set of files our pipeline has already written, used below to
+    # detect scaffold files that have never been touched by the pipeline.
+    _pipeline_written: set[str] = set(memory.all_files().keys()) if memory else set()
+    _scaffolded_root: str | None = getattr(memory, '_scaffolded_subproject', None)
+
     for filepath, new_content in list(files.items()):
         full_path = os.path.join(base_dir, filepath)
         if not os.path.isfile(full_path):
             continue  # new file, nothing to compare
+
+        # Skip hazard check for npm/framework scaffold files on their FIRST
+        # modification in this session.  When a project-creation command ran
+        # (e.g. `npm create vite@latest my-app`), the generated template files
+        # (App.jsx, main.jsx, index.css, …) are expected to be fully replaced.
+        # Replacing a 3 KB template with a 300-byte component is intentional.
+        if _scaffolded_root and filepath not in _pipeline_written:
+            _norm = filepath.replace("\\", "/")
+            _root_prefix = _scaffolded_root.rstrip("/") + "/"
+            if _norm.startswith(_root_prefix) or _norm == _scaffolded_root:
+                log.info(f"[Scaffold] Skipping hazard check for '{filepath}' "
+                         f"(first write into scaffolded project '{_scaffolded_root}')")
+                continue
 
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -2651,6 +2696,19 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
     ctx_budget = int(context_window * 0.8)
     prev_files: dict[str, str] = {}  # Track files from previous attempt
 
+    # Pre-compute CSS conflicts once (not per retry) so styling steps also
+    # update the global CSS files that would otherwise override the change.
+    _t3_plan_targets = (
+        list(plan_step.target_files)
+        if (plan_step and getattr(plan_step, 'target_files', None))
+        else []
+    )
+    _t3_css_conflicts = _find_css_conflicts(
+        step_text,
+        _t3_plan_targets or _detect_target_files(step_text, memory),
+        memory,
+    )
+
     for attempt in range(1, MAX_STEP_RETRIES + 1):
         # Prepend project orientation + knowledge context
         context_prefix = ""
@@ -2732,6 +2790,37 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 related = memory.related_context(step_text, max_tokens=ctx_budget)
                 if related:
                     context += f"\nExisting files (overwrite as needed):\n{related}"
+
+        # ── CSS conflict injection ──
+        # When the step changes a visual style, inject any global CSS files whose
+        # selectors match the target component so the LLM can also remove the
+        # conflicting rule that would otherwise override the change.
+        if _t3_css_conflicts:
+            _css_injected: list[str] = []
+            for css_path, css_content in _t3_css_conflicts.items():
+                if f"#### [FILE]: {css_path}" not in context:
+                    context += f"\n\n#### [FILE]: {css_path}\n```css\n{css_content}\n```"
+                _css_injected.append(css_path)
+            context += (
+                "\n\nCSS OVERRIDE WARNING: The CSS file(s) shown above contain global "
+                "rules that may override your component-level style change. For example, "
+                "`.header, .footer { background-color: var(--bg); }` will cascade over "
+                "a component's own `background-color` declaration. "
+                "After updating the target component, ALSO update those CSS file(s): "
+                "remove the conflicting property from the shared rule, scope it more "
+                "narrowly, or replace it — so the user's intended change is actually visible."
+            )
+            # Expand TARGET FILE(S) hint to include the conflicting CSS files
+            # so the LLM knows it is allowed to output [FILE] blocks for them.
+            if plan_step and getattr(plan_step, 'target_files', None):
+                _tf_base = ", ".join(plan_step.target_files)
+                _tf_extra = [p for p in _css_injected if p not in plan_step.target_files]
+                if _tf_extra and f"TARGET FILE(S): {_tf_base}" in context:
+                    context = context.replace(
+                        f"TARGET FILE(S): {_tf_base}",
+                        f"TARGET FILE(S): {_tf_base}, " + ", ".join(_tf_extra),
+                    )
+
         if memory.summary() != "(no files yet)":
             context += f"\nAll project files: {memory.summary()}"
         if feedback:
@@ -2807,7 +2896,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         # Auto-fix hazardous diffs before showing to user
         files = _auto_fix_hazards(files, coder, executor, display, step_idx,
-                                  step_text, language=language)
+                                  step_text, language=language, memory=memory)
 
         # Show diffs and wait for approval before writing
         display.stop_spinner()
@@ -3959,7 +4048,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 # Triage: test bug or source bug?
                 bug_origin = _triage_test_failure(
                     error_detail, source_ctx,
-                    f"{test_path}:\n{current_content[:1000]}\n",
+                    f"{test_path}:\n{current_content[:3000]}\n",
                     coder.llm_client, display, step_idx)
                 is_source_bug = (bug_origin == "SOURCE_BUG")
 
@@ -4075,8 +4164,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     file_fixed = True
                     break
 
-                # Stuck detection: same errors after fix
-                if output == prev_output:
+                # Stuck detection: same errors after fix — only bail on the
+                # last attempt, so earlier retries still get a chance.
+                if output == prev_output and fix_attempt == MAX_STEP_RETRIES:
                     log.warning(
                         f"Step {step_idx+1}: [{f_basename}] identical "
                         f"output after fix attempt {fix_attempt}, stopping.")
@@ -4329,6 +4419,91 @@ def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
     return None
 
 
+_CSS_STYLE_STEP_RE = re.compile(
+    r'\b(background|bg.?color|color|colour|theme|dark.?mode|light.?mode|'
+    r'primary|secondary|accent|brand|fill|stroke|opacity|gradient|'
+    r'foreground|surface|tint|shade|hue|palette|style)\b',
+    re.IGNORECASE,
+)
+
+
+def _find_css_conflicts(
+    step_text: str,
+    target_files: list[str],
+    memory: FileMemory,
+) -> dict[str, str]:
+    """Return CSS/SCSS files whose selectors may override styles in target components.
+
+    Only triggered when the step text involves colour/style changes.
+    Returns ``{css_file_path: full_content}`` for every CSS file that
+    contains a selector matching a class name used in the target components.
+    The caller should inject these files into context and instruct the LLM
+    to also update any conflicting rules.
+    """
+    if not _CSS_STYLE_STEP_RE.search(step_text):
+        return {}
+
+    all_files = memory.all_files()
+    css_candidates = {
+        fpath: content
+        for fpath, content in all_files.items()
+        if fpath.endswith(('.css', '.scss', '.sass', '.less'))
+        and fpath not in target_files
+    }
+    if not css_candidates:
+        return {}
+
+    # Collect CSS class-name hints from the target component files.
+    component_classes: set[str] = set()
+    for fpath in target_files:
+        content = all_files.get(fpath, '') or ''
+        # JSX: className="foo bar" or className='foo bar'
+        for m in re.finditer(r'className=["\']([^"\']+)["\']', content):
+            component_classes.update(m.group(1).split())
+        # JSX: className={`foo bar ${dynamic}`} — template literals (very common in React)
+        for m in re.finditer(r'className=\{`([^`]+)`\}', content):
+            static_part = re.sub(r'\$\{[^}]*\}', ' ', m.group(1))
+            component_classes.update(static_part.split())
+        # CSS selectors inside CSS files (.foo, .foo-bar)
+        for m in re.finditer(r'\.([\w-]+)', content):
+            component_classes.add(m.group(1))
+        # File stem: Header.jsx → "header"
+        raw_stem = os.path.basename(fpath).split('.')[0]
+        component_classes.add(raw_stem.lower())
+        # Convert PascalCase/camelCase stem to kebab-case: HeroBanner → hero-banner
+        kebab_stem = re.sub(r'([a-z])([A-Z])', r'\1-\2', raw_stem).lower()
+        if kebab_stem != raw_stem.lower():
+            component_classes.add(kebab_stem)
+
+    # Common component keywords from the step text itself.
+    for word in re.findall(
+        r'\b(header|footer|hero|banner|sidebar|navbar|nav|main|app|body)\b',
+        step_text, re.IGNORECASE,
+    ):
+        component_classes.add(word.lower())
+    # Also extract hyphenated CSS-class-like tokens from step text
+    # (e.g. "hero-banner", "hero-section" written in the task description).
+    for m in re.findall(r'\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b', step_text, re.IGNORECASE):
+        component_classes.add(m.lower())
+
+    if not component_classes:
+        return {}
+
+    # Find CSS files whose rules target any of those classes.
+    conflicts: dict[str, str] = {}
+    for css_path, css_content in css_candidates.items():
+        for cls in component_classes:
+            # Match ".header" but not ".my-header-thing" (word-boundary on both sides)
+            if re.search(
+                rf'(?<![.\w-])\.{re.escape(cls)}(?![.\w-])',
+                css_content, re.IGNORECASE
+            ):
+                conflicts[css_path] = css_content
+                break
+
+    return conflicts
+
+
 def _detect_target_files(step_text: str, memory: FileMemory,
                          max_files: int = 3) -> list[str]:
     """Identify ALL target files for editing from the step text."""
@@ -4406,6 +4581,14 @@ Rules:
 4. Match the existing indentation style exactly
 5. Use the exact file paths shown in the context above
 6. The line numbers MUST match the line ranges shown in EDITABLE markers
+7. TAILWIND DEDUPLICATION — when adding a Tailwind utility class to a className:
+   a. Do NOT add the same class token more than once (e.g. do not write `bg-orange-100 ... bg-orange-100`).
+   b. If the task is ADDING a utility (e.g. `bg-orange-100`), append it ONCE and keep all unrelated classes.
+   c. If the new utility conflicts with an existing one for the same CSS property (same prefix, e.g. `bg-indigo-600` vs `bg-orange-100`), REMOVE the old conflicting utility and keep only the new one — unless the task explicitly says to keep both.
+8. CHUNK COMPLETENESS — your replacement must include EVERY line shown in the original EDITABLE chunk.
+   Do NOT stop outputting after the function/class closing brace if the original chunk continues
+   beyond it (e.g. `Foo.propTypes = ...`, `Foo.defaultProps = ...`, `export default Foo`).
+   If those lines appear in the original chunk, reproduce them verbatim in your replacement.
 """
 
 
@@ -4474,6 +4657,14 @@ def _try_chunk_edit(
     target_files = _detect_target_files(step_text, memory, max_files=max_files)
     if not target_files:
         log.debug("[ChunkEdit] No target files identified")
+        return None
+
+    # Styling steps that conflict with global CSS need full-file context so
+    # both the component AND the overriding CSS file can be updated together.
+    # Chunk edit can only emit [EDIT] markers for the component chunks, so
+    # fall through to Tier 3 which handles the joint edit.
+    if _find_css_conflicts(step_text, target_files, memory):
+        log.debug("[ChunkEdit] CSS override conflicts detected — deferring to Tier 3")
         return None
 
     chunk_editor = ChunkEditor()

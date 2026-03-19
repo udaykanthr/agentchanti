@@ -871,6 +871,222 @@ def from_legacy_steps(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Heuristic fallback parser for weaker LLMs
+# ---------------------------------------------------------------------------
+
+# Matches markdown section headers like: ### Step 1: description
+#                                         ## Step 1.1 - description
+_HEURISTIC_HEADER_RE = re.compile(
+    r'^#{1,4}\s+(?:Step\s+)([\d.]+)[:.)\s-]*\s*(.*)?$',
+    re.IGNORECASE,
+)
+
+# Matches bold key-value lines: **Type:** CODE  or  **Dependencies:** 1.1
+# Handles both `**Key:** value` (markdown bold with colon inside closing **)
+# and plain `Key: value` formats. The middle `\*{0,2}:` consumes `**:` or `:`.
+_HEURISTIC_KV_RE = re.compile(
+    r'^\*{0,2}(step\s*(?:id|#|number)?|type|dependenc(?:y|ies)|depends?(?:\s*on)?'
+    r'|target|exports?|imports?|produces?|description)\*{0,2}:\s*(.*)$',
+    re.IGNORECASE,
+)
+
+# Standalone **Step ID:** 1.1 — can appear as step boundary without a header
+_HEURISTIC_STEPID_RE = re.compile(
+    r'^\*{0,2}Step\s*(?:ID|#|Number)\*{0,2}:\s*\*{0,2}\s*([\d.]+)',
+    re.IGNORECASE,
+)
+
+_VALID_STEP_TYPES = {"CMD", "CODE", "TEST", "IGNORE", "SEARCH"}
+
+
+def parse_heuristic_plan(text: str) -> list[PlanStep]:
+    """Fallback parser for non-standard plan formats produced by weaker LLMs.
+
+    Handles markdown-heavy outputs like::
+
+        ### Step 1: Create Pricelist Component
+        **Step ID:** 1.1
+        **Type:** CODE
+        **Dependencies:** None
+        **Target:** src/components/Pricelist.jsx
+        **Exports:** Pricelist
+        **Imports:** None
+
+        ### Step 2: Integrate into App
+        **Step ID:** 1.2
+        **Type:** CODE
+        **Dependencies:** 1.1
+        **Target:** src/App.jsx
+
+    Also handles ``> command`` lines and commands inside ```bash fences.
+
+    Returns an empty list if no recognisable steps are found — safe to
+    call unconditionally before the legacy numbered-list parser.
+    """
+    steps: list[PlanStep] = []
+    current: Optional[PlanStep] = None
+    desc_lines: list[str] = []
+    cmd_lines: list[str] = []
+    in_code_fence = False
+
+    def _flush() -> None:
+        nonlocal current, desc_lines, cmd_lines
+        if current is None:
+            return
+        if not current.description and desc_lines:
+            current.description = " ".join(desc_lines).strip()
+        _flush_echo_inline(current, cmd_lines)
+        steps.append(current)
+        current = None
+        desc_lines = []
+        cmd_lines = []
+
+    def _strip_value(raw: str) -> str:
+        """Strip markdown bold markers, backticks, and trailing whitespace."""
+        v = raw.strip()
+        # Strip leading ** (residual closing bold from **key:** format)
+        if v.startswith("**"):
+            v = v[2:].strip()
+        # Strip backtick wrapping (e.g. `value`)
+        v = v.strip("`")
+        # Strip trailing markdown bold/whitespace
+        v = v.rstrip("* \t").strip()
+        return v
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        # ── Code fence tracking ──
+        if line.startswith("```"):
+            in_code_fence = not in_code_fence
+            continue
+
+        # ── Markdown section header → new step ──
+        m_hdr = _HEURISTIC_HEADER_RE.match(line)
+        if m_hdr:
+            _flush()
+            step_id = m_hdr.group(1)
+            description = (m_hdr.group(2) or "").strip()
+            current = PlanStep(id=step_id, step_type="UNCLASSIFIED",
+                               description=description)
+            desc_lines = []
+            cmd_lines = []
+            continue
+
+        # ── Standalone **Step ID:** as boundary when no header was used ──
+        m_sid = _HEURISTIC_STEPID_RE.match(line)
+        if m_sid:
+            if current is None:
+                # No header yet — start a new step
+                _flush()
+                current = PlanStep(id=m_sid.group(1), step_type="UNCLASSIFIED")
+                desc_lines = []
+                cmd_lines = []
+            else:
+                # Inside a step: refine the ID (header may have said "Step 1",
+                # **Step ID:** may say "1.1" for more precision)
+                current.id = m_sid.group(1)
+            continue
+
+        if current is None:
+            continue  # skip preamble lines before any step is detected
+
+        # ── Key-value metadata line ──
+        m_kv = _HEURISTIC_KV_RE.match(line)
+        if m_kv:
+            key = m_kv.group(1).lower().replace(" ", "").rstrip("*")
+            val = _strip_value(m_kv.group(2))
+
+            if "type" in key:
+                t = val.upper()
+                if t in _VALID_STEP_TYPES:
+                    current.step_type = t
+
+            elif "depend" in key:
+                if val.lower() not in ("none", "n/a", ""):
+                    current.depends_on = [
+                        d.strip() for d in val.split(",") if d.strip()
+                    ]
+
+            elif key == "target":
+                if val.lower() not in ("none", "n/a", ""):
+                    current.target_files = [
+                        f.strip() for f in val.split(",") if f.strip()
+                    ]
+
+            elif "export" in key:
+                if val.lower() not in ("none", "n/a", ""):
+                    current.exports = [
+                        e.strip() for e in val.split(",") if e.strip()
+                    ]
+
+            elif "import" in key:
+                if val.lower() not in ("none", "n/a", ""):
+                    for entry in val.split(","):
+                        entry = entry.strip()
+                        if ":" in entry:
+                            fp, sym = entry.rsplit(":", 1)
+                            current.imports_from.setdefault(
+                                fp.strip(), []
+                            ).append(sym.strip())
+
+            elif "produce" in key:
+                if val.lower() not in ("none", "n/a", ""):
+                    for f in val.split(","):
+                        f = f.strip()
+                        if f and f not in current.target_files:
+                            current.target_files.append(f)
+
+            elif "description" in key:
+                if val:
+                    current.description = val
+
+            elif "stepid" in key or "step#" in key or "stepnumber" in key:
+                if re.match(r'^[\d.]+$', val):
+                    current.id = val
+
+            continue  # metadata line — don't fall through to description
+
+        # ── Command line (> cmd) ── works both inside and outside fences
+        if line.startswith("> "):
+            cmd_text = line[2:].strip()
+            _bare = cmd_text.lstrip("*_ \t")
+            _meta_prefixes = ("produces:", "note:", "output:", "creates:",
+                              "result:", "generates:", "returns:")
+            if not cmd_text.startswith("**") and not any(
+                _bare.lower().startswith(p) for p in _meta_prefixes
+            ):
+                if current.command:
+                    current.command = current.command + " && " + cmd_text
+                else:
+                    current.command = cmd_text
+                cmd_lines.append(cmd_text)
+            continue
+
+        # ── Ignore horizontal rules and plan boundary markers ──
+        if line.startswith("---") or line.startswith("===") or line.startswith("***"):
+            continue
+
+        # ── Description continuation (plain text, not a metadata key) ──
+        if line and not line.startswith("==") and not line.startswith("**"):
+            desc_lines.append(line)
+
+    _flush()
+
+    # ── Post-process: infer type from content when still UNCLASSIFIED ──
+    for idx, step in enumerate(steps):
+        step.index = idx
+        if step.step_type == "UNCLASSIFIED":
+            if step.command and not step.target_files:
+                step.step_type = "CMD"
+            elif step.target_files:
+                step.step_type = "CODE"
+
+    # Only return steps that have at least a description or target/command
+    return [s for s in steps if s.description or s.target_files or s.command]
+
+
 def is_structured_plan(text: str) -> bool:
     """Check if LLM output is in the new structured format."""
     # Check each line independently (handles leading whitespace in raw text)

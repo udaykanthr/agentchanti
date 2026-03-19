@@ -33,6 +33,12 @@ _JS_PATTERNS = [
         r"^((?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?(?:function|\())",
         re.MULTILINE,
     ),
+    # React component metadata: Foo.propTypes = / Foo.defaultProps = / Foo.displayName =
+    # These must be separate chunk boundaries so the LLM never silently drops them
+    # when asked to edit only the function body above.
+    re.compile(r"^(\w[\w.]*\.(propTypes|defaultProps|displayName|contextTypes)\s*=)", re.MULTILINE),
+    # Bare `export default <identifier>` (not class/function — those are already above)
+    re.compile(r"^(export\s+default\s+\w+\s*$)", re.MULTILINE),
 ]
 
 _GO_PATTERNS = [
