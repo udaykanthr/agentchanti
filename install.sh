@@ -1,19 +1,31 @@
 #!/bin/bash
 
-# Ensure pip is installed
-if ! command -v pip3 &> /dev/null; then
-    echo "pip3 could not be found. Please install python3-pip."
+set -e
+
+# Check python3 is available
+if ! command -v python3 &> /dev/null; then
+    echo "python3 could not be found. Please install Python 3.10+ from https://python.org"
     exit 1
 fi
 
-echo "Installing multi-agent coder..."
-
-# Install the package in editable mode or normally
-pip3 install -e .
-
-if [ $? -eq 0 ]; then
-    echo "Installation successful! You can now run 'agentchanti' from anywhere."
-else
-    echo "Installation failed."
+# Check minimum Python version (3.10)
+python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null || {
+    echo "Python 3.10+ is required. Found: $(python3 --version)"
     exit 1
-fi
+}
+
+echo "Setting up virtual environment..."
+python3 -m venv .venv
+
+echo "Installing agentchanti..."
+.venv/bin/python -m pip install --quiet --upgrade pip
+.venv/bin/python -m pip install -e .
+
+echo ""
+echo "Installation successful!"
+echo ""
+echo "Activate the environment before use:"
+echo "  source .venv/bin/activate"
+echo ""
+echo "Then run:"
+echo "  agentchanti \"your task\" --provider ollama --model deepseek-coder-v2:16b"
