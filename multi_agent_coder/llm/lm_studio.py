@@ -165,4 +165,11 @@ class LMStudioClient(LLMClient):
             return vectors
         except Exception as e:
             log.warning(f"[LM Studio] Batch embedding failed, falling back to sequential: {e}")
-            return [self.generate_embedding(t, model=model, **kwargs) for t in texts]
+            results = [self.generate_embedding(t, model=model, **kwargs) for t in texts]
+            if all(not v for v in results):
+                raise RuntimeError(
+                    f"LM Studio embedding unavailable: batch and all {len(texts)} sequential "
+                    f"attempts returned empty vectors. The embedding model may have crashed "
+                    f"(check LM Studio logs for GPU/Vulkan errors like 'ErrorDeviceLost')."
+                )
+            return results

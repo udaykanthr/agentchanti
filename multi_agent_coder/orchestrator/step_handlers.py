@@ -1234,6 +1234,32 @@ def _handle_cmd_step(step_text: str, executor: Executor,
 
     if success:
         display.step_info(step_idx, "Command succeeded.")
+        # Mark scaffold files: when a project-creation command succeeds, record
+        # the subproject so that _auto_fix_hazards can skip hazard checks for
+        # npm/framework-generated template files on their first modification.
+        if not getattr(memory, '_scaffolded_subproject', None):
+            _SCAFFOLD_PATTERNS = [
+                re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
+                re.compile(r'create-react-app\s+(\S+)'),
+                re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
+                re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+                re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),
+                re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),
+                re.compile(r'vue\s+create\s+(\S+)'),
+                re.compile(r'ng\s+new\s+(\S+)'),
+                re.compile(r'rails\s+new\s+(\S+)'),
+                re.compile(r'cargo\s+new\s+(\S+)'),
+                re.compile(r'django-admin\s+startproject\s+(\S+)'),
+            ]
+            for _pat in _SCAFFOLD_PATTERNS:
+                _m = _pat.search(cmd)
+                if _m:
+                    _candidate = _m.group(1).strip().rstrip('/')
+                    if _candidate not in ('.', './', '') and not _candidate.startswith('./'):
+                        memory._scaffolded_subproject = _candidate
+                        log.info(f"[Scaffold] Marked '{_candidate}' as freshly "
+                                 f"scaffolded — hazard check skipped on first write")
+                    break
         return True, ""
     else:
         display.step_info(step_idx, "Command failed. See log.")
@@ -1245,7 +1271,8 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
                       executor: Executor, display: CLIDisplay,
                       step_idx: int, step_text: str,
                       language: str | None = None,
-                      base_dir: str = ".") -> dict[str, str]:
+                      base_dir: str = ".",
+                      memory: "FileMemory | None" = None) -> dict[str, str]:
     """Scan generated files for hazardous diffs and auto-fix them.
 
     For each file where ``_detect_hazards`` flags problems (e.g. significant
@@ -1257,10 +1284,28 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
     """
     fixed_files = dict(files)
 
+    # Build the set of files our pipeline has already written, used below to
+    # detect scaffold files that have never been touched by the pipeline.
+    _pipeline_written: set[str] = set(memory.all_files().keys()) if memory else set()
+    _scaffolded_root: str | None = getattr(memory, '_scaffolded_subproject', None)
+
     for filepath, new_content in list(files.items()):
         full_path = os.path.join(base_dir, filepath)
         if not os.path.isfile(full_path):
             continue  # new file, nothing to compare
+
+        # Skip hazard check for npm/framework scaffold files on their FIRST
+        # modification in this session.  When a project-creation command ran
+        # (e.g. `npm create vite@latest my-app`), the generated template files
+        # (App.jsx, main.jsx, index.css, …) are expected to be fully replaced.
+        # Replacing a 3 KB template with a 300-byte component is intentional.
+        if _scaffolded_root and filepath not in _pipeline_written:
+            _norm = filepath.replace("\\", "/")
+            _root_prefix = _scaffolded_root.rstrip("/") + "/"
+            if _norm.startswith(_root_prefix) or _norm == _scaffolded_root:
+                log.info(f"[Scaffold] Skipping hazard check for '{filepath}' "
+                         f"(first write into scaffolded project '{_scaffolded_root}')")
+                continue
 
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -2851,7 +2896,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         # Auto-fix hazardous diffs before showing to user
         files = _auto_fix_hazards(files, coder, executor, display, step_idx,
-                                  step_text, language=language)
+                                  step_text, language=language, memory=memory)
 
         # Show diffs and wait for approval before writing
         display.stop_spinner()
@@ -4003,7 +4048,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 # Triage: test bug or source bug?
                 bug_origin = _triage_test_failure(
                     error_detail, source_ctx,
-                    f"{test_path}:\n{current_content[:1000]}\n",
+                    f"{test_path}:\n{current_content[:3000]}\n",
                     coder.llm_client, display, step_idx)
                 is_source_bug = (bug_origin == "SOURCE_BUG")
 
@@ -4119,8 +4164,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     file_fixed = True
                     break
 
-                # Stuck detection: same errors after fix
-                if output == prev_output:
+                # Stuck detection: same errors after fix — only bail on the
+                # last attempt, so earlier retries still get a chance.
+                if output == prev_output and fix_attempt == MAX_STEP_RETRIES:
                     log.warning(
                         f"Step {step_idx+1}: [{f_basename}] identical "
                         f"output after fix attempt {fix_attempt}, stopping.")
