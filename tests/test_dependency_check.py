@@ -206,7 +206,10 @@ class TestBuildSnapshot:
         assert "package.json" not in snap.file_deps
         assert "src/App.tsx" in snap.file_deps
 
-    def test_skips_test_files(self):
+    def test_includes_test_files(self):
+        # build_snapshot intentionally includes test files so find_gaps can
+        # detect exports that are only consumed by tests (vs real callers).
+        # find_gaps itself skips test files when reporting orphaned exports.
         files = {
             "src/App.tsx": "export default function App() {}",
             "src/App.test.tsx": "import App from './App';\ntest('renders', () => {});",
@@ -214,8 +217,8 @@ class TestBuildSnapshot:
         }
         snap = build_snapshot(files)
         assert "src/App.tsx" in snap.file_deps
-        assert "src/App.test.tsx" not in snap.file_deps
-        assert "tests/test_views.py" not in snap.file_deps
+        assert "src/App.test.tsx" in snap.file_deps
+        assert "tests/test_views.py" in snap.file_deps
 
 
 # ── _is_test_file ────────────────────────────────────────────────

@@ -160,6 +160,20 @@ class SearchAgent:
                 if part and len(part) < 30:
                     keywords.append(part)
 
+        # Extract from "Installed: pkg1, pkg2, ..." line (may include scoped
+        # packages like @tailwindcss/postcss — strip scope prefix for readability)
+        installed_match = re.search(r'Installed:\s*(.+)', kb_context)
+        if installed_match:
+            existing_lower = {kw.lower() for kw in keywords}
+            for pkg in installed_match.group(1).split(","):
+                pkg = pkg.strip()
+                # Strip flags (--save-dev etc.) and scope prefix (@org/)
+                pkg = re.sub(r'^@[\w-]+/', '', pkg)  # @scope/name → name
+                pkg = pkg.split("@")[0].strip()       # name@version → name
+                if pkg and len(pkg) < 30 and pkg.lower() not in existing_lower:
+                    keywords.append(pkg)
+                    existing_lower.add(pkg.lower())
+
         # Extract framework/tool with version patterns like "React 18.2"
         # from anywhere in the context (only if not already captured above)
         versioned = re.findall(
