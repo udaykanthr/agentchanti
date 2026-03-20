@@ -107,7 +107,7 @@ def main():
     parser.add_argument("task", nargs="?", help="The coding task to perform")
     parser.add_argument("--prompt-from-file", help="Read prompt from a text file")
     parser.add_argument("--provider", choices=["ollama", "lm_studio", "openai", "gemini", "anthropic"],
-                        default="lm_studio", help="The LLM provider to use")
+                        default=None, help="The LLM provider to use (default: from config or lm_studio)")
     parser.add_argument("--model", default=None,
                         help="The model name to use (default: from config)")
     parser.add_argument("--embed-model", default=None,
@@ -157,8 +157,8 @@ def main():
     embed_model = args.embed_model or cfg.EMBEDDING_MODEL
 
     # Update config object with CLI overrides (for --generate-yaml)
-    if args.provider:
-        cfg.PROVIDER = args.provider # Note: config doesn't actually store PROVIDER yet, but let's update what we can
+    if args.provider is not None:
+        cfg.PROVIDER = args.provider
     if args.model:
         cfg.DEFAULT_MODEL = args.model
     if args.embed_model:
@@ -548,6 +548,7 @@ def main():
             kb_context_builder=kb_context_builder,
             knowledge_base=knowledge_base,
             test_analysis=test_analysis,
+            language=language,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
@@ -1009,6 +1010,25 @@ def main():
 
             if not pipeline_success:
                 break
+
+    # ── 13.5. Final cross-step test verification ──
+    # Re-run all session test files together to catch regressions where a
+    # source fix in step N broke tests that already passed in step M.
+    if pipeline_success:
+        from .pipeline import run_final_test_verification
+        verif_ok, verif_err = run_final_test_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            language=language,
+            task=args.task,
+            cfg=cfg,
+            project_context=project_context,
+        )
+        if not verif_ok:
+            pipeline_success = False
+            log.warning(f"[FinalVerify] Pipeline marked failed: {verif_err[:200]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

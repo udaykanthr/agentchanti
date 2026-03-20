@@ -92,6 +92,26 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="recursion,stack,overflow,depth,python",
     ),
+    ErrorFix(
+        error_type="UnboundLocalError",
+        language="python",
+        pattern=r"UnboundLocalError:\s*(?:local variable\s+'(\w+)'\s+referenced before assignment|cannot access local variable\s+'(\w+)'\s+where it is not associated with a value)",
+        cause="A variable is used before it is assigned in the function. "
+              "Python marks any variable assigned anywhere in a function as local, "
+              "so if execution reaches a read before the assignment (e.g. inside an "
+              "if-branch or event loop), this error occurs. "
+              "This is a CODE BUG in the source file — not a missing package or wrong command.",
+        fix_template="THIS IS A CODE BUG — fix the source file, do NOT run a shell command. "
+                     "Look at the traceback to find the exact file and line. "
+                     "Initialize the variable with a sensible default value at the TOP of the "
+                     "function, BEFORE any conditional logic or loops that might skip the assignment. "
+                     "For game variables like speed/direction, use the initial value (e.g. snake_speed = [20, 0]). "
+                     "Provide the COMPLETE corrected file using the `#### [FILE]: path/to/file.py` marker "
+                     "followed by the full file content in a python code block. "
+                     "Do NOT output a bash command as the fix.",
+        severity="error",
+        tags="unbound,local,variable,scope,initialization,python",
+    ),
 
     # ── JavaScript ──────────────────────────────────────────────────────
     ErrorFix(

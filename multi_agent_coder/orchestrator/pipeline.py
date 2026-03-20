@@ -15,6 +15,7 @@ from .plan_step import PlanStep, build_step_context, update_step_after_execution
 from .step_handlers import (
     _handle_cmd_step, _handle_code_step, _handle_test_step,
     _handle_search_step,
+    _build_scoped_test_cmd,
     MAX_STEP_RETRIES,
 )
 from .diagnosis import _diagnose_failure, _apply_fix
@@ -765,3 +766,150 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
     log.error(f"Task {step_idx+1}: Failed after {MAX_DIAGNOSIS_RETRIES} "
               f"diagnosis attempts. Halting pipeline.")
     return False
+
+
+# ── Final cross-step test verification ────────────────────────────────────────
+
+_MAX_FINAL_VERIFY_ATTEMPTS = 2
+
+
+def run_final_test_verification(
+    *,
+    memory: FileMemory,
+    executor,
+    coder,
+    display: CLIDisplay,
+    language: str | None,
+    task: str,
+    cfg=None,
+    project_context=None,
+) -> tuple[bool, str]:
+    """Re-run all test files generated in this session as a final regression gate.
+
+    Individual TEST steps only verify their own test files in isolation.  When a
+    source fix in step N causes tests from step M to regress, the pipeline would
+    naively declare success.  This function catches those cross-step regressions
+    by running every test file written during the session together, after all
+    steps have completed.
+
+    Only runs when there are 2+ distinct test files (a single test file was
+    already verified by its own step — no cross-step regression is possible).
+
+    Returns ``(success, error_info)``.
+    """
+    from ..language import get_test_framework, detect_language_from_files
+
+    # Collect session test files
+    all_files = memory.all_files()
+    test_files = {
+        fpath: content
+        for fpath, content in all_files.items()
+        if _is_test_file(fpath) and not fpath.startswith("_")
+    }
+
+    if len(test_files) <= 1:
+        _logger.info(
+            "[FinalVerify] %d test file(s) — no cross-step regression possible, skipping.",
+            len(test_files),
+        )
+        return True, ""
+
+    _logger.info(
+        "[FinalVerify] Running final regression check on %d test file(s): %s",
+        len(test_files), list(test_files.keys()),
+    )
+    print(f"\n  [FinalVerify] Re-running {len(test_files)} test file(s) for cross-step regression check...")
+
+    # Determine test command (mirror _handle_test_step detection logic)
+    lang = language
+    if lang is None:
+        lang = detect_language_from_files(list(test_files.keys()))
+
+    fw = get_test_framework(lang) if lang else get_test_framework("python")
+    base_cmd = fw["command"]
+
+    # Vitest override: if any test file imports from 'vitest', prefer vitest
+    if "jest" in base_cmd.lower():
+        uses_vitest = any(
+            "from 'vitest'" in c or 'from "vitest"' in c
+            for c in test_files.values()
+        )
+        if uses_vitest:
+            base_cmd = "npx vitest run"
+            _logger.info("[FinalVerify] Overriding to vitest (detected vitest imports)")
+
+    # Detect subproject root (reuse step_handlers helper)
+    from .step_handlers import _detect_subproject_root
+    subproject_cwd = _detect_subproject_root(memory)
+
+    test_cmd = _build_scoped_test_cmd(base_cmd, test_files, subproject_cwd)
+    _logger.info("[FinalVerify] Test command: %s", test_cmd)
+
+    last_output = ""
+    for attempt in range(1, _MAX_FINAL_VERIFY_ATTEMPTS + 1):
+        ok, output = executor.run_command(test_cmd, cwd=subproject_cwd)
+        last_output = output
+        if ok:
+            _logger.info("[FinalVerify] All tests passed on attempt %d.", attempt)
+            print(f"  [FinalVerify] All tests passed.")
+            return True, ""
+
+        _logger.warning(
+            "[FinalVerify] Attempt %d/%d failed:\n%s",
+            attempt, _MAX_FINAL_VERIFY_ATTEMPTS, output[:800],
+        )
+
+        if attempt == _MAX_FINAL_VERIFY_ATTEMPTS:
+            break
+
+        # Ask coder to fix source files only (test files are already correct —
+        # they passed during their own steps; only source regressions are at fault)
+        print(f"  [FinalVerify] Tests failed — asking coder to fix source files (attempt {attempt})...")
+        source_files = {
+            fpath: content
+            for fpath, content in all_files.items()
+            if not _is_test_file(fpath) and not fpath.startswith("_")
+        }
+        if not source_files:
+            _logger.warning("[FinalVerify] No source files to fix — aborting fix loop.")
+            break
+
+        context_parts = [
+            f"#### [FILE]: {fpath}\n```\n{content}\n```"
+            for fpath, content in list(source_files.items())[:6]
+        ]
+        fix_prompt = (
+            f"Task: {task}\n\n"
+            f"All individual test steps passed, but running the full test suite together "
+            f"revealed a cross-step regression: a source fix for one test broke another.\n\n"
+            f"Test command: {test_cmd}\n\n"
+            f"Failure output:\n{output[:2500]}\n\n"
+            f"Source files (do NOT modify test files — they are correct):\n"
+            + "\n\n".join(context_parts)
+            + "\n\nFix the source file(s) so ALL tests pass. Output only the fixed files."
+        )
+        try:
+            fix_response = coder.llm_client.generate_response(fix_prompt)
+            fix_files = executor.parse_code_blocks(fix_response)
+            # Strictly filter: only apply fixes to non-test source files
+            fix_files = {
+                fpath: content for fpath, content in fix_files.items()
+                if not _is_test_file(fpath)
+            }
+            if fix_files:
+                executor.write_files(fix_files)
+                memory.update(fix_files)
+                _logger.info("[FinalVerify] Applied source fixes: %s", list(fix_files.keys()))
+            else:
+                _logger.warning("[FinalVerify] Coder produced no source-only fixes.")
+                break
+        except Exception as exc:
+            _logger.warning("[FinalVerify] Fix generation failed: %s", exc)
+            break
+
+    error_msg = (
+        f"Final cross-step test verification failed: {len(test_files)} test file(s) "
+        f"did not all pass together after source fixes.\n{last_output[:600]}"
+    )
+    print(f"  [FinalVerify] FAILED — cross-step regression detected.")
+    return False, error_msg

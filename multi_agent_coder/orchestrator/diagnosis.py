@@ -274,6 +274,54 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     return diagnosis
 
 
+def _extract_echo_chain_file_writes(text: str) -> dict[str, str]:
+    """Parse bash blocks where an LLM writes a file via chained echo calls.
+
+    Detects the pattern::
+
+        ```bash
+        (
+        echo line1 && echo line2 && ...
+        ) > path/to/file.py
+        ```
+
+    Returns ``{filepath: content}`` for any such blocks found.  The file
+    content is extracted in Python so that special shell characters (``<``,
+    ``>``, ``|``) inside the source code do not cause the echo commands to
+    fail on Windows CMD.
+    """
+    result: dict[str, str] = {}
+    for m in re.finditer(r"```(?:bash|shell|cmd|bat|batch)?\n(.*?)```",
+                         text, re.DOTALL | re.IGNORECASE):
+        block = m.group(1).rstrip()
+        # Must end with ) > filepath
+        tail_m = re.search(
+            r'\)\s*>\s*([^\s\r\n]+\.(?:py|js|ts|jsx|tsx|html|css|json|yaml|yml|toml|sh|txt))\s*$',
+            block, re.IGNORECASE,
+        )
+        if not tail_m:
+            continue
+        filepath = tail_m.group(1).replace("\\", "/")
+        content_lines: list[str] = []
+        for raw_line in block.splitlines():
+            stripped = raw_line.strip()
+            # Skip structural lines
+            if (stripped.startswith("type ") or stripped.startswith("del ")
+                    or stripped.startswith("rm ") or stripped == "("
+                    or stripped.startswith(") >") or not stripped):
+                continue
+            # Split on && to handle multiple echo calls per line
+            for part in re.split(r"\s*&&\s*", stripped):
+                part = part.strip()
+                if part in ("echo.", "echo", "echo "):
+                    content_lines.append("")
+                elif re.match(r"^echo\s", part, re.IGNORECASE):
+                    content_lines.append(part[5:])  # strip 'echo '
+        if content_lines:
+            result[filepath] = "\n".join(content_lines)
+    return result
+
+
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                display: CLIDisplay, step_idx: int,
                step_type: str = "CODE",
@@ -309,6 +357,15 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         if files:
             log.info(f"Step {step_idx+1}: Standard parser found nothing, "
                      f"fuzzy parser extracted: {list(files.keys())}")
+
+    # Fallback: detect echo-chain file writes — low-IQ LLMs often generate
+    # `(echo line && echo line ...) > file.py` instead of #### [FILE]: blocks.
+    # Parse the echo content in Python to avoid shell special-char failures.
+    if not files:
+        files = _extract_echo_chain_file_writes(diagnosis)
+        if files:
+            log.info(f"Step {step_idx+1}: Detected echo-chain file write(s), "
+                     f"extracting content: {list(files.keys())}")
 
     if files:
         # Strip protected manifest files before any further processing

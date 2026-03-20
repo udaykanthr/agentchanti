@@ -362,10 +362,47 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             # Skip markdown metadata annotations that the LLM sometimes
             # prefixes with ">" (e.g. "> **produces:** ..." or "> **note:** ...")
             _bare = cmd_text.lstrip("*_ \t")
-            _meta_prefixes = ("produces:", "note:", "output:", "creates:",
+            _bare_lower = _bare.lower()
+            # Handle CODE/TEST metadata that some LLMs incorrectly prefix with "> "
+            # (they see CMD steps use "> command" and copy the pattern to metadata)
+            if _bare_lower.startswith("target:"):
+                raw = _bare[7:].strip()
+                if raw:
+                    current.target_files = [f.strip() for f in raw.split(",") if f.strip()]
+                continue
+            elif _bare_lower.startswith("exports:"):
+                raw = _bare[8:].strip()
+                if raw and raw.lower() != "none":
+                    current.exports = [e.strip() for e in raw.split(",") if e.strip()]
+                continue
+            elif _bare_lower.startswith("imports:"):
+                raw = _bare[8:].strip()
+                if raw and raw.lower() != "none":
+                    for entry in raw.split(","):
+                        entry = entry.strip()
+                        if ":" in entry:
+                            file_path, symbol = entry.rsplit(":", 1)
+                            current.imports_from.setdefault(
+                                file_path.strip(), []
+                            ).append(symbol.strip())
+                continue
+            elif _bare_lower.startswith("content:"):
+                # Inline code block follows as a ``` fence — enter code-block mode
+                in_code_block = True
+                in_markdown_fence = False
+                code_lines = []
+                continue
+            elif _bare_lower.startswith("produces:"):
+                raw = _bare[9:].strip()
+                if raw:
+                    current.target_files.extend(
+                        f.strip() for f in raw.split(",") if f.strip()
+                    )
+                continue
+            _meta_prefixes = ("note:", "output:", "creates:",
                               "result:", "generates:", "returns:")
             if cmd_text.startswith("**") or any(
-                _bare.lower().startswith(p) for p in _meta_prefixes
+                _bare_lower.startswith(p) for p in _meta_prefixes
             ):
                 continue  # metadata annotation, not a shell command
             # Join multiple commands per step with && so all run sequentially

@@ -191,7 +191,8 @@ class PlannerAgent(Agent):
                     source_files: dict[str, str] | None = None,
                     kb_context_builder=None,
                     knowledge_base=None,
-                    test_analysis: str | None = None) -> str:
+                    test_analysis: str | None = None,
+                    language: str | None = None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -268,10 +269,16 @@ class PlannerAgent(Agent):
                             w.lower() for w in _TK.findall(task)
                         ))
                         # Precompute task word set (≥4 chars) for title
-                        # relevance scoring (Filter 3)
+                        # relevance scoring (Filter 3).
+                        # Include the detected project language so that
+                        # language-specific KB docs (e.g. "Python Stdlib
+                        # Reference") are not filtered out when the task
+                        # description doesn't mention the language by name.
                         _task_words_set = set(
                             re.findall(r'[a-zA-Z]{4,}', task.lower())
                         )
+                        if language and len(language) >= 4:
+                            _task_words_set.add(language.lower())
                         _MIN_TITLE_SCORE = 0.20  # ≥20% of title words in task
                         doc_hints: list[str] = []
                         _MAX_GENERIC_DOCS = 2  # cap for topic-relevant generics
@@ -314,7 +321,7 @@ class PlannerAgent(Agent):
                                 re.findall(r'[a-zA-Z]{4,}',
                                            (doc.title or "").lower())
                             )
-                            if title_words and task_techs:
+                            if title_words:
                                 title_score = (
                                     len(title_words & _task_words_set)
                                     / len(title_words)
@@ -357,7 +364,7 @@ class PlannerAgent(Agent):
                                         doc.title, _generic_count,
                                         _MAX_GENERIC_DOCS,
                                     )
-                            elif not doc_techs and task_techs:
+                            elif not doc_techs:
                                 # Generic doc with no parseable title words
                                 # — apply cap as fallback
                                 _generic_count += 1
