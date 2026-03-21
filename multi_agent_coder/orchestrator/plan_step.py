@@ -741,13 +741,31 @@ def build_step_context(
 
     # 1. Plan-declared imports (real or ghost)
     for file_path, symbols in step.imports_from.items():
+        # Compute the correct Python import path relative to each target file.
+        # The first target is used as the reference; if there are no targets,
+        # fall back to a simple path→module conversion.
+        ref_target = step.target_files[0] if step.target_files else ""
+        import_hint = ""
+        _JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
+        if ref_target and file_path.endswith(".py"):
+            import_module = _relative_import_path(ref_target, file_path)
+            symbol_str = ", ".join(symbols) if symbols else "..."
+            import_hint = f"# Correct Python import: from {import_module} import {symbol_str}\n"
+        elif ref_target and any(file_path.endswith(ext) for ext in _JS_EXTS):
+            import_module = _relative_import_path(ref_target, file_path)
+            # JS/TS relative imports need ./ prefix for same/sub-directory files
+            if not import_module.startswith(".."):
+                import_module = "./" + import_module
+            symbol_str = ", ".join(symbols) if symbols else "..."
+            import_hint = f"// Correct import: import {{ {symbol_str} }} from '{import_module}'\n"
+
         content = memory.get(file_path) if memory else None
         if content:
-            files[file_path] = content
+            files[file_path] = import_hint + content
         elif read_from_disk:
             disk_content = read_from_disk(file_path)
             if disk_content:
-                files[file_path] = disk_content
+                files[file_path] = import_hint + disk_content
         else:
             # Ghost contract: file not yet created, include planned info
             producer = _find_producer(file_path, all_steps)
@@ -755,6 +773,7 @@ def build_step_context(
                 ghost = (
                     f"# [PLANNED FILE — will be created by step {producer.id}]\n"
                     f"# Exports: {', '.join(producer.exports) if producer.exports else 'TBD'}\n"
+                    + import_hint
                 )
                 files[file_path] = ghost
 
@@ -783,6 +802,47 @@ def build_step_context(
                 pass  # best-effort dependency resolution
 
     return files
+
+
+def _relative_import_path(target_file: str, dep_file: str) -> str:
+    """
+    Compute the correct Python import module name for *dep_file* as seen
+    from *target_file*.
+
+    Both paths use forward slashes and are relative to the project root.
+
+    Examples
+    --------
+    >>> _relative_import_path("src/main.py", "src/cracker_anim.py")
+    'cracker_anim'
+    >>> _relative_import_path("main.py", "src/cracker_anim.py")
+    'src.cracker_anim'
+    >>> _relative_import_path("a/b/c.py", "a/b/utils.py")
+    'utils'
+    >>> _relative_import_path("a/b/c.py", "a/helpers.py")
+    'a.helpers'
+    """
+    import posixpath
+
+    target_dir = posixpath.dirname(target_file.replace("\\", "/"))
+    dep_norm = dep_file.replace("\\", "/")
+    # Strip .py extension to get module path
+    dep_module = dep_norm[:-3] if dep_norm.endswith(".py") else dep_norm
+
+    target_parts = [p for p in target_dir.split("/") if p]
+    dep_parts = dep_module.split("/")
+
+    # Find common prefix
+    common = 0
+    for t, d in zip(target_parts, dep_parts):
+        if t == d:
+            common += 1
+        else:
+            break
+
+    # If dep is directly accessible from the same directory, use the remainder
+    remaining = dep_parts[common:]
+    return ".".join(remaining) if remaining else dep_module.replace("/", ".")
 
 
 def _find_producer(file_path: str, steps: list[PlanStep]) -> Optional[PlanStep]:

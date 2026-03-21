@@ -23,6 +23,7 @@ class OllamaClient(LLMClient):
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Ollama] Sending ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
         log.debug(f"[Ollama] Prompt:\n{prompt}")
 
         payload = {
@@ -51,6 +52,7 @@ class OllamaClient(LLMClient):
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Ollama] Streaming ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
 
         payload = {
             "model": self.model,

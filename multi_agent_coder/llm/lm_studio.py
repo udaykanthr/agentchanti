@@ -8,17 +8,20 @@ from ..cli_display import token_tracker, log
 
 class LMStudioClient(LLMClient):
 
-    def __init__(self, base_url: str, model: str, **kwargs):
+    def __init__(self, base_url: str, model: str,
+                 reasoning_effort: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self.base_url = base_url
         self.model = model
+        self.reasoning_effort = reasoning_effort
 
     # ── Non-streaming generation ──
 
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[LM Studio] Sending ~{est_tokens} est. tokens")
-        log.debug(f"[LM Studio] Prompt:\n{prompt}")
+        token_tracker.set_context(est_tokens)
+        # log.debug(f"[LM Studio] Prompt:\n{prompt}")
 
         payload = {
             "model": self.model,
@@ -29,6 +32,8 @@ class LMStudioClient(LLMClient):
             "temperature": 0.7,
             "stream": False,
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         headers = {"Content-Type": "application/json"}
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=headers, json=payload,
@@ -55,6 +60,8 @@ class LMStudioClient(LLMClient):
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[LM Studio] Streaming ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
+        # log.debug(f"[LM Studio] Prompt:\n{prompt}")
 
         payload = {
             "model": self.model,
@@ -66,6 +73,9 @@ class LMStudioClient(LLMClient):
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+            log.debug(f"[LM Studio] reasoning_effort={self.reasoning_effort}")
         headers = {"Content-Type": "application/json"}
         url = f"{self.base_url}/chat/completions"
 

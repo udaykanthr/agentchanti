@@ -45,6 +45,50 @@ _RUNNER_INSTALL = {
     "phpunit": "composer require --dev phpunit/phpunit",
 }
 
+# Manifest file → (package_manager_name, install_all_cmd, install_pkgs_prefix)
+# Ordered: most specific manifests first (pyproject.toml before setup.py, etc.)
+_MANIFEST_TO_PM: list[tuple[str, str, str, str]] = [
+    # manifest filename  , pm name   , install-all cmd              , add-package prefix
+    ("package.json",       "npm",      "npm install",                 "npm install"),
+    ("pyproject.toml",     "pip",      "pip install -e .",            "pip install"),
+    ("requirements.txt",   "pip",      "pip install -r requirements.txt", "pip install"),
+    ("setup.py",           "pip",      "pip install -e .",            "pip install"),
+    ("Gemfile",            "bundler",  "bundle install",              "gem install"),
+    ("go.mod",             "go",       "go mod download",             "go get"),
+    ("Cargo.toml",         "cargo",    "cargo build --quiet",         "cargo add"),
+    ("composer.json",      "composer", "composer install",            "composer require"),
+]
+
+# Package manager name → default add-package prefix (fallback when no manifest found)
+_PM_INSTALL_PREFIX: dict[str, str] = {
+    "pip":      "pip install",
+    "npm":      "npm install",
+    "bundler":  "gem install",
+    "gem":      "gem install",
+    "go":       "go get",
+    "cargo":    "cargo add",
+    "composer": "composer require",
+}
+
+
+def _detect_package_manager(cwd: str | None = None) -> tuple[str | None, str | None, str | None]:
+    """Detect the package manager in *cwd* by scanning manifest files.
+
+    Returns (pm_name, install_all_cmd, install_pkgs_prefix) or (None, None, None).
+    """
+    root = cwd or "."
+    for manifest, pm, install_all, install_prefix in _MANIFEST_TO_PM:
+        if os.path.isfile(os.path.join(root, manifest)):
+            return pm, install_all, install_prefix
+    # Fallback: check for .csproj files (C# / .NET)
+    try:
+        for fname in os.listdir(root):
+            if fname.endswith(".csproj"):
+                return "dotnet", "dotnet restore", "dotnet add package"
+    except OSError:
+        pass
+    return None, None, None
+
 
 _DEV_ONLY_PACKAGES = re.compile(
     r'^(@types/|eslint|prettier|@eslint|stylelint|'
@@ -95,14 +139,22 @@ def _ensure_packages_installed(
     if not required:
         return
 
-    # Read the *current* manifest from disk (may differ from the snapshot
-    # taken during analysis, because earlier CMD steps installed packages).
+    # Detect the project's package manager from manifest files.
     root = subproject_cwd or "."
-    pkg_json_path = os.path.join(root, "package.json")
-    reqs_txt_path = os.path.join(root, "requirements.txt")
+    pm_name, _, install_prefix = _detect_package_manager(root)
+
+    if not install_prefix:
+        # No manifest found yet — project may not be scaffolded
+        return
 
     currently_installed: set[str] = set()
-    install_tool: str | None = None
+
+    # Read already-installed packages from the manifest to avoid reinstalling.
+    pkg_json_path = os.path.join(root, "package.json")
+    reqs_txt_path = os.path.join(root, "requirements.txt")
+    gemfile_lock_path = os.path.join(root, "Gemfile.lock")
+    cargo_lock_path = os.path.join(root, "Cargo.lock")
+    composer_lock_path = os.path.join(root, "composer.lock")
 
     if os.path.isfile(pkg_json_path):
         try:
@@ -110,7 +162,6 @@ def _ensure_packages_installed(
                 pkg = json.loads(f.read())
             currently_installed.update(pkg.get("dependencies", {}).keys())
             currently_installed.update(pkg.get("devDependencies", {}).keys())
-            install_tool = "npm install"
         except Exception:
             pass
     elif os.path.isfile(reqs_txt_path):
@@ -121,19 +172,46 @@ def _ensure_packages_installed(
                     if line and not line.startswith("#"):
                         pkg_name = re.split(r'[>=<~!\[]', line)[0].strip()
                         if pkg_name:
-                            currently_installed.add(pkg_name)
-            install_tool = "pip install"
+                            currently_installed.add(pkg_name.lower())
+        except Exception:
+            pass
+    elif os.path.isfile(gemfile_lock_path):
+        # Gemfile.lock: lines like "    rack (2.2.3)" inside GEM section
+        try:
+            with open(gemfile_lock_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'^\s{4}(\S+)\s+\(', line)
+                    if m:
+                        currently_installed.add(m.group(1).lower())
+        except Exception:
+            pass
+    elif os.path.isfile(cargo_lock_path):
+        # Cargo.lock: lines like 'name = "serde"'
+        try:
+            with open(cargo_lock_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'^name\s*=\s*"(.+)"', line)
+                    if m:
+                        currently_installed.add(m.group(1).lower())
+        except Exception:
+            pass
+    elif os.path.isfile(composer_lock_path):
+        # composer.lock: JSON with packages[].name
+        try:
+            with open(composer_lock_path, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            for pkg in data.get("packages", []) + data.get("packages-dev", []):
+                if "name" in pkg:
+                    currently_installed.add(pkg["name"].lower())
         except Exception:
             pass
 
-    if not install_tool:
-        # No manifest found yet — project may not be scaffolded
-        return
+    install_tool = install_prefix
 
-    # Determine what's truly missing right now
+    # Determine what's truly missing right now (case-insensitive for pip/gem/cargo)
     missing = [
         pkg for pkg in required
-        if pkg not in currently_installed
+        if pkg.lower() not in currently_installed
         and pkg not in ('--save-dev', '--save', '-D', '-g')
     ]
 
@@ -148,7 +226,7 @@ def _ensure_packages_installed(
 
     # For npm: split into production deps and dev-only deps so they land
     # in the correct section of package.json.
-    if "npm" in install_tool:
+    if pm_name == "npm":
         prod_pkgs = [p for p in missing if not _DEV_ONLY_PACKAGES.match(p)]
         dev_pkgs = [p for p in missing if _DEV_ONLY_PACKAGES.match(p)]
 
@@ -195,13 +273,22 @@ def _ensure_packages_installed(
     memory._packages_preinstalled = True
 
 
-def _get_runner_install_cmd(runner: str) -> str | None:
+def _get_runner_install_cmd(runner: str, cwd: str | None = None) -> str | None:
     """Return the install command for a test runner binary.
 
+    Looks up the explicit map first, then falls back to the package manager
+    detected in *cwd* so that non-Python runners use the right tool.
     Returns ``None`` for tools that must be installed manually (e.g. ``go``,
-    ``cargo``) — the caller must handle this gracefully.
+    ``cargo``).
     """
-    return _RUNNER_INSTALL.get(runner, f"pip install {runner}")
+    if runner in _RUNNER_INSTALL:
+        return _RUNNER_INSTALL[runner]
+    # Detect the project's package manager and use its prefix
+    pm, _, install_prefix = _detect_package_manager(cwd)
+    if install_prefix:
+        return f"{install_prefix} {runner}"
+    # Ultimate fallback: pip (Python project assumed)
+    return f"pip install {runner}"
 
 
 def _read_js_project_env(cwd: str | None = None) -> dict:
@@ -3535,10 +3622,35 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     # Ensure the test runner binary is installed before attempting to run tests
     parts = test_cmd.split()
     runner = parts[0]
+    # For "python -m <module>" (e.g. "python -m pytest"), check if the module
+    # is importable rather than checking the binary — python is always on PATH.
+    if runner in ("python", "python3") and "-m" in parts:
+        try:
+            m_idx = parts.index("-m")
+            actual_tool = parts[m_idx + 1] if m_idx + 1 < len(parts) else None
+        except (ValueError, IndexError):
+            actual_tool = None
+        if actual_tool:
+            import importlib.util as _ilu
+            try:
+                module_found = _ilu.find_spec(actual_tool) is not None
+            except Exception:
+                module_found = False
+            if not module_found:
+                install_cmd = _get_runner_install_cmd(actual_tool, cwd=subproject_cwd)
+                if install_cmd:
+                    display.step_info(step_idx, f"`{actual_tool}` not found, installing...")
+                    log.info(f"Step {step_idx+1}: Auto-installing: {install_cmd}")
+                    ok, out = executor.run_command(install_cmd, cwd=subproject_cwd)
+                    if ok:
+                        display.step_info(step_idx, f"Installed `{actual_tool}`")
+                    else:
+                        log.warning(f"Step {step_idx+1}: Failed to install "
+                                    f"{actual_tool}: {out[:200]}")
     # For "npx <tool>", the binary to check is "npx" itself
-    if not shutil.which(runner):
+    elif not shutil.which(runner):
         actual_tool = parts[1] if runner == "npx" and len(parts) > 1 else runner
-        install_cmd = _get_runner_install_cmd(actual_tool)
+        install_cmd = _get_runner_install_cmd(actual_tool, cwd=subproject_cwd)
         if install_cmd is None:
             # System-level tool (go, cargo, etc.) — can't auto-install
             msg = (f"`{runner}` is not installed. It must be installed manually "

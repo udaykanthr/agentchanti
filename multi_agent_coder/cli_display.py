@@ -22,6 +22,11 @@ class TokenTracker:
         self.current_context_size = 0
         self._lock = threading.Lock()
 
+    def set_context(self, tokens: int) -> None:
+        """Pre-call: update context size with estimated prompt tokens (shown in status bar)."""
+        with self._lock:
+            self.current_context_size = tokens
+
     def record(self, prompt_tokens: int, completion_tokens: int, model_name: str | None = None):
         with self._lock:
             self.total_prompt_tokens += prompt_tokens

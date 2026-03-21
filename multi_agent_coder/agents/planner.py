@@ -547,7 +547,12 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     code that relies on them (test framework, CSS config, build tools).
 
 16. **Scaffold blank projects FIRST**: When project is BLANK/EMPTY, scaffold
-    first (npm create vite, create-next-app, etc.) before any code steps.
+    first using the appropriate tool for the detected language
+    (Python: `python -m venv venv && pip install ...`;
+     JavaScript/TypeScript: `npm create vite@latest`, `npm install`;
+     Go: `go mod init`; Rust: `cargo init`)
+    before any code steps. Use the language-specific examples from the
+    PROJECT STATE context above — do NOT default to npm for non-JS projects.
 
 17. **Leaf components BEFORE parents**: Create child components first, then
     parents that import them. Declare imports: to enforce correct ordering.

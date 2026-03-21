@@ -30,6 +30,7 @@ class OpenAIClient(LLMClient):
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[OpenAI] Sending ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
         # log.debug(f"[OpenAI] Prompt:\n{prompt}")
 
         payload = {
@@ -65,6 +66,7 @@ class OpenAIClient(LLMClient):
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[OpenAI] Streaming ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
 
         # log.debug(f"[OpenAI] Prompt:\n{prompt}")
         payload = {

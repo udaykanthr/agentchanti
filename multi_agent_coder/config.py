@@ -23,6 +23,7 @@ _DEFAULTS = {
     "checkpoint_file": ".agentchanti_checkpoint.json",
     "ollama_base_url": "http://localhost:11434/api/generate",
     "lm_studio_base_url": "http://localhost:1234/v1",
+    "lm_studio_reasoning_effort": None,  # None | "low" | "medium" | "high"
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "gemini_api_key": "",
@@ -171,6 +172,12 @@ class Config:
                                     _DEFAULTS["ollama_base_url"])
         self.LM_STUDIO_BASE_URL = _get("LM_STUDIO_BASE_URL", "lm_studio_base_url",
                                        _DEFAULTS["lm_studio_base_url"])
+        self.LM_STUDIO_REASONING_EFFORT = (
+            os.getenv("LM_STUDIO_REASONING_EFFORT")
+            or (yd.get("lm_studio", {}) or {}).get("reasoning_effort")
+            or yd.get("reasoning_effort")  # top-level fallback
+            or _DEFAULTS["lm_studio_reasoning_effort"]
+        )
 
         # OpenAI / cloud provider
         openai_section = yd.get("openai", {}) if isinstance(yd.get("openai"), dict) else {}

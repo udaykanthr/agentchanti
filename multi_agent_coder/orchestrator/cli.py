@@ -95,6 +95,21 @@ def _rematch_plan_steps(new_steps, old_plan_steps, dependencies):
     return result
 
 
+def _blank_project_scaffold_hint(language: str | None) -> str:
+    """Return language-appropriate scaffolding examples for blank-project prompt."""
+    lang = (language or "").lower()
+    if lang == "python":
+        return "e.g. `python -m venv venv`, `pip install <packages>`"
+    if lang in ("javascript", "typescript"):
+        return "e.g. `npm create vite@latest`, `npm install`, framework setup"
+    if lang == "go":
+        return "e.g. `go mod init`, `go get <packages>`"
+    if lang == "rust":
+        return "e.g. `cargo init`, `cargo add <crates>`"
+    # Generic fallback
+    return "e.g. project init command, package install, framework setup"
+
+
 def main():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -242,7 +257,8 @@ def main():
             api_key=api_key, **llm_kwargs)
     else:
         llm_client = LMStudioClient(
-            base_url=cfg.LM_STUDIO_BASE_URL, model=model, **llm_kwargs)
+            base_url=cfg.LM_STUDIO_BASE_URL, model=model,
+            reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
 
     # ── 3. Scan existing project ──
     scan_result = scan_project(".")
@@ -369,7 +385,8 @@ def main():
                 api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
         else:
             return LMStudioClient(
-                base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model, **llm_kwargs)
+                base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model,
+                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
 
     # Custom prompt suffixes from config
     planner_suffix = cfg.PROMPT_SUFFIXES.get("planner_suffix", "")
@@ -500,12 +517,11 @@ def main():
         if _has_project_config:
             planner_context = f"Existing project:\n{project_context}"
         else:
+            _scaffold_hint = _blank_project_scaffold_hint(language)
             planner_context = (
-                "PROJECT STATE: BLANK / EMPTY directory — no package.json, "
-                "no pyproject.toml, no build config files found.\n"
-                "The plan MUST start with project scaffolding / initialization steps "
-                "(e.g. `npm create vite@latest`, `npm install`, framework setup) "
-                "before writing any source code.\n"
+                f"PROJECT STATE: BLANK / EMPTY directory — no build config files found.\n"
+                f"The plan MUST start with project scaffolding / initialization steps "
+                f"({_scaffold_hint}) before writing any source code.\n"
             )
             if project_context:
                 planner_context += f"\nCurrent directory contents:\n{project_context}"
@@ -1025,6 +1041,7 @@ def main():
             task=args.task,
             cfg=cfg,
             project_context=project_context,
+            kb_context_builder=kb_context_builder,
         )
         if not verif_ok:
             pipeline_success = False
