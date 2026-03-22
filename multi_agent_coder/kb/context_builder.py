@@ -305,21 +305,31 @@ class ContextBuilder:
         # saving 2 embedding API calls compared to separate searches.
         if self._global_store is not None:
             try:
-                # Build category limits based on intent
-                category_limits: dict[str, int] = {
-                    "doc": 4,
-                    "behavioral": 3,
-                }
+                # Build category limits based on intent.
+                # During error diagnosis (is_error=True) skip generic doc
+                # search — the step description often matches irrelevant
+                # docs by keyword overlap (e.g. "install required packages"
+                # matches npm/Vitest setup guides).  Error-fix patterns are
+                # already handled by step 4 (search_errors) which uses the
+                # actual error output for matching.
+                category_limits: dict[str, int] = {}
+                if not is_error:
+                    category_limits["doc"] = 4
+                    category_limits["behavioral"] = 3
                 if is_review:
                     category_limits["pattern"] = 3
                     category_limits["adr"] = 3
 
-                buckets = self._global_store.batch_search(
-                    task_description,
-                    category_limits=category_limits,
-                    language=language,
-                    api_client=self._api_client,
-                )
+                if not category_limits:
+                    # Nothing to search — skip the vector call entirely
+                    buckets: dict = {}
+                else:
+                    buckets = self._global_store.batch_search(
+                        task_description,
+                        category_limits=category_limits,
+                        language=language,
+                        api_client=self._api_client,
+                    )
 
                 # Distribute results into ctx fields
                 patterns = buckets.get("pattern", []) + buckets.get("adr", [])

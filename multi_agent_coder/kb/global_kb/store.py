@@ -595,17 +595,36 @@ class GlobalKBStore:
                 # "Tailwind CSS" → "tailwindcss" so query "tailwindcss" matches
                 title_compressed = _re.sub(r'[\s\-_]+', '', title_lower)
 
+                # Use word-set matching (not substring) to prevent short
+                # query words (e.g. "in", "and") from false-matching unrelated
+                # docs via substrings of longer title/tag words (e.g. "in" ⊂
+                # "testing-library", "in" ⊂ "install").
+                title_words = set(_re.findall(r'\w+', title_lower))
+                tag_words = set(_re.findall(r'\w+', tags_lower))
+
                 body_hits = sum(
                     1.0 for w in query_words if w in content_lower
                 )
                 title_hits = sum(
                     3.0 for w in query_words
-                    if w in title_lower or w in title_compressed
+                    if w in title_words or (len(w) >= 4 and w in title_compressed)
                 )
                 tag_hits = sum(
-                    2.0 for w in query_words if w in tags_lower
+                    2.0 for w in query_words if w in tag_words
                 )
                 score = (body_hits + title_hits + tag_hits) / max(len(query_words), 1)
+
+                # language="all" docs cover every stack (Tailwind, Vitest,
+                # Qdrant, etc.).  Body-only keyword matches on generic terms
+                # like "create", "project", "install", "run" produce false
+                # positives that fill the prompt with irrelevant docs.
+                # Require at least one title or tag keyword match so that
+                # only topically relevant generic docs are included.
+                # Language-specific docs (e.g. language="python") are not
+                # subject to this extra gate — they were already filtered by
+                # the language check above and are assumed to be on-topic.
+                if doc_lang == "all" and title_hits == 0 and tag_hits == 0:
+                    continue
 
                 if score > 0:
                     tags_str = meta.get("tags", "")

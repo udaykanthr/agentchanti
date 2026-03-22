@@ -770,7 +770,142 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
 
 # ── Final cross-step test verification ────────────────────────────────────────
 
-_MAX_FINAL_VERIFY_ATTEMPTS = 2
+_MAX_FINAL_VERIFY_ATTEMPTS = 3
+
+
+def _lazify_display_imports(content: str) -> str:
+    """
+    Post-process a source file to prevent test-collection failures caused by
+    display-requiring imports (e.g. pygame) at module level.
+
+    Strategy:
+    1. Strip any unindented 'import pygame' / 'from pygame import ...' lines.
+    2. For every function that references 'pygame.' but has no local
+       'import pygame', inject one as the first statement of the function body.
+
+    This is a deterministic guard — the LLM frequently ignores the KB
+    instruction to use lazy imports, so we enforce it here instead.
+    """
+    _DISPLAY_PKGS = ("pygame",)
+
+    def _is_display_import(line: str) -> bool:
+        s = line.strip()
+        return any(
+            s.startswith(f"import {pkg}") or s.startswith(f"from {pkg}")
+            for pkg in _DISPLAY_PKGS
+        )
+
+    lines = content.splitlines()
+
+    # Fast-exit: nothing to do if there are no display imports at all
+    if not any(not ln.startswith((" ", "\t")) and _is_display_import(ln) for ln in lines):
+        return content
+
+    # Pass 1 — remove module-level display imports
+    lines = [
+        ln for ln in lines
+        if not (not ln.startswith((" ", "\t")) and _is_display_import(ln))
+    ]
+
+    # Pass 2 — inject lazy imports inside functions that use 'pygame.'
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        is_toplevel_def = (
+            not line.startswith((" ", "\t"))
+            and stripped.startswith("def ")
+            and stripped.rstrip().endswith(":")
+        )
+        if not is_toplevel_def:
+            result.append(line)
+            i += 1
+            continue
+
+        # Collect the entire function block (until next unindented non-empty line)
+        func: list[str] = [line]
+        i += 1
+        while i < len(lines):
+            nxt = lines[i]
+            if nxt.strip() and not nxt.startswith((" ", "\t")):
+                break
+            func.append(nxt)
+            i += 1
+
+        func_text = "\n".join(func)
+        needs_pygame = "pygame." in func_text
+
+        if needs_pygame:
+            # Determine body indentation from the first non-empty body line
+            body_indent = "    "
+            for fl in func[1:]:
+                if fl.strip():
+                    body_indent = " " * (len(fl) - len(fl.lstrip()))
+                    break
+            lazy_import = f"{body_indent}import pygame"
+            if lazy_import not in func_text:
+                # Insert after the def line (skip past any docstring)
+                insert_at = 1
+                in_docstring = False
+                quote = None
+                for j, fl in enumerate(func[1:], start=1):
+                    s = fl.strip()
+                    if not in_docstring:
+                        if s.startswith(('"""', "'''")):
+                            quote = s[:3]
+                            in_docstring = not s.endswith(quote) or len(s) == 3
+                            if not in_docstring:
+                                insert_at = j + 1
+                        else:
+                            insert_at = j
+                            break
+                    else:
+                        if s.endswith(quote):
+                            in_docstring = False
+                            insert_at = j + 1
+                func.insert(insert_at, lazy_import)
+
+        result.extend(func)
+
+    return "\n".join(result)
+
+
+def _extract_failing_test_imports(error_output: str, all_files: dict) -> str:
+    """
+    Parse ERROR lines from pytest output, find those test files in memory,
+    and return their import statements so the LLM knows exactly which symbols
+    each failing test needs from the source files.
+    """
+    import re as _re
+    # Match lines like "ERROR collecting test_foo.py"
+    failing = _re.findall(r"ERROR collecting (\S+\.py)", error_output)
+    if not failing:
+        return ""
+
+    lines = []
+    for test_fname in failing:
+        # Normalise path separators and find the file in memory
+        needle = test_fname.replace("\\", "/")
+        content = None
+        for fpath, fcontent in all_files.items():
+            if fpath.replace("\\", "/").endswith(needle):
+                content = fcontent
+                break
+        if content is None:
+            continue
+        # Collect import lines only
+        imports = [
+            ln.strip()
+            for ln in content.splitlines()
+            if ln.strip().startswith(("import ", "from "))
+        ]
+        if imports:
+            lines.append(f"  {needle} imports:\n    " + "\n    ".join(imports))
+
+    if not lines:
+        return ""
+    return "\n\nSymbols required by failing tests (you MUST export all of these from the source):\n" + "\n".join(lines)
 
 
 def run_final_test_verification(
@@ -783,6 +918,7 @@ def run_final_test_verification(
     task: str,
     cfg=None,
     project_context=None,
+    kb_context_builder=None,
 ) -> tuple[bool, str]:
     """Re-run all test files generated in this session as a final regression gate.
 
@@ -878,23 +1014,54 @@ def run_final_test_verification(
             f"#### [FILE]: {fpath}\n```\n{content}\n```"
             for fpath, content in list(source_files.items())[:6]
         ]
+        # Optionally inject KB behavioral instructions into the fix prompt
+        kb_instructions = ""
+        if kb_context_builder is not None:
+            try:
+                from ..kb.context_builder import ContextBuilder
+                kb_ctx = kb_context_builder.build_context(
+                    task_description=task,
+                    current_file=None,
+                    max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
+                    language=language,
+                )
+                kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
+                if kb_text:
+                    kb_instructions = f"\n\nKnowledge base guidance:\n{kb_text}"
+            except Exception:
+                pass
+
+        failing_imports = _extract_failing_test_imports(output, all_files)
+
         fix_prompt = (
             f"Task: {task}\n\n"
             f"All individual test steps passed, but running the full test suite together "
             f"revealed a cross-step regression: a source fix for one test broke another.\n\n"
             f"Test command: {test_cmd}\n\n"
-            f"Failure output:\n{output[:2500]}\n\n"
+            f"Failure output:\n{output[:8000]}\n\n"
             f"Source files (do NOT modify test files — they are correct):\n"
             + "\n\n".join(context_parts)
-            + "\n\nFix the source file(s) so ALL tests pass. Output only the fixed files."
+            + failing_imports
+            + kb_instructions
+            + "\n\nFix the source file(s) so ALL tests pass."
+            + "\n\nIMPORTANT: Preserve ALL existing public symbols (classes, functions, constants) — only add or modify, never remove."
+            + "\n\nOutput ONLY the complete fixed file(s) using this exact format — no prose, no explanation:\n"
+            + "#### [FILE]: path/to/file.py\n```python\n...full file content...\n```"
         )
         try:
             fix_response = coder.llm_client.generate_response(fix_prompt)
             fix_files = executor.parse_code_blocks(fix_response)
+            if not fix_files:
+                fix_files = executor.parse_code_blocks_fuzzy(fix_response)
             # Strictly filter: only apply fixes to non-test source files
             fix_files = {
                 fpath: content for fpath, content in fix_files.items()
                 if not _is_test_file(fpath)
+            }
+            # Post-process: enforce lazy display imports regardless of LLM output
+            fix_files = {
+                fpath: _lazify_display_imports(content)
+                for fpath, content in fix_files.items()
             }
             if fix_files:
                 executor.write_files(fix_files)
@@ -902,7 +1069,7 @@ def run_final_test_verification(
                 _logger.info("[FinalVerify] Applied source fixes: %s", list(fix_files.keys()))
             else:
                 _logger.warning("[FinalVerify] Coder produced no source-only fixes.")
-                break
+                continue
         except Exception as exc:
             _logger.warning("[FinalVerify] Fix generation failed: %s", exc)
             break

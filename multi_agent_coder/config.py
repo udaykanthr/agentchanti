@@ -23,6 +23,7 @@ _DEFAULTS = {
     "checkpoint_file": ".agentchanti_checkpoint.json",
     "ollama_base_url": "http://localhost:11434/api/generate",
     "lm_studio_base_url": "http://localhost:1234/v1",
+    "lm_studio_reasoning_effort": None,  # None | "low" | "medium" | "high"
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "gemini_api_key": "",
@@ -65,6 +66,7 @@ _DEFAULTS = {
     "editing_max_chunk_files": 3,
     "review_mode": "static",
     "dependency_check_enabled": True,
+    "analyser_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -171,6 +173,12 @@ class Config:
                                     _DEFAULTS["ollama_base_url"])
         self.LM_STUDIO_BASE_URL = _get("LM_STUDIO_BASE_URL", "lm_studio_base_url",
                                        _DEFAULTS["lm_studio_base_url"])
+        self.LM_STUDIO_REASONING_EFFORT = (
+            os.getenv("LM_STUDIO_REASONING_EFFORT")
+            or (yd.get("lm_studio", {}) or {}).get("reasoning_effort")
+            or yd.get("reasoning_effort")  # top-level fallback
+            or _DEFAULTS["lm_studio_reasoning_effort"]
+        )
 
         # OpenAI / cloud provider
         openai_section = yd.get("openai", {}) if isinstance(yd.get("openai"), dict) else {}
@@ -371,6 +379,13 @@ class Config:
             dep_section.get("enabled", _DEFAULTS["dependency_check_enabled"]),
         )
 
+        # Analyser LLM enrichment (off by default — costs 1 LLM call per run)
+        analyser_section = yd.get("analyser", {}) if isinstance(yd.get("analyser"), dict) else {}
+        self.ANALYSER_ENABLED = _get_bool(
+            "ANALYSER_ENABLED", "analyser_enabled",
+            analyser_section.get("enabled", _DEFAULTS["analyser_enabled"]),
+        )
+
         # Plugins
         self.PLUGINS: list[str] = yd.get("plugins", _DEFAULTS["plugins"])
         if not isinstance(self.PLUGINS, list):
@@ -444,6 +459,9 @@ class Config:
             },
             "dependency_check": {
                 "enabled": self.DEPENDENCY_CHECK_ENABLED,
+            },
+            "analyser": {
+                "enabled": self.ANALYSER_ENABLED,
             },
         }
 

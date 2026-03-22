@@ -656,7 +656,15 @@ def _is_external_import(import_source: str, importer_file: str) -> bool:
         if import_source.startswith("."):
             return False
         top_module = import_source.split(".")[0]
-        return top_module in _PYTHON_STDLIB
+        if top_module in _PYTHON_STDLIB:
+            return True
+        # Also treat installed third-party packages (pytest, pygame, requests, …)
+        # as external so they never trigger a "broken import" false positive.
+        try:
+            import importlib.util as _ilu
+            return _ilu.find_spec(top_module) is not None
+        except Exception:
+            return False
 
     if ext == ".go":
         # Local relative imports start with "."; stdlib has no "."

@@ -43,7 +43,7 @@ EXTENSION_MAP = {
 
 TEST_FRAMEWORKS = {
     "python": {
-        "command": "pytest",
+        "command": "python -m pytest",
         "dir": "tests",
         "ext": ".py",
         "prefix": "test_",

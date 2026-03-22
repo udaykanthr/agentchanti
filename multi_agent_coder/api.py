@@ -146,7 +146,8 @@ def _run_task_impl(
             api_key=api_key, **llm_kwargs)
     else:
         llm_client = LMStudioClient(
-            base_url=cfg.LM_STUDIO_BASE_URL, model=model, **llm_kwargs)
+            base_url=cfg.LM_STUDIO_BASE_URL, model=model,
+            reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
 
     # Project scan TODO: Dont scan entire project instead scan only the files that are relevant to the task or 1 layer of folders
     scan_result = scan_project(".")
@@ -175,7 +176,8 @@ def _run_task_impl(
                 api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
         else:
             return LMStudioClient(
-                base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model, **llm_kwargs)
+                base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model,
+                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
 
     planner = PlannerAgent("Planner", "Senior Software Architect",
                            "Create a step-by-step plan for the coding task.",
@@ -276,12 +278,12 @@ def _run_task_impl(
     if _has_project_config:
         planner_context = f"Existing project:\n{project_context}"
     else:
+        from .orchestrator.cli import _blank_project_scaffold_hint
+        _scaffold_hint = _blank_project_scaffold_hint(language)
         planner_context = (
-            "PROJECT STATE: BLANK / EMPTY directory — no package.json, "
-            "no pyproject.toml, no build config files found.\n"
-            "The plan MUST start with project scaffolding / initialization steps "
-            "(e.g. `npm create vite@latest`, `npm install`, framework setup) "
-            "before writing any source code.\n"
+            f"PROJECT STATE: BLANK / EMPTY directory — no build config files found.\n"
+            f"The plan MUST start with project scaffolding / initialization steps "
+            f"({_scaffold_hint}) before writing any source code.\n"
         )
         if project_context:
             planner_context += f"\nCurrent directory contents:\n{project_context}"
@@ -407,27 +409,32 @@ def _run_task_impl(
 
     # LLM enrichment — adds deeper success criteria, assertion hints,
     # and testable unit identification.  Uses 1 LLM call.
-    display.show_status("Analysing project...")
-    try:
-        analyser = AnalyseAgent(
-            "Analyser", "Senior Technical Analyst",
-            "Analyse the task and project to guide downstream agents.",
-            _make_llm("analyser"))
-        project_context_obj = analyser.enrich_context(
-            project_context_obj, task, steps, source_files or {})
-        _logger.info(
-            "[Analysis] ProjectContext built: lang=%s, framework=%s, "
-            "test_fw=%s, %d installed pkgs, %d testable units, %d criteria",
-            project_context_obj.language,
-            project_context_obj.framework,
-            project_context_obj.test_framework,
-            len(project_context_obj.installed_packages),
-            len(project_context_obj.testable_units),
-            len(project_context_obj.success_criteria),
-        )
-    except Exception as analyse_exc:
-        _logger.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
-                        analyse_exc)
+    # Disabled by default; enable via `analyser: {enabled: true}` in .agentchanti.yaml
+    # or ANALYSER_ENABLED=true env var.
+    if cfg.ANALYSER_ENABLED:
+        display.show_status("Analysing project...")
+        try:
+            analyser = AnalyseAgent(
+                "Analyser", "Senior Technical Analyst",
+                "Analyse the task and project to guide downstream agents.",
+                _make_llm("analyser"))
+            project_context_obj = analyser.enrich_context(
+                project_context_obj, task, steps, source_files or {})
+            _logger.info(
+                "[Analysis] ProjectContext built: lang=%s, framework=%s, "
+                "test_fw=%s, %d installed pkgs, %d testable units, %d criteria",
+                project_context_obj.language,
+                project_context_obj.framework,
+                project_context_obj.test_framework,
+                len(project_context_obj.installed_packages),
+                len(project_context_obj.testable_units),
+                len(project_context_obj.success_criteria),
+            )
+        except Exception as analyse_exc:
+            _logger.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                            analyse_exc)
+    else:
+        _logger.info("[Analysis] LLM enrichment skipped (analyser_enabled: false)")
 
     display.set_steps(steps)
 
@@ -522,6 +529,7 @@ def _run_task_impl(
             task=task,
             cfg=cfg,
             project_context=project_context_obj,
+            kb_context_builder=kb_context_builder,
         )
         if not verif_ok:
             pipeline_success = False

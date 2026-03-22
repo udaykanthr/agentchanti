@@ -23,6 +23,7 @@ class GeminiClient(LLMClient):
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Gemini] Sending ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
         log.debug(f"[Gemini] Prompt:\n{prompt}")
 
         payload = {
@@ -65,6 +66,7 @@ class GeminiClient(LLMClient):
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Gemini] Streaming ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
 
         payload = {
             "contents": [

@@ -32,6 +32,7 @@ class AnthropicClient(LLMClient):
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Anthropic] Sending ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
         log.debug(f"[Anthropic] Prompt:\n{prompt}")
 
         payload = {
@@ -71,6 +72,7 @@ class AnthropicClient(LLMClient):
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Anthropic] Streaming ~{est_tokens} est. tokens")
+        token_tracker.set_context(est_tokens)
 
         payload = {
             "model": self.model,
