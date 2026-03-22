@@ -690,6 +690,28 @@ def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
         primary = s.id.split(".")[0] if "." in s.id else s.id
         phase_groups.setdefault(primary, []).append(s)
 
+    # ── Infer implicit deps: within a phase, steps with no declared deps
+    #    should wait for any CMD steps that precede them (by step ID).
+    #    This handles the common case where the LLM scaffolds a project in
+    #    step 1.1 [CMD] and then writes files in 1.4–1.9 [CODE] with
+    #    depends:none, causing them to run concurrently with the scaffold.
+    for phase_steps in phase_groups.values():
+        # Collect CMD step IDs in sorted order within the phase
+        cmd_ids_in_phase = sorted(
+            s.id for s in phase_steps if s.step_type == "CMD"
+        )
+        if not cmd_ids_in_phase:
+            continue
+        for s in phase_steps:
+            if s.step_type == "CMD":
+                continue  # CMD steps don't auto-depend on other CMDs here
+            if s.depends_on:
+                continue  # already has explicit deps — don't override
+            # Add any CMD steps whose ID sorts before this step's ID
+            implicit = [cid for cid in cmd_ids_in_phase if cid < s.id]
+            if implicit:
+                s.depends_on = list(implicit)
+
     waves: list[list[PlanStep]] = []
     completed: set[str] = set()
 

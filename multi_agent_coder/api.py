@@ -409,27 +409,32 @@ def _run_task_impl(
 
     # LLM enrichment — adds deeper success criteria, assertion hints,
     # and testable unit identification.  Uses 1 LLM call.
-    display.show_status("Analysing project...")
-    try:
-        analyser = AnalyseAgent(
-            "Analyser", "Senior Technical Analyst",
-            "Analyse the task and project to guide downstream agents.",
-            _make_llm("analyser"))
-        project_context_obj = analyser.enrich_context(
-            project_context_obj, task, steps, source_files or {})
-        _logger.info(
-            "[Analysis] ProjectContext built: lang=%s, framework=%s, "
-            "test_fw=%s, %d installed pkgs, %d testable units, %d criteria",
-            project_context_obj.language,
-            project_context_obj.framework,
-            project_context_obj.test_framework,
-            len(project_context_obj.installed_packages),
-            len(project_context_obj.testable_units),
-            len(project_context_obj.success_criteria),
-        )
-    except Exception as analyse_exc:
-        _logger.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
-                        analyse_exc)
+    # Disabled by default; enable via `analyser: {enabled: true}` in .agentchanti.yaml
+    # or ANALYSER_ENABLED=true env var.
+    if cfg.ANALYSER_ENABLED:
+        display.show_status("Analysing project...")
+        try:
+            analyser = AnalyseAgent(
+                "Analyser", "Senior Technical Analyst",
+                "Analyse the task and project to guide downstream agents.",
+                _make_llm("analyser"))
+            project_context_obj = analyser.enrich_context(
+                project_context_obj, task, steps, source_files or {})
+            _logger.info(
+                "[Analysis] ProjectContext built: lang=%s, framework=%s, "
+                "test_fw=%s, %d installed pkgs, %d testable units, %d criteria",
+                project_context_obj.language,
+                project_context_obj.framework,
+                project_context_obj.test_framework,
+                len(project_context_obj.installed_packages),
+                len(project_context_obj.testable_units),
+                len(project_context_obj.success_criteria),
+            )
+        except Exception as analyse_exc:
+            _logger.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                            analyse_exc)
+    else:
+        _logger.info("[Analysis] LLM enrichment skipped (analyser_enabled: false)")
 
     display.set_steps(steps)
 

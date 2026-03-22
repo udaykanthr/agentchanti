@@ -371,6 +371,38 @@ class TestBuildWaves(unittest.TestCase):
         # 2.1 and 2.2 should be parallel in the same wave
         self.assertEqual(len(waves[2]), 2)
 
+    def test_cmd_implicit_dep_within_same_phase(self):
+        """CMD scaffold + CODE writes all in phase 1 — CODE must wait for CMD.
+
+        Reproduces the bug seen when the LLM puts npm-create (1.1 [CMD]) and
+        all file-write steps (1.4–1.9 [CODE] depends:none) in the same phase,
+        causing them to execute concurrently.
+        """
+        steps = [
+            PlanStep(id="1.1", step_type="CMD", index=0),   # npm create vite
+            PlanStep(id="1.2", step_type="CODE", depends_on=["1.1"], index=1),
+            PlanStep(id="1.3", step_type="CODE", depends_on=["1.2"], index=2),
+            PlanStep(id="1.4", step_type="CODE", index=3),   # depends:none
+            PlanStep(id="1.5", step_type="CODE", index=4),   # depends:none
+            PlanStep(id="1.6", step_type="CODE", index=5),   # depends:none
+        ]
+        waves = build_waves(steps)
+
+        # 1.1 must be alone in the first wave
+        self.assertEqual([s.id for s in waves[0]], ["1.1"])
+
+        # 1.4, 1.5, 1.6 must NOT appear in the first wave (they should
+        # implicitly depend on 1.1 now)
+        first_wave_ids = {s.id for s in waves[0]}
+        self.assertNotIn("1.4", first_wave_ids)
+        self.assertNotIn("1.5", first_wave_ids)
+        self.assertNotIn("1.6", first_wave_ids)
+
+        # All step IDs must appear in exactly one wave
+        all_ids_in_waves = [s.id for w in waves for s in w]
+        self.assertEqual(sorted(all_ids_in_waves),
+                         ["1.1", "1.2", "1.3", "1.4", "1.5", "1.6"])
+
     def test_phase_ordering_real_world(self):
         """Real-world plan: CMD setup then CODE generation."""
         steps = [

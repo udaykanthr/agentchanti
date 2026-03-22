@@ -1460,6 +1460,22 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         cmd, background=is_background, cwd=subproject_cwd)
     log.info(f"Step {step_idx+1}: Command output:\n{output}")
 
+    # ── Semantic failure check ──
+    # Some CLIs exit 0 but print failure text (e.g. create-vite outputs
+    # "Operation cancelled" when run in an existing non-empty directory).
+    if success and output:
+        _SEMANTIC_FAILURE_PATTERNS = [
+            re.compile(r'Operation cancell?ed', re.IGNORECASE),
+        ]
+        for _sfp in _SEMANTIC_FAILURE_PATTERNS:
+            if _sfp.search(output):
+                log.warning(
+                    f"Step {step_idx+1}: Exit code 0 but semantic failure "
+                    f"detected in output ('{_sfp.pattern}'). Treating as failure."
+                )
+                success = False
+                break
+
     if output:
         truncated = output[:4000] if len(output) > 4000 else output
         memory.update({

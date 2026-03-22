@@ -814,25 +814,28 @@ def main():
             source_files=source_files or {},
             language=language,
         )
-        display.show_status("Analysing project...")
-        try:
-            analyser = AnalyseAgent(
-                "Analyser", "Senior Technical Analyst",
-                "Analyse the task and project to guide downstream agents.",
-                _make_llm_for_agent("analyser"))
-            project_context = analyser.enrich_context(
-                project_context, args.task, steps, source_files or {})
-            log.info(
-                "[Analysis] ProjectContext: lang=%s, fw=%s, test_fw=%s, "
-                "%d pkgs, %d testable units",
-                project_context.language, project_context.framework,
-                project_context.test_framework,
-                len(project_context.installed_packages),
-                len(project_context.testable_units),
-            )
-        except Exception as analyse_exc:
-            log.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
-                        analyse_exc)
+        if cfg.ANALYSER_ENABLED:
+            display.show_status("Analysing project...")
+            try:
+                analyser = AnalyseAgent(
+                    "Analyser", "Senior Technical Analyst",
+                    "Analyse the task and project to guide downstream agents.",
+                    _make_llm_for_agent("analyser"))
+                project_context = analyser.enrich_context(
+                    project_context, args.task, steps, source_files or {})
+                log.info(
+                    "[Analysis] ProjectContext: lang=%s, fw=%s, test_fw=%s, "
+                    "%d pkgs, %d testable units",
+                    project_context.language, project_context.framework,
+                    project_context.test_framework,
+                    len(project_context.installed_packages),
+                    len(project_context.testable_units),
+                )
+            except Exception as analyse_exc:
+                log.warning("[Analysis] LLM enrichment failed (non-fatal): %s",
+                            analyse_exc)
+        else:
+            log.info("[Analysis] LLM enrichment skipped (analyser_enabled: false)")
 
     # ── 12. Build execution waves ──
     # Use phase-aware wave builder when structured plan steps are available.
