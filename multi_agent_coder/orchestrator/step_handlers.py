@@ -1166,6 +1166,143 @@ def _handle_search_step(step_text: str, search_agent,
     return True, ""
 
 
+def _get_pip_cmd(cwd: str | None = None) -> str:
+    """Return the venv pip if present in *cwd*, else fall back to 'pip'."""
+    root = cwd or "."
+    candidates = [
+        os.path.join(root, "venv", "Scripts", "pip.exe"),   # Windows venv
+        os.path.join(root, "venv", "bin", "pip"),            # Unix venv
+        os.path.join(root, ".venv", "Scripts", "pip.exe"),
+        os.path.join(root, ".venv", "bin", "pip"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return "pip"
+
+
+def _make_cmd_idempotent(
+    cmd: str,
+    executor: Executor,
+    cwd: str | None = None,
+) -> tuple[str | None, str]:
+    """Check whether a setup command is redundant and skip or trim it.
+
+    Returns ``(cmd_to_run, skip_reason)``:
+    - ``cmd_to_run=None``  → skip entirely, *skip_reason* explains why.
+    - ``cmd_to_run=str``   → run this (may be a trimmed version of *cmd*).
+    - ``skip_reason=""``   → no skip, run normally.
+    """
+    stripped = cmd.strip()
+    root = cwd or "."
+
+    # ── venv activation — always a no-op in a subprocess ──
+    if re.match(
+        r'^(source\s+\S+/activate'
+        r'|[\w./\\]+[/\\]Scripts[/\\]activate(\.bat)?'
+        r'|\.\s+\S+/activate)$',
+        stripped, re.IGNORECASE,
+    ):
+        return None, "venv activation is a no-op inside a subprocess"
+
+    # ── python -m venv <dir> ──
+    m = re.match(r'^python3?\s+-m\s+venv\s+(\S+)', stripped)
+    if m:
+        venv_dir = m.group(1)
+        if os.path.isdir(os.path.join(root, venv_dir)):
+            return None, f"virtualenv '{venv_dir}' already exists, skipping creation"
+        return cmd, ""
+
+    # ── git init ──
+    if re.match(r'^git\s+init\b', stripped, re.IGNORECASE):
+        if os.path.isdir(os.path.join(root, ".git")):
+            return None, "git repository already initialised"
+        return cmd, ""
+
+    # ── pip install <packages> ──
+    m = re.match(
+        r'^(pip3?|python3?\s+-m\s+pip)\s+install\s+(.*)',
+        stripped, re.IGNORECASE,
+    )
+    if m:
+        rest = m.group(2).strip()
+        flags, pkgs = [], []
+        for tok in rest.split():
+            # Flags and -r/--requirement targets are not package names
+            if tok.startswith("-") or tok.endswith(".txt") or tok.endswith(".cfg"):
+                flags.append(tok)
+            else:
+                pkgs.append(tok)
+        if not pkgs:
+            return cmd, ""  # only flags (e.g. -r requirements.txt) — run as-is
+
+        pip_cmd = _get_pip_cmd(root)
+        missing = []
+        for pkg in pkgs:
+            pkg_name = re.split(r"[>=<~!\[]", pkg)[0].strip()
+            if not pkg_name:
+                continue
+            ok, _ = executor.run_command(f'"{pip_cmd}" show {pkg_name}', cwd=cwd)
+            if not ok:
+                missing.append(pkg)
+
+        if not missing:
+            skipped = ", ".join(pkgs)
+            return None, f"all packages already installed ({skipped}), skipping"
+
+        if len(missing) < len(pkgs):
+            skipped = ", ".join(p for p in pkgs if p not in missing)
+            prefix_m = re.match(
+                r'^(pip3?|python3?\s+-m\s+pip)\s+install', stripped, re.IGNORECASE
+            )
+            prefix = prefix_m.group(0) if prefix_m else "pip install"
+            flag_str = (" " + " ".join(flags)) if flags else ""
+            new_cmd = f"{prefix}{flag_str} {' '.join(missing)}"
+            return new_cmd, f"skipping already-installed: {skipped}"
+
+        return cmd, ""
+
+    # ── npm install <specific packages> ──
+    m = re.match(
+        r'^npm\s+install\s+((?:--save-dev|-D|-P|--save)?\s*)(.+)',
+        stripped, re.IGNORECASE,
+    )
+    if m:
+        flags_part = m.group(1).strip()
+        pkgs_part = m.group(2).strip()
+        pkgs = [t for t in pkgs_part.split() if not t.startswith("-")]
+        if not pkgs:
+            return cmd, ""  # bare `npm install` — always run
+
+        nm = os.path.join(root, "node_modules")
+        if not os.path.isdir(nm):
+            return cmd, ""  # node_modules absent — install everything
+
+        missing = []
+        for pkg in pkgs:
+            # Handle scoped packages (@scope/name) and version suffixes (pkg@1.0)
+            if pkg.startswith("@"):
+                bare = pkg[1:].split("@")[0]
+                pkg_dir = os.path.join(nm, "@" + bare.split("/")[0], bare.split("/")[1] if "/" in bare else "")
+            else:
+                pkg_dir = os.path.join(nm, pkg.split("@")[0])
+            if not os.path.isdir(pkg_dir):
+                missing.append(pkg)
+
+        if not missing:
+            return None, f"all npm packages already installed ({', '.join(pkgs)}), skipping"
+
+        if len(missing) < len(pkgs):
+            skipped = ", ".join(p for p in pkgs if p not in missing)
+            flag_str = (" " + flags_part) if flags_part else ""
+            new_cmd = f"npm install{flag_str} {' '.join(missing)}"
+            return new_cmd, f"skipping already-installed: {skipped}"
+
+        return cmd, ""
+
+    return cmd, ""
+
+
 def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
@@ -1244,6 +1381,16 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # ── Normalize command ──
     # Clean up bash-style line continuations and dangling operators
     cmd = _cleanup_shell_command(cmd)
+
+    # ── Idempotency check ──
+    # Detect the subproject root early so idempotency checks resolve
+    # paths relative to the correct directory.
+    _early_cwd = _detect_subproject_root(memory) or None
+    cmd, skip_reason = _make_cmd_idempotent(cmd, executor, cwd=_early_cwd)
+    if cmd is None:
+        log.info(f"Step {step_idx+1}: Skipping redundant command — {skip_reason}")
+        display.step_info(step_idx, f"Skipped (already done): {skip_reason}")
+        return True, skip_reason
 
     # Detect sub-project root so commands like `npm install` run in the
     # correct directory instead of the repo root.
