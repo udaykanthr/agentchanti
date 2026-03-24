@@ -890,6 +890,11 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
 
     Returns the subdirectory name (e.g. ``my-app``) or ``None``.
     """
+    # ── Fast path: a prior scaffold CMD already identified the subproject ──
+    scaffolded = getattr(memory, '_scaffolded_subproject', None)
+    if scaffolded and os.path.isdir(scaffolded):
+        return scaffolded
+
     all_files = memory.all_files()
 
     # ── Fallback 0: Parse CMD outputs for project-creation commands ──
@@ -957,6 +962,12 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         if not p.startswith(_internal) and '/' in p
     ]
     if not source_paths:
+        log.debug(
+            "[SubProject] No source files in memory — "
+            "Fallback 0 did not detect a scaffold cmd. "
+            "Memory keys: %s",
+            list(all_files.keys())[:10],
+        )
         return None
 
     # Directories that are NOT sub-project roots — they are conventional
@@ -1096,8 +1107,23 @@ def _prefix_subproject_paths(files: dict[str, str],
             corrected[fpath] = content
             continue
 
-        # Already a known file in memory (exact match) — don't touch
+        # Already a known file in memory (exact match) — fpath does NOT
+        # start with prefix (that case was caught above).
         if fpath in known_paths:
+            # Tracked without the subproject prefix — check if the
+            # prefixed version exists in memory or on disk.  If so,
+            # the LLM wrote to the wrong (root-level) path in a
+            # previous step; redirect this write and clean up the stale
+            # memory entry so it no longer pollutes context.
+            new_path = prefix + fpath
+            if new_path in known_paths or os.path.isfile(new_path):
+                log.warning(f"[SubProject] Redirected stale root-level path: "
+                            f"'{fpath}' → '{new_path}'")
+                corrected[new_path] = content
+                memory.delete(fpath)
+                continue
+            # Legitimately at the project root (e.g. README.md written
+            # before the scaffold CMD ran) — leave unchanged.
             corrected[fpath] = content
             continue
 
@@ -1218,6 +1244,18 @@ def _make_cmd_idempotent(
         if os.path.isdir(os.path.join(root, ".git")):
             return None, "git repository already initialised"
         return cmd, ""
+
+    # ── mkdir / mkdir -p ──
+    # executor.write_files() calls os.makedirs(..., exist_ok=True) for every
+    # file it writes, so explicit mkdir steps are always redundant.  Skipping
+    # them also avoids Windows cmd.exe treating forward-slash paths (e.g.
+    # `mkdir src/components`) as invalid option flags.
+    # Handles compound commands like `cd myapp && mkdir src/components` by
+    # checking that every non-cd segment is a mkdir.
+    _segments = [s.strip() for s in stripped.split('&&')]
+    _non_cd = [s for s in _segments if not re.match(r'^cd\s+', s, re.IGNORECASE)]
+    if _non_cd and all(re.match(r'^mkdir\b', s, re.IGNORECASE) for s in _non_cd):
+        return None, "mkdir skipped — parent directories are created automatically on file write"
 
     # ── pip install <packages> ──
     m = re.match(
@@ -2892,6 +2930,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 _beh_results = _gstore.get_behavioral_instructions(
                     "react component export default jsx tsx generate modify",
                     api_client=getattr(kb_context_builder, '_api_client', None),
+                    language=language,
                 )
                 if _beh_results:
                     _beh_parts = []
@@ -2936,6 +2975,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             project_profile=project_profile,
             project_context=project_context,
             kb_context_builder=kb_context_builder,
+            behavioral_ctx=_code_behavioral_ctx,
         )
         if chunk_result is not None:
             return chunk_result
@@ -4000,6 +4040,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 _beh_results = _gstore.get_behavioral_instructions(
                     "react component test generation testing-library",
                     api_client=getattr(kb_context_builder, '_api_client', None),
+                    language=language,
                 )
                 if _beh_results:
                     _beh_parts = []
@@ -4867,12 +4908,38 @@ Rules:
 """
 
 
+def _find_importers(fpath: str, memory: FileMemory) -> list[tuple[str, str]]:
+    """Return (path, content) pairs for files in memory that import *fpath*.
+
+    Used to give the reviewer visibility into how the changed file is consumed,
+    catching issues like duplicate Router/Provider wrapping.
+    """
+    basename = os.path.splitext(os.path.basename(fpath))[0]  # e.g. "App"
+    results: list[tuple[str, str]] = []
+    for mpath, mcontent in memory.all_files().items():
+        if mpath == fpath:
+            continue
+        # Quick check: does this file reference the changed file's basename?
+        if basename not in mcontent:
+            continue
+        # Confirm it's an actual import/require, not just a comment mention
+        if not re.search(
+            r'(import\b|require\s*\()',
+            mcontent,
+        ):
+            continue
+        results.append((mpath, mcontent))
+        if len(results) >= 3:  # cap to avoid bloating the prompt
+            break
+    return results
+
+
 def _build_review_context(
     new_files: dict[str, str],
     memory: FileMemory,
     step_text: str,
 ) -> str:
-    """Build a compact review context showing only what changed."""
+    """Build a compact review context showing what changed plus importer files."""
     import difflib
 
     parts: list[str] = []
@@ -4902,6 +4969,15 @@ def _build_review_context(
         else:
             parts.append(f"#### [NEW FILE]: {fpath}\n```\n{new_content}\n```")
 
+        # Inject files that import this file so the reviewer can catch
+        # duplicate wrappers (e.g. BrowserRouter in both App.jsx and main.jsx)
+        importers = _find_importers(fpath, memory)
+        for imp_path, imp_content in importers:
+            parts.append(
+                f"#### [IMPORTER — read-only context]: {imp_path}\n"
+                f"```\n{imp_content[:2000]}\n```"
+            )
+
     return "\n\n".join(parts)
 
 
@@ -4921,6 +4997,7 @@ def _try_chunk_edit(
     project_profile=None,
     project_context=None,
     kb_context_builder=None,
+    behavioral_ctx: str = "",
 ) -> tuple[bool, str] | None:
     """Attempt chunk-level editing. Returns (success, error) or None for fallback."""
     try:
@@ -5015,32 +5092,11 @@ def _try_chunk_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prompt_prefix += kb_ctx + "\n\n"
-    # Explicit behavioral instructions for JS/TS chunk edits — only when
-    # batch_search didn't already include them (avoids bloating context
-    # and preserves framework/library doc priority).
-    if (language in ("javascript", "typescript")
-            and kb_context_builder is not None
+    # Reuse behavioral instructions already fetched by _handle_code_step
+    # (avoids a duplicate KB search call for the same step).
+    if (behavioral_ctx
             and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix):
-        try:
-            _gstore = getattr(kb_context_builder, '_global_store', None)
-            if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component export default jsx tsx generate modify",
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                )
-                if _beh_results:
-                    _beh_parts = []
-                    for item in _beh_results:
-                        content = getattr(item, "content", "") or getattr(item, "title", "")
-                        if content:
-                            _beh_parts.append(content)
-                    if _beh_parts:
-                        prompt_prefix += (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
-                            + "\n".join(_beh_parts) + "\n\n"
-                        )
-        except Exception:
-            pass
+        prompt_prefix += behavioral_ctx + "\n\n"
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
         step_text, formatted, slim_ctx, language=language,

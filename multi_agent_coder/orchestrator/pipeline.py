@@ -16,6 +16,8 @@ from .step_handlers import (
     _handle_cmd_step, _handle_code_step, _handle_test_step,
     _handle_search_step,
     _build_scoped_test_cmd,
+    _detect_subproject_root,
+    _prefix_subproject_paths,
     MAX_STEP_RETRIES,
 )
 from .diagnosis import _diagnose_failure, _apply_fix
@@ -233,16 +235,47 @@ def _execute_step(step_idx: int, step_text: str, *,
                 )
 
         # 3. KB context (Phase 4 — symbols, error fixes, patterns)
+        #
+        # Use a clean short description as the KB search query.
+        # step_text may contain inline code blocks from the plan (e.g. a full
+        # JSX component), which explodes the keyword-score denominator and
+        # dilutes all meaningful matches.  plan_step.description is the
+        # one-line human description; fall back to the first line of step_text.
+        _kb_query = (
+            (plan_step.description if plan_step and plan_step.description else None)
+            or step_text.split("\n")[0].strip()
+        )
+        # Augment _kb_query with project tech stack so framework docs are
+        # found for steps whose description doesn't mention the framework
+        # by name (e.g. "Replace main.jsx" doesn't mention "tailwindcss").
+        # Uses installed_packages from knowledge_base (already in memory —
+        # no I/O or LLM calls) filtered to recognised tech keywords only.
+        if knowledge_base is not None:
+            try:
+                _pk = knowledge_base.load()
+                _pkgs = getattr(_pk, "installed_packages", [])
+                if _pkgs:
+                    from ..orchestrator.plan_optimizer import _TECH_KEYWORDS
+                    _tech_hits = _TECH_KEYWORDS.findall(" ".join(_pkgs[:50]))
+                    _query_lower = _kb_query.lower()
+                    _tech_extras = [
+                        t for t in dict.fromkeys(t.lower() for t in _tech_hits)
+                        if t.lower() not in _query_lower
+                    ][:8]
+                    if _tech_extras:
+                        _kb_query = f"{_kb_query} {' '.join(_tech_extras)}"
+            except Exception:
+                pass
         if kb_context_builder is not None:
             try:
                 from ..kb.context_builder import ContextBuilder
                 kb_ctx = kb_context_builder.build_context(
-                    task_description=step_text,
+                    task_description=_kb_query,
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 4000) if cfg else 4000,
                     language=getattr(project_context, "language", None) if project_context else None,
                 )
-                if kb_ctx.kb_available or kb_ctx.behavioral_instructions:
+                if kb_ctx.kb_available or kb_ctx.behavioral_instructions or kb_ctx.global_patterns:
                     kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
                     if kb_text:
                         context_parts.append(kb_text)
@@ -286,7 +319,7 @@ def _execute_step(step_idx: int, step_text: str, *,
             try:
                 changed = list(memory.all_files().keys())[:10]
                 relevant_files = kb_context_builder.get_relevant_files(
-                    task_description=step_text,
+                    task_description=_kb_query,
                     changed_files=changed,
                     max_files=15,
                 )
@@ -456,7 +489,45 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and plan_step.inline_code
                     and len(plan_step.inline_code) > 0):
                 display.step_info(step_idx, "Writing inline code from plan (0 LLM calls)")
-                _inline_files = plan_step.inline_code
+                _inline_files = dict(plan_step.inline_code)
+                _inline_subproject = _detect_subproject_root(memory)
+                # Fallback: if memory-based detection failed (e.g. no source
+                # files in memory yet, so _detect_subproject_root bails early),
+                # infer from the CMD-output entries that ARE in memory.
+                if not _inline_subproject:
+                    import re as _re
+                    _mem_all = memory.all_files()
+                    _scaffold_pats = [
+                        _re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-react-app\s+(\S+)'),
+                        _re.compile(r'ng\s+new\s+(\S+)'),
+                    ]
+                    import os as _os
+                    for _fpath, _content in _mem_all.items():
+                        if not _fpath.startswith('_cmd_output/'):
+                            continue
+                        _first = _content.split('\n')[0] if _content else ''
+                        for _pat in _scaffold_pats:
+                            _m = _pat.search(_first)
+                            if _m:
+                                _cand = _m.group(1).strip().rstrip('/')
+                                if _cand and _os.path.isdir(_cand):
+                                    _inline_subproject = _cand
+                                    _logger.info(
+                                        "[Inline] Subproject from CMD "
+                                        "fallback: %s/", _cand)
+                                    break
+                        if _inline_subproject:
+                            break
+                _logger.debug(
+                    "[Inline] subproject=%r inline_keys=%r",
+                    _inline_subproject, list(_inline_files.keys()),
+                )
+                if _inline_subproject:
+                    _inline_files = _prefix_subproject_paths(
+                        _inline_files, _inline_subproject, memory)
                 executor.write_files(_inline_files)
                 memory.update(_inline_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -506,7 +577,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and plan_step.inline_code
                     and len(plan_step.inline_code) > 0):
                 display.step_info(step_idx, "Writing inline test code from plan (0 LLM calls)")
-                _inline_test_files = plan_step.inline_code
+                _inline_test_files = dict(plan_step.inline_code)
+                _inline_test_subproject = _detect_subproject_root(memory)
+                _logger.debug(
+                    "[Inline/test] subproject=%r inline_keys=%r",
+                    _inline_test_subproject, list(_inline_test_files.keys()),
+                )
+                if _inline_test_subproject:
+                    _inline_test_files = _prefix_subproject_paths(
+                        _inline_test_files, _inline_test_subproject, memory)
                 executor.write_files(_inline_test_files)
                 memory.update(_inline_test_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -974,8 +1053,7 @@ def run_final_test_verification(
             base_cmd = "npx vitest run"
             _logger.info("[FinalVerify] Overriding to vitest (detected vitest imports)")
 
-    # Detect subproject root (reuse step_handlers helper)
-    from .step_handlers import _detect_subproject_root
+    # Detect subproject root
     subproject_cwd = _detect_subproject_root(memory)
 
     test_cmd = _build_scoped_test_cmd(base_cmd, test_files, subproject_cwd)

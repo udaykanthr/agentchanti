@@ -126,6 +126,8 @@ class Executor:
         never write files outside the project directory.
         Returns empty string for clearly invalid/placeholder paths.
         """
+        # Normalise Unicode look-alike characters before any other processing
+        raw = Executor._sanitize_unicode(raw)
         # Reject anything with newlines (multi-line capture mistake)
         name = raw.split('\n')[0].strip()
         # Strip trailing parenthetical descriptions: "file.py (main file)"
@@ -609,6 +611,42 @@ class Executor:
         'Get-Process', 'Stop-Process', 'Get-Service', 'Resolve-Path',
     )
 
+    # Unicode look-alikes that LLMs sometimes emit instead of plain ASCII.
+    # Maps each offending codepoint to its ASCII replacement.
+    _UNICODE_REPLACEMENTS: list[tuple[str, str]] = [
+        # Hyphens / dashes → ASCII hyphen-minus
+        ("\u2011", "-"),   # NON-BREAKING HYPHEN
+        ("\u2013", "-"),   # EN DASH
+        ("\u2014", "-"),   # EM DASH
+        ("\u2212", "-"),   # MINUS SIGN
+        ("\u00ad", "-"),   # SOFT HYPHEN
+        ("\ufe58", "-"),   # SMALL EM DASH
+        ("\ufe63", "-"),   # SMALL HYPHEN-MINUS
+        ("\uff0d", "-"),   # FULLWIDTH HYPHEN-MINUS
+        # Curly / typographic quotes → straight ASCII quotes
+        ("\u2018", "'"),   # LEFT SINGLE QUOTATION MARK
+        ("\u2019", "'"),   # RIGHT SINGLE QUOTATION MARK
+        ("\u201c", '"'),   # LEFT DOUBLE QUOTATION MARK
+        ("\u201d", '"'),   # RIGHT DOUBLE QUOTATION MARK
+        ("\u00b4", "'"),   # ACUTE ACCENT
+        ("\u2032", "'"),   # PRIME
+    ]
+
+    @staticmethod
+    def _sanitize_unicode(text: str) -> str:
+        """Replace Unicode look-alike characters with plain ASCII equivalents.
+
+        LLMs occasionally emit typographic hyphens (U+2011, U+2013, U+2014)
+        or curly quotes instead of their ASCII counterparts.  On Windows this
+        creates directories / filenames with invisible Unicode characters that
+        differ from what the plan expected (the ``responsive‑web‑page`` vs
+        ``responsive-web-page`` problem).
+        """
+        for unicode_char, ascii_char in Executor._UNICODE_REPLACEMENTS:
+            if unicode_char in text:
+                text = text.replace(unicode_char, ascii_char)
+        return text
+
     @staticmethod
     def _needs_powershell(cmd: str) -> bool:
         """Return True if *cmd* contains PowerShell-specific cmdlets."""
@@ -789,6 +827,7 @@ class Executor:
         current working directory.
         """
         try:
+            cmd = Executor._sanitize_unicode(cmd)
             log.info(f"[Executor] Running {'background ' if background else ''}command: {cmd}"
                      f"{f' (cwd={cwd})' if cwd else ''}")
             # Translate Unix commands to Windows cmd.exe equivalents

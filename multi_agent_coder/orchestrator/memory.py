@@ -220,6 +220,11 @@ class FileMemory:
         with self._lock:
             return self._files.get(filepath)
 
+    def delete(self, filepath: str) -> None:
+        """Remove a tracked file from memory (e.g., after path correction)."""
+        with self._lock:
+            self._files.pop(filepath, None)
+
     def all_files(self) -> dict[str, str]:
         with self._lock:
             return dict(self._files)

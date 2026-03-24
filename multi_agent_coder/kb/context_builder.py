@@ -342,8 +342,16 @@ class ContextBuilder:
                     ctx.global_patterns.extend(docs)
                 if patterns or docs:
                     ctx.sources_used.append("global_kb")
+                    logger.debug(
+                        "[KB] Global docs injected: %s",
+                        [r.title for r in (patterns + docs)],
+                    )
                 if behavioral:
                     ctx.behavioral_instructions = behavioral
+                    logger.debug(
+                        "[KB] Behavioral instructions injected: %s",
+                        [r.title for r in behavioral],
+                    )
             except Exception as exc:
                 logger.debug("[KB] Batched global KB search failed: %s", exc)
 

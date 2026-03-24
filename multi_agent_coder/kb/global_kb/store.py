@@ -201,6 +201,7 @@ class GlobalKBStore:
         self,
         context: str,
         api_client=None,
+        language: Optional[str] = None,
     ) -> list[GlobalKBResult]:
         """
         Retrieve behavioral instructions relevant to *context*.
@@ -213,6 +214,11 @@ class GlobalKBStore:
             Description of the current task or situation.
         api_client:
             LLM client for embedding the query.
+        language:
+            Project language (e.g. ``"javascript"``).  Passed to the
+            fallback file search so that language-specific docs from
+            other stacks (e.g. ``Python-Specific Instructions``) are
+            filtered out when the project language is known.
 
         Returns
         -------
@@ -224,6 +230,7 @@ class GlobalKBStore:
             categories=["behavioral"],
             top_k=3,
             api_client=api_client,
+            language=language,
         )
 
     def get_content_fixes(

@@ -323,7 +323,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 if line.startswith("```"):
                     in_markdown_fence = not in_markdown_fence
                     continue
-                code_lines.append(raw_line)  # preserve original indentation
+                # Strip "> " prefix from code lines — the LLM sometimes
+                # carries over the CMD "> command" format into code blocks
+                code_line = raw_line
+                if code_line.lstrip().startswith("> "):
+                    code_line = code_line.lstrip()[2:]
+                code_lines.append(code_line)  # preserve original indentation
                 continue
 
         # Skip plan boundary markers
@@ -387,10 +392,16 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                             ).append(symbol.strip())
                 continue
             elif _bare_lower.startswith("content:"):
-                # Inline code block follows as a ``` fence — enter code-block mode
+                # Inline code block follows — enter code-block mode
                 in_code_block = True
                 in_markdown_fence = False
                 code_lines = []
+                rest = _bare[8:].strip()
+                # Strip opening markdown fence (```jsx, ```, etc.)
+                if rest.startswith("```"):
+                    rest = rest[3:].lstrip("abcdefghijklmnopqrstuvwxyz").strip()
+                if rest:
+                    code_lines.append(rest)
                 continue
             elif _bare_lower.startswith("produces:"):
                 raw = _bare[9:].strip()
@@ -405,6 +416,22 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 _bare_lower.startswith(p) for p in _meta_prefixes
             ):
                 continue  # metadata annotation, not a shell command
+            # Check for "content:" appearing mid-line (e.g.
+            # "> prop-types:default content: ```" where content: is not
+            # at the start).  Only trigger when followed by ``` or nothing.
+            _content_pos = _bare_lower.find(" content:")
+            if _content_pos >= 0:
+                _after = _bare[_content_pos + 9:].strip()
+                if not _after or _after.startswith("```"):
+                    in_code_block = True
+                    in_markdown_fence = False
+                    code_lines = []
+                    if _after.startswith("```"):
+                        _after = _after[3:].lstrip(
+                            "abcdefghijklmnopqrstuvwxyz").strip()
+                    if _after:
+                        code_lines.append(_after)
+                    continue
             # Join multiple commands per step with && so all run sequentially
             if current.command:
                 current.command = current.command + " && " + cmd_text
@@ -443,8 +470,42 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 produced = [f.strip() for f in raw.split(",") if f.strip()]
                 current.target_files.extend(produced)
 
-        # Description line (anything else)
+        # Inline code block via bare "Content:" keyword (no "> " prefix).
+        # The "> content:" variant is already handled inside the "> " branch
+        # above.  Here we catch the unindented form that the planner sometimes
+        # emits when the step has a pre-written code body.
+        elif line.lower().startswith("content:"):
+            in_code_block = True
+            in_markdown_fence = False
+            code_lines = []
+            rest = line[8:].strip()  # anything after "Content:" on the same line
+            # Strip opening markdown fence (```jsx, ```, etc.)
+            if rest.startswith("```"):
+                rest = rest[3:].lstrip("abcdefghijklmnopqrstuvwxyz").strip()
+            if rest:
+                code_lines.append(rest)
+
+        # Description line (anything else) — but check for mid-line content:
         elif not line.startswith("=="):
+            _lower_line = line.lower()
+            _cpos = _lower_line.find(" content:")
+            if _cpos >= 0:
+                _after_c = line[_cpos + 9:].strip()
+                if not _after_c or _after_c.startswith("```"):
+                    # Split: text before content: goes to description,
+                    # everything after enters code block mode
+                    before = line[:_cpos].strip()
+                    if before:
+                        desc_lines.append(before)
+                    in_code_block = True
+                    in_markdown_fence = False
+                    code_lines = []
+                    if _after_c.startswith("```"):
+                        _after_c = _after_c[3:].lstrip(
+                            "abcdefghijklmnopqrstuvwxyz").strip()
+                    if _after_c:
+                        code_lines.append(_after_c)
+                    continue
             desc_lines.append(line)
 
     # Flush any open inline code block
