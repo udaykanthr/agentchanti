@@ -281,6 +281,7 @@ class PlannerAgent(Agent):
                             _task_words_set.add(language.lower())
                         _MIN_TITLE_SCORE = 0.20  # ≥20% of title words in task
                         doc_hints: list[str] = []
+                        _preloaded: list = []  # filtered GlobalKBResult objects
                         _MAX_GENERIC_DOCS = 2  # cap for topic-relevant generics
                         _generic_count = 0
                         for doc in docs:
@@ -386,10 +387,15 @@ class PlannerAgent(Agent):
                             content = doc.content or doc.title
                             if content:
                                 doc_hints.append(f"### {doc.title}\n{content}")
+                                _preloaded.append(doc)
                                 _logger.info(
                                     "[PreAnalysis] Loaded doc: '%s'",
                                     doc.title,
                                 )
+                        # Persist filtered docs so build_context merges
+                        # them into every step's KB context automatically.
+                        if _preloaded and kb_context_builder is not None:
+                            kb_context_builder._preloaded_docs = _preloaded
                         if doc_hints:
                             parts.append("\n[Framework/Library Documentation]")
                             parts.append(
@@ -453,17 +459,48 @@ Create the Express server with GET /api/health endpoint
 target: src/server.js
 exports: app, startServer
 imports: none
+content:
+```js
+const express = require('express');
+const app = express();
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+function startServer(port = 3000) { return app.listen(port); }
+module.exports = { app, startServer };
+```
+---file-content-end---
 
 --STEP 2.2 [CODE] depends:1.1
 Create input validation utility
 target: src/utils/validate.js
 exports: validateInput, sanitize
 imports: none
+content:
+```js
+function validateInput(input) { return input != null && input !== ''; }
+function sanitize(input) { return String(input).trim().replace(/[<>]/g, ''); }
+module.exports = { validateInput, sanitize };
+```
+---file-content-end---
 
 --STEP 3.1 [CODE] depends:2.1, 2.2
 Update server to use validation middleware
 target: src/server.js
 imports: src/utils/validate.js:validateInput, src/utils/validate.js:sanitize
+content:
+```js
+const express = require('express');
+const { validateInput, sanitize } = require('./utils/validate');
+const app = express();
+app.use(express.json());
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+app.post('/api/data', (req, res) => {
+  if (!validateInput(req.body.value)) return res.status(400).json({ error: 'invalid' });
+  res.json({ value: sanitize(req.body.value) });
+});
+function startServer(port = 3000) { return app.listen(port); }
+module.exports = { app, startServer };
+```
+---file-content-end---
 
 --STEP 4.1 [TEST] depends:3.1
 Write and run tests for the server and validation
@@ -480,6 +517,11 @@ target: <file1>, <file2>               ← CODE/TEST steps. Files to create or m
 exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
 imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
 produces: <file1>, <file2>             ← CMD steps. Files created by the command.
+content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
+```<lang>                              ←   Fenced code block immediately after content:
+<complete file source>                 ←   Full file — not a snippet. Every line.
+```                                    ←   Close the fence.
+---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 
 ═══════ STEP ID FORMAT ═══════
 Use wave.sequence numbering:
@@ -557,9 +599,22 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 17. **Leaf components BEFORE parents**: Create child components first, then
     parents that import them. Declare imports: to enforce correct ordering.
 
+18. **ALWAYS include inline code for CODE and TEST steps**: Every CODE and
+    TEST step MUST include a `content:` block with the complete file source.
+    This is MANDATORY — it eliminates a separate Coder LLM call per step.
+    Use the exact format:
+      content:
+      ```<lang>
+      <full file content>
+      ```
+      ---file-content-end---
+    The code must be COMPLETE — every import, every function, every line.
+    Do NOT write a stub or partial implementation.
+
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
+- [ ] Every CODE and TEST step has a content: block with complete file source
 - [ ] No two steps have the same target: file (consolidate into one step)
 - [ ] If step B imports from step A's target file, B depends on A
 - [ ] No vague steps — each step is specific and actionable

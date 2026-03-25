@@ -528,6 +528,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                 if _inline_subproject:
                     _inline_files = _prefix_subproject_paths(
                         _inline_files, _inline_subproject, memory)
+
+                # Gate: strip any pseudo-diff markers the planner may have emitted
+                from .dependency_check import clean_diff_markers as _clean_diff
+                _inline_files = {
+                    path: _clean_diff(content)
+                    for path, content in _inline_files.items()
+                }
+
                 executor.write_files(_inline_files)
                 memory.update(_inline_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -536,6 +544,41 @@ def _execute_step(step_idx: int, step_text: str, *,
                     len(_inline_files), plan_step.id,
                     list(_inline_files.keys()),
                 )
+
+                # Deterministic KB content-fix gate for inline code.
+                #
+                # The planner generates inline code WITH full KB context
+                # (e.g. Tailwind v4 docs), so its output is typically correct.
+                # Sending it to an LLM reviewer is counterproductive — local
+                # models apply outdated training-data bias and "fix" correct
+                # code back to v3 patterns.  Instead, apply the same
+                # deterministic _apply_content_fixes() rules used in
+                # _handle_code_step — these catch known LLM mistakes (e.g.
+                # @tailwind directives, wrong plugin names) without LLM calls.
+                from .step_handlers import _apply_content_fixes
+                _cf = getattr(memory, "_content_fixes", None)
+                if _cf:
+                    _fixed_inline = _apply_content_fixes(_inline_files, _cf)
+                    _changed = [
+                        p for p in _inline_files
+                        if _fixed_inline.get(p) != _inline_files.get(p)
+                    ]
+                    if _changed:
+                        executor.write_files(
+                            {p: _fixed_inline[p] for p in _changed})
+                        memory.update(
+                            {p: _fixed_inline[p] for p in _changed})
+                        display.step_info(
+                            step_idx,
+                            f"[Inline] Content fixes applied to "
+                            f"{len(_changed)} file(s): "
+                            f"{', '.join(_changed)}",
+                        )
+                    else:
+                        _logger.debug(
+                            "[Inline] Content fixes checked — "
+                            "no corrections needed"
+                        )
             else:
                 # Extract code graph from kb_context_builder if available
                 _graph = code_graph
@@ -586,6 +629,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                 if _inline_test_subproject:
                     _inline_test_files = _prefix_subproject_paths(
                         _inline_test_files, _inline_test_subproject, memory)
+
+                # Gate: strip any pseudo-diff markers
+                from .dependency_check import clean_diff_markers as _clean_diff_t
+                _inline_test_files = {
+                    path: _clean_diff_t(content)
+                    for path, content in _inline_test_files.items()
+                }
+
                 executor.write_files(_inline_test_files)
                 memory.update(_inline_test_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -594,6 +645,26 @@ def _execute_step(step_idx: int, step_text: str, *,
                     len(_inline_test_files), plan_step.id,
                     list(_inline_test_files.keys()),
                 )
+
+                # Deterministic KB content-fix gate (e.g. jest-dom → jest-dom/vitest)
+                from .step_handlers import _apply_content_fixes as _acf_test
+                _cf_test = getattr(memory, "_content_fixes", None)
+                if _cf_test:
+                    _fixed_test = _acf_test(_inline_test_files, _cf_test)
+                    _changed_test = [
+                        p for p in _inline_test_files
+                        if _fixed_test.get(p) != _inline_test_files.get(p)
+                    ]
+                    if _changed_test:
+                        executor.write_files(
+                            {p: _fixed_test[p] for p in _changed_test})
+                        memory.update(
+                            {p: _fixed_test[p] for p in _changed_test})
+                        display.step_info(
+                            step_idx,
+                            f"[Inline/test] Content fixes applied to "
+                            f"{len(_changed_test)} file(s)",
+                        )
             else:
                 success, error_info = _handle_test_step(
                     step_text, tester, coder, reviewer, executor,
@@ -1043,15 +1114,33 @@ def run_final_test_verification(
     fw = get_test_framework(lang) if lang else get_test_framework("python")
     base_cmd = fw["command"]
 
-    # Vitest override: if any test file imports from 'vitest', prefer vitest
+    # Vitest override: check imports, config files, and package.json
     if "jest" in base_cmd.lower():
+        # 1. Explicit vitest imports (works when globals:false)
         uses_vitest = any(
             "from 'vitest'" in c or 'from "vitest"' in c
             for c in test_files.values()
         )
+        # 2. vitest.config.* present in session memory (covers globals:true setups)
+        if not uses_vitest:
+            _vitest_configs = (
+                "vitest.config.js", "vitest.config.ts",
+                "vitest.config.mjs", "vitest.config.mts",
+            )
+            uses_vitest = any(
+                any(f.endswith(cfg) for cfg in _vitest_configs)
+                for f in all_files
+            )
+        # 3. vitest listed in package.json (covers installed-but-config-not-in-memory)
+        if not uses_vitest:
+            pkg_content = next(
+                (c for f, c in all_files.items() if f.endswith("package.json")),
+                "",
+            )
+            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
         if uses_vitest:
             base_cmd = "npx vitest run"
-            _logger.info("[FinalVerify] Overriding to vitest (detected vitest imports)")
+            _logger.info("[FinalVerify] Overriding to vitest (detected vitest config/package)")
 
     # Detect subproject root
     subproject_cwd = _detect_subproject_root(memory)
@@ -1102,6 +1191,7 @@ def run_final_test_verification(
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
                     language=language,
+                    step_type="TEST",
                 )
                 kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
                 if kb_text:

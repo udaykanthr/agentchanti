@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 _GLOBAL_DIR = os.path.dirname(os.path.abspath(__file__))
 _CORE_DIR = os.path.join(_GLOBAL_DIR, "core")
 
+# Minimum cosine similarity score for vector search results.
+# Results below this threshold are dropped to avoid injecting
+# loosely related docs that waste LLM tokens.
+MIN_RELEVANCE_SCORE = 0.25
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -71,6 +76,13 @@ class GlobalKBStore:
             self._errors_db_path = os.path.join(_CORE_DIR, "errors.db")
         self._error_dict: Optional[ErrorDict] = None
         self._vector_store = None
+        # Frontmatter metadata cache: {filepath -> (mtime, {title, tags, language})}
+        # Avoids re-reading .md files on every fallback search call.
+        self._fm_cache: dict[str, tuple[float, dict]] = {}
+        # Query embedding cache: {(query, model) -> vector}
+        # The same task description is searched multiple times per run
+        # (planning + per-step context); cache avoids redundant API calls.
+        self._query_embed_cache: dict[tuple[str, str], list[float]] = {}
 
     # ------------------------------------------------------------------
     # Lazy initializers
@@ -133,13 +145,14 @@ class GlobalKBStore:
         except Exception as exc:
             logger.warning("Vector search failed, falling back to file search: %s", exc)
 
-        # Always merge file-based search results so that registry docs
-        # added after the last `kb update` (not yet embedded) are still
-        # discoverable — even when vector results already fill top_k.
+        # Merge file-based search results only when vector search left gaps —
+        # i.e. un-embedded docs (added via `kb update` but not yet `kb embed`)
+        # need to be discoverable.  Skip the scan entirely when vector results
+        # already fill top_k to avoid reading all .md files on every call.
         try:
             file_results = self._fallback_file_search(
-                query, categories, language, top_k,
-            )
+                query, categories, language, max(0, top_k - len(results)),
+            ) if len(results) < top_k else []
             seen = {r.file for r in results}
             added = 0
             for fr in file_results:
@@ -366,6 +379,10 @@ class GlobalKBStore:
         seen_titles: set[str] = set()
 
         for hit in raw_results:
+            # Drop results below minimum relevance threshold
+            if hit.get("score", 0.0) < MIN_RELEVANCE_SCORE:
+                continue
+
             payload = hit.get("payload", {})
             cat = payload.get("category", "")
 
@@ -437,10 +454,15 @@ class GlobalKBStore:
         cfg = Config.load()
         embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
 
-        vectors = _embed_batch(api_client, [query], embed_model)
-        if not vectors:
-            return []
-        query_vector = vectors[0]
+        cache_key = (query, embed_model or "")
+        if cache_key in self._query_embed_cache:
+            query_vector = self._query_embed_cache[cache_key]
+        else:
+            vectors = _embed_batch(api_client, [query], embed_model)
+            if not vectors:
+                return []
+            query_vector = vectors[0]
+            self._query_embed_cache[cache_key] = query_vector
 
         store = self._get_vector_store()
 
@@ -466,6 +488,10 @@ class GlobalKBStore:
         seen_files: set[str] = set()
         seen_titles: set[str] = set()
         for hit in raw_results:
+            # Drop results below minimum relevance threshold
+            if hit.get("score", 0.0) < MIN_RELEVANCE_SCORE:
+                continue
+
             payload = hit.get("payload", {})
             cat = payload.get("category", "")
 
@@ -531,10 +557,19 @@ class GlobalKBStore:
         top_k: int,
     ) -> list[GlobalKBResult]:
         """
-        Simple keyword-based file search when the vector store is unavailable.
+        Keyword-based file search for un-embedded registry docs.
 
-        Scans registry markdown files for query terms.
+        Two-pass approach:
+        1. Score all docs using cached frontmatter metadata (title + tags) —
+           no file I/O for docs already in ``_fm_cache``.
+        2. Read full body only for docs that scored above zero.
+
+        The metadata cache (``_fm_cache``) stores ``{filepath: (mtime, meta)}``
+        and invalidates individual entries when the file changes on disk.
         """
+        if top_k <= 0:
+            return []
+
         from .seeder import _REGISTRY_DIR, _parse_frontmatter
 
         registry_dir = (
@@ -552,7 +587,7 @@ class GlobalKBStore:
             )
             if len(w) >= 2
         )
-        results: list[tuple[float, GlobalKBResult]] = []
+        scored: list[tuple[float, str, str, dict]] = []  # (score, filepath, cat, meta)
 
         category_dirs = {
             "pattern": "patterns",
@@ -561,6 +596,7 @@ class GlobalKBStore:
             "behavioral": "behavioral",
         }
 
+        # Pass 1: score using cached frontmatter — zero file reads for warm cache
         for cat, dirname in category_dirs.items():
             if categories and cat not in categories:
                 continue
@@ -575,43 +611,34 @@ class GlobalKBStore:
 
                 filepath = os.path.join(cat_dir, fname)
                 try:
-                    with open(filepath, encoding="utf-8") as fh:
-                        content = fh.read()
+                    mtime = os.path.getmtime(filepath)
                 except OSError:
                     continue
 
-                meta = _parse_frontmatter(content)
+                # Serve from cache when file hasn't changed
+                cached = self._fm_cache.get(filepath)
+                if cached and cached[0] == mtime:
+                    meta = cached[1]
+                else:
+                    # Read only to populate / refresh cache entry
+                    try:
+                        with open(filepath, encoding="utf-8") as fh:
+                            raw = fh.read()
+                    except OSError:
+                        continue
+                    meta = _parse_frontmatter(raw)
+                    self._fm_cache[filepath] = (mtime, meta)
+
                 doc_lang = meta.get("language", "all")
                 if language and doc_lang != "all" and doc_lang != language:
                     continue
 
-                # Strip frontmatter so content is just the body
-                body = content
-                if content.startswith("---"):
-                    end = content.find("---", 3)
-                    if end != -1:
-                        body = content[end + 3:].strip()
-
-                # Score: count matching words with title/tag boosting.
-                # Title and tag matches are weighted higher because they
-                # indicate the doc's primary topic matches the query.
-                content_lower = content.lower()
                 title_lower = meta.get("title", "").lower()
                 tags_lower = meta.get("tags", "").lower()
-                # Compressed title for compound-name matching:
-                # "Tailwind CSS" → "tailwindcss" so query "tailwindcss" matches
                 title_compressed = _re.sub(r'[\s\-_]+', '', title_lower)
-
-                # Use word-set matching (not substring) to prevent short
-                # query words (e.g. "in", "and") from false-matching unrelated
-                # docs via substrings of longer title/tag words (e.g. "in" ⊂
-                # "testing-library", "in" ⊂ "install").
                 title_words = set(_re.findall(r'\w+', title_lower))
                 tag_words = set(_re.findall(r'\w+', tags_lower))
 
-                body_hits = sum(
-                    1.0 for w in query_words if w in content_lower
-                )
                 title_hits = sum(
                     3.0 for w in query_words
                     if w in title_words or (len(w) >= 4 and w in title_compressed)
@@ -619,36 +646,57 @@ class GlobalKBStore:
                 tag_hits = sum(
                     2.0 for w in query_words if w in tag_words
                 )
-                score = (body_hits + title_hits + tag_hits) / max(len(query_words), 1)
 
-                # language="all" docs cover every stack (Tailwind, Vitest,
-                # Qdrant, etc.).  Body-only keyword matches on generic terms
-                # like "create", "project", "install", "run" produce false
-                # positives that fill the prompt with irrelevant docs.
-                # Require at least one title or tag keyword match so that
-                # only topically relevant generic docs are included.
-                # Language-specific docs (e.g. language="python") are not
-                # subject to this extra gate — they were already filtered by
-                # the language check above and are assumed to be on-topic.
+                # language="all" docs require a title/tag match to avoid
+                # generic false-positives on words like "install", "run".
                 if doc_lang == "all" and title_hits == 0 and tag_hits == 0:
                     continue
 
-                if score > 0:
-                    tags_str = meta.get("tags", "")
-                    tags = [t.strip() for t in tags_str.split(",") if t.strip()]
-                    rel_path = os.path.relpath(filepath, global_dir).replace("\\", "/")
+                # Metadata-only score (body hits added in pass 2)
+                meta_score = (title_hits + tag_hits) / max(len(query_words), 1)
+                if meta_score > 0:
+                    scored.append((meta_score, filepath, cat, meta))
 
-                    results.append((score, GlobalKBResult(
-                        title=meta.get("title", fname),
-                        category=cat,
-                        content=body[:4000],
-                        file=rel_path,
-                        score=score,
-                        tags=tags,
-                        language=doc_lang,
-                    )))
+        if not scored:
+            return []
 
-        results.sort(key=lambda x: x[0], reverse=True)
+        # Pass 2: read body only for docs that passed metadata scoring
+        scored.sort(key=lambda x: -x[0])
+        results: list[tuple[float, GlobalKBResult]] = []
+
+        for meta_score, filepath, cat, meta in scored:
+            try:
+                with open(filepath, encoding="utf-8") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+
+            # Strip frontmatter
+            body = content
+            if content.startswith("---"):
+                end = content.find("---", 3)
+                if end != -1:
+                    body = content[end + 3:].strip()
+
+            content_lower = content.lower()
+            body_hits = sum(1.0 for w in query_words if w in content_lower)
+            score = meta_score + body_hits / max(len(query_words), 1)
+
+            tags_str = meta.get("tags", "")
+            tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+            rel_path = os.path.relpath(filepath, global_dir).replace("\\", "/")
+
+            results.append((score, GlobalKBResult(
+                title=meta.get("title", os.path.basename(filepath)),
+                category=cat,
+                content=body[:4000],
+                file=rel_path,
+                score=score,
+                tags=tags,
+                language=meta.get("language", "all"),
+            )))
+
+        results.sort(key=lambda x: -x[0])
         return [r for _, r in results[:top_k]]
 
 

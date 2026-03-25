@@ -2920,15 +2920,23 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             subproject_cwd=subproject_cwd, language=language,
         )
 
-    # Pre-fetch behavioral instructions for JS/TS code generation.
-    # Vector search may miss the React export-default doc, so fetch explicitly.
+    # Pre-fetch KB docs for code generation — scoped to behavioral +
+    # doc categories only (no patterns/ADRs) and filtered by relevance
+    # to the specific step description so that unrelated docs (e.g. test
+    # generation instructions for a CSS step) are excluded.
     _code_behavioral_ctx = ""
-    if language in ("javascript", "typescript") and kb_context_builder is not None:
+    if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component export default jsx tsx generate modify",
+                _step_query = (
+                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                    or step_text.split("\n")[0].strip()
+                )
+                _beh_results = _gstore.search(
+                    query=_step_query,
+                    categories=["behavioral", "doc"],
+                    top_k=4,
                     api_client=getattr(kb_context_builder, '_api_client', None),
                     language=language,
                 )
@@ -2940,7 +2948,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                             _beh_parts.append(content)
                     if _beh_parts:
                         _code_behavioral_ctx = (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            "\n[KB INSTRUCTIONS]\n"
                             + "\n".join(_beh_parts) + "\n"
                         )
         except Exception:
@@ -3019,7 +3027,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         # missed by vector search).  This avoids bloating the prompt and
         # ensures framework/library docs keep their higher priority.
         if (_code_behavioral_ctx
-                and "[BEHAVIORAL INSTRUCTIONS]" not in context_prefix):
+                and "[BEHAVIORAL INSTRUCTIONS]" not in context_prefix
+                and "[KB INSTRUCTIONS]" not in context_prefix):
             context_prefix += _code_behavioral_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
@@ -3254,6 +3263,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 continue
             display.step_info(step_idx, "Static checks passed ✔")
             log.info(f"Step {step_idx+1}: Static review passed (lint + imports OK)")
+            return True, ""
+
+        # Skip LLM review if all files were already correct (coder produced no
+        # actual diffs). The reviewer would incorrectly FAIL on "no changes"
+        # even when the file already satisfies the task requirements.
+        if use_diff_review and "```diff" not in review_ctx:
+            display.step_info(step_idx, "File(s) already correct, no review needed ✔")
+            log.info(f"Step {step_idx+1}: Skipped LLM review — file(s) already correct")
             return True, ""
 
         # Full LLM review path (review_mode == "full")
@@ -4030,15 +4047,22 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     prev_gen_error = None  # Track errors across gen attempts for early exit
     prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
-    # Pre-fetch behavioral instructions for JS/TS test generation.
-    # Vector search may miss these, so fetch them explicitly once.
+    # Pre-fetch KB docs for test generation — scoped to behavioral +
+    # doc categories and filtered by relevance to the specific step
+    # description so unrelated docs are excluded.
     _behavioral_ctx = ""
-    if language in ("javascript", "typescript") and kb_context_builder is not None:
+    if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component test generation testing-library",
+                _step_query = (
+                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                    or step_text.split("\n")[0].strip()
+                )
+                _beh_results = _gstore.search(
+                    query=_step_query,
+                    categories=["behavioral", "doc"],
+                    top_k=4,
                     api_client=getattr(kb_context_builder, '_api_client', None),
                     language=language,
                 )
@@ -4050,7 +4074,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                             _beh_parts.append(content)
                     if _beh_parts:
                         _behavioral_ctx = (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            "\n[KB INSTRUCTIONS]\n"
                             + "\n".join(_beh_parts) + "\n"
                         )
         except Exception:
@@ -4074,7 +4098,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # only when batch_search didn't already include them (avoids
         # bloating prompt; framework/library docs keep higher priority).
         if (_behavioral_ctx
-                and "[BEHAVIORAL INSTRUCTIONS]" not in gen_context):
+                and "[BEHAVIORAL INSTRUCTIONS]" not in gen_context
+                and "[KB INSTRUCTIONS]" not in gen_context):
             gen_context += _behavioral_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"
 
@@ -4376,6 +4401,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                             task_description=step_text,
                             error_output=output,
                             max_tokens=2000,
+                            step_type="TEST",
                         )
                         if kb_ctx.error_fixes:
                             kb_fix_context = (
@@ -5095,7 +5121,8 @@ def _try_chunk_edit(
     # Reuse behavioral instructions already fetched by _handle_code_step
     # (avoids a duplicate KB search call for the same step).
     if (behavioral_ctx
-            and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix):
+            and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix
+            and "[KB INSTRUCTIONS]" not in prompt_prefix):
         prompt_prefix += behavioral_ctx + "\n\n"
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
@@ -5232,6 +5259,12 @@ def _try_chunk_edit(
             return None  # Fall back to full-file with static errors as feedback
         display.step_info(step_idx, "Static checks passed ✔")
         log.info("[ChunkEdit] Static review passed (lint + imports OK)")
+        return True, ""
+
+    # Skip LLM review if all files were already correct (no actual diffs).
+    if "```diff" not in review_ctx:
+        display.step_info(step_idx, "File(s) already correct, no review needed ✔")
+        log.info("[ChunkEdit] Skipped LLM review — file(s) already correct")
         return True, ""
 
     # Full LLM review path (review_mode == "full")

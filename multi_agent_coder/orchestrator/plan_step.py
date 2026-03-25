@@ -765,7 +765,18 @@ def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
             continue
         for s in phase_steps:
             if s.step_type == "CMD":
-                continue  # CMD steps don't auto-depend on other CMDs here
+                # Chain CMD steps sequentially within the same phase to
+                # prevent parallel package-manager operations (npm/pip/yarn)
+                # targeting the same directory — causes ENOTEMPTY on Windows.
+                # Always enforce this: even if a CMD step already has explicit
+                # deps (e.g. depends:1.1), it must also wait for the immediately
+                # preceding CMD step so installs don't run concurrently.
+                preceding = [cid for cid in cmd_ids_in_phase if cid < s.id]
+                if preceding:
+                    prev_cmd = preceding[-1]
+                    if prev_cmd not in s.depends_on:
+                        s.depends_on = list(s.depends_on) + [prev_cmd]
+                continue
             if s.depends_on:
                 continue  # already has explicit deps — don't override
             # Add any CMD steps whose ID sorts before this step's ID

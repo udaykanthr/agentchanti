@@ -15,6 +15,57 @@ from dataclasses import dataclass, field
 
 _logger = logging.getLogger(__name__)
 
+
+def clean_diff_markers(content: str) -> str:
+    """Strip pseudo-diff +/- markers from LLM output that should be clean code.
+
+    Local LLMs sometimes emit a diff-style response (lines prefixed with ``+``
+    for additions and ``-`` for removals) instead of complete file content.
+    This function detects that pattern and reconstructs clean source code:
+    - Lines starting with ``+`` (single, not ``++`` or ``+++``) → strip the ``+``
+    - Lines starting with ``-`` (single, not ``--`` or ``---``) → removed, skip
+    - Diff headers (``+++``, ``---``, ``@@``) → skip
+    - All other lines → kept as-is (context lines)
+
+    Only activates when >5% of non-empty lines carry diff markers to avoid
+    false positives on legitimate code that starts a line with ``+`` or ``-``.
+    """
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return content
+
+    non_empty = [l for l in lines if l.strip()]
+    if not non_empty:
+        return content
+
+    plus_count = sum(
+        1 for l in non_empty
+        if l.startswith("+") and not l.startswith("+++")
+    )
+    minus_count = sum(
+        1 for l in non_empty
+        if l.startswith("-") and not l.startswith("---")
+    )
+    diff_count = plus_count + minus_count
+    if diff_count == 0 or diff_count / len(non_empty) < 0.05:
+        return content
+
+    result: list[str] = []
+    for line in lines:
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue  # diff headers
+        elif line.startswith("+") and not line.startswith("++"):
+            result.append(line[1:])  # strip leading +
+        elif line.startswith("-") and not line.startswith("--"):
+            pass  # skip removed lines
+        else:
+            result.append(line)  # context line — keep as-is
+    cleaned = "".join(result)
+    _logger.debug("[clean_diff_markers] Stripped diff markers from content (%d→%d chars)",
+                  len(content), len(cleaned))
+    return cleaned
+
+
 # ── Extension → language family mapping ──────────────────────────
 
 _EXT_TO_LANG_FAMILY: dict[str, str] = {
@@ -1134,6 +1185,9 @@ def run_dependency_check(
             validated[matched] = content
         else:
             _logger.warning("[DepCheck] Ignoring unexpected file in fix: %s", fpath)
+
+    # Clean any pseudo-diff markers the LLM may have emitted
+    validated = {path: clean_diff_markers(content) for path, content in validated.items()}
 
     if validated:
         _logger.info("[DepCheck] Generated fixes for %d file(s)", len(validated))

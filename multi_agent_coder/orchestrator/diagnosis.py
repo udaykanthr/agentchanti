@@ -38,6 +38,7 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                 error_output=error_info,
                 max_tokens=2000,
                 language=language,
+                step_type=step_type,
             )
             if kb_ctx.error_fixes or kb_ctx.behavioral_instructions:
                 kb_error_context = kb_context_builder.format_context_for_prompt(kb_ctx)
