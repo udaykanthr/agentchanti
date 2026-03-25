@@ -10,6 +10,7 @@ from ..config import Config
 from ..llm.ollama import OllamaClient
 from ..llm.lm_studio import LMStudioClient
 from ..llm.base import LLMError
+from ..llm import build_embed_client
 from ..agents.planner import PlannerAgent
 from ..agents.coder import CoderAgent
 from ..agents.reviewer import ReviewerAgent
@@ -270,20 +271,28 @@ def main():
         source_files=source_files)
 
     # ── 4. Init embedding store (SQLite-backed for persistence) ──
+    # Build a dedicated embed client (respects embedding_provider config).
+    # Kept as a top-level var so KB components can reuse it instead of llm_client.
+    embed_client = None if args.no_embeddings else build_embed_client(cfg)
     embed_store = None
-    if not args.no_embeddings:
+    if args.no_embeddings:
+        log.info("Embeddings disabled")
+    elif embed_client is None:
+        log.info(
+            "Embeddings disabled: Anthropic has no embedding API. "
+            "Set 'embedding_provider' in .agentchanti.yaml (ollama/openai/gemini)."
+        )
+    else:
         try:
             from ..embedding_store_sqlite import SQLiteEmbeddingStore
             import os
             db_path = os.path.join(cfg.EMBEDDING_CACHE_DIR, "embeddings.db")
             embed_store = SQLiteEmbeddingStore(
-                llm_client, embed_model=embed_model, db_path=db_path)
+                embed_client, embed_model=embed_model, db_path=db_path)
             log.info(f"Embeddings enabled with SQLite cache (model: {embed_model})")
         except Exception as e:
             log.warning(f"SQLite embedding store failed ({e}), falling back to in-memory")
-            embed_store = EmbeddingStore(llm_client, embed_model=embed_model)
-    else:
-        log.info("Embeddings disabled")
+            embed_store = EmbeddingStore(embed_client, embed_model=embed_model)
 
     # ── 4b. Init step cache ──
     step_cache = None
@@ -339,14 +348,17 @@ def main():
             from ..kb.context_builder import ContextBuilder
             from ..kb.runtime_watcher import RuntimeWatcher
 
-            # Smart startup check — handles global KB, local KB
-            KBStartupManager().run(project_root=_os.getcwd(), api_client=llm_client)
+            # Use embed_client for KB vector ops; fall back to llm_client if unavailable
+            kb_api_client = embed_client or llm_client
 
-            kb_context_builder = ContextBuilder(project_root=_os.getcwd(), api_client=llm_client)
+            # Smart startup check — handles global KB, local KB
+            KBStartupManager().run(project_root=_os.getcwd(), api_client=kb_api_client)
+
+            kb_context_builder = ContextBuilder(project_root=_os.getcwd(), api_client=kb_api_client)
             kb_runtime_watcher = RuntimeWatcher(
                 debounce_seconds=cfg.KB_WATCHER_DEBOUNCE_SECONDS,
             )
-            kb_runtime_watcher.start(project_root=_os.getcwd(), api_client=llm_client)
+            kb_runtime_watcher.start(project_root=_os.getcwd(), api_client=kb_api_client)
             log.info("[KB] Context builder and runtime watcher initialised")
         except Exception as kb_exc:
             log.warning(f"[KB] Initialisation failed (non-fatal): {kb_exc}")
@@ -450,6 +462,8 @@ def main():
     if resuming and checkpoint_state:
         log.info("Resuming from checkpoint...")
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        if kb_runtime_watcher is not None:
+            memory.watcher_created_files = kb_runtime_watcher.created_files
         memory.update(checkpoint_state.get("file_memory", {}))
         steps = checkpoint_state["steps"]
         step_results = checkpoint_state.get("step_results", {})
@@ -772,6 +786,8 @@ def main():
         log.info(f"Approved {len(steps)} steps.")
 
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        if kb_runtime_watcher is not None:
+            memory.watcher_created_files = kb_runtime_watcher.created_files
 
         # Pre-load existing source files into memory so the coder
         # can see and modify them instead of creating new files

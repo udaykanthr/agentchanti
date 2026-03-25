@@ -314,17 +314,24 @@ class PlannerAgent(Agent):
 
                             # Filter 3: title relevance
                             # Compute what fraction of the doc's title words
-                            # (≥4 chars) appear in the task text.  Docs that
-                            # only match the task on one secondary tech but
-                            # whose title focuses on something unrelated score
-                            # below the threshold and are skipped.
+                            # (≥4 chars) match the task text.  Uses prefix
+                            # matching so "testing"↔"test", "errors"↔"error",
+                            # "fixing"↔"fix", etc. are treated as matches.
                             title_words = set(
                                 re.findall(r'[a-zA-Z]{4,}',
                                            (doc.title or "").lower())
                             )
                             if title_words:
+                                def _title_word_matches(tw: str) -> bool:
+                                    if tw in _task_words_set:
+                                        return True
+                                    for sw in _task_words_set:
+                                        if tw.startswith(sw) or sw.startswith(tw):
+                                            return True
+                                    return False
                                 title_score = (
-                                    len(title_words & _task_words_set)
+                                    sum(1 for tw in title_words
+                                        if _title_word_matches(tw))
                                     / len(title_words)
                                 )
                                 if title_score < _MIN_TITLE_SCORE:
@@ -517,6 +524,7 @@ target: <file1>, <file2>               ← CODE/TEST steps. Files to create or m
 exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
 imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
 produces: <file1>, <file2>             ← CMD steps. Files created by the command.
+kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
 ```<lang>                              ←   Fenced code block immediately after content:
 <complete file source>                 ←   Full file — not a snippet. Every line.
@@ -610,6 +618,20 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
       ---file-content-end---
     The code must be COMPLETE — every import, every function, every line.
     Do NOT write a stub or partial implementation.
+
+19. **Declare KB docs used for inline code**: For every CODE or TEST step
+    with a content: block, add a `kb_docs:` line listing the exact titles
+    of any KB documents from the [KNOWLEDGE BASE] context above that you
+    referenced while writing that inline code. Use the titles verbatim —
+    no paraphrasing. Place the kb_docs: line immediately before content:.
+    Omit this line entirely if no KB docs were relevant to the step.
+    Example:
+      kb_docs: React TailwindCSS Responsive Header, React Component Patterns
+      content:
+      ```jsx
+      ...
+      ```
+      ---file-content-end---
 
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths

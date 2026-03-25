@@ -139,6 +139,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
         r'|expect\(|Expected\b|Received\b|Difference:'
         r'|×\s|✕\s|✗\s|FAIL\b|FAILED\b'
         r'|Unable to find|TestingLibraryElementError'
+        r'|Transform failed|PARSE_ERROR|Unterminated'
+        r'|╭─\[|─{3,}'  # Vite/OXC error box: "╭─[ file.jsx:132:27 ]"
         r'|\d+\s*\|)',  # source pointer lines like "  29 | expect(...)"
         re.IGNORECASE)
 
@@ -164,6 +166,23 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
         if current_file and _KEEP.search(stripped):
             per_file[current_file].append(stripped)
 
+    # Detect transform errors — the actual broken file is the SOURCE file
+    # referenced in the Vite/OXC error box "╭─[ path/file.jsx:line:col ]",
+    # NOT the test file that imports it.  Append a clear directive so the
+    # planner doesn't rewrite the test file instead of fixing the source.
+    _transform_source_re = re.compile(
+        r'(?:╭─\[\s*|File:\s*)([^\s:\]]+\.[jt]sx?):(\d+)', re.IGNORECASE)
+    transform_source_hint: str = ""
+    if re.search(r'Transform failed|PARSE_ERROR', clean, re.IGNORECASE):
+        m = _transform_source_re.search(clean)
+        if m:
+            src_file, src_line = m.group(1), m.group(2)
+            transform_source_hint = (
+                f"\nNOTE: This is a TRANSFORM error — the syntax problem is in the SOURCE FILE "
+                f"'{src_file}' at line {src_line}, NOT in the test file. "
+                f"Fix the source file '{src_file}' to resolve the parse error."
+            )
+
     # Also do a fallback scan: if we couldn't attribute errors to files,
     # collect all error-like lines as a generic block
     result: dict[str, str] = {}
@@ -172,6 +191,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
             text = '\n'.join(err_lines[:15])  # cap at 15 lines
             if len(text) > max_chars_per_file:
                 text = text[:max_chars_per_file] + '\n... [truncated]'
+            if transform_source_hint:
+                text += transform_source_hint
             result[basename] = text
 
     # Fallback: if no file-specific errors found, extract generic error lines
@@ -187,6 +208,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
             text = '\n'.join(generic_errors)
             if len(text) > max_chars_per_file:
                 text = text[:max_chars_per_file] + '\n... [truncated]'
+            if transform_source_hint:
+                text += transform_source_hint
             for basename in failed_basenames:
                 result[basename] = text
 

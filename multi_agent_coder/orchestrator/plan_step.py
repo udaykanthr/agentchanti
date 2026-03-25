@@ -51,6 +51,7 @@ class PlanStep:
     status: str = "pending"                     # pending, in_progress, completed, failed, skipped
     actual_exports: list[str] = field(default_factory=list)  # filled after step execution
     inline_code: dict[str, str] = field(default_factory=dict)  # file -> code from plan
+    kb_docs: list[str] = field(default_factory=list)  # KB doc titles used when writing inline code
 
     # Legacy compat: 0-based integer index assigned after parsing
     index: int = -1
@@ -72,6 +73,8 @@ class PlanStep:
         }
         if self.inline_code:
             d["inline_code"] = dict(self.inline_code)
+        if self.kb_docs:
+            d["kb_docs"] = list(self.kb_docs)
         return d
 
     @classmethod
@@ -89,6 +92,7 @@ class PlanStep:
             status=d.get("status", "pending"),
             actual_exports=d.get("actual_exports", []),
             inline_code=d.get("inline_code", {}),
+            kb_docs=d.get("kb_docs", []),
             index=d.get("index", -1),
         )
 
@@ -470,6 +474,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 produced = [f.strip() for f in raw.split(",") if f.strip()]
                 current.target_files.extend(produced)
 
+        # KB docs declared by planner for reviewer context
+        elif line.lower().startswith("kb_docs:"):
+            raw = line[8:].strip()
+            if raw and raw.lower() != "none":
+                current.kb_docs = [t.strip() for t in raw.split(",") if t.strip()]
+
         # Inline code block via bare "Content:" keyword (no "> " prefix).
         # The "> content:" variant is already handled inside the "> " branch
         # above.  Here we catch the unindented form that the planner sometimes
@@ -623,6 +633,55 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
                 if not producers:
                     # Not an error — could be an existing project file
                     pass
+
+    # Check inline code imports: if inline code contains local imports
+    # (e.g. import './Hero.css'), verify that some step produces the file.
+    # Strip unresolvable imports to prevent broken builds.
+    import re as _re
+    _local_import_re = _re.compile(
+        r"""(?:import\s+.*?from\s+|import\s+)['"](\.[^'"]+)['"]""",
+    )
+    _css_import_re = _re.compile(
+        r"""@import\s+['"](\.[^'"]+)['"]""",
+    )
+    for step in steps:
+        if not step.inline_code:
+            continue
+        for fpath, code in list(step.inline_code.items()):
+            # Determine the directory context of this file
+            import os as _os
+            file_dir = _os.path.dirname(fpath)
+            for pat in (_local_import_re, _css_import_re):
+                for m in pat.finditer(code):
+                    imp_path = m.group(1)
+                    # Resolve relative to the file's directory
+                    resolved = _os.path.normpath(
+                        _os.path.join(file_dir, imp_path)
+                    ).replace("\\", "/")
+                    # Check all possible extensions
+                    candidates = [resolved]
+                    if not _os.path.splitext(resolved)[1]:
+                        for ext in (".js", ".jsx", ".ts", ".tsx", ".css"):
+                            candidates.append(resolved + ext)
+                    is_produced = any(
+                        c in produced_files or any(
+                            c == tf or tf.endswith("/" + _os.path.basename(c))
+                            for tf in produced_files
+                        )
+                        for c in candidates
+                    )
+                    if not is_produced and not any(
+                        _os.path.basename(c) in _os.path.basename(tf)
+                        for c in candidates for tf in produced_files
+                    ):
+                        # Strip the dangling import from inline code
+                        step.inline_code[fpath] = code.replace(
+                            m.group(0) + ";", ""
+                        ).replace(m.group(0), "")
+                        errors.append(
+                            f"Step {step.id}: inline code in '{fpath}' imports "
+                            f"'{imp_path}' but no step produces it — import removed"
+                        )
 
     # Check for circular dependencies
     if _has_cycle(steps):

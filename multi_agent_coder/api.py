@@ -27,6 +27,7 @@ _logger = logging.getLogger(__name__)
 from .config import Config
 from .llm.ollama import OllamaClient
 from .llm.lm_studio import LMStudioClient
+from .llm import build_embed_client
 from .agents.planner import PlannerAgent
 from .agents.coder import CoderAgent
 from .agents.reviewer import ReviewerAgent
@@ -156,10 +157,11 @@ def _run_task_impl(
         scan_result, max_chars=cfg.PLANNER_CONTEXT_CHARS,
         source_files=source_files)
 
-    # Embedding store
+    # Embedding store — embed_client kept at top level for KB component reuse
+    embed_client = None if no_embeddings else build_embed_client(cfg)
     embed_store = None
-    if not no_embeddings:
-        embed_store = EmbeddingStore(llm_client, embed_model=embed_model)
+    if embed_client is not None:
+        embed_store = EmbeddingStore(embed_client, embed_model=embed_model)
 
     # Per-agent model helper
     def _make_llm(agent_name: str):
@@ -217,14 +219,18 @@ def _run_task_impl(
             from .kb.context_builder import ContextBuilder
             from .kb.runtime_watcher import RuntimeWatcher
 
-            # Smart startup check — handles global KB, local KB
-            KBStartupManager().run(project_root=os.getcwd(), api_client=llm_client)
+            # Use embed_client for KB vector ops; fall back to llm_client if unavailable
+            kb_api_client = embed_client or llm_client
 
-            kb_context_builder = ContextBuilder(project_root=os.getcwd(), api_client=llm_client)
+            # Smart startup check — handles global KB, local KB
+            KBStartupManager().run(project_root=os.getcwd(), api_client=kb_api_client)
+
+            kb_context_builder = ContextBuilder(project_root=os.getcwd(), api_client=kb_api_client)
             kb_runtime_watcher = RuntimeWatcher(
                 debounce_seconds=cfg.KB_WATCHER_DEBOUNCE_SECONDS,
             )
-            kb_runtime_watcher.start(project_root=os.getcwd(), api_client=llm_client)
+            kb_runtime_watcher.start(project_root=os.getcwd(), api_client=kb_api_client)
+            memory.watcher_created_files = kb_runtime_watcher.created_files
             _logger.info("[KB] Context builder and runtime watcher initialised")
         except Exception as kb_exc:
             _logger.warning("[KB] Initialisation failed (non-fatal): %s", kb_exc)

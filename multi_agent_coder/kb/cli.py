@@ -92,6 +92,31 @@ def _print_results(results: list[dict], title: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Embedding client factory
+# ---------------------------------------------------------------------------
+
+def _build_embed_client(cfg, *, require: bool = False, **llm_kwargs):
+    """
+    Thin wrapper around ``llm.build_embed_client`` that adds ``require`` support:
+    exits with an error when no embedding-capable provider is available and
+    ``require=True`` (used by ``kb embed`` where embeddings are mandatory).
+    """
+    from ..llm import build_embed_client
+
+    client = build_embed_client(cfg, **llm_kwargs)
+    if client is None:
+        msg = (
+            "Anthropic does not provide an embedding API. "
+            "Set 'embedding_provider' in .agentchanti.yaml to ollama, openai, or gemini."
+        )
+        if require:
+            print(f"ERROR: {msg}", file=sys.stderr)
+            sys.exit(1)
+        print(f"NOTE: {msg}", file=sys.stderr)
+    return client
+
+
+# ---------------------------------------------------------------------------
 # Sub-command handlers
 # ---------------------------------------------------------------------------
 
@@ -286,40 +311,7 @@ def _cmd_embed(args: argparse.Namespace) -> None:
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=False,
     )
-    provider = cfg.PROVIDER
-    model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-    api_client = None
-
-    if provider == "ollama":
-        api_client = OllamaClient(
-            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
-    elif provider == "openai":
-        from ..llm.openai_client import OpenAIClient
-        if not cfg.OPENAI_API_KEY:
-             print("OPENAI_API_KEY is required for OpenAI provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = OpenAIClient(
-            base_url=cfg.OPENAI_BASE_URL, model=model,
-            api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
-    elif provider == "gemini":
-        from ..llm.gemini_client import GeminiClient
-        if not cfg.GEMINI_API_KEY:
-             print("GEMINI_API_KEY is required for Gemini provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = GeminiClient(
-            base_url=cfg.GEMINI_BASE_URL, model=model,
-            api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
-    elif provider == "anthropic":
-        from ..llm.anthropic_client import AnthropicClient
-        if not cfg.ANTHROPIC_API_KEY:
-             print("ANTHROPIC_API_KEY is required for Anthropic provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = AnthropicClient(
-            base_url=cfg.ANTHROPIC_BASE_URL, model=model,
-            api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
-    else:
-        api_client = LMStudioClient(
-            base_url=cfg.LM_STUDIO_BASE_URL, model=model, **llm_kwargs)
+    api_client = _build_embed_client(cfg, require=True, **llm_kwargs)
 
     import time as _time
     t0 = _time.perf_counter()
@@ -384,48 +376,13 @@ def _cmd_search(args: argparse.Namespace) -> None:
     manifest = Manifest(_manifest_path(project_root))
     vector_store = create_vector_store(project_root, backend=backend)
 
-    # Initialize LLM Client
+    # Initialize LLM Client (None when no embedding provider is available)
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=False,
     )
-    provider = cfg.PROVIDER
-    model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-    api_client = None
-
-    if provider == "ollama":
-        from ..llm.ollama import OllamaClient
-        api_client = OllamaClient(
-            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
-    elif provider == "openai":
-        from ..llm.openai_client import OpenAIClient
-        if not cfg.OPENAI_API_KEY:
-             print("OPENAI_API_KEY is required for OpenAI provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = OpenAIClient(
-            base_url=cfg.OPENAI_BASE_URL, model=model,
-            api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
-    elif provider == "gemini":
-        from ..llm.gemini_client import GeminiClient
-        if not cfg.GEMINI_API_KEY:
-             print("GEMINI_API_KEY is required for Gemini provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = GeminiClient(
-            base_url=cfg.GEMINI_BASE_URL, model=model,
-            api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
-    elif provider == "anthropic":
-        from ..llm.anthropic_client import AnthropicClient
-        if not cfg.ANTHROPIC_API_KEY:
-             print("ANTHROPIC_API_KEY is required for Anthropic provider in .agentchanti.yaml", file=sys.stderr)
-             sys.exit(1)
-        api_client = AnthropicClient(
-            base_url=cfg.ANTHROPIC_BASE_URL, model=model,
-            api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
-    else:
-        from ..llm.lm_studio import LMStudioClient
-        api_client = LMStudioClient(
-            base_url=cfg.LM_STUDIO_BASE_URL, model=model, **llm_kwargs)
+    api_client = _build_embed_client(cfg, require=False, **llm_kwargs)
 
     searcher = Searcher(
         graph=graph,
@@ -480,46 +437,14 @@ def _cmd_seed(args: argparse.Namespace) -> None:
 
     embed = not getattr(args, "no_embed", False)
     project_root = _project_root()
-    
+
     api_client = None
     if embed:
         from ..config import Config
-        from ..llm.ollama import OllamaClient
-        from ..llm.lm_studio import LMStudioClient
-
         cfg = Config.load()
-        provider = cfg.PROVIDER
-        if provider == "ollama":
-            api_client = OllamaClient(
-                base_url=cfg.OLLAMA_BASE_URL,
-                model=cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL,
-            )
-        elif provider == "openai":
-            from ..llm.openai_client import OpenAIClient
-            api_client = OpenAIClient(
-                base_url=cfg.OPENAI_BASE_URL,
-                model=cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL,
-                api_key=cfg.OPENAI_API_KEY,
-            )
-        elif provider == "gemini":
-            from ..llm.gemini_client import GeminiClient
-            api_client = GeminiClient(
-                base_url=cfg.GEMINI_BASE_URL,
-                model=cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL,
-                api_key=cfg.GEMINI_API_KEY,
-            )
-        elif provider == "anthropic":
-            from ..llm.anthropic_client import AnthropicClient
-            api_client = AnthropicClient(
-                base_url=cfg.ANTHROPIC_BASE_URL,
-                model=cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL,
-                api_key=cfg.ANTHROPIC_API_KEY,
-            )
-        else:
-            api_client = LMStudioClient(
-                base_url=cfg.LM_STUDIO_BASE_URL,
-                model=cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL,
-            )
+        api_client = _build_embed_client(cfg, require=False)
+        if api_client is None:
+            embed = False  # no embedding provider — skip embedding step
 
     print("Seeding global knowledge base...")
     t0 = time.perf_counter()
@@ -795,55 +720,29 @@ def _cmd_update(args: argparse.Namespace) -> None:
         print(f"\nEmbedding registry documents...")
         try:
             from ..config import Config
-            from ..llm.ollama import OllamaClient
-            from ..llm.lm_studio import LMStudioClient
-
             cfg = Config.load()
-            provider = cfg.PROVIDER
-            embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-            api_client = None
+            api_client = _build_embed_client(cfg, require=False)
 
-            if provider == "ollama":
-                api_client = OllamaClient(
-                    base_url=cfg.OLLAMA_BASE_URL, model=embed_model)
-            elif provider == "openai":
-                from ..llm.openai_client import OpenAIClient
-                api_client = OpenAIClient(
-                    base_url=cfg.OPENAI_BASE_URL, model=embed_model,
-                    api_key=cfg.OPENAI_API_KEY)
-            elif provider == "gemini":
-                from ..llm.gemini_client import GeminiClient
-                api_client = GeminiClient(
-                    base_url=cfg.GEMINI_BASE_URL, model=embed_model,
-                    api_key=cfg.GEMINI_API_KEY)
-            elif provider == "anthropic":
-                from ..llm.anthropic_client import AnthropicClient
-                api_client = AnthropicClient(
-                    base_url=cfg.ANTHROPIC_BASE_URL, model=embed_model,
-                    api_key=cfg.ANTHROPIC_API_KEY)
-            else:
-                api_client = LMStudioClient(
-                    base_url=cfg.LM_STUDIO_BASE_URL, model=embed_model)
-
-            from .global_kb.seeder import (
-                _embed_md_files, collect_all_registry_md_files,
-            )
-
-            # Collect existing registry files not in the update set
-            update_paths = {p for p, _, _ in md_files}
-            existing_files = collect_all_registry_md_files(
-                exclude_paths=update_paths,
-            )
-            all_files = md_files + existing_files
-
-            if existing_files:
-                print(
-                    f"  Including {len(existing_files)} existing doc(s) "
-                    f"from kb seed"
+            if api_client is not None:
+                from .global_kb.seeder import (
+                    _embed_md_files, collect_all_registry_md_files,
                 )
 
-            chunks = _embed_md_files(all_files, _project_root(), api_client)
-            print(f"  Chunks embedded: {chunks}")
+                # Collect existing registry files not in the update set
+                update_paths = {p for p, _, _ in md_files}
+                existing_files = collect_all_registry_md_files(
+                    exclude_paths=update_paths,
+                )
+                all_files = md_files + existing_files
+
+                if existing_files:
+                    print(
+                        f"  Including {len(existing_files)} existing doc(s) "
+                        f"from kb seed"
+                    )
+
+                chunks = _embed_md_files(all_files, _project_root(), api_client)
+                print(f"  Chunks embedded: {chunks}")
         except Exception as exc:
             print(
                 f"  Embedding skipped (docs saved but not indexed): {exc}",

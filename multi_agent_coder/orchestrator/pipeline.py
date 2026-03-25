@@ -579,6 +579,118 @@ def _execute_step(step_idx: int, step_text: str, *,
                             "[Inline] Content fixes checked — "
                             "no corrections needed"
                         )
+
+                # ── Reviewer gate for inline code ──
+                # Run a reviewer check with KB context so the reviewer
+                # has up-to-date framework docs and doesn't regress
+                # planner-generated code based on outdated training data.
+                # On FAIL, fall back to the full Coder + Reviewer fix loop.
+                if reviewer is not None:
+                    # Prefer the exact KB docs the planner declared (plan_step.kb_docs)
+                    # over the similarity-search context — these are the docs the planner
+                    # actually read when writing the inline code, so the reviewer gets
+                    # the same frame of reference.
+                    _inline_kb = ""
+                    if (plan_step and plan_step.kb_docs
+                            and kb_context_builder is not None):
+                        try:
+                            _gstore = getattr(kb_context_builder, '_global_store', None)
+                            if _gstore is not None:
+                                _fetched_parts: list[str] = []
+                                for _doc_title in plan_step.kb_docs:
+                                    _doc_results = _gstore.search(
+                                        query=_doc_title,
+                                        top_k=1,
+                                        api_client=getattr(
+                                            kb_context_builder, '_api_client', None),
+                                        language=language,
+                                    )
+                                    if _doc_results:
+                                        _fetched_parts.append(
+                                            f"### {_doc_results[0].title}\n"
+                                            f"{_doc_results[0].content}"
+                                        )
+                                if _fetched_parts:
+                                    _inline_kb = "\n\n".join(_fetched_parts)
+                                    _logger.debug(
+                                        "[Inline] Reviewer KB: using planner-declared "
+                                        "docs %s", plan_step.kb_docs,
+                                    )
+                        except Exception:
+                            pass
+                    if not _inline_kb:
+                        # Fallback: use the KB context built by similarity search
+                        _inline_kb = getattr(memory, "_kb_context", "") or ""
+                    _reviewer_kb_inline = ""
+                    if _inline_kb:
+                        _reviewer_kb_inline = (
+                            "\n\n[KB Documentation — trust this over your training data]\n"
+                            + _inline_kb + "\n"
+                        )
+                    _criteria_ctx_inline = ""
+                    if project_context is not None:
+                        _criteria_inline = getattr(project_context, "success_criteria", [])
+                        if _criteria_inline:
+                            _criteria_ctx_inline = (
+                                "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
+                                + "\n".join(f"- {c}" for c in _criteria_inline)
+                            )
+                    # Use post-fix content from memory so reviewer sees corrected code
+                    _all_mem_inline = memory.all_files()
+                    _review_code_inline = "\n\n".join(
+                        f"#### [FILE]: {path}\n```\n{_all_mem_inline.get(path, content)}\n```"
+                        for path, content in _inline_files.items()
+                    )
+                    _step_desc_inline = (
+                        (plan_step.description if plan_step and plan_step.description else None)
+                        or step_text.split("\n")[0].strip()
+                    )
+                    display.step_info(step_idx, "[Inline] Reviewing with KB context...")
+                    _inline_review = reviewer.process(
+                        f"Review this code for the step: {_step_desc_inline}\n\n{_review_code_inline}",
+                        context=(
+                            f"Step: {_step_desc_inline}\n"
+                            f"Review ONLY the files shown above."
+                            f"{_reviewer_kb_inline}{_criteria_ctx_inline}"
+                        ),
+                        language=language,
+                    )
+                    if "FAIL" in _inline_review:
+                        display.step_info(
+                            step_idx,
+                            "[Inline] Reviewer flagged issues — falling back to Coder+Reviewer loop",
+                        )
+                        _logger.info(
+                            "[Inline] Reviewer FAIL for step %s — "
+                            "falling back to _handle_code_step",
+                            plan_step.id if plan_step else step_idx,
+                        )
+                        _graph_inline = code_graph
+                        if _graph_inline is None and kb_context_builder is not None:
+                            _graph_inline = getattr(kb_context_builder, "_graph", None)
+                        _has_test_after_inline = False
+                        if all_plan_steps is not None:
+                            _has_test_after_inline = any(
+                                s.step_type == "TEST" for s in all_plan_steps
+                                if s.index > step_idx
+                            )
+                        success, error_info = _handle_code_step(
+                            step_text, coder, reviewer, executor,
+                            task, memory, display, step_idx,
+                            language=language, cfg=cfg,
+                            auto=auto, code_graph=_graph_inline,
+                            project_profile=project_profile,
+                            skip_review=_has_test_after_inline,
+                            project_context=project_context,
+                            plan_step=plan_step,
+                            all_plan_steps=all_plan_steps,
+                            kb_context_builder=kb_context_builder,
+                        )
+                    else:
+                        _logger.info(
+                            "[Inline] Reviewer approved step %s",
+                            plan_step.id if plan_step else step_idx,
+                        )
             else:
                 # Extract code graph from kb_context_builder if available
                 _graph = code_graph
@@ -665,6 +777,32 @@ def _execute_step(step_idx: int, step_text: str, *,
                             f"[Inline/test] Content fixes applied to "
                             f"{len(_changed_test)} file(s)",
                         )
+
+                # Verify the inline tests actually pass — if they fail, fall
+                # back to the full _handle_test_step loop which can diagnose
+                # and fix the failure (e.g. the error is in a source file).
+                from .step_handlers import _read_js_project_env
+                from ..language import get_test_framework as _gtf
+                _inline_subproject_cwd = _detect_subproject_root(memory)
+                _js_env_inline = _read_js_project_env(_inline_subproject_cwd) if language in ("javascript", "typescript") else {}
+                _test_runner_inline = _js_env_inline.get("test_runner")
+                _fw_inline = _gtf(language or "python", test_runner=_test_runner_inline)
+                _verify_ok, _verify_out = executor.run_tests(
+                    _fw_inline["command"], cwd=_inline_subproject_cwd)
+                if not _verify_ok:
+                    display.step_info(
+                        step_idx,
+                        "[Inline/test] Inline tests failed after write — falling back to fix loop",
+                    )
+                    success, error_info = _handle_test_step(
+                        step_text, tester, coder, reviewer, executor,
+                        task, memory, display, step_idx, language=language,
+                        auto=auto, search_agent=search_agent,
+                        project_context=project_context,
+                        kb_context_builder=kb_context_builder,
+                        plan_step=plan_step,
+                        all_plan_steps=all_plan_steps,
+                        project_profile=project_profile)
             else:
                 success, error_info = _handle_test_step(
                     step_text, tester, coder, reviewer, executor,
@@ -712,6 +850,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         step_idx, step_text, new_or_changed,
                         dep_before, dep_after,
                         memory, llm_client, executor, display, language, cfg,
+                        all_plan_steps=all_plan_steps,
                     )
                     if integration_fixes:
                         executor.write_files(integration_fixes)

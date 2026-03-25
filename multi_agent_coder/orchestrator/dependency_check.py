@@ -1104,6 +1104,7 @@ def run_dependency_check(
     display,
     language: str | None,
     cfg=None,
+    all_plan_steps=None,
 ) -> dict[str, str]:
     """Run post-step dependency validation and return fixes.
 
@@ -1123,6 +1124,14 @@ def run_dependency_check(
 
     if not new_files:
         return {}
+
+    # Build the set of all files this session plans to create (from plan steps).
+    # These are treated as "session files" even if not yet written to memory.
+    session_files: set[str] = set(memory_files.keys())
+    if all_plan_steps:
+        for ps in all_plan_steps:
+            for tf in (ps.target_files or []):
+                session_files.add(tf.replace("\\", "/"))
 
     # Detect gaps
     display.step_info(step_idx, "[DepCheck] Scanning dependencies...")
@@ -1166,23 +1175,66 @@ def run_dependency_check(
         display.step_info(step_idx, "[DepCheck] No parseable fixes in response")
         return {}
 
-    # Validate: only accept files relevant to the gaps
+    # Validate: only accept files relevant to the gaps.
+    # Three tiers:
+    #   1. Gap source/target files — always accepted
+    #   2. Session files (plan target_files + memory) — always accepted
+    #   3. Wiring files for watcher-created sources — if the runtime watcher
+    #      saw a gap source file being CREATED (not just modified) this session,
+    #      allow the dep-check to propose a new wiring file (e.g. App.jsx) in
+    #      the same project root, as long as the agent hasn't written it yet
     relevant_files: set[str] = set()
+    project_roots: set[str] = set()
     for gap in gaps:
         relevant_files.add(gap.source_file)
         if gap.target_file:
             relevant_files.add(gap.target_file)
+        root = gap.source_file.replace("\\", "/").split("/")[0]
+        if root:
+            project_roots.add(root)
+
+    # Files the runtime watcher saw being CREATED on disk this session
+    watcher_created: set[str] = getattr(memory, "watcher_created_files", set()) or set()
+    # Allow wiring files only when at least one orphaned-export source was
+    # freshly created by the agent (not just modified).
+    has_watcher_created_sources = any(
+        gap.gap_type == "orphaned_export" and any(
+            gap.source_file.replace("\\", "/").endswith(wf)
+            or wf.endswith(os.path.basename(gap.source_file))
+            for wf in watcher_created
+        )
+        for gap in gaps
+    )
 
     validated: dict[str, str] = {}
     for fpath, content in fix_files.items():
         matched = fpath
+        norm_matched = fpath.replace("\\", "/")
         if fpath not in memory_files:
             for known in memory_files:
                 if known.endswith(fpath) or fpath.endswith(os.path.basename(known)):
                     matched = known
+                    norm_matched = matched.replace("\\", "/")
                     break
-        if matched in relevant_files or matched in memory_files:
+        # Tier 1: gap source/target
+        if matched in relevant_files:
             validated[matched] = content
+            continue
+        # Tier 2: planned session file
+        is_session_file = norm_matched in session_files or any(
+            sf.endswith("/" + norm_matched) or norm_matched.endswith("/" + sf)
+            for sf in session_files
+        )
+        if is_session_file:
+            validated[matched] = content
+            _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            continue
+        # Tier 3: wiring file for watcher-created sources
+        in_project = any(norm_matched.startswith(root + "/") for root in project_roots)
+        not_yet_written = matched not in memory_files
+        if has_watcher_created_sources and in_project and not_yet_written:
+            validated[matched] = content
+            _logger.debug("[DepCheck] Accepted new wiring file from fix: %s", fpath)
         else:
             _logger.warning("[DepCheck] Ignoring unexpected file in fix: %s", fpath)
 
