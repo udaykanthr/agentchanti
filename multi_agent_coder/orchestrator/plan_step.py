@@ -53,6 +53,9 @@ class PlanStep:
     inline_code: dict[str, str] = field(default_factory=dict)  # file -> code from plan
     kb_docs: list[str] = field(default_factory=list)  # KB doc titles used when writing inline code
 
+    # Which files should import this step's target file (plan-declared or derived)
+    imported_by: list[str] = field(default_factory=list)
+
     # Legacy compat: 0-based integer index assigned after parsing
     index: int = -1
 
@@ -75,6 +78,8 @@ class PlanStep:
             d["inline_code"] = dict(self.inline_code)
         if self.kb_docs:
             d["kb_docs"] = list(self.kb_docs)
+        if self.imported_by:
+            d["imported_by"] = list(self.imported_by)
         return d
 
     @classmethod
@@ -93,6 +98,7 @@ class PlanStep:
             actual_exports=d.get("actual_exports", []),
             inline_code=d.get("inline_code", {}),
             kb_docs=d.get("kb_docs", []),
+            imported_by=d.get("imported_by", []),
             index=d.get("index", -1),
         )
 
@@ -370,6 +376,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Command line (for CMD steps)
         if line.startswith("> "):
             cmd_text = line[2:].strip()
+            # Strip backtick wrapping added by LLMs (e.g. `> `npm install`` -> `npm install`)
+            if len(cmd_text) >= 2 and cmd_text[0] == "`" and cmd_text[-1] == "`":
+                cmd_text = cmd_text[1:-1]
             # Skip markdown metadata annotations that the LLM sometimes
             # prefixes with ">" (e.g. "> **produces:** ..." or "> **note:** ...")
             _bare = cmd_text.lstrip("*_ \t")
@@ -396,6 +405,11 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                             current.imports_from.setdefault(
                                 file_path.strip(), []
                             ).append(symbol.strip())
+                continue
+            elif _bare_lower.startswith("imported_by:"):
+                raw = _bare[12:].strip()
+                if raw and raw.lower() != "none":
+                    current.imported_by = [f.strip() for f in raw.split(",") if f.strip()]
                 continue
             elif _bare_lower.startswith("content:"):
                 # Inline code block follows — enter code-block mode
@@ -482,6 +496,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             if raw and raw.lower() != "none":
                 current.kb_docs = [t.strip() for t in raw.split(",") if t.strip()]
 
+        # imported_by: which files should import this step's target file
+        elif line.lower().startswith("imported_by:"):
+            raw = line[12:].strip()
+            if raw and raw.lower() != "none":
+                current.imported_by = [f.strip() for f in raw.split(",") if f.strip()]
+
         # Inline code block via bare "Content:" keyword (no "> " prefix).
         # The "> content:" variant is already handled inside the "> " branch
         # above.  Here we catch the unindented form that the planner sometimes
@@ -538,7 +558,146 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     for idx, step in enumerate(steps):
         step.index = idx
 
+    # Derive imported_by from imports_from relationships across all steps.
+    # This is free (no LLM cost) and ensures that when step B declares
+    # imports_from step A's target file, step A gets imported_by = step B's target.
+    _derive_imported_by(steps)
+
+    # For steps that still have no imported_by after derivation, infer it from
+    # the plan structure (entry-point files in later waves).  Works even when the
+    # planner forgets to add a wiring step or an explicit imported_by: line.
+    _infer_missing_imported_by(steps)
+
     return steps
+
+
+def _derive_imported_by(steps: list[PlanStep]) -> None:
+    """Populate ``imported_by`` on each step from other steps' ``imports_from``.
+
+    For every consumer step that declares ``imports_from: {file: [symbols]}``,
+    find the producer step whose ``target_files`` includes *file* and add the
+    consumer's target files to the producer's ``imported_by`` list.
+
+    This is zero-cost (no LLM) and fires automatically after parsing so that
+    DepCheck can use ``plan_step.imported_by`` instead of guessing heuristically.
+    Explicit ``imported_by:`` lines in the plan take precedence (they are set
+    first during parsing; derivation only appends new entries, never clears them).
+    """
+    import os as _os
+
+    # Build file → step map (normalized paths + basenames for fuzzy lookup)
+    file_to_step: dict[str, PlanStep] = {}
+    for step in steps:
+        for tf in step.target_files:
+            norm = tf.replace("\\", "/")
+            file_to_step[norm] = step
+            file_to_step[_os.path.basename(norm)] = step
+
+    for consumer_step in steps:
+        consumer_files = consumer_step.target_files
+        if not consumer_files:
+            continue
+        for src_file in consumer_step.imports_from:
+            src_norm = src_file.replace("\\", "/")
+            src_basename = _os.path.basename(src_norm)
+            producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
+            if producer is None:
+                continue
+            for cf in consumer_files:
+                if cf not in producer.imported_by:
+                    producer.imported_by.append(cf)
+
+
+# Entry-point file basenames that commonly import/mount other components.
+# Ordered from most-specific to least-specific.
+_ENTRY_POINT_BASENAMES = (
+    "main.tsx", "main.ts", "main.jsx", "main.js",
+    "App.tsx", "App.ts", "App.jsx", "App.js",
+    "index.tsx", "index.ts", "index.jsx", "index.js",
+    "router.tsx", "router.ts", "router.jsx", "router.js",
+    "__init__.py", "main.py", "app.py", "index.py",
+)
+
+
+def _infer_missing_imported_by(steps: list[PlanStep]) -> None:
+    """For CODE steps with exports but no ``imported_by``, infer the consumer
+    from other plan steps whose target files look like entry-points or whose
+    wave number is later.
+
+    Strategy (in order, first match wins):
+    1. Another step in a later wave whose target is an entry-point file and
+       that step's description mentions the orphaned step's exported symbol
+       or file stem.
+    2. Any step in a later wave whose target is an entry-point file.
+    3. Any step in a later wave that has no ``imports_from`` declared
+       (likely a wiring/mounting step with incomplete metadata).
+
+    Only fires when ``imported_by`` is still empty after ``_derive_imported_by``
+    — i.e. the planner neither added a wiring step nor wrote ``imported_by:``.
+    Operates purely on plan metadata, zero LLM cost.
+    """
+    import os as _os
+
+    def _wave(step: PlanStep) -> int:
+        """Return the wave number from the step id (e.g. '3.1' → 3)."""
+        try:
+            return int(step.id.split(".")[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def _is_entry_point(path: str) -> bool:
+        base = _os.path.basename(path).lower()
+        return base in {ep.lower() for ep in _ENTRY_POINT_BASENAMES}
+
+    for step in steps:
+        # Only care about CODE steps with exports and no consumer yet
+        if step.step_type not in ("CODE", "UNCLASSIFIED"):
+            continue
+        if not step.exports or step.imported_by:
+            continue
+        if not step.target_files:
+            continue
+
+        step_wave = _wave(step)
+        exported_lower = {e.lower() for e in step.exports}
+        stem_lower = {
+            _os.path.splitext(_os.path.basename(tf))[0].lower()
+            for tf in step.target_files
+        }
+
+        # Collect candidate steps: later wave, has target files
+        candidates = [
+            s for s in steps
+            if _wave(s) > step_wave and s.target_files and s is not step
+        ]
+
+        # Strategy 1: entry-point target + description mentions our symbol/stem
+        for cand in candidates:
+            if not any(_is_entry_point(tf) for tf in cand.target_files):
+                continue
+            desc_lower = cand.description.lower()
+            if exported_lower & set(desc_lower.split()) or stem_lower & set(desc_lower.split()):
+                step.imported_by = list(cand.target_files[:1])
+                break
+
+        if step.imported_by:
+            continue
+
+        # Strategy 2: any entry-point target in a later wave
+        for cand in candidates:
+            ep_targets = [tf for tf in cand.target_files if _is_entry_point(tf)]
+            if ep_targets:
+                step.imported_by = [ep_targets[0]]
+                break
+
+        if step.imported_by:
+            continue
+
+        # Strategy 3: a later step with no imports_from (likely incomplete wiring step)
+        for cand in candidates:
+            if not cand.imports_from and cand.step_type in ("CODE", "UNCLASSIFIED"):
+                step.imported_by = list(cand.target_files[:1])
+                break
 
 
 # File header comment pattern for splitting multi-file inline code blocks
@@ -1380,6 +1539,9 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
         # ── Command line (> cmd) ── works both inside and outside fences
         if line.startswith("> "):
             cmd_text = line[2:].strip()
+            # Strip backtick wrapping added by LLMs (e.g. `> `npm install`` -> `npm install`)
+            if len(cmd_text) >= 2 and cmd_text[0] == "`" and cmd_text[-1] == "`":
+                cmd_text = cmd_text[1:-1]
             _bare = cmd_text.lstrip("*_ \t")
             _meta_prefixes = ("produces:", "note:", "output:", "creates:",
                               "result:", "generates:", "returns:")

@@ -788,6 +788,58 @@ def _guess_parent_file(
     return None
 
 
+def _llm_guess_parent_file(
+    new_file: str,
+    exported_symbols: list[str],
+    memory_files: dict[str, str],
+    llm_client,
+) -> str | None:
+    """Use a tiny LLM call to identify which file should import *new_file*.
+
+    Only called when both the plan map and the heuristic return ``None``.
+    Keeps the prompt minimal so even small models can answer reliably.
+    Returns a validated file path from *memory_files*, or ``None``.
+    """
+    # Exclude test files and the file itself from candidates
+    candidates = [
+        f for f in sorted(memory_files.keys())
+        if f != new_file and not _is_test_file(f)
+    ]
+    if not candidates:
+        return None
+
+    file_list = "\n".join(f"- {f}" for f in candidates)
+    sym_str = ", ".join(exported_symbols) if exported_symbols else os.path.basename(new_file)
+    prompt = (
+        f"Task: identify which file should import a new module.\n\n"
+        f"New file: {new_file}\n"
+        f"Exports: {sym_str}\n\n"
+        f"Existing project files:\n{file_list}\n\n"
+        f"Which ONE file from the list above should import '{os.path.basename(new_file)}'?\n"
+        f"Reply with ONLY the exact file path. No explanation."
+    )
+    try:
+        response = llm_client.generate_response(prompt).strip().strip("'\"` \n")
+        # Exact match
+        if response in memory_files:
+            return response
+        # Case-insensitive match
+        response_lower = response.lower()
+        for fpath in memory_files:
+            if fpath.lower() == response_lower:
+                return fpath
+        # Basename match as last resort
+        resp_base = os.path.basename(response).lower()
+        for fpath in memory_files:
+            if os.path.basename(fpath).lower() == resp_base:
+                return fpath
+        _logger.debug("[DepCheck] LLM parent guess '%s' not in project files", response)
+        return None
+    except Exception as exc:
+        _logger.debug("[DepCheck] LLM parent guess failed: %s", exc)
+        return None
+
+
 def _find_file_by_name(name: str, memory_files: dict[str, str]) -> str | None:
     """Find a file in memory whose stem matches *name* (case-insensitive)."""
     name_lower = name.lower()
@@ -806,6 +858,7 @@ def find_gaps(
     new_files: list[str],
     step_text: str,
     memory_files: dict[str, str],
+    plan_imported_by: dict[str, str] | None = None,
 ) -> list[IntegrationGap]:
     """Compare before/after snapshots to detect integration gaps.
 
@@ -855,7 +908,19 @@ def find_gaps(
                 break
 
         if not is_imported and len(after.file_deps) > 1:
-            likely_parent = _guess_parent_file(nf, step_text, memory_files)
+            # Priority order: plan declaration > heuristic (LLM fallback in caller)
+            nf_norm = nf.replace("\\", "/")
+            plan_parent = (plan_imported_by or {}).get(nf_norm)
+            if plan_parent is None:
+                # Also try basename match for plan map (sub-project path differences)
+                nf_base = os.path.basename(nf_norm)
+                for k, v in (plan_imported_by or {}).items():
+                    if os.path.basename(k) == nf_base:
+                        plan_parent = v
+                        break
+            likely_parent = plan_parent or _guess_parent_file(nf, step_text, memory_files)
+            if plan_parent:
+                _logger.debug("[DepCheck] Plan-declared parent for '%s': %s", nf, plan_parent)
             gaps.append(IntegrationGap(
                 gap_type="orphaned_export",
                 source_file=nf,
@@ -1128,15 +1193,27 @@ def run_dependency_check(
     # Build the set of all files this session plans to create (from plan steps).
     # These are treated as "session files" even if not yet written to memory.
     session_files: set[str] = set(memory_files.keys())
+    # Build plan_imported_by map: source_file → consumer_file (first declared wins)
+    # Uses PlanStep.imported_by which is auto-derived from imports_from relationships
+    # plus any explicit imported_by: lines the planner wrote.
+    plan_imported_by: dict[str, str] = {}
     if all_plan_steps:
         for ps in all_plan_steps:
             for tf in (ps.target_files or []):
                 session_files.add(tf.replace("\\", "/"))
+            for consumer_file in (ps.imported_by or []):
+                for tf in (ps.target_files or []):
+                    norm_tf = tf.replace("\\", "/")
+                    if norm_tf not in plan_imported_by:
+                        plan_imported_by[norm_tf] = consumer_file
 
     # Detect gaps
     display.step_info(step_idx, "[DepCheck] Scanning dependencies...")
     try:
-        gaps = find_gaps(dep_before, dep_after, new_files, step_text, memory_files)
+        gaps = find_gaps(
+            dep_before, dep_after, new_files, step_text, memory_files,
+            plan_imported_by=plan_imported_by or None,
+        )
     except Exception as exc:
         _logger.warning("[DepCheck] Gap detection failed: %s", exc)
         return {}
@@ -1145,6 +1222,19 @@ def run_dependency_check(
         _logger.debug("[DepCheck] No integration gaps for step %d", step_idx + 1)
         display.step_info(step_idx, "[DepCheck] All dependencies connected.")
         return {}
+
+    # LLM fallback: for orphaned exports where both plan and heuristic returned None,
+    # make a small targeted LLM call to identify the correct parent file.
+    for gap in gaps:
+        if gap.gap_type == "orphaned_export" and gap.target_file is None:
+            _logger.debug("[DepCheck] Heuristic failed for '%s', trying LLM parent guess", gap.source_file)
+            nf_deps = dep_after.file_deps.get(gap.source_file)
+            symbols = nf_deps.exports[:5] if nf_deps else []
+            guessed = _llm_guess_parent_file(gap.source_file, symbols, memory_files, llm_client)
+            if guessed:
+                _logger.info("[DepCheck] LLM identified parent '%s' for '%s'", guessed, gap.source_file)
+                gap.target_file = guessed
+                gap.description += f" LLM-identified parent: '{guessed}'."
 
     # Report gaps
     display.step_info(

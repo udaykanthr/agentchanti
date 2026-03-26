@@ -523,6 +523,7 @@ imports: src/server.js:app, src/utils/validate.js:validateInput
 target: <file1>, <file2>               ← CODE/TEST steps. Files to create or modify.
 exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
 imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
+imported_by: <file1>, <file2>          ← CODE steps. Optional. Files that will import this step's target. Use when no explicit wiring step exists.
 produces: <file1>, <file2>             ← CMD steps. Files created by the command.
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
@@ -607,7 +608,18 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 17. **Leaf components BEFORE parents**: Create child components first, then
     parents that import them. Declare imports: to enforce correct ordering.
 
-18. **ALWAYS include inline code for CODE and TEST steps**: Every CODE and
+18. **Explicitly wire entry-point and parent files**: When a new component or
+    module must be mounted/imported by an existing file (e.g. main.jsx, App.tsx,
+    router.py, index.ts), you MUST include a dedicated CODE step that modifies
+    that entry-point file to add the import. Do NOT assume the pipeline will
+    auto-wire it. The wiring step must declare:
+      imports: <new-component-file>:<ExportedSymbol>
+    This also lets the pipeline derive `imported_by` automatically — so the
+    dependency checker knows the exact parent without guessing.
+    If you cannot add a wiring step, declare `imported_by: <parent-file>` on
+    the child component step so the dependency checker knows where to wire it.
+
+19. **ALWAYS include inline code for CODE and TEST steps**: Every CODE and
     TEST step MUST include a `content:` block with the complete file source.
     This is MANDATORY — it eliminates a separate Coder LLM call per step.
     Use the exact format:
@@ -619,7 +631,7 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     The code must be COMPLETE — every import, every function, every line.
     Do NOT write a stub or partial implementation.
 
-19. **Declare KB docs used for inline code**: For every CODE or TEST step
+20. **Declare KB docs used for inline code**: For every CODE or TEST step
     with a content: block, add a `kb_docs:` line listing the exact titles
     of any KB documents from the [KNOWLEDGE BASE] context above that you
     referenced while writing that inline code. Use the titles verbatim —
@@ -644,5 +656,6 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] No install steps for already-installed packages
 - [ ] Config/tooling steps come BEFORE code that depends on them
 - [ ] Leaf components created BEFORE parent components
+- [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
 """
         return self.llm_client.generate_response(prompt)
