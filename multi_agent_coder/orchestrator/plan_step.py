@@ -801,16 +801,20 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
 
     # Check inline code for truncation: if the parser never saw a closing
     # marker (---file-content-end---, ==END==, or next --STEP), the LLM
-    # output was cut off.  Clear inline_code so the coder path handles it.
+    # output was cut off.  Preserve the partial code as a hint for the coder
+    # (so it can complete rather than regenerate from scratch), then clear
+    # inline_code so the normal coder path handles full generation.
     import os as _os
     for step in steps:
         if not step.inline_code:
             continue
         if getattr(step, "_inline_truncated", False):
+            # Preserve partial content as a completion hint before clearing
+            step._partial_inline_code = dict(step.inline_code)  # type: ignore[attr-defined]
             step.inline_code.clear()
             errors.append(
                 f"Step {step.id}: inline code was truncated (no closing marker) "
-                f"— cleared, will use coder LLM call instead"
+                f"— preserved as partial hint, coder will complete it"
             )
             continue
 

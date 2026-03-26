@@ -2908,7 +2908,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       project_context=None,
                       plan_step=None,
                       all_plan_steps=None,
-                      kb_context_builder=None) -> tuple[bool, str]:
+                      kb_context_builder=None,
+                      partial_inline_code: dict[str, str] | None = None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -3032,6 +3033,21 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             context_prefix += _code_behavioral_ctx + "\n\n"
 
         context = context_prefix + f"Task: {task}"
+
+        # ── Partial inline code hint (truncation recovery) ──
+        # When the planner's inline code was cut off by a token limit,
+        # inject the partial content so the coder completes rather than
+        # regenerates the entire file from scratch.
+        if partial_inline_code:
+            _partial_hint = "\n\n[PARTIAL CODE — the planner started writing this; " \
+                            "complete it without restarting from scratch]\n"
+            for _ph_path, _ph_content in partial_inline_code.items():
+                _partial_hint += (
+                    f"\n#### [FILE]: {_ph_path}\n"
+                    f"```\n{_ph_content}\n```\n"
+                    f"^ This file is INCOMPLETE — output the full completed version.\n"
+                )
+            context += _partial_hint
 
         # ── Target file enforcement (full-file tier) ──
         # Explicitly tell the LLM which file to modify so it doesn't

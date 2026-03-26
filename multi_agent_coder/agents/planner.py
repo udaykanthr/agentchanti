@@ -236,10 +236,13 @@ class PlannerAgent(Agent):
             try:
                 kb_context_builder._ensure_global()
                 if kb_context_builder._global_store is not None:
+                    _logger.info(
+                        "[PreAnalysis] Querying global KB for task: %s", task
+                    )
                     docs = kb_context_builder._global_store.search(
                         query=task,
                         categories=["doc", "pattern"],
-                        top_k=10,
+                        top_k=20,
                         api_client=kb_context_builder._api_client,
                     )
                     _logger.info(

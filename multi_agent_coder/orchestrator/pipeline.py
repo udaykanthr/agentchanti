@@ -27,6 +27,30 @@ _logger = logging.getLogger(__name__)
 
 MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
 
+
+def _try_trivial_close(
+    partial: dict[str, str],
+    language: str | None,
+) -> dict[str, str] | None:
+    """Attempt to close trivially truncated inline code without LLM.
+
+    If each file in *partial* has ≤2 unmatched opening braces and ≤2
+    unmatched opening parens, append the missing closing tokens.
+    Returns the closed dict on success, or None if any file is too
+    complex to close deterministically.
+    """
+    result: dict[str, str] = {}
+    for path, content in partial.items():
+        open_braces = content.count('{') - content.count('}')
+        open_parens = content.count('(') - content.count(')')
+        # Only attempt closure when the gap is tiny (likely a cut-off tail)
+        if open_braces < 0 or open_parens < 0 or open_braces > 2 or open_parens > 2:
+            return None
+        tail = ('}\n' * open_braces) + (')\n' * open_parens)
+        result[path] = content + ('\n' + tail if tail else '')
+    return result
+
+
 # ── Test file detection ───────────────────────────────────────
 # Patterns that indicate a file is a test file (used for CODE→TEST
 # auto-correction when the planner marks a test-editing step as CODE).
@@ -580,100 +604,53 @@ def _execute_step(step_idx: int, step_text: str, *,
                             "no corrections needed"
                         )
 
-                # ── Reviewer gate for inline code ──
-                # Run a reviewer check with KB context so the reviewer
-                # has up-to-date framework docs and doesn't regress
-                # planner-generated code based on outdated training data.
-                # On FAIL, fall back to the full Coder + Reviewer fix loop.
-                if reviewer is not None:
-                    # Prefer the exact KB docs the planner declared (plan_step.kb_docs)
-                    # over the similarity-search context — these are the docs the planner
-                    # actually read when writing the inline code, so the reviewer gets
-                    # the same frame of reference.
-                    _inline_kb = ""
-                    if (plan_step and plan_step.kb_docs
-                            and kb_context_builder is not None):
-                        try:
-                            _gstore = getattr(kb_context_builder, '_global_store', None)
-                            if _gstore is not None:
-                                _fetched_parts: list[str] = []
-                                for _doc_title in plan_step.kb_docs:
-                                    _doc_results = _gstore.search(
-                                        query=_doc_title,
-                                        top_k=1,
-                                        api_client=getattr(
-                                            kb_context_builder, '_api_client', None),
-                                        language=language,
-                                    )
-                                    if _doc_results:
-                                        _fetched_parts.append(
-                                            f"### {_doc_results[0].title}\n"
-                                            f"{_doc_results[0].content}"
-                                        )
-                                if _fetched_parts:
-                                    _inline_kb = "\n\n".join(_fetched_parts)
-                                    _logger.debug(
-                                        "[Inline] Reviewer KB: using planner-declared "
-                                        "docs %s", plan_step.kb_docs,
-                                    )
-                        except Exception:
-                            pass
-                    if not _inline_kb:
-                        # Fallback: use the KB context built by similarity search
-                        _inline_kb = getattr(memory, "_kb_context", "") or ""
-                    _reviewer_kb_inline = ""
-                    if _inline_kb:
-                        _reviewer_kb_inline = (
-                            "\n\n[KB Documentation — trust this over your training data]\n"
-                            + _inline_kb + "\n"
-                        )
-                    _criteria_ctx_inline = ""
-                    if project_context is not None:
-                        _criteria_inline = getattr(project_context, "success_criteria", [])
-                        if _criteria_inline:
-                            _criteria_ctx_inline = (
-                                "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
-                                + "\n".join(f"- {c}" for c in _criteria_inline)
-                            )
-                    # Use post-fix content from memory so reviewer sees corrected code
-                    _all_mem_inline = memory.all_files()
-                    _review_code_inline = "\n\n".join(
-                        f"#### [FILE]: {path}\n```\n{_all_mem_inline.get(path, content)}\n```"
-                        for path, content in _inline_files.items()
+                # ── Inline code quality gate (Phase 1) ──
+                # The planner wrote this code WITH full KB context, so it is
+                # typically correct.  We avoid unconditional reviewer LLM calls
+                # and instead apply a 3-tier static gate:
+                #
+                #   Tier A: TEST-step lookahead — tests will validate; skip all.
+                #   Tier B: Static lint + import checks (free, no LLM).
+                #           Fail → fall back to Coder+Reviewer loop.
+                #   Tier C: All clear → done.  The post-step dependency check
+                #           (run_dependency_check at line ~830) already handles
+                #           orphaned exports and wiring via its own LLM fix path.
+                _has_test_after_inline = False
+                if all_plan_steps is not None:
+                    _has_test_after_inline = any(
+                        s.step_type == "TEST" for s in all_plan_steps
+                        if s.index > step_idx
                     )
-                    _step_desc_inline = (
-                        (plan_step.description if plan_step and plan_step.description else None)
-                        or step_text.split("\n")[0].strip()
+
+                if _has_test_after_inline:
+                    # Tier A: TEST follows — tests will validate, skip review.
+                    _logger.info(
+                        "[Inline] Skipping review for step %s — TEST step follows",
+                        plan_step.id if plan_step else step_idx,
                     )
-                    display.step_info(step_idx, "[Inline] Reviewing with KB context...")
-                    _inline_review = reviewer.process(
-                        f"Review this code for the step: {_step_desc_inline}\n\n{_review_code_inline}",
-                        context=(
-                            f"Step: {_step_desc_inline}\n"
-                            f"Review ONLY the files shown above."
-                            f"{_reviewer_kb_inline}{_criteria_ctx_inline}"
-                        ),
-                        language=language,
+                else:
+                    # Tier B: Static lint + import checks
+                    from .step_handlers import _quick_offline_lint, _validate_import_paths
+                    _inline_lint = _quick_offline_lint(_inline_files)
+                    _inline_import_errs = _validate_import_paths(_inline_files, memory)
+                    _inline_static_errs = (
+                        (_inline_lint + "\n" + _inline_import_errs).strip()
+                        if _inline_import_errs else _inline_lint
                     )
-                    if "FAIL" in _inline_review:
+                    if _inline_static_errs:
                         display.step_info(
                             step_idx,
-                            "[Inline] Reviewer flagged issues — falling back to Coder+Reviewer loop",
+                            "[Inline] Static errors found — falling back to Coder+Reviewer loop",
                         )
                         _logger.info(
-                            "[Inline] Reviewer FAIL for step %s — "
-                            "falling back to _handle_code_step",
+                            "[Inline] Static check failed for step %s — "
+                            "falling back to _handle_code_step: %s",
                             plan_step.id if plan_step else step_idx,
+                            _inline_static_errs[:200],
                         )
                         _graph_inline = code_graph
                         if _graph_inline is None and kb_context_builder is not None:
                             _graph_inline = getattr(kb_context_builder, "_graph", None)
-                        _has_test_after_inline = False
-                        if all_plan_steps is not None:
-                            _has_test_after_inline = any(
-                                s.step_type == "TEST" for s in all_plan_steps
-                                if s.index > step_idx
-                            )
                         success, error_info = _handle_code_step(
                             step_text, coder, reviewer, executor,
                             task, memory, display, step_idx,
@@ -687,42 +664,115 @@ def _execute_step(step_idx: int, step_text: str, *,
                             kb_context_builder=kb_context_builder,
                         )
                     else:
+                        # Tier C: Static clean — accept inline code as-is.
+                        # Dependency wiring (orphaned exports) is handled by
+                        # run_dependency_check after this block completes.
                         _logger.info(
-                            "[Inline] Reviewer approved step %s",
+                            "[Inline] Static checks passed for step %s — "
+                            "accepted (0 reviewer LLM calls)",
                             plan_step.id if plan_step else step_idx,
                         )
             else:
-                # Extract code graph from kb_context_builder if available
-                _graph = code_graph
-                if _graph is None and kb_context_builder is not None:
-                    _graph = getattr(kb_context_builder, "_graph", None)
+                # ── No inline code (or inline was truncated) ──
+                # Phase 2: If the planner's inline code was truncated (token
+                # limit), _partial_inline_code holds what was written before
+                # the cut-off.  Two strategies:
+                #
+                #   1. Trivial close: if unmatched braces/parens are small
+                #      (≤2 each), close them deterministically — 0 LLM calls.
+                #   2. Partial hint: inject the partial code into coder context
+                #      so the coder completes rather than regenerates cold.
+                #      Skip reviewer (static-only) since the base was planner-
+                #      written and only the tail needs filling.
+                _partial = getattr(plan_step, '_partial_inline_code', None) if plan_step else None
+                _used_trivial_close = False
 
-                # Look ahead: skip LLM review if a TEST step follows
-                if all_plan_steps is not None:
-                    _has_test_after = any(
-                        s.step_type == "TEST" for s in all_plan_steps
-                        if s.index > step_idx
+                if _partial:
+                    _closed = _try_trivial_close(_partial, language)
+                    if _closed is not None:
+                        # Strategy 1: lint first, write only if clean
+                        from .dependency_check import clean_diff_markers as _clean_diff_trunc
+                        _closed = {p: _clean_diff_trunc(c) for p, c in _closed.items()}
+                        from .step_handlers import _quick_offline_lint, _validate_import_paths
+                        _trunc_lint = _quick_offline_lint(_closed)
+                        _trunc_imp = _validate_import_paths(_closed, memory)
+                        if not _trunc_lint and not _trunc_imp:
+                            # Lint clean — write and accept
+                            _trunc_subproject = _detect_subproject_root(memory)
+                            if _trunc_subproject:
+                                _closed = _prefix_subproject_paths(
+                                    _closed, _trunc_subproject, memory)
+                            executor.write_files(_closed)
+                            memory.update(_closed)
+                            display.step_tokens(step_idx, 0, 0)
+                            display.step_info(
+                                step_idx,
+                                "[Inline/trunc] Trivially closed truncated code (0 LLM calls)",
+                            )
+                            _logger.info(
+                                "[Inline/trunc] Step %s: trivial close succeeded for %s",
+                                plan_step.id if plan_step else step_idx,
+                                list(_closed.keys()),
+                            )
+                            _used_trivial_close = True
+                            success, error_info = True, ""
+                        else:
+                            _logger.info(
+                                "[Inline/trunc] Trivial close lint failed for step %s "
+                                "— falling through to coder with partial hint",
+                                plan_step.id if plan_step else step_idx,
+                            )
+
+                if _partial and not _used_trivial_close:
+                    # Strategy 2: inject partial code as completion hint
+                    _logger.info(
+                        "[Inline/trunc] Step %s: using partial code as coder hint (%d file(s))",
+                        plan_step.id if plan_step else step_idx,
+                        len(_partial),
                     )
-                else:
-                    _test_keywords = re.compile(
-                        r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
-                        re.IGNORECASE,
-                    )
-                    _has_test_after = any(
-                        _test_keywords.search(steps[j])
-                        for j in range(step_idx + 1, len(steps))
+                    display.step_info(
+                        step_idx,
+                        "[Inline/trunc] Completing truncated inline code via coder hint",
                     )
 
-                success, error_info = _handle_code_step(
-                    step_text, coder, reviewer, executor,
-                    task, memory, display, step_idx, language=language, cfg=cfg,
-                    auto=auto, code_graph=_graph,
-                    project_profile=project_profile,
-                    skip_review=_has_test_after,
-                    project_context=project_context,
-                    plan_step=plan_step,
-                    all_plan_steps=all_plan_steps,
-                    kb_context_builder=kb_context_builder)
+                if not _used_trivial_close:
+                    # Extract code graph from kb_context_builder if available
+                    _graph = code_graph
+                    if _graph is None and kb_context_builder is not None:
+                        _graph = getattr(kb_context_builder, "_graph", None)
+
+                    # Look ahead: skip LLM review if a TEST step follows OR
+                    # if we are completing partial planner code (base was correct)
+                    if all_plan_steps is not None:
+                        _has_test_after = any(
+                            s.step_type == "TEST" for s in all_plan_steps
+                            if s.index > step_idx
+                        )
+                    else:
+                        _test_keywords = re.compile(
+                            r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
+                            re.IGNORECASE,
+                        )
+                        _has_test_after = any(
+                            _test_keywords.search(steps[j])
+                            for j in range(step_idx + 1, len(steps))
+                        )
+
+                    # Partial hint: skip reviewer — coder is only completing tail
+                    _skip_review_for_partial = bool(_partial and not _used_trivial_close)
+
+                    success, error_info = _handle_code_step(
+                        step_text, coder, reviewer, executor,
+                        task, memory, display, step_idx, language=language, cfg=cfg,
+                        auto=auto, code_graph=_graph,
+                        project_profile=project_profile,
+                        skip_review=_has_test_after or _skip_review_for_partial,
+                        project_context=project_context,
+                        plan_step=plan_step,
+                        all_plan_steps=all_plan_steps,
+                        kb_context_builder=kb_context_builder,
+                        partial_inline_code=_partial,
+                    )
 
         elif step_type == "TEST":
             # ── Inline test fast path ──
