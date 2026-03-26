@@ -25,8 +25,10 @@ agentchanti kb search "<query>" --filter language=python
 
 Phase 3 — Global Knowledge Base
 agentchanti kb update                       -- pull latest from GitHub registry
+agentchanti kb update --version 1.2.3       -- download a specific version
 agentchanti kb update --category errors     -- update specific category only
 agentchanti kb update --check               -- check for updates, don't download
+agentchanti kb update --check --version 1.2.3 -- check a specific version
 agentchanti kb clean                        -- remove all global KB data for fresh start
 agentchanti kb clean --force                -- skip confirmation prompt
 agentchanti kb version                      -- show current global KB version
@@ -684,10 +686,12 @@ def _cmd_update(args: argparse.Namespace) -> None:
 
     check_only = getattr(args, "check", False)
     category = getattr(args, "category", None)
+    version = getattr(args, "version", None)
 
     if check_only:
-        print(f"Checking for updates from {owner}/{repo}...")
-        status = check_for_updates(owner, repo)
+        version_label = f"v{version}" if version else "latest"
+        print(f"Checking for updates from {owner}/{repo} ({version_label})...")
+        status = check_for_updates(owner, repo, version=version)
         print(f"\n  Current version : {status.current_version}")
         print(f"  Latest version  : {status.latest_version}")
         if status.update_available:
@@ -698,10 +702,11 @@ def _cmd_update(args: argparse.Namespace) -> None:
             print(f"  You are up to date.")
         return
 
-    print(f"Downloading update from {owner}/{repo}...")
+    version_label = f"v{version}" if version else "latest"
+    print(f"Downloading update from {owner}/{repo} ({version_label})...")
     categories = [category] if category else None
     try:
-        summary = download_update(owner, repo, categories=categories)
+        summary = download_update(owner, repo, version=version, categories=categories)
         print(
             f"\nUpdate complete:\n"
             f"  Version        : {summary['version']}\n"
@@ -880,7 +885,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # --- update ---
     update_p = subparsers.add_parser(
-        "update", help="Pull latest updates from GitHub registry"
+        "update", help="Pull updates from GitHub registry"
     )
     update_p.add_argument(
         "--check", action="store_true",
@@ -889,6 +894,10 @@ def _build_parser() -> argparse.ArgumentParser:
     update_p.add_argument(
         "--category", default=None,
         help="Update only a specific category (errors, patterns, adrs, docs, behavioral)",
+    )
+    update_p.add_argument(
+        "--version", dest="version", default=None, metavar="VERSION",
+        help="Specific version to download (e.g. 1.2.3). Defaults to latest.",
     )
     update_p.set_defaults(func=_cmd_update)
 

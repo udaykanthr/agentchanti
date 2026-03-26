@@ -315,11 +315,13 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         if in_code_block:
             # Structural markers end the code block implicitly
             # (handles LLM omitting ---file-content-end---)
+            # Mark as truncated — proper close uses ---file-content-end---
             if line.upper() in ("==END==",) or _STEP_RE.match(line):
                 in_code_block = False
                 in_markdown_fence = False
                 if current is not None and code_lines:
                     _assign_inline_code(current, code_lines)
+                    current._inline_truncated = True  # type: ignore[attr-defined]
                 code_lines = []
                 # Fall through to process this line normally
             else:
@@ -518,9 +520,13 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                     continue
             desc_lines.append(line)
 
-    # Flush any open inline code block
+    # Flush any open inline code block.
+    # If the code block was never closed (no ---file-content-end---, ==END==,
+    # or next --STEP marker), the LLM output was truncated.  Assign what we
+    # have but mark the step so validate_plan() can clear it.
     if in_code_block and current is not None and code_lines:
         _assign_inline_code(current, code_lines)
+        current._inline_truncated = True  # type: ignore[attr-defined]
 
     # Flush last step
     if current is not None:
@@ -634,35 +640,108 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
                     # Not an error — could be an existing project file
                     pass
 
-    # Check inline code imports: if inline code contains local imports
-    # (e.g. import './Hero.css'), verify that some step produces the file.
-    # Strip unresolvable imports to prevent broken builds.
-    import re as _re
-    _local_import_re = _re.compile(
-        r"""(?:import\s+.*?from\s+|import\s+)['"](\.[^'"]+)['"]""",
-    )
-    _css_import_re = _re.compile(
-        r"""@import\s+['"](\.[^'"]+)['"]""",
-    )
+    # Check inline code for truncation: if the parser never saw a closing
+    # marker (---file-content-end---, ==END==, or next --STEP), the LLM
+    # output was cut off.  Clear inline_code so the coder path handles it.
+    import os as _os
     for step in steps:
         if not step.inline_code:
             continue
-        for fpath, code in list(step.inline_code.items()):
-            # Determine the directory context of this file
-            import os as _os
+        if getattr(step, "_inline_truncated", False):
+            step.inline_code.clear()
+            errors.append(
+                f"Step {step.id}: inline code was truncated (no closing marker) "
+                f"— cleared, will use coder LLM call instead"
+            )
+            continue
+
+    # Check inline code imports: if inline code contains local imports
+    # (e.g. import './Hero.css'), verify that some step produces the file.
+    # When a dangling import is found, clear the entire step's inline_code
+    # so the regular coder path handles it — the coder can generate both the
+    # component AND the missing file with full KB/memory context.
+    import re as _re
+
+    # Language-specific local import patterns (group 1 = the import path)
+    _IMPORT_PATTERNS: dict[str, list[_re.Pattern]] = {
+        # JS/TS: import X from './Y'  |  import './Y'
+        "js": [
+            _re.compile(r"""(?:import\s+.*?from\s+|import\s+)['"](\.[^'"]+)['"]"""),
+            _re.compile(r"""@import\s+['"](\.[^'"]+)['"]"""),   # CSS @import
+            _re.compile(r"""require\s*\(\s*['"](\.[^'"]+)['"]\s*\)"""),  # CJS require
+        ],
+        # Python: from .module import X  |  from . import module
+        "py": [
+            _re.compile(r"""from\s+(\.[\w.]+)\s+import"""),
+        ],
+        # Go: import "./pkg"  |  in import block
+        "go": [
+            _re.compile(r"""(?:import\s+|")(\./[^"]+)"""),
+        ],
+        # Rust: mod submodule;  (local module declaration)
+        "rs": [
+            _re.compile(r"""mod\s+(\w+)\s*;"""),
+        ],
+    }
+
+    # Map file extensions to pattern keys
+    _EXT_TO_PATTERN_KEY = {
+        ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+        ".ts": "js", ".tsx": "js",
+        ".css": "js",   # CSS uses @import
+        ".py": "py",
+        ".go": "go",
+        ".rs": "rs",
+    }
+
+    # Extension candidates per language when import has no extension
+    _EXT_CANDIDATES = {
+        "js": [".js", ".jsx", ".ts", ".tsx", ".css", ".mjs"],
+        "py": [".py"],
+        "go": [".go"],
+        "rs": [".rs"],
+    }
+
+    for step in steps:
+        if not step.inline_code:
+            continue
+        has_dangling = False
+        for fpath, code in step.inline_code.items():
+            if has_dangling:
+                break
+            ext = _os.path.splitext(fpath)[1].lower()
+            pattern_key = _EXT_TO_PATTERN_KEY.get(ext)
+            if not pattern_key:
+                continue
+            patterns = _IMPORT_PATTERNS.get(pattern_key, [])
             file_dir = _os.path.dirname(fpath)
-            for pat in (_local_import_re, _css_import_re):
+            for pat in patterns:
+                if has_dangling:
+                    break
                 for m in pat.finditer(code):
                     imp_path = m.group(1)
-                    # Resolve relative to the file's directory
+                    # Python relative imports use dots: from .models import X
+                    if pattern_key == "py" and imp_path.startswith("."):
+                        # Convert .models to ./models for path resolution
+                        dotless = imp_path.lstrip(".")
+                        depth = len(imp_path) - len(dotless)
+                        base = file_dir
+                        for _ in range(depth - 1):
+                            base = _os.path.dirname(base)
+                        imp_path = "./" + dotless.replace(".", "/")
+                    # Rust mod X; → ./X.rs or ./X/mod.rs
+                    if pattern_key == "rs":
+                        imp_path = "./" + imp_path
                     resolved = _os.path.normpath(
                         _os.path.join(file_dir, imp_path)
                     ).replace("\\", "/")
-                    # Check all possible extensions
                     candidates = [resolved]
                     if not _os.path.splitext(resolved)[1]:
-                        for ext in (".js", ".jsx", ".ts", ".tsx", ".css"):
-                            candidates.append(resolved + ext)
+                        for cand_ext in _EXT_CANDIDATES.get(pattern_key, []):
+                            candidates.append(resolved + cand_ext)
+                        # Rust: mod X → X/mod.rs
+                        if pattern_key == "rs":
+                            candidates.append(resolved + "/mod.rs")
                     is_produced = any(
                         c in produced_files or any(
                             c == tf or tf.endswith("/" + _os.path.basename(c))
@@ -674,14 +753,14 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
                         _os.path.basename(c) in _os.path.basename(tf)
                         for c in candidates for tf in produced_files
                     ):
-                        # Strip the dangling import from inline code
-                        step.inline_code[fpath] = code.replace(
-                            m.group(0) + ";", ""
-                        ).replace(m.group(0), "")
-                        errors.append(
-                            f"Step {step.id}: inline code in '{fpath}' imports "
-                            f"'{imp_path}' but no step produces it — import removed"
-                        )
+                        has_dangling = True
+                        break
+        if has_dangling:
+            step.inline_code.clear()
+            errors.append(
+                f"Step {step.id}: inline code imports a file no step produces "
+                f"— cleared inline_code, will use coder LLM call instead"
+            )
 
     # Check for circular dependencies
     if _has_cycle(steps):
