@@ -4058,6 +4058,17 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         step_idx=step_idx,
     )
 
+    # ── Skip test generation when all tests already pass ──
+    # If the baseline run succeeded (all tests green) and there are no
+    # new source files tracked in memory (i.e. this is a pure verification
+    # step, not a code-then-test step), skip the TesterAgent entirely and
+    # just run the test suite directly.
+    if getattr(memory, '_tester_baseline_success', False) and not memory.all_files():
+        display.step_info(step_idx, "All tests already passing — running suite directly (skipping generation).")
+        log.info(f"Step {step_idx+1}: Baseline passed and no new source files — skipping test generation.")
+        ok, out = executor.run_tests(test_cmd, cwd=subproject_cwd)
+        return ok, out
+
     feedback = ""
     last_test_output = ""
     prev_gen_error = None  # Track errors across gen attempts for early exit
@@ -4331,6 +4342,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             if success:
                 display.step_info(
                     step_idx, f"{f_basename} passed ✔ ({file_idx}/{file_count})")
+                display.record_test_result(test_path, passed=1, total=1, failures=[])
                 continue
 
             # ── System / env checks (shared across files, run once) ──
@@ -4519,6 +4531,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         step_idx,
                         f"{f_basename} passed after fix ✔ "
                         f"({file_idx}/{file_count})")
+                    display.record_test_result(test_path, passed=1, total=1, failures=[])
                     file_fixed = True
                     break
 
@@ -4539,6 +4552,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 log.warning(
                     f"Step {step_idx+1}: [{f_basename}] still failing "
                     f"after {MAX_STEP_RETRIES} fixes.")
+                # Extract top failure names from last output for display
+                _fail_names: list[dict] = []
+                if output:
+                    for _m in re.finditer(
+                        r'(?:FAILED\s+|×\s+|✕\s+|✗\s+|--- FAIL:\s*)(\S+)',
+                        _ANSI_RE.sub('', output)
+                    ):
+                        _fail_names.append({"name": _m.group(1), "message": ""})
+                        if len(_fail_names) >= 5:
+                            break
+                display.record_test_result(test_path, passed=0, total=1,
+                                           failures=_fail_names)
 
         # ── Summary ──
         if not failed_files:

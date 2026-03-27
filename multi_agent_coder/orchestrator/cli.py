@@ -1046,12 +1046,14 @@ def main():
             if not pipeline_success:
                 break
 
-    # ── 13.5. Final cross-step test verification ──
-    # Re-run all session test files together to catch regressions where a
-    # source fix in step N broke tests that already passed in step M.
+    # ── 13.5. Bulk test execution + per-file fix ──
+    # All TEST steps with inline code deferred their runs until now so that:
+    #   • parallel wave steps don't race to run the full suite simultaneously
+    #   • source fixes for one test can't break another before it's verified
+    # Run all test files once; fix failing ones one at a time; final run-all.
     if pipeline_success:
-        from .pipeline import run_final_test_verification
-        verif_ok, verif_err = run_final_test_verification(
+        from .pipeline import run_bulk_test_execution_and_fix
+        verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
             coder=coder,
@@ -1064,7 +1066,7 @@ def main():
         )
         if not verif_ok:
             pipeline_success = False
-            log.warning(f"[FinalVerify] Pipeline marked failed: {verif_err[:200]}")
+            log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

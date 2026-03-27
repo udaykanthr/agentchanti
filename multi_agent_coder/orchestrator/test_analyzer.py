@@ -348,4 +348,5 @@ def perform_baseline_test_analysis(
     summary = "\n".join(analysis_lines)
     memory._tester_pre_analysis_done = True
     memory._tester_pre_analysis_summary = summary
+    memory._tester_baseline_success = success
     return summary

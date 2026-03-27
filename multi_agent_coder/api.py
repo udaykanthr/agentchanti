@@ -521,12 +521,11 @@ def _run_task_impl(
         if not pipeline_success:
             break
 
-    # ── Final cross-step test verification ──
-    # Re-run all session test files together to catch regressions where a
-    # source fix in step N broke tests that already passed in step M.
+    # ── Bulk test execution + per-file fix ──
+    # All inline TEST steps deferred their runs — execute once here.
     if pipeline_success:
-        from .orchestrator.pipeline import run_final_test_verification
-        verif_ok, verif_err = run_final_test_verification(
+        from .orchestrator.pipeline import run_bulk_test_execution_and_fix
+        verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
             coder=coder,
@@ -539,7 +538,7 @@ def _run_task_impl(
         )
         if not verif_ok:
             pipeline_success = False
-            log.warning(f"[FinalVerify] Pipeline marked failed: {verif_err[:200]}")
+            log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
 
     # Stop KB runtime watcher
     if kb_runtime_watcher is not None:

@@ -828,31 +828,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                             f"{len(_changed_test)} file(s)",
                         )
 
-                # Verify the inline tests actually pass — if they fail, fall
-                # back to the full _handle_test_step loop which can diagnose
-                # and fix the failure (e.g. the error is in a source file).
-                from .step_handlers import _read_js_project_env
-                from ..language import get_test_framework as _gtf
-                _inline_subproject_cwd = _detect_subproject_root(memory)
-                _js_env_inline = _read_js_project_env(_inline_subproject_cwd) if language in ("javascript", "typescript") else {}
-                _test_runner_inline = _js_env_inline.get("test_runner")
-                _fw_inline = _gtf(language or "python", test_runner=_test_runner_inline)
-                _verify_ok, _verify_out = executor.run_tests(
-                    _fw_inline["command"], cwd=_inline_subproject_cwd)
-                if not _verify_ok:
-                    display.step_info(
-                        step_idx,
-                        "[Inline/test] Inline tests failed after write — falling back to fix loop",
-                    )
-                    success, error_info = _handle_test_step(
-                        step_text, tester, coder, reviewer, executor,
-                        task, memory, display, step_idx, language=language,
-                        auto=auto, search_agent=search_agent,
-                        project_context=project_context,
-                        kb_context_builder=kb_context_builder,
-                        plan_step=plan_step,
-                        all_plan_steps=all_plan_steps,
-                        project_profile=project_profile)
+                # Defer test execution — all TEST steps write their files
+                # first; a single bulk run happens after all waves complete.
+                # This avoids redundant parallel runs when multiple TEST steps
+                # are in the same wave and prevents source-fixes for one test
+                # from breaking another test that hasn't run yet.
+                display.step_info(
+                    step_idx,
+                    "[Inline/test] Test files written — execution deferred to bulk run",
+                )
             else:
                 success, error_info = _handle_test_step(
                     step_text, tester, coder, reviewer, executor,
@@ -1436,4 +1420,248 @@ def run_final_test_verification(
         f"did not all pass together after source fixes.\n{last_output[:600]}"
     )
     print(f"  [FinalVerify] FAILED — cross-step regression detected.")
+    return False, error_msg
+
+
+# ---------------------------------------------------------------------------
+# Bulk test execution and per-file fix (replaces per-step inline test runs)
+# ---------------------------------------------------------------------------
+
+_MAX_BULK_TEST_FIX_ATTEMPTS = 3
+
+
+def _parse_failed_test_files(output: str, known_test_files: list[str]) -> list[str]:
+    """Parse test runner output to find which test files failed.
+
+    Matches FAIL lines from vitest/jest/pytest against the known test files
+    written during the session.  Returns a list of matching file paths.
+    """
+    from .step_handlers import _ANSI_RE
+    clean = _ANSI_RE.sub('', output)
+    failed: list[str] = []
+    for fpath in known_test_files:
+        basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        # vitest/jest: " FAIL src/__tests__/Foo.test.jsx"
+        # pytest:      "FAILED tests/test_foo.py::test_bar"
+        if re.search(
+            r'(?:^|\s)(?:FAIL(?:ED)?)\s.*' + re.escape(basename),
+            clean,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            failed.append(fpath)
+    # Fallback: if we couldn't identify specific files but tests failed,
+    # treat all known test files as candidates
+    if not failed and output:
+        failed = list(known_test_files)
+    return failed
+
+
+def run_bulk_test_execution_and_fix(
+    *,
+    memory: FileMemory,
+    executor,
+    coder,
+    display: CLIDisplay,
+    language: str | None,
+    task: str,
+    cfg=None,
+    project_context=None,
+    kb_context_builder=None,
+) -> tuple[bool, str]:
+    """Run all session test files in a single bulk execution, then fix failures
+    one test file at a time.
+
+    This replaces the per-step inline test runs that used to fire immediately
+    after each TEST step wrote its files.  By deferring execution until all
+    test files are written:
+
+      - Parallel TEST steps in the same wave no longer race to run the full
+        suite simultaneously.
+      - A source-file fix for one failing test cannot break another test
+        before it has been verified.
+      - Total LLM calls are reduced because a single diagnosis loop handles
+        all failures rather than one loop per step.
+
+    Fix strategy: run all tests → collect failed files → for each failed file
+    ask the coder to fix it (or its imported source) → re-run that single file
+    → move to the next.  A final run-all confirms everything passes.
+
+    Returns ``(success, error_info)``.
+    """
+    from ..language import get_test_framework, detect_language_from_files
+    from .step_handlers import (
+        _extract_file_specific_errors,
+        _extract_imported_sources,
+        _ANSI_RE,
+    )
+
+    all_files = memory.all_files()
+    test_files = {
+        fpath: content
+        for fpath, content in all_files.items()
+        if _is_test_file(fpath) and not fpath.startswith("_")
+    }
+
+    if not test_files:
+        _logger.info("[BulkTest] No test files found — skipping bulk run.")
+        return True, ""
+
+    _logger.info(
+        "[BulkTest] Running bulk test execution on %d file(s): %s",
+        len(test_files), list(test_files.keys()),
+    )
+    print(f"\n  [BulkTest] Running all {len(test_files)} test file(s)...")
+
+    # Detect test command
+    subproject_cwd = _detect_subproject_root(memory)
+    lang = language
+    if lang is None:
+        lang = detect_language_from_files(list(test_files.keys()))
+
+    fw = get_test_framework(lang) if lang else get_test_framework("python")
+    base_cmd = fw["command"]
+
+    # Vitest override (mirrors run_final_test_verification detection logic)
+    if "jest" in base_cmd.lower():
+        uses_vitest = any(
+            "from 'vitest'" in c or 'from "vitest"' in c
+            for c in test_files.values()
+        )
+        if not uses_vitest:
+            _vitest_cfgs = (
+                "vitest.config.js", "vitest.config.ts",
+                "vitest.config.mjs", "vitest.config.mts",
+            )
+            uses_vitest = any(
+                any(f.endswith(vc) for vc in _vitest_cfgs)
+                for f in all_files
+            )
+        if not uses_vitest:
+            pkg_content = next(
+                (c for f, c in all_files.items() if f.endswith("package.json")),
+                "",
+            )
+            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
+        if uses_vitest:
+            base_cmd = "npx vitest run"
+            _logger.info("[BulkTest] Overriding to vitest")
+
+    # ── Step 1: Run all tests ──
+    ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
+    if ok:
+        _logger.info("[BulkTest] All tests passed on first run.")
+        print("  [BulkTest] All tests passed.")
+        return True, ""
+
+    _logger.warning("[BulkTest] Tests failed:\n%s", output[:1000])
+
+    # ── Step 2: Fix one failing test file at a time ──
+    failed_files = _parse_failed_test_files(output, list(test_files.keys()))
+    _logger.info("[BulkTest] Failed test files: %s", failed_files)
+    print(f"  [BulkTest] {len(failed_files)} test file(s) failed — fixing one at a time...")
+
+    lang_tag = lang or "python"
+
+    for test_path in failed_files:
+        basename = test_path.rsplit('/', 1)[-1]
+        print(f"  [BulkTest] Fixing {basename}...")
+
+        current_output = output  # use full output for first attempt
+
+        for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
+            # Extract error relevant to this file
+            file_error = _extract_file_specific_errors(
+                current_output, test_path, max_chars=3000)
+            if not file_error:
+                file_error = current_output[:3000]
+
+            # Build source context for this test file
+            current_content = memory.all_files().get(test_path, "")
+            imported_sources = _extract_imported_sources(
+                {test_path: current_content}, memory)
+
+            source_ctx = (
+                f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
+            )
+            for fp, cnt in imported_sources.items():
+                source_ctx += (
+                    f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
+                )
+
+            # Optionally inject KB guidance
+            kb_instructions = ""
+            if kb_context_builder is not None:
+                try:
+                    from ..kb.context_builder import ContextBuilder
+                    kb_ctx = kb_context_builder.build_context(
+                        task_description=task,
+                        current_file=test_path,
+                        max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
+                        language=lang,
+                        step_type="TEST",
+                    )
+                    kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
+                    if kb_text:
+                        kb_instructions = f"\n\nKnowledge base guidance:\n{kb_text}"
+                except Exception:
+                    pass
+
+            fix_prompt = (
+                f"Task: {task}\n\n"
+                f"Test file `{test_path}` failed. Fix it so the tests pass.\n\n"
+                f"Error output:\n{file_error}\n\n"
+                f"Relevant files:\n{source_ctx}"
+                f"{kb_instructions}\n\n"
+                "You may fix the test file itself OR fix a source file it imports — "
+                "whichever is correct.  Do NOT remove any existing tests.\n\n"
+                "Output ONLY the complete fixed file(s) using this exact format:\n"
+                f"#### [FILE]: path/to/file\n```{lang_tag}\n...full content...\n```"
+            )
+
+            try:
+                fix_response = coder.llm_client.generate_response(fix_prompt)
+                fix_files = executor.parse_code_blocks(fix_response)
+                if not fix_files:
+                    fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                if fix_files:
+                    executor.write_files(fix_files)
+                    memory.update(fix_files)
+                    _logger.info(
+                        "[BulkTest] Applied fixes for %s: %s",
+                        basename, list(fix_files.keys()),
+                    )
+            except Exception as exc:
+                _logger.warning("[BulkTest] Fix generation failed for %s: %s", basename, exc)
+                break
+
+            # Re-run this single file
+            single_cmd = _build_scoped_test_cmd(
+                base_cmd, {test_path: ""}, subproject_cwd)
+            ok_single, current_output = executor.run_command(
+                single_cmd, cwd=subproject_cwd)
+            if ok_single:
+                _logger.info("[BulkTest] %s now passes.", basename)
+                print(f"  [BulkTest] {basename} fixed ✔")
+                break
+            _logger.warning(
+                "[BulkTest] %s still failing (attempt %d/%d)",
+                basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+            )
+        else:
+            print(f"  [BulkTest] {basename} could not be fixed after "
+                  f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
+
+    # ── Step 3: Final run-all to confirm everything passes ──
+    ok_final, output_final = executor.run_command(base_cmd, cwd=subproject_cwd)
+    if ok_final:
+        _logger.info("[BulkTest] Final run-all passed.")
+        print("  [BulkTest] All tests pass after fixes.")
+        return True, ""
+
+    error_msg = (
+        f"Bulk test execution failed: some test file(s) still failing "
+        f"after per-file fix attempts.\n{output_final[:600]}"
+    )
+    _logger.warning("[BulkTest] Final run-all failed:\n%s", output_final[:600])
+    print("  [BulkTest] FAILED — some tests still failing after fixes.")
     return False, error_msg
