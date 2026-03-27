@@ -763,7 +763,7 @@ def _match_target(name: str, targets: list[str]) -> Optional[str]:
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_plan(steps: list[PlanStep]) -> list[str]:
+def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> list[str]:
     """Validate a parsed plan for structural correctness.
 
     Returns a list of error messages (empty = valid).
@@ -912,12 +912,19 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
                         )
                         for c in candidates
                     )
-                    if not is_produced and not any(
+                    if is_produced:
+                        continue
+                    if any(
                         _os.path.basename(c) in _os.path.basename(tf)
                         for c in candidates for tf in produced_files
                     ):
-                        has_dangling = True
-                        break
+                        continue
+                    # Also accept files that already exist on disk
+                    _base = working_dir or _os.getcwd()
+                    if any(_os.path.exists(_os.path.join(_base, c)) for c in candidates):
+                        continue
+                    has_dangling = True
+                    break
         if has_dangling:
             step.inline_code.clear()
             errors.append(

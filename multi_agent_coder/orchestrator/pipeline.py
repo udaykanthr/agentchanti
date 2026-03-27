@@ -560,6 +560,12 @@ def _execute_step(step_idx: int, step_text: str, *,
                     for path, content in _inline_files.items()
                 }
 
+                # Capture which targets already exist before overwriting
+                import os as _os_inline
+                _existing_inline_targets = {
+                    p for p in _inline_files if _os_inline.path.exists(p)
+                }
+
                 executor.write_files(_inline_files)
                 memory.update(_inline_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -607,12 +613,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                 # ── Inline code quality gate (Phase 1) ──
                 # The planner wrote this code WITH full KB context, so it is
                 # typically correct.  We avoid unconditional reviewer LLM calls
-                # and instead apply a 3-tier static gate:
+                # and instead apply a tiered gate:
                 #
                 #   Tier A: TEST-step lookahead — tests will validate; skip all.
                 #   Tier B: Static lint + import checks (free, no LLM).
                 #           Fail → fall back to Coder+Reviewer loop.
-                #   Tier C: All clear → done.  The post-step dependency check
+                #   Tier C: Existing-file rewrite + full review mode → run
+                #           Reviewer LLM to verify the overwrite is correct.
+                #           Fail → fall back to Coder+Reviewer loop.
+                #   Tier D: All clear → done.  The post-step dependency check
                 #           (run_dependency_check at line ~830) already handles
                 #           orphaned exports and wiring via its own LLM fix path.
                 _has_test_after_inline = False
@@ -664,14 +673,108 @@ def _execute_step(step_idx: int, step_text: str, *,
                             kb_context_builder=kb_context_builder,
                         )
                     else:
-                        # Tier C: Static clean — accept inline code as-is.
-                        # Dependency wiring (orphaned exports) is handled by
-                        # run_dependency_check after this block completes.
-                        _logger.info(
-                            "[Inline] Static checks passed for step %s — "
-                            "accepted (0 reviewer LLM calls)",
-                            plan_step.id if plan_step else step_idx,
+                        # Tier C: Existing-file rewrite — run Reviewer when in
+                        # full review mode so overwritten files are verified.
+                        _inline_review_mode = "static"
+                        if cfg is not None:
+                            _inline_review_mode = getattr(
+                                cfg, "REVIEW_MODE", "static"
+                            )
+                        _should_review_inline = (
+                            _inline_review_mode == "full"
+                            and bool(_existing_inline_targets)
                         )
+                        if _should_review_inline:
+                            display.step_info(
+                                step_idx,
+                                f"[Inline] Reviewing overwrite of "
+                                f"{len(_existing_inline_targets)} existing "
+                                f"file(s) via Reviewer...",
+                            )
+                            _inline_review_code = "\n\n".join(
+                                f"#### {p}\n```\n{_inline_files[p]}\n```"
+                                for p in _existing_inline_targets
+                                if p in _inline_files
+                            )
+                            _kb_ctx_inline = getattr(memory, "_kb_context", "")
+                            _reviewer_kb_inline = (
+                                f"\n\n[KB Documentation — trust this over your "
+                                f"training data]\n{_kb_ctx_inline}\n"
+                                if _kb_ctx_inline else ""
+                            )
+                            _inline_review_resp = reviewer.process(
+                                f"Review this inline code for the step: "
+                                f"{step_text}\n\n{_inline_review_code}",
+                                context=(
+                                    f"Step: {step_text}\n"
+                                    f"This code replaces existing file(s). "
+                                    f"Verify the replacement is complete and "
+                                    f"correct."
+                                    f"{_reviewer_kb_inline}"
+                                ),
+                                language=language,
+                            )
+                            _inline_review_lower = (
+                                _inline_review_resp or ""
+                            ).lower()
+                            _inline_approved = any(
+                                phrase in _inline_review_lower for phrase in (
+                                    "code looks good", "looks good",
+                                    "no issues", "no critical issues",
+                                    "no bugs found", "code is correct",
+                                    "functionally correct", "lgtm",
+                                )
+                            )
+                            if _inline_approved:
+                                display.step_info(
+                                    step_idx,
+                                    "[Inline] Reviewer approved existing-file "
+                                    "rewrite ✔",
+                                )
+                                _logger.info(
+                                    "[Inline] Reviewer approved inline rewrite "
+                                    "for step %s",
+                                    plan_step.id if plan_step else step_idx,
+                                )
+                            else:
+                                display.step_info(
+                                    step_idx,
+                                    "[Inline] Reviewer flagged issues — "
+                                    "falling back to Coder+Reviewer loop",
+                                )
+                                _logger.info(
+                                    "[Inline] Reviewer rejected inline rewrite "
+                                    "for step %s — falling back: %s",
+                                    plan_step.id if plan_step else step_idx,
+                                    (_inline_review_resp or "")[:200],
+                                )
+                                _graph_inline = code_graph
+                                if _graph_inline is None and kb_context_builder is not None:
+                                    _graph_inline = getattr(
+                                        kb_context_builder, "_graph", None
+                                    )
+                                success, error_info = _handle_code_step(
+                                    step_text, coder, reviewer, executor,
+                                    task, memory, display, step_idx,
+                                    language=language, cfg=cfg,
+                                    auto=auto, code_graph=_graph_inline,
+                                    project_profile=project_profile,
+                                    skip_review=_has_test_after_inline,
+                                    project_context=project_context,
+                                    plan_step=plan_step,
+                                    all_plan_steps=all_plan_steps,
+                                    kb_context_builder=kb_context_builder,
+                                )
+                        else:
+                            # Tier D: Static clean, no existing-file rewrite
+                            # concern — accept inline code as-is.
+                            # Dependency wiring (orphaned exports) is handled
+                            # by run_dependency_check after this block.
+                            _logger.info(
+                                "[Inline] Static checks passed for step %s — "
+                                "accepted (0 reviewer LLM calls)",
+                                plan_step.id if plan_step else step_idx,
+                            )
             else:
                 # ── No inline code (or inline was truncated) ──
                 # Phase 2: If the planner's inline code was truncated (token

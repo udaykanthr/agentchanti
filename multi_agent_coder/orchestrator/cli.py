@@ -693,7 +693,7 @@ def main():
         if args.auto:
             log.info(f"Auto-approved {len(steps)} steps (--auto mode)")
         while not args.auto:
-            display.stop_spinner()
+            display.pause()  # stop Rich Live so print()/input() are visible
             # Reattach dependency markers so they are visible and editable in TUI
             display_steps = []
             for i, step in enumerate(steps):
@@ -709,6 +709,7 @@ def main():
             if action == "approve":
                 break
             elif action == "replan":
+                display.resume()  # restart Live for spinner during replan
                 display.show_status("Re-planning...")
                 plan = planner.process(args.task, context=planner_context)
                 log.info(f"Re-plan:\n{plan}")
@@ -781,6 +782,7 @@ def main():
                     else:
                         plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
+        display.resume()  # restart Live after approval loop exits
         display.set_steps(steps)
         display.render()
         log.info(f"Approved {len(steps)} steps.")
