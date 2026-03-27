@@ -266,6 +266,10 @@ def perform_baseline_test_analysis(
     # task (allow updating passing tests to cover new code).
     _is_test_fix = task_intent in ("test", "bug_fix")
 
+    # Track file lists for callers (e.g. task interpretation LLM)
+    _baseline_failing_files: list[str] = []
+    _baseline_passing_files: list[str] = []
+
     if success:
         analysis_lines.append("- All existing tests are currently PASSING.")
         if _is_test_fix:
@@ -281,6 +285,8 @@ def perform_baseline_test_analysis(
         # 2. Identify failed/passing files
         all_files = memory.all_files()
         failed_paths, passing_paths = _identify_test_files(output, all_files, language=language)
+        _baseline_failing_files = list(failed_paths)
+        _baseline_passing_files = list(passing_paths)
         total_fails = _count_test_failures(output)
 
         # Collect failed basenames for error extraction
@@ -349,4 +355,101 @@ def perform_baseline_test_analysis(
     memory._tester_pre_analysis_done = True
     memory._tester_pre_analysis_summary = summary
     memory._tester_baseline_success = success
+    # Store file lists so callers can build richer task interpretations
+    memory._tester_baseline_failing_files = _baseline_failing_files
+    memory._tester_baseline_passing_files = _baseline_passing_files
     return summary
+
+
+def analyze_task_for_planner(
+    task: str,
+    relevant_files: list[tuple[str, str, str]],
+    test_analysis: str,
+    llm_client,
+) -> str:
+    """LLM-based pre-planning analysis grounded in actual project files and test state.
+
+    *relevant_files* is a list of ``(path, reason, skeleton)`` tuples produced
+    by the keyword/KB pre-filter — only the files already deemed relevant to
+    the task, not the entire project.  This keeps the prompt focused.
+
+    *test_analysis* is the raw PRE-EXECUTION ANALYSIS text from
+    ``perform_baseline_test_analysis`` (pass/fail state, error output, etc.).
+
+    Returns a ``TASK BRIEFING`` block string, or empty string on failure.
+    The caller (``PlannerAgent.pre_analyze``) injects it as the first thing
+    the planner sees.
+    """
+    # Build the file context from pre-filtered relevant files only
+    file_section = ""
+    if relevant_files:
+        file_lines = []
+        for fpath, reason, skeleton in relevant_files:
+            file_lines.append(f"### {fpath}  ({reason})")
+            if skeleton:
+                file_lines.append(f"```\n{skeleton}\n```")
+        file_section = (
+            "RELEVANT PROJECT FILES (pre-filtered to match the task):\n"
+            + "\n".join(file_lines)
+        )
+
+    # Summarise the test state concisely for the prompt
+    test_section = ""
+    if test_analysis:
+        # Extract just the key lines (pass/fail summary + failing file names)
+        # to avoid flooding the prompt with full error output
+        summary_lines = []
+        for line in test_analysis.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("- ", "DIRECTIVE", "BROKEN", "HEALTHY",
+                                    "PRE-EXECUTION", "Baseline:")):
+                summary_lines.append(stripped)
+            if len(summary_lines) >= 10:
+                break
+        test_section = (
+            "CURRENT TEST STATE (from a live test run done seconds ago):\n"
+            + "\n".join(summary_lines)
+        )
+
+    sections = "\n\n".join(s for s in [file_section, test_section] if s)
+
+    prompt = f"""\
+You are a software project analyst preparing a briefing for an AI coding agent.
+The agent will plan and execute code changes to accomplish the user's task.
+Your job is to determine — based on the ACTUAL current project state below —
+exactly what needs to change and what must not be touched.
+
+USER TASK:
+{task}
+
+{sections}
+
+Answer these questions concisely and precisely:
+1. What is the real goal of this task (one sentence)?
+2. Which existing files need to be modified?  Name them specifically.
+3. Which new files (if any) need to be created?
+4. Which files must NOT be touched and why?
+5. What does a successful result look like?  (observable outcome, not process steps)
+6. What is the single most important constraint the coding agent must respect?
+
+Respond in this EXACT format — no extra text, no markdown outside the block:
+TASK BRIEFING:
+Goal: <one sentence>
+Modify: <specific file paths, or NONE>
+Create: <specific new file paths, or NONE>
+Do not touch: <file paths or patterns that must not change>
+Expected output: <observable result when done>
+Key constraint: <the one rule the agent must not break>
+Agent directive: <one concrete instruction for the planner>
+"""
+    try:
+        response = llm_client.generate_response(prompt)
+        if "TASK BRIEFING:" in response and "Agent directive:" in response:
+            _logger.info("[TaskBriefing] LLM briefing:\n%s", response)
+            return response.strip()
+        _logger.warning(
+            "[TaskBriefing] LLM response missing expected structure, skipping.")
+        return ""
+    except Exception as exc:
+        _logger.warning("[TaskBriefing] LLM call failed: %s", exc)
+        return ""

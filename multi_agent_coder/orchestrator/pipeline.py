@@ -179,6 +179,180 @@ def _detect_system_level_failure(error_info: str) -> str | None:
     return None
 
 
+def _infer_test_file_path(src_path: str, language: str | None) -> str:
+    """Return the conventional test-file path for *src_path*.
+
+    Examples:
+        src/components/Footer.jsx  ->  src/components/__tests__/Footer.test.jsx
+        src/utils/math.ts          ->  src/utils/__tests__/math.test.ts
+        api/views.py               ->  api/tests/test_views.py
+    """
+    src_dir = src_path.rsplit("/", 1)[0] if "/" in src_path else "."
+    basename = src_path.rsplit("/", 1)[-1]
+    stem, _, ext = basename.rpartition(".")
+
+    _ext_map: dict[str, str] = {
+        "jsx": "test.jsx", "tsx": "test.tsx",
+        "js": "test.js",   "ts": "test.ts",
+        "py": "py",        "rb": "spec.rb",
+    }
+    test_suffix = _ext_map.get(ext, f"test.{ext}")
+
+    if ext == "py":
+        return f"{src_dir}/tests/test_{stem}.{test_suffix}"
+    return f"{src_dir}/__tests__/{stem}.{test_suffix}"
+
+
+def _source_covered_by_test_step(
+    src_path: str,
+    test_step: "PlanStep",
+) -> bool:
+    """Return True if *test_step* explicitly references *src_path*.
+
+    Checks plan-declared imports and inline test-file content so that
+    both plan-parsed and LLM-inlined test specs are handled.
+    """
+    src_basename = src_path.rsplit("/", 1)[-1]
+    src_stem = src_basename.rsplit(".", 1)[0]
+
+    # Plan-declared imports (e.g. imports: src/components/Footer.jsx:default)
+    for imp_path in (test_step.imports_from or {}):
+        if src_stem in imp_path or src_basename in imp_path or src_path in imp_path:
+            return True
+
+    # Inline test code content
+    for content in (test_step.inline_code or {}).values():
+        if src_stem in content or src_basename in content:
+            return True
+
+    return False
+
+
+def _generate_test_coverage_for_inline_changes(
+    *,
+    uncovered_files: list[str],
+    before_files: dict[str, str],
+    memory: "FileMemory",
+    executor,
+    coder,
+    display: "CLIDisplay",
+    step_idx: int,
+    language: str | None,
+    plan_step: "PlanStep | None",
+) -> None:
+    """Ask the coder LLM to generate/update test files for source files
+    that have no corresponding TEST step in the plan.
+
+    Called from the Tier A inline-code path when reviewer is skipped because
+    a TEST step follows — but the specific source files changed here are NOT
+    imported by any of those TEST steps.  Without this function those changes
+    would reach the bulk test run untested.
+
+    For each uncovered source file:
+      1. Find the best matching test file already in memory (by imports or name).
+      2. Ask the LLM to add tests for the new/changed behaviour (diff context).
+      3. Write the result to memory — it will be executed by run_bulk_test_execution_and_fix.
+    """
+    from ..language import get_code_block_lang
+
+    all_files = memory.all_files()
+    lang_tag = get_code_block_lang(language) if language else "python"
+
+    for src_path in uncovered_files:
+        old_content = before_files.get(src_path, "")
+        new_content = all_files.get(src_path, "")
+        if not new_content:
+            continue
+
+        src_basename = src_path.rsplit("/", 1)[-1]
+        src_stem = src_basename.rsplit(".", 1)[0]
+
+        # ── Find best existing test file ──
+        existing_test_path: str | None = None
+        existing_test_content: str = ""
+        for fpath, content in all_files.items():
+            if not _is_test_file(fpath):
+                continue
+            if src_stem in content or src_basename in content:
+                existing_test_path = fpath
+                existing_test_content = content
+                break
+
+        target_test_path = existing_test_path or _infer_test_file_path(src_path, language)
+        action = "update" if existing_test_path else "create"
+
+        display.step_info(
+            step_idx,
+            f"[Inline] No test coverage for {src_basename} — "
+            f"{'updating' if action == 'update' else 'generating'} "
+            f"{target_test_path.rsplit('/', 1)[-1]}...",
+        )
+        _logger.info(
+            "[Inline] Generating test coverage for uncovered source %s -> %s",
+            src_path, target_test_path,
+        )
+
+        ctx = ""
+        if existing_test_content:
+            ctx = (
+                f"Existing test file (DO NOT remove any existing tests):\n"
+                f"#### [FILE]: {existing_test_path}\n"
+                f"```{lang_tag}\n{existing_test_content}\n```\n\n"
+            )
+
+        old_block = ""
+        if old_content:
+            old_block = (
+                f"Previous version of source (for reference — only test "
+                f"new/changed behaviour):\n"
+                f"```{lang_tag}\n{old_content}\n```\n\n"
+            )
+
+        prompt = (
+            f"Source file `{src_path}` was just written/updated and has "
+            f"no corresponding test step in the plan.\n\n"
+            f"New source content:\n"
+            f"#### [FILE]: {src_path}\n```{lang_tag}\n{new_content}\n```\n\n"
+            f"{old_block}"
+            f"{ctx}"
+            f"{'Add tests for the new or changed behaviour to the existing test file.'  if action == 'update' else 'Create a new test file covering the key functionality.'}\n\n"
+            f"Requirements:\n"
+            f"- Target file: `{target_test_path}`\n"
+            f"- Do NOT remove existing tests\n"
+            f"- Only test observable behaviour, not implementation details\n\n"
+            f"Output ONLY the complete test file:\n"
+            f"#### [FILE]: {target_test_path}\n```{lang_tag}\n...full content...\n```"
+        )
+
+        try:
+            response = coder.llm_client.generate_response(prompt)
+            gen_files = executor.parse_code_blocks(response)
+            if not gen_files:
+                gen_files = executor.parse_code_blocks_fuzzy(response)
+            # Accept only test files
+            gen_files = {p: c for p, c in gen_files.items() if _is_test_file(p)}
+            if gen_files:
+                executor.write_files(gen_files)
+                memory.update(gen_files)
+                _logger.info(
+                    "[Inline] Test coverage written for %s: %s",
+                    src_path, list(gen_files.keys()),
+                )
+                display.step_info(
+                    step_idx,
+                    f"[Inline] Test coverage written: "
+                    f"{', '.join(p.rsplit('/', 1)[-1] for p in gen_files)}",
+                )
+            else:
+                _logger.warning(
+                    "[Inline] LLM produced no test files for %s", src_path
+                )
+        except Exception as exc:
+            _logger.warning(
+                "[Inline] Test coverage generation failed for %s: %s", src_path, exc
+            )
+
+
 def build_step_waves(steps: list[str], dependencies: dict[int, set[int]]) -> list[list[int]]:
     """Group step indices into execution waves using topological ordering.
 
@@ -637,6 +811,41 @@ def _execute_step(step_idx: int, step_text: str, *,
                         "[Inline] Skipping review for step %s — TEST step follows",
                         plan_step.id if plan_step else step_idx,
                     )
+
+                    # ── Coverage gap check ──
+                    # A TEST step exists somewhere after this CODE step, but it
+                    # may not import the specific source files written here.
+                    # Identify any source files that no future TEST step covers
+                    # and proactively generate/update their test files so the
+                    # bulk run at end-of-pipeline exercises the new changes.
+                    _inline_sources = [
+                        p for p in _inline_files if not _is_test_file(p)
+                    ]
+                    if _inline_sources and all_plan_steps is not None:
+                        _covered: set[str] = set()
+                        for _ts in all_plan_steps:
+                            if _ts.index <= step_idx or _ts.step_type != "TEST":
+                                continue
+                            for _sp in _inline_sources:
+                                if _source_covered_by_test_step(_sp, _ts):
+                                    _covered.add(_sp)
+                        _uncovered = [p for p in _inline_sources if p not in _covered]
+                        if _uncovered:
+                            _logger.info(
+                                "[Inline] Source files with no TEST-step coverage: %s",
+                                _uncovered,
+                            )
+                            _generate_test_coverage_for_inline_changes(
+                                uncovered_files=_uncovered,
+                                before_files=_before_files or {},
+                                memory=memory,
+                                executor=executor,
+                                coder=coder,
+                                display=display,
+                                step_idx=step_idx,
+                                language=language,
+                                plan_step=plan_step,
+                            )
                 else:
                     # Tier B: Static lint + import checks
                     from .step_handlers import _quick_offline_lint, _validate_import_paths

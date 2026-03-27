@@ -452,8 +452,9 @@ def main():
                 resuming = True
                 log.info("Auto-resuming from checkpoint" if args.auto else "Resuming (--resume)")
             else:
-                display.stop_spinner()
+                display.pause()
                 resuming = CLIDisplay.prompt_resume(checkpoint_state)
+                display.resume()
 
     # ── 8. Restore state or create git checkpoint ──
     checkpoint_branch: str | None = None

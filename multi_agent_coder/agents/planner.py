@@ -211,7 +211,7 @@ class PlannerAgent(Agent):
             }
             parts.append(f"[Task Analysis] {intent_hints.get(intent, '')}")
 
-        # 2. Find and annotate relevant files
+        # 2. Find and annotate relevant files (KB search first, keyword fallback)
         relevant = _find_relevant_files(
             task, source_files, kb_context_builder, max_files=5)
 
@@ -225,6 +225,34 @@ class PlannerAgent(Agent):
                     parts.append(f"  ^ Check this file for the bug described in the task")
                 elif intent == "feature":
                     parts.append(f"  ^ This file may need modification for the new feature")
+
+        # 2b. LLM-based task briefing using ONLY the pre-filtered relevant files.
+        # We deliberately pass only the files from step 2 (not the whole project)
+        # so the LLM gets focused context without being flooded.  The result is
+        # a concrete TASK BRIEFING block injected as the highest-priority context.
+        if relevant or test_analysis:
+            try:
+                from ..orchestrator.test_analyzer import analyze_task_for_planner
+                _briefing = analyze_task_for_planner(
+                    task=task,
+                    relevant_files=relevant,           # (path, reason, skeleton) tuples
+                    test_analysis=test_analysis or "",
+                    llm_client=self.llm_client,
+                )
+                if _briefing:
+                    parts.insert(
+                        0,
+                        "╔══ TASK BRIEFING (independent analysis before planning) ══╗\n"
+                        + _briefing
+                        + "\n╚════════════════════════════════════════════════════════╝\n"
+                        "CRITICAL: The briefing above was produced by an independent analyst\n"
+                        "who read your task against the actual project files and live test results.\n"
+                        "Your plan MUST follow the 'Agent directive' line exactly.\n"
+                        "Do not second-guess the file list or add steps the briefing does not call for.",
+                    )
+                    _logger.info("[PreAnalysis] Task briefing injected.")
+            except Exception as _br_exc:
+                _logger.warning("[PreAnalysis] Task briefing failed: %s", _br_exc)
 
         # 3. Knowledge base context — SKIPPED here to avoid duplication.
         # knowledge_base.format_for_planner() is already injected by api.py
@@ -426,7 +454,8 @@ class PlannerAgent(Agent):
             except Exception as e:
                 _logger.debug(f"[PreAnalysis] Global KB doc search failed: {e}")
 
-        # 5. Baseline test analysis results
+        # 5. Baseline test analysis results (raw evidence — the TASK BRIEFING
+        # above is the derived conclusion; this is the supporting data).
         if test_analysis:
             parts.append(f"\n[Baseline Test Analysis]\n{test_analysis}")
             parts.append(

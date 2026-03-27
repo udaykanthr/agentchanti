@@ -2409,6 +2409,86 @@ def _auto_install_code_imports(
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
+def _parse_test_counts(output: str) -> tuple[int, int, list[dict]]:
+    """Parse test runner output into (passed, total, failures).
+
+    Works with pytest, Jest, Vitest, Go test, RSpec, and generic patterns.
+    *failures* is a list of ``{"name": str, "message": str}`` dicts (max 5).
+    """
+    if not output:
+        return 1, 1, []
+    clean = _ANSI_RE.sub('', output)
+
+    passed = failed = 0
+
+    # ── Jest / Vitest: "Tests: 5 failed, 3 passed, 8 total" ──
+    m = re.search(r'Tests:\s*(?:(\d+)\s+failed,\s*)?(\d+)\s+passed', clean)
+    if m:
+        failed = int(m.group(1) or 0)
+        passed = int(m.group(2))
+        total  = passed + failed
+        if total:
+            return passed, total, _extract_failure_names(clean)
+
+    # ── pytest: "3 passed, 2 failed" or "5 passed" ──
+    m_p = re.search(r'(\d+)\s+passed', clean)
+    m_f = re.search(r'(\d+)\s+failed', clean)
+    if m_p or m_f:
+        passed = int(m_p.group(1)) if m_p else 0
+        failed = int(m_f.group(1)) if m_f else 0
+        total  = passed + failed
+        if total:
+            return passed, total, _extract_failure_names(clean) if failed else []
+
+    # ── Vitest summary: "5 | 3 passed (8)" ──
+    m = re.search(r'(\d+)\s+passed\s*\((\d+)\)', clean)
+    if m:
+        passed = int(m.group(1))
+        total  = int(m.group(2))
+        failed = total - passed
+        return passed, total, _extract_failure_names(clean) if failed else []
+
+    # ── Go test: count PASS/FAIL lines ──
+    pass_count = len(re.findall(r'--- PASS:', clean))
+    fail_count = len(re.findall(r'--- FAIL:', clean))
+    if pass_count or fail_count:
+        return pass_count, pass_count + fail_count, _extract_failure_names(clean)
+
+    # ── RSpec: "5 examples, 2 failures" ──
+    m = re.search(r'(\d+)\s+example[s]?,\s*(\d+)\s+failure', clean)
+    if m:
+        total  = int(m.group(1))
+        failed = int(m.group(2))
+        return total - failed, total, _extract_failure_names(clean)
+
+    # ── Fallback: overall pass/fail ──
+    overall_pass = not re.search(r'\bFAIL\b|\bFAILED\b', clean, re.IGNORECASE)
+    return (1, 1, []) if overall_pass else (0, 1, _extract_failure_names(clean))
+
+
+def _extract_failure_names(clean: str) -> list[dict]:
+    """Pull up to 5 individual failing test names from stripped test output."""
+    names: list[dict] = []
+    _PATTERNS = [
+        re.compile(r'FAILED\s+([\w/:. -]+)'),          # pytest
+        re.compile(r'×\s+([\w/:. -]+)'),               # Vitest ×
+        re.compile(r'✕\s+([\w/:. -]+)'),               # Jest ✕
+        re.compile(r'✗\s+([\w/:. -]+)'),               # generic
+        re.compile(r'--- FAIL:\s+([\w/.]+)'),           # Go
+        re.compile(r'it\s+[\'"](.+?)[\'"].*failed'),   # Mocha/Jest
+    ]
+    seen: set[str] = set()
+    for pat in _PATTERNS:
+        for m in pat.finditer(clean):
+            name = m.group(1).strip()[:60]
+            if name and name not in seen:
+                seen.add(name)
+                names.append({"name": name, "message": ""})
+                if len(names) >= 5:
+                    return names
+    return names
+
+
 def _extract_test_error(output: str, max_chars: int = 1500) -> str:
     """Extract actionable error info from verbose test runner output.
 
@@ -4340,10 +4420,19 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             last_test_output = output
 
             if success:
+                _t_passed, _t_total, _ = _parse_test_counts(output)
                 display.step_info(
-                    step_idx, f"{f_basename} passed ✔ ({file_idx}/{file_count})")
-                display.record_test_result(test_path, passed=1, total=1, failures=[])
+                    step_idx,
+                    f"{f_basename} passed ✔  {_t_passed}/{_t_total}"
+                    f" ({file_idx}/{file_count})")
+                display.record_test_result(test_path, passed=_t_passed,
+                                           total=_t_total, failures=[])
                 continue
+
+            # Record initial failure immediately so TEST RESULTS panel appears
+            _t_passed0, _t_total0, _t_fails0 = _parse_test_counts(output)
+            display.record_test_result(test_path, passed=_t_passed0,
+                                       total=_t_total0, failures=_t_fails0)
 
             # ── System / env checks (shared across files, run once) ──
             from .pipeline import _detect_system_level_failure
@@ -4527,11 +4616,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 last_test_output = output
 
                 if success:
+                    _t_passed, _t_total, _ = _parse_test_counts(output)
                     display.step_info(
                         step_idx,
-                        f"{f_basename} passed after fix ✔ "
-                        f"({file_idx}/{file_count})")
-                    display.record_test_result(test_path, passed=1, total=1, failures=[])
+                        f"{f_basename} passed after fix ✔  {_t_passed}/{_t_total}"
+                        f" ({file_idx}/{file_count})")
+                    display.record_test_result(test_path, passed=_t_passed,
+                                               total=_t_total, failures=[])
                     file_fixed = True
                     break
 
@@ -4552,18 +4643,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 log.warning(
                     f"Step {step_idx+1}: [{f_basename}] still failing "
                     f"after {MAX_STEP_RETRIES} fixes.")
-                # Extract top failure names from last output for display
-                _fail_names: list[dict] = []
-                if output:
-                    for _m in re.finditer(
-                        r'(?:FAILED\s+|×\s+|✕\s+|✗\s+|--- FAIL:\s*)(\S+)',
-                        _ANSI_RE.sub('', output)
-                    ):
-                        _fail_names.append({"name": _m.group(1), "message": ""})
-                        if len(_fail_names) >= 5:
-                            break
-                display.record_test_result(test_path, passed=0, total=1,
-                                           failures=_fail_names)
+                _t_passed, _t_total, _fail_names = _parse_test_counts(output)
+                display.record_test_result(test_path, passed=_t_passed,
+                                           total=_t_total, failures=_fail_names)
 
         # ── Summary ──
         if not failed_files:

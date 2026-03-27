@@ -475,7 +475,7 @@ class CLIDisplay:
         if len(task_preview) > 110:
             task_preview = task_preview[:107] + "…"
 
-        # Line 1: brand + version
+        # ── Line 1: brand + version + model ──
         line1 = Text()
         line1.append("⚡ ", style="yellow")
         line1.append("AgentChanti", style=_CLR["brand"])
@@ -484,13 +484,44 @@ class CLIDisplay:
             line1.append("   ·   ", style="dim")
             line1.append(self._model_info, style=_CLR["model"])
 
-        # Line 2: task description (indented to align with brand text)
+        # ── Line 2: task description ──
         line2 = Text()
-        line2.append("   ", style="")          # indent under ⚡
+        line2.append("   ", style="")
         line2.append(task_preview, style=_CLR["task"])
 
+        # ── Line 3: live metrics (replaces the separate footer panel) ──
+        t = token_tracker
+        elapsed   = _time.monotonic() - self.start_time
+        p, c      = t.snapshot()
+        total_tok = p + c
+
+        with self._lock:
+            steps     = list(self.steps)
+            wave_info = self._wave_info
+        done_steps  = sum(1 for s in steps if s["status"] in ("done", "skipped", "failed"))
+        total_steps = len(steps)
+
+        line3 = Text()
+        line3.append("   ", style="")           # align under ⚡
+        line3.append("⏱ ", style="dim")
+        line3.append(_format_elapsed(elapsed), style=_CLR["metric_value"])
+        line3.append("   ↑ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(p), style=_CLR["metric_tokens"])
+        line3.append("  ↓ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(c), style=_CLR["metric_tokens"])
+        line3.append("  Σ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(total_tok), style=_CLR["metric_total"])
+        line3.append(f"   {t.call_count} calls", style="dim")
+        if t.total_cost > 0:
+            line3.append("   ", style="")
+            line3.append(f"${t.total_cost:.4f}", style=_CLR["metric_cost"])
+        if total_steps:
+            line3.append(f"   ·   Steps {done_steps}/{total_steps}", style="dim")
+        if wave_info[1] > 0:
+            line3.append(f"  ·  Wave {wave_info[0]}/{wave_info[1]}", style="dim")
+
         return Panel(
-            Group(line1, line2),
+            Group(line1, line2, line3),
             border_style=_CLR["panel_border"],
             box=rich_box.ROUNDED,
             padding=(0, 1),
@@ -732,50 +763,6 @@ class CLIDisplay:
             padding=(0, 0),
         )
 
-    def _build_footer(self) -> Panel:
-        with self._lock:
-            steps     = list(self.steps)
-            wave_info = self._wave_info
-
-        t           = token_tracker
-        elapsed     = _time.monotonic() - self.start_time
-        p, c        = t.snapshot()
-        total_tok   = p + c
-        total_steps = len(steps)
-        done_steps  = sum(1 for s in steps if s["status"] in ("done", "skipped", "failed"))
-
-        # ── Metrics row ──
-        metrics = Text()
-        metrics.append("⏱ ", style="dim")
-        metrics.append(_format_elapsed(elapsed), style=_CLR["metric_value"])
-        metrics.append("    ↑ ", style=_CLR["metric_label"])
-        metrics.append(_fmt_k(p), style=_CLR["metric_tokens"])
-        metrics.append("  ↓ ", style=_CLR["metric_label"])
-        metrics.append(_fmt_k(c), style=_CLR["metric_tokens"])
-        metrics.append("  Σ ", style=_CLR["metric_label"])
-        metrics.append(_fmt_k(total_tok), style=_CLR["metric_total"])
-        metrics.append(f"    {t.call_count} calls", style="dim")
-        if t.total_cost > 0:
-            metrics.append("    ", style="")
-            metrics.append(f"${t.total_cost:.4f}", style=_CLR["metric_cost"])
-
-        # ── Step progress bar row ──
-        frac = done_steps / total_steps if total_steps else 0
-        filled, empty = _fill_bar(frac, width=28)
-        prog = Text()
-        prog.append(filled, style=_CLR["bar_filled"])
-        prog.append(empty,  style=_CLR["bar_empty"])
-        prog.append(f"   Steps {done_steps}/{total_steps}", style="dim white")
-        if wave_info[1] > 0:
-            prog.append(f"   ·   Wave {wave_info[0]}/{wave_info[1]}", style="dim")
-
-        return Panel(
-            Group(metrics, prog),
-            border_style=_CLR["section_border"],
-            box=rich_box.ROUNDED,
-            padding=(0, 1),
-        )
-
     def _build_panels(self) -> list:
         """Assemble all Rich renderables for the current state."""
         parts = []
@@ -794,7 +781,6 @@ class CLIDisplay:
         if has_tests:
             parts.append(self._build_tests_section())
 
-        parts.append(self._build_footer())
         return parts
 
     # ── Finish screen ─────────────────────────────────────────────────────────
