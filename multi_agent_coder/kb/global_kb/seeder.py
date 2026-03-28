@@ -1223,6 +1223,43 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="django,tests,import,tests.py,startapp,__init__,namespace,package,python,ImportError",
     ),
+    # ── Django makemigrations: No installed app with label 'X' ──────────
+    ErrorFix(
+        error_type="DjangoNoInstalledAppWithLabel",
+        language="python",
+        pattern=r"No installed app with label '(\w+)'",
+        cause="The app label passed to makemigrations is not in INSTALLED_APPS, OR the agent "
+              "edited the WRONG settings.py. Django nested-layout projects have TWO settings files: "
+              "a root-level one (ignored by Django) and an inner config-package one "
+              "(<project>/<project>/settings.py) which DJANGO_SETTINGS_MODULE actually points to. "
+              "The agent almost always edits the root-level file and leaves the real one unchanged. "
+              "Additionally, apps.py `name` must match the importable module path — for a flat layout "
+              "where manage.py is in the project root and `api/` is a sibling, `name = 'api'` is "
+              "correct; `name = 'django_service.api'` is WRONG for that layout.",
+        fix_template="FIX: Find the REAL settings file before editing anything.\n\n"
+                     "STEP 1 — Identify which settings file Django actually loads:\n"
+                     "  grep -r 'DJANGO_SETTINGS_MODULE' manage.py\n"
+                     "  # e.g. output: django_service.settings\n"
+                     "  # → real settings file is: <project_root>/django_service/settings.py\n"
+                     "  # NOT the root-level settings.py\n\n"
+                     "STEP 2 — Open THAT file and add the app to INSTALLED_APPS:\n"
+                     "  INSTALLED_APPS = [\n"
+                     "      ...\n"
+                     "      'api',   # use the simple app label, NOT 'django_service.api'\n"
+                     "  ]\n\n"
+                     "STEP 3 — Check apps.py name matches the importable path:\n"
+                     "  If manage.py is at <project_root>/manage.py and api/ is at "
+                     "<project_root>/api/, then:\n"
+                     "    name = 'api'        ← CORRECT\n"
+                     "    name = 'django_service.api'  ← WRONG (double-prefix)\n\n"
+                     "STEP 4 — Re-run:\n"
+                     "  python manage.py makemigrations <app_label>\n"
+                     "  python manage.py migrate\n\n"
+                     "RULE: NEVER edit a settings.py without first confirming it is the file "
+                     "DJANGO_SETTINGS_MODULE points to. There may be two settings files.",
+        severity="error",
+        tags="django,makemigrations,migrate,INSTALLED_APPS,app,label,settings,nested,layout,python",
+    ),
     # ── Django admin list_display field does not exist on model ─────────
     ErrorFix(
         error_type="DjangoAdminListDisplayInvalidField",
