@@ -479,6 +479,48 @@ class PlannerAgent(Agent):
                                     len(_pkg_docs),
                                 )
 
+                                # Re-generate the briefing now that we have
+                                # verified (search + KB) package docs so the
+                                # "Agent directive" uses the correct import
+                                # paths / APIs instead of training-data guesses.
+                                _full_pkg_context = (
+                                    (_pre_pkg_context + "\n\n"
+                                     if _pre_pkg_context else "")
+                                    + "\n\n".join(_pkg_docs)
+                                )
+                                _logger.info(
+                                    "[PreAnalysis] Re-generating briefing with "
+                                    "verified package docs"
+                                )
+                                _updated_briefing = analyze_task_for_planner(
+                                    task=task,
+                                    relevant_files=relevant,
+                                    test_analysis=test_analysis or "",
+                                    llm_client=self.llm_client,
+                                    passing_files=baseline_passing_files,
+                                    failing_files=baseline_failing_files,
+                                    editable_contracts=_contracts,
+                                    package_docs=_full_pkg_context,
+                                )
+                                if _updated_briefing:
+                                    _updated_section = (
+                                        "╔══ TASK BRIEFING (independent analysis before planning) ══╗\n"
+                                        + _updated_briefing
+                                        + "\n╚════════════════════════════════════════════════════════╝\n"
+                                        "CRITICAL: The briefing above was produced by an independent analyst\n"
+                                        "who read your task against the actual project files and live test results.\n"
+                                        "Your plan MUST follow the 'Agent directive' line exactly.\n"
+                                        "The 'Preserve:' line lists behaviors the coder must NOT break — treat\n"
+                                        "each item as a hard constraint that applies to every CODE step you generate.\n"
+                                        "Do not second-guess the file list or add steps the briefing does not call for."
+                                    )
+                                    parts[0] = _updated_section
+                                    self._task_briefing = _updated_briefing
+                                    _logger.info(
+                                        "[PreAnalysis] Briefing updated with "
+                                        "verified package docs."
+                                    )
+
             except Exception as _br_exc:
                 _logger.warning("[PreAnalysis] Task briefing failed: %s", _br_exc)
 
