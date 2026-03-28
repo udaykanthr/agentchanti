@@ -419,8 +419,90 @@ class SearchAgent:
 
         return ""
 
+    def search_for_package(self, package_name: str,
+                           language: str | None = None,
+                           existing_kb_doc: str = "",
+                           kb_context: str = "") -> str:
+        """Search for latest package docs, merging with any existing KB doc.
+
+        Both sources are passed to the summariser together so the LLM can
+        reconcile version conflicts and produce a single authoritative
+        reference (install command, import syntax, key API, test notes).
+
+        Args:
+            package_name: Bare package name (e.g. "animejs", "lodash").
+            language: Programming language for query focus.
+            existing_kb_doc: Current KB doc content for this package, if any.
+                             May be stale — the LLM will prefer live results
+                             when they conflict.
+            kb_context: Tech-stack KB context for version filtering.
+
+        Returns:
+            Compact package reference string, or empty string on failure.
+        """
+        try:
+            lang_suffixes = {
+                "javascript": "javascript npm",
+                "typescript": "typescript npm",
+                "python": "python pip",
+                "go": "golang",
+                "ruby": "ruby gem",
+                "java": "java maven",
+                "rust": "rust cargo",
+            }
+            lang_suffix = lang_suffixes.get(language or "", language or "")
+            query = (
+                f"{package_name} install usage api guide {lang_suffix}".strip()
+            )
+            if len(query) > 150:
+                query = query[:150].rsplit(" ", 1)[0]
+
+            log.info(f"[SearchAgent] Package doc search: {query}")
+
+            results = web_search(
+                query,
+                provider=self.provider,
+                api_key=self.api_key,
+                api_url=self.api_url,
+                max_results=self.max_results,
+            )
+
+            raw_live = self._format_results(results) if results else ""
+
+            # Combine existing KB doc with live search results
+            combined_parts: list[str] = []
+            if existing_kb_doc:
+                combined_parts.append(
+                    f"=== Existing KB documentation (may be stale) ===\n"
+                    f"{existing_kb_doc}"
+                )
+            if raw_live:
+                combined_parts.append(
+                    f"=== Live web search results ===\n{raw_live}"
+                )
+
+            if not combined_parts:
+                log.info("[SearchAgent] No package docs found for: %s",
+                         package_name)
+                return ""
+
+            combined = "\n\n".join(combined_parts)
+            return self._summarize(
+                combined,
+                mode="package",
+                query=query,
+                package_name=package_name,
+                kb_context=kb_context,
+            )
+
+        except Exception as exc:
+            log.warning(f"[SearchAgent] Package search failed for "
+                        f"'{package_name}': {exc}")
+            return ""
+
     def _summarize(self, raw_context: str, *, mode: str = "error",
-                   query: str = "", kb_context: str = "") -> str:
+                   query: str = "", kb_context: str = "",
+                   package_name: str = "") -> str:
         """Use LLM to condense raw search results into a compact guide.
 
         When ``kb_context`` is provided (tech stack, installed packages,
@@ -461,6 +543,28 @@ class SearchAgent:
                 f"{kb_block}"
                 f"Search query: {query}\n\n"
                 f"Raw search results:\n{raw_context}"
+            )
+        elif mode == "package":
+            pkg = package_name or query
+            instruction = (
+                "You are a concise technical assistant. Given the documentation "
+                f"below about the '{pkg}' package (from an existing KB doc and/or "
+                "live web search), produce a SHORT authoritative reference "
+                "(max ~200 words). Format as:\n"
+                "- **Install**: exact install command with correct flags "
+                "(e.g. npm install animejs, pip install animejs)\n"
+                "- **Import**: correct import/require statement for the current "
+                "version\n"
+                "- **Key API**: 1-3 most important usage patterns with brief "
+                "examples\n"
+                "- **Test setup**: any mocking or vitest/jest setup required\n"
+                "- **Version note**: if KB doc and live docs disagree on API or "
+                "import path, state which is current and use the live result\n\n"
+                "If KB and live docs conflict, the live web results are "
+                "authoritative — clearly prefer them.\n\n"
+                f"{kb_block}"
+                f"Package: {pkg}\n\n"
+                f"Documentation sources:\n{raw_context}"
             )
         else:
             instruction = (

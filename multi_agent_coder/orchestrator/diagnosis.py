@@ -100,9 +100,19 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     # Detect sub-project root to inform the LLM
     subproject = _detect_subproject_root(memory)
 
+    # Inject task briefing so diagnosis never removes features to bypass failures.
+    _diag_briefing = getattr(memory, '_task_briefing', '')
+    _briefing_block = (
+        "TASK BRIEFING (the overall goal — respect Preserve and Key constraint):\n"
+        f"{_diag_briefing}\n\n"
+    ) if _diag_briefing else ""
+
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
         "Analyze the failure and provide a concrete fix.\n\n"
+        f"{_briefing_block}"
+        "CRITICAL: Do NOT remove, comment out, or skip the feature/component that is failing. "
+        "Fix the root cause instead.\n\n"
         f"Step {step_idx+1}: {step_text}\n"
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
@@ -238,22 +248,20 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += (
             "Respond with:\n"
             "1. ROOT CAUSE: one-line explanation of what went wrong\n"
-            "2. FIX: provide the COMPLETE corrected file(s). Do NOT use diffs or patches.\n"
-            "   Write the ENTIRE file content, not just the changed parts.\n\n"
-            "CRITICAL FORMAT — the #### [FILE]: marker must be OUTSIDE and BEFORE the code block:\n\n"
-            "#### [FILE]: path/to/file.py\n"
-            "```python\n"
-            "# entire file contents here\n"
-            "```\n\n"
-            "WRONG (do NOT do this):\n"
-            "```python\n"
-            "#### [FILE]: path/to/file.py   <-- WRONG! marker inside code block\n"
-            "```\n\n"
-            "WRONG (do NOT do this):\n"
-            "```diff\n"
-            "-old line   <-- WRONG! do not use diff format\n"
-            "+new line\n"
-            "```\n"
+            "2. FIX: PREFER chunk format to avoid unintended changes to unrelated code.\n\n"
+            "   PREFERRED — chunk format (surgical, only the broken section):\n"
+            "   #### [EDIT]: path/to/file.py:function_or_class_name (lines start-end)\n"
+            "   ```python\n"
+            "   # complete replacement for this chunk only\n"
+            "   ```\n\n"
+            "   FALLBACK — full file (only when the entire file must be rewritten):\n"
+            "   #### [FILE]: path/to/file.py\n"
+            "   ```python\n"
+            "   # entire file contents here\n"
+            "   ```\n\n"
+            "CRITICAL: Do NOT use diff/patch format. "
+            "Use [EDIT]: for targeted fixes, [FILE]: only when truly needed.\n"
+            "The [EDIT]: marker MUST be OUTSIDE and BEFORE the code block.\n"
         )
 
     sent_before, recv_before = token_tracker.snapshot()
@@ -348,8 +356,39 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
 
     display.step_info(step_idx, "Applying diagnosis fix...")
 
-    # Extract code file fixes regardless of step type, allowing CMD steps to fix code bugs
-    files = executor.parse_code_blocks(diagnosis)
+    # ── Preferred: parse [EDIT]: chunk markers (surgical, avoids unintended changes) ──
+    files: dict[str, str] = {}
+    try:
+        from ..editing.chunk_editor import ChunkEditor as _CE
+        _ce = _CE()
+        _chunk_edits = _ce.parse_chunk_response(diagnosis)
+        if _chunk_edits:
+            for _edit in _chunk_edits:
+                _fpath = _edit.file_path
+                _existing = memory.get(_fpath)
+                if _existing is None:
+                    try:
+                        with open(_fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            _existing = _f.read()
+                    except OSError:
+                        pass
+                if _existing is not None:
+                    try:
+                        files[_fpath] = _ce.apply_chunk_edits(
+                            _existing, [_edit])
+                    except Exception as _exc:
+                        log.warning(
+                            "Step %d: ChunkEdit apply failed for %s: %s",
+                            step_idx + 1, _fpath, _exc)
+            if files:
+                log.info("Step %d: Diagnosis applied %d chunk edit(s): %s",
+                         step_idx + 1, len(files), list(files.keys()))
+    except ImportError:
+        pass
+
+    # ── Fallback: full-file [FILE]: markers ──
+    if not files:
+        files = executor.parse_code_blocks(diagnosis)
 
     # Fallback: try fuzzy parsing (handles diff blocks, inline file
     # comments, and other common LLM diagnosis formats)

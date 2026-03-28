@@ -67,7 +67,7 @@ _DEFAULTS = {
     "editing_max_chunk_files": 3,
     "review_mode": "static",
     "dependency_check_enabled": True,
-    "analyser_enabled": True,
+    "analyser_enabled": False,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},

@@ -51,6 +51,7 @@ class PlanStep:
     status: str = "pending"                     # pending, in_progress, completed, failed, skipped
     actual_exports: list[str] = field(default_factory=list)  # filled after step execution
     inline_code: dict[str, str] = field(default_factory=dict)  # file -> code from plan
+    inline_edits: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # file -> [(find, replace), ...]
     kb_docs: list[str] = field(default_factory=list)  # KB doc titles used when writing inline code
 
     # Which files should import this step's target file (plan-declared or derived)
@@ -76,6 +77,8 @@ class PlanStep:
         }
         if self.inline_code:
             d["inline_code"] = dict(self.inline_code)
+        if self.inline_edits:
+            d["inline_edits"] = {k: list(v) for k, v in self.inline_edits.items()}
         if self.kb_docs:
             d["kb_docs"] = list(self.kb_docs)
         if self.imported_by:
@@ -97,6 +100,7 @@ class PlanStep:
             status=d.get("status", "pending"),
             actual_exports=d.get("actual_exports", []),
             inline_code=d.get("inline_code", {}),
+            inline_edits={k: [tuple(p) for p in v] for k, v in d.get("inline_edits", {}).items()},
             kb_docs=d.get("kb_docs", []),
             imported_by=d.get("imported_by", []),
             index=d.get("index", -1),
@@ -296,8 +300,63 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
     in_markdown_fence = False  # track ```...``` inside inline blocks
 
+    # edit: block state
+    in_edit_block = False       # between edit: and <<<END>>>
+    _edit_section = "find"      # "find" or "replace"
+    _edit_find_lines: list[str] = []
+    _edit_replace_lines: list[str] = []
+    _edit_target: Optional[str] = None  # file path for current edit block
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
+
+        # ── Edit block handling (find/replace patches) ──
+        # Format:
+        #   edit:
+        #   <<<FIND>>>
+        #   old text
+        #   <<<REPLACE>>>
+        #   new text
+        #   <<<END>>>
+        if in_edit_block:
+            _lnorm = line.upper().replace(" ", "")
+            # Structural markers (new step header or plan end) terminate the
+            # edit block — fall through to be processed normally.
+            if line.upper() in ("==END==",) or _STEP_RE.match(line):
+                in_edit_block = False
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                _edit_target = None
+                # Fall through to process this line as a step header / ==END==
+            elif _lnorm in ("<<<FIND>>>", "<<FIND>>", "<FIND>"):
+                _edit_section = "find"
+                _edit_find_lines = []
+                continue
+            elif _lnorm in ("<<<REPLACE>>>", "<<REPLACE>>", "<REPLACE>"):
+                _edit_section = "replace"
+                _edit_replace_lines = []
+                continue
+            elif _lnorm in ("<<<END>>>", "<<END>>", "<END>", "<<<EDITEND>>>"):
+                # Commit this find/replace pair
+                if current is not None and (_edit_find_lines or _edit_replace_lines):
+                    _find_str = "\n".join(_edit_find_lines)
+                    _repl_str = "\n".join(_edit_replace_lines)
+                    _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+                    if _tgt:
+                        current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
+                # Stay in edit block — there may be more <<<FIND>>>...<<<END>>> pairs.
+                # The block ends naturally when a new --STEP header or ==END== is seen.
+                _edit_section = "find"
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                continue
+            else:
+                # Accumulate lines
+                if _edit_section == "find":
+                    _edit_find_lines.append(raw_line)
+                else:
+                    _edit_replace_lines.append(raw_line)
+                continue
 
         # ── Inline code block handling ──
         # Accept multiple LLM output variants:
@@ -502,6 +561,21 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             if raw and raw.lower() != "none":
                 current.imported_by = [f.strip() for f in raw.split(",") if f.strip()]
 
+        # edit: block — find/replace patch for an existing file.
+        # Supports optional "edit: path/to/file" to specify a different target.
+        elif line.lower().startswith("edit:"):
+            rest = line[5:].strip()
+            # If a file path is given on the same line, use it; otherwise use
+            # the step's first target file (resolved when <<<END>>> is hit).
+            if rest and not rest.startswith("<<<"):
+                _edit_target = rest
+            else:
+                _edit_target = None
+            in_edit_block = True
+            _edit_section = "find"
+            _edit_find_lines = []
+            _edit_replace_lines = []
+
         # Inline code block via bare "Content:" keyword (no "> " prefix).
         # The "> content:" variant is already handled inside the "> " branch
         # above.  Here we catch the unindented form that the planner sometimes
@@ -539,6 +613,21 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                         code_lines.append(_after_c)
                     continue
             desc_lines.append(line)
+
+    # Flush any open edit block (LLM omitted the final <<<END>>>).
+    if in_edit_block and current is not None and (_edit_find_lines or _edit_replace_lines):
+        _find_str = "\n".join(_edit_find_lines)
+        _repl_str = "\n".join(_edit_replace_lines)
+        # Skip if the find string is only file-content markers (e.g.
+        # ---file-content-end--- accumulated after the last <<<END>>>).
+        _find_meaningful = [
+            l for l in _edit_find_lines
+            if l.strip() and not l.strip().startswith("---")
+        ]
+        if _find_meaningful:
+            _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+            if _tgt:
+                current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
 
     # Flush any open inline code block.
     # If the code block was never closed (no ---file-content-end---, ==END==,

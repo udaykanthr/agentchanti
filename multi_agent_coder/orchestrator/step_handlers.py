@@ -1634,7 +1634,12 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
 
         sent_before, recv_before = token_tracker.snapshot()
 
-        fix_response = coder.process(fix_prompt, context="", language=language)
+        _hazard_briefing = getattr(memory, '_task_briefing', '')
+        _hazard_context = (
+            "TASK BRIEFING (the overall goal — do not lose features listed under Preserve):\n"
+            f"{_hazard_briefing}\n"
+        ) if _hazard_briefing else ""
+        fix_response = coder.process(fix_prompt, context=_hazard_context, language=language)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before
@@ -3112,6 +3117,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 and "[KB INSTRUCTIONS]" not in context_prefix):
             context_prefix += _code_behavioral_ctx + "\n\n"
 
+        # Inject task briefing (Preserve / Key constraint / Agent directive)
+        # so the coder never accidentally removes features or breaks contracts.
+        _task_briefing = getattr(memory, '_task_briefing', '')
+        if _task_briefing:
+            context_prefix += (
+                "TASK BRIEFING — follow the Preserve and Key constraint lines exactly:\n"
+                f"{_task_briefing}\n\n"
+            )
+
         context = context_prefix + f"Task: {task}"
 
         # ── Partial inline code hint (truncation recovery) ──
@@ -3393,6 +3407,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                     "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
                     + "\n".join(f"- {c}" for c in criteria)
                 )
+
+        # Inject task briefing so the reviewer can catch regressions against
+        # the Preserve list (e.g. a feature accidentally removed by the coder).
+        _reviewer_briefing = getattr(memory, '_task_briefing', '')
+        if _reviewer_briefing:
+            criteria_ctx += (
+                "\n\nTASK BRIEFING — flag as FAIL if any Preserve item was broken:\n"
+                f"{_reviewer_briefing}"
+            )
 
         use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
         if use_diff_review:
@@ -4528,11 +4551,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         pass
 
                 # Build focused fix context
+                # Prepend task context so the coder never "fixes" a test by
+                # removing the component under test or deleting assertions.
+                _task_context_header = f"TASK CONTEXT:\n{task}\n\n"
+                if pre_analysis_results:
+                    _task_context_header += f"{pre_analysis_results}\n\n"
+
                 if is_source_bug:
                     display.step_info(
                         step_idx,
                         f"Bug in SOURCE for {f_basename}, fixing source...")
                     fix_ctx = (
+                        f"{_task_context_header}"
                         f"Test command: `{single_cmd}`\n\n"
                         f"{error_detail}\n\n"
                         f"Source files under test:\n{source_ctx}\n\n"
@@ -4543,11 +4573,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         "The test has revealed a BUG IN THE SOURCE CODE.\n"
                         "Fix the SOURCE files to make the test pass.\n"
                         "Do NOT modify the test file.\n"
+                        "CRITICAL: Do NOT remove, comment out, or skip the tested component or feature. "
+                        "The task requires this functionality to exist and work correctly.\n"
                         f"{jsx_hint}"
                         "Return corrected source file(s) using "
                         "#### [FILE]: format.")
                 else:
                     fix_ctx = (
+                        f"{_task_context_header}"
                         f"Test command: `{single_cmd}`\n\n"
                         f"ERRORS for {test_path}:\n{error_detail}\n\n"
                         f"Test file to fix:\n"
@@ -4561,6 +4594,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         f"Fix ONLY the test file '{test_path}'.\n"
                         "Do NOT output any other test files or source files.\n"
                         "Focus on fixing ONLY the failing tests.\n"
+                        "CRITICAL: Do NOT remove, comment out, or skip tests for the component/feature "
+                        "mentioned in the task. If a test fails due to an integration issue (e.g. anime.js, "
+                        "a missing mock, or a changed API), FIX the test to correctly test the feature — "
+                        "do NOT delete the test or the component import.\n"
                         f"{jsx_hint}"
                         "Do NOT modify source files, package.json, or "
                         "config files. Do NOT add new dependencies.\n"
@@ -4569,22 +4606,53 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 if kb_fix_context:
                     fix_ctx += f"\n\n{kb_fix_context}"
 
-                sent_before, recv_before = token_tracker.snapshot()
-                fix_response = coder.process(
-                    fix_prompt, context=fix_ctx, language=language)
-                sent_after, recv_after = token_tracker.snapshot()
-                display.step_tokens(
-                    step_idx,
-                    sent_after - sent_before,
-                    recv_after - recv_before)
+                # ── Try surgical chunk-level fix first ──
+                # For both TEST_BUG and SOURCE_BUG, attempt to edit only the
+                # failing chunk(s) rather than rewriting the whole file.
+                # Falls back to full-file if ChunkEditor can't parse/apply.
+                _chunk_step_desc = fix_prompt + "\n\n" + error_detail
+                if is_source_bug:
+                    # Try chunk fix on each source file individually
+                    _chunk_fix_results: dict[str, str] = {}
+                    for _sfp, _sfc in single_imports.items():
+                        _res = _chunk_fix_file(
+                            _sfp, _sfc, _chunk_step_desc,
+                            coder.llm_client, language, memory,
+                            display, step_idx)
+                        if _res:
+                            _chunk_fix_results.update(_res)
+                    fix_files = _chunk_fix_results or None
+                else:
+                    fix_files = _chunk_fix_file(
+                        test_path, current_content, _chunk_step_desc,
+                        coder.llm_client, language, memory,
+                        display, step_idx)
 
-                explanation = CLIDisplay.extract_explanation(fix_response)
-                if explanation:
-                    display.add_llm_log(explanation, source="Coder")
-
-                fix_files = executor.parse_code_blocks(fix_response)
+                # Fall back to full-file if chunk fix didn't produce results
                 if not fix_files:
-                    fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    # Ensure _task_briefing is in the fallback context
+                    _briefing = getattr(memory, '_task_briefing', '')
+                    if _briefing and _briefing not in fix_ctx:
+                        fix_ctx = (
+                            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+                            f"{_briefing}\n\n"
+                        ) + fix_ctx
+                    sent_before, recv_before = token_tracker.snapshot()
+                    fix_response = coder.process(
+                        fix_prompt, context=fix_ctx, language=language)
+                    sent_after, recv_after = token_tracker.snapshot()
+                    display.step_tokens(
+                        step_idx,
+                        sent_after - sent_before,
+                        recv_after - recv_before)
+
+                    explanation = CLIDisplay.extract_explanation(fix_response)
+                    if explanation:
+                        display.add_llm_log(explanation, source="Coder")
+
+                    fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
                     fix_files = _strip_protected_files(fix_files)
                     fix_files = _normalize_fix_paths(fix_files, memory)
@@ -4671,6 +4739,88 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 # Diff-aware editing (Phase 5)
 # ---------------------------------------------------------------------------
 
+def _chunk_fix_file(
+    file_path: str,
+    content: str,
+    step_description: str,
+    llm_client,
+    language: str | None,
+    memory: "FileMemory",
+    display: "CLIDisplay",
+    step_idx: int,
+) -> dict[str, str] | None:
+    """Try to fix a single file using chunk-level editing.
+
+    Sends only the chunks relevant to the error/fix description to the LLM,
+    then splices the result back — avoiding unintended changes to unrelated code.
+
+    Returns ``{file_path: new_content}`` on success, or ``None`` to signal
+    the caller should fall back to full-file editing.
+    """
+    try:
+        from ..editing.chunk_editor import ChunkEditor
+    except ImportError:
+        return None
+
+    chunk_editor = ChunkEditor()
+    chunks = chunk_editor.chunk_file(file_path, content)
+    if not chunks:
+        return None
+
+    targets = chunk_editor.identify_target_chunks(chunks, step_description)
+    if not targets:
+        # No targeted chunks found — send all non-import chunks but warn
+        targets = [c.chunk_id for c in chunks if c.chunk_type != "imports"]
+        if not targets:
+            return None
+
+    formatted = chunk_editor.format_chunks_for_prompt(chunks, targets)
+
+    _task_briefing = getattr(memory, '_task_briefing', '')
+    briefing_prefix = (
+        "TASK BRIEFING (respect Preserve and Key constraint — fix ONLY what the error requires):\n"
+        f"{_task_briefing}\n\n"
+    ) if _task_briefing else ""
+
+    prompt = briefing_prefix + _build_chunk_prompt(
+        step_description, formatted, "", language=language)
+
+    display.step_info(
+        step_idx,
+        f"[ChunkFix] {os.path.basename(file_path)}: {len(targets)} target chunk(s)...")
+
+    sent_before, recv_before = token_tracker.snapshot()
+    llm_response = llm_client.generate_response(prompt)
+    sent_after, recv_after = token_tracker.snapshot()
+    display.step_tokens(step_idx, sent_after - sent_before, recv_after - recv_before)
+
+    edits = chunk_editor.parse_chunk_response(llm_response)
+    if edits is None:
+        log.info("[ChunkFix] LLM used full-file format for %s, falling back", file_path)
+        return None
+    if not edits:
+        return None
+
+    file_chunks = [c for c in chunks if c.file_path == file_path]
+    try:
+        new_content = chunk_editor.apply_chunk_edits(
+            content, edits, known_chunks=file_chunks)
+    except Exception as exc:
+        log.warning("[ChunkFix] Failed to apply edits to %s: %s", file_path, exc)
+        return None
+
+    # Destructive edit guard: if output shrinks >75%, fall back
+    if content and len(content) > 200:
+        ratio = len(new_content) / len(content)
+        if ratio < 0.25:
+            log.warning(
+                "[ChunkFix] Destructive edit for %s (%.0f%% reduction), falling back",
+                file_path, (1 - ratio) * 100)
+            return None
+
+    return {file_path: new_content}
+
+
 def _try_diff_edit(
     *,
     step_text: str,
@@ -4747,6 +4897,12 @@ def _try_diff_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prefix_parts.append(kb_ctx)
+    _diff_briefing = getattr(memory, '_task_briefing', '')
+    if _diff_briefing:
+        prefix_parts.append(
+            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+            + _diff_briefing
+        )
     if prefix_parts:
         formatted = "\n\n".join(prefix_parts) + "\n\n" + formatted
 
@@ -5247,6 +5403,12 @@ def _try_chunk_edit(
             and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix
             and "[KB INSTRUCTIONS]" not in prompt_prefix):
         prompt_prefix += behavioral_ctx + "\n\n"
+    _chunk_briefing = getattr(memory, '_task_briefing', '')
+    if _chunk_briefing:
+        prompt_prefix += (
+            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+            f"{_chunk_briefing}\n\n"
+        )
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
         step_text, formatted, slim_ctx, language=language,
@@ -5415,6 +5577,12 @@ def _try_chunk_edit(
                 "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
                 + "\n".join(f"- {c}" for c in criteria)
             )
+    _chunk_reviewer_briefing = getattr(memory, '_task_briefing', '')
+    if _chunk_reviewer_briefing:
+        criteria_ctx += (
+            "\n\nTASK BRIEFING — flag as FAIL if any Preserve item was broken:\n"
+            f"{_chunk_reviewer_briefing}"
+        )
 
     review = reviewer.process(
         f"Review this code change for the step: {step_text}\n\n{review_ctx}",

@@ -585,6 +585,7 @@ def main():
                 _pre_mem_local, '_tester_baseline_passing_files', None),
             baseline_failing_files=getattr(
                 _pre_mem_local, '_tester_baseline_failing_files', None),
+            search_agent=search_agent,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
@@ -812,6 +813,10 @@ def main():
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
         if kb_runtime_watcher is not None:
             memory.watcher_created_files = kb_runtime_watcher.created_files
+        # Propagate task briefing to memory so all downstream agents can use it
+        _briefing_text = getattr(planner, '_task_briefing', '')
+        if _briefing_text:
+            memory._task_briefing = _briefing_text
 
         # Pre-load existing source files into memory so the coder
         # can see and modify them instead of creating new files

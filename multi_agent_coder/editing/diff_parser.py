@@ -341,22 +341,33 @@ class DiffParser:
         return lines
 
     @staticmethod
-    def _validate_hunk(hunk: DiffHunk, file_lines: list[str]) -> bool:
-        """Check if hunk's original lines match the file at the given line number."""
+    def _validate_hunk(hunk: DiffHunk, file_lines: list[str], fuzzy_window: int = 3) -> bool:
+        """Check if hunk's original lines match the file at the given line number.
+
+        Accepts the hunk if it matches within ±fuzzy_window lines of the
+        stated line number, consistent with PatchApplier._apply_hunk so that
+        hunks the applier can recover are never wrongly rejected here.
+        """
         if hunk.is_insertion:
             # Insertions are valid as long as the line number is within range
             return 1 <= hunk.line_number <= len(file_lines) + 1
 
-        start = hunk.line_number - 1  # Convert to 0-indexed
-        end = start + len(hunk.original_lines)
-
-        if start < 0 or end > len(file_lines):
-            return False
-
-        # Compare original lines against actual file content
-        for i, orig_line in enumerate(hunk.original_lines):
-            actual_line = file_lines[start + i].rstrip("\n").rstrip("\r")
-            if orig_line.rstrip() != actual_line.rstrip():
+        def _matches_at(start: int) -> bool:
+            end = start + len(hunk.original_lines)
+            if start < 0 or end > len(file_lines):
                 return False
+            for i, orig_line in enumerate(hunk.original_lines):
+                actual_line = file_lines[start + i].rstrip("\n").rstrip("\r")
+                if orig_line.rstrip() != actual_line.rstrip():
+                    return False
+            return True
 
-        return True
+        exact_start = hunk.line_number - 1  # Convert to 0-indexed
+        if _matches_at(exact_start):
+            return True
+
+        for offset in range(1, fuzzy_window + 1):
+            if _matches_at(exact_start - offset) or _matches_at(exact_start + offset):
+                return True
+
+        return False

@@ -194,7 +194,8 @@ class PlannerAgent(Agent):
                     test_analysis: str | None = None,
                     language: str | None = None,
                     baseline_passing_files: list[str] | None = None,
-                    baseline_failing_files: list[str] | None = None) -> str:
+                    baseline_failing_files: list[str] | None = None,
+                    search_agent=None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -276,6 +277,57 @@ class PlannerAgent(Agent):
 
                     _contracts[_fpath] = _entry
 
+                # ── Pre-fetch KB package docs BEFORE generating the briefing ──
+                # Scan the task text for likely package names and pull their
+                # KB docs so the briefing's "Agent directive" uses the correct
+                # current API rather than LLM training-data guesses.
+                # (The search-agent step below is a fallback for packages the
+                # KB doesn't yet have, and it runs after briefing generation.)
+                _pre_pkg_docs: list[str] = []
+                if kb_context_builder is not None:
+                    try:
+                        import re as _re_pkg
+                        # Heuristic: words in the task that look like npm/pip
+                        # package names (lowercase, may contain hyphens/dots,
+                        # not common English words)
+                        _COMMON_WORDS = frozenset({
+                            "the", "and", "for", "with", "this", "that",
+                            "using", "use", "add", "implement", "enhance",
+                            "game", "visuals", "visual", "animation",
+                        })
+                        _task_tokens = [
+                            w.lower() for w in _re_pkg.findall(
+                                r'[a-zA-Z][a-zA-Z0-9._-]{2,}', task)
+                            if w.lower() not in _COMMON_WORDS
+                        ]
+                        kb_context_builder._ensure_global()
+                        _gs_pre = kb_context_builder._global_store
+                        if _gs_pre is not None and _task_tokens:
+                            for _tok in _task_tokens[:5]:
+                                _hits = _gs_pre.search(
+                                    query=_tok,
+                                    categories=["doc"],
+                                    top_k=2,
+                                    api_client=kb_context_builder._api_client,
+                                )
+                                for _h in (_hits or []):
+                                    if _tok in (_h.title or "").lower():
+                                        _pre_pkg_docs.append(
+                                            f"### {_h.title}\n{_h.content or ''}"
+                                        )
+                                        break
+                    except Exception:
+                        pass
+
+                _pre_pkg_context = (
+                    "\n\n".join(_pre_pkg_docs) if _pre_pkg_docs else None
+                )
+                if _pre_pkg_context:
+                    _logger.info(
+                        "[PreAnalysis] Pre-fetched %d KB doc(s) for briefing",
+                        len(_pre_pkg_docs),
+                    )
+
                 _briefing = analyze_task_for_planner(
                     task=task,
                     relevant_files=relevant,           # (path, reason, skeleton) tuples
@@ -284,6 +336,7 @@ class PlannerAgent(Agent):
                     passing_files=baseline_passing_files,
                     failing_files=baseline_failing_files,
                     editable_contracts=_contracts,
+                    package_docs=_pre_pkg_context,
                 )
                 if _briefing:
                     parts.insert(
@@ -299,6 +352,129 @@ class PlannerAgent(Agent):
                         "Do not second-guess the file list or add steps the briefing does not call for.",
                     )
                     _logger.info("[PreAnalysis] Task briefing injected.")
+                    # Store on instance so callers can propagate it to memory
+                    self._task_briefing = _briefing
+
+                    # Inject full source of files being modified so the planner
+                    # can copy them verbatim and make only the minimal change.
+                    # Without this, the planner reconstructs files from memory
+                    # and inevitably introduces unintended rewrites.
+                    _MAX_INJECT_CHARS = 8000  # per-file cap
+                    _src_sections: list[str] = []
+                    for _fpath, _reason, _skeleton in relevant:
+                        if source_files and _fpath in source_files:
+                            _full = source_files[_fpath]
+                            _truncated = len(_full) > _MAX_INJECT_CHARS
+                            _src_sections.append(
+                                f"### {_fpath}\n"
+                                f"```\n"
+                                + (_full[:_MAX_INJECT_CHARS]
+                                   + ("\n... (truncated)" if _truncated else ""))
+                                + "\n```"
+                            )
+                    if _src_sections:
+                        parts.insert(
+                            1,
+                            "╔══ FILES TO MODIFY — FULL CURRENT SOURCE ══╗\n"
+                            "CRITICAL: When writing content: blocks for CODE steps that MODIFY\n"
+                            "these files, you MUST start from this exact source and change ONLY\n"
+                            "what the 'Agent directive' above requires. Do NOT restructure,\n"
+                            "rename, reorder, or add comments. Copy every line verbatim except\n"
+                            "the specific className/value/line the directive points to.\n\n"
+                            + "\n\n".join(_src_sections)
+                            + "\n╚═══════════════════════════════════════════╝",
+                        )
+                        _logger.info(
+                            "[PreAnalysis] Full source injected for %d file(s)",
+                            len(_src_sections),
+                        )
+
+                    # 2c. Package documentation: parse "New packages:" from
+                    # the briefing, then for each new package combine the
+                    # existing KB doc (if any) with a live web search and let
+                    # the LLM produce a single authoritative reference.
+                    # This ensures the coder uses the correct install command,
+                    # import path, and API for the current package version —
+                    # even when the KB doc is stale.
+                    if search_agent is not None and _briefing:
+                        _pkg_line = ""
+                        for _bl in _briefing.splitlines():
+                            if _bl.startswith("New packages:"):
+                                _pkg_line = _bl[len("New packages:"):].strip()
+                                break
+
+                        if _pkg_line and _pkg_line.upper() != "NONE":
+                            _new_pkgs = [
+                                p.strip()
+                                for p in _pkg_line.split(",")
+                                if p.strip() and p.strip().upper() != "NONE"
+                            ][:3]  # cap at 3 to bound latency
+
+                            _pkg_docs: list[str] = []
+                            for _pkg in _new_pkgs:
+                                # Pull any existing KB doc for this package
+                                _existing_doc = ""
+                                if kb_context_builder is not None:
+                                    try:
+                                        kb_context_builder._ensure_global()
+                                        _gs = kb_context_builder._global_store
+                                        if _gs is not None:
+                                            _kb_hits = _gs.search(
+                                                query=_pkg,
+                                                categories=["doc", "pattern"],
+                                                top_k=3,
+                                                api_client=kb_context_builder._api_client,
+                                            )
+                                            if _kb_hits:
+                                                # Prefer a hit whose title
+                                                # contains the package name
+                                                for _kh in _kb_hits:
+                                                    if _pkg.lower() in (
+                                                        _kh.title or ""
+                                                    ).lower():
+                                                        _existing_doc = (
+                                                            _kh.content or ""
+                                                        )
+                                                        break
+                                                if not _existing_doc:
+                                                    _existing_doc = (
+                                                        _kb_hits[0].content or ""
+                                                    )
+                                    except Exception:
+                                        pass
+
+                                _logger.info(
+                                    "[PreAnalysis] Fetching docs for new "
+                                    "package: %s (kb_doc=%d chars)",
+                                    _pkg, len(_existing_doc),
+                                )
+                                _pkg_summary = search_agent.search_for_package(
+                                    _pkg,
+                                    language=language,
+                                    existing_kb_doc=_existing_doc,
+                                )
+                                if _pkg_summary:
+                                    _pkg_docs.append(
+                                        f"### {_pkg}\n{_pkg_summary}"
+                                    )
+
+                            if _pkg_docs:
+                                # Insert right after the briefing (index 0)
+                                # so the planner sees package refs immediately
+                                parts.insert(
+                                    1,
+                                    "\n[New Package Documentation]\n"
+                                    "CRITICAL: Use EXACTLY these install "
+                                    "commands, import paths, and APIs — they "
+                                    "are verified against current package "
+                                    "docs and override your training data:\n\n"
+                                    + "\n\n".join(_pkg_docs),
+                                )
+                                _logger.info(
+                                    "[PreAnalysis] %d package doc(s) injected",
+                                    len(_pkg_docs),
+                                )
+
             except Exception as _br_exc:
                 _logger.warning("[PreAnalysis] Task briefing failed: %s", _br_exc)
 
@@ -580,24 +756,21 @@ module.exports = { validateInput, sanitize };
 ---file-content-end---
 
 --STEP 3.1 [CODE] depends:2.1, 2.2
-Update server to use validation middleware
+Add validation middleware to existing server (surgical edit — file already exists)
 target: src/server.js
 imports: src/utils/validate.js:validateInput, src/utils/validate.js:sanitize
-content:
-```js
-const express = require('express');
-const { validateInput, sanitize } = require('./utils/validate');
-const app = express();
+edit:
+<<<FIND>>>
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+<<<REPLACE>>>
 app.use(express.json());
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.post('/api/data', (req, res) => {
+  const { validateInput, sanitize } = require('./utils/validate');
   if (!validateInput(req.body.value)) return res.status(400).json({ error: 'invalid' });
   res.json({ value: sanitize(req.body.value) });
 });
-function startServer(port = 3000) { return app.listen(port); }
-module.exports = { app, startServer };
-```
----file-content-end---
+<<<END>>>
 
 --STEP 4.1 [TEST] depends:3.1
 Write and run tests for the server and validation
@@ -614,6 +787,17 @@ target: <file1>, <file2>               ← CODE/TEST steps. Files to create or m
 exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
 imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
 imported_by: <file1>, <file2>          ← CODE steps. Optional. Files that will import this step's target. Use when no explicit wiring step exists.
+edit:                                  ← CODE steps that MODIFY existing files. Preferred over content: for modifications.
+<<<FIND>>>                             ←   Exact text to find (copied verbatim from current source).
+<old text>
+<<<REPLACE>>>                          ←   Replacement text.
+<new text>
+<<<END>>>                              ←   Closes one find/replace pair. Repeat FIND/REPLACE/END for multiple changes.
+content:                               ← CODE/TEST steps that CREATE new files. Required for new files.
+```<lang>                              ←   Fenced code block immediately after content:
+<complete file source>                 ←   Full file — not a snippet. Every line.
+```                                    ←   Close the fence.
+---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 produces: <file1>, <file2>             ← CMD steps. Files created by the command.
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
@@ -709,10 +893,37 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     If you cannot add a wiring step, declare `imported_by: <parent-file>` on
     the child component step so the dependency checker knows where to wire it.
 
-19. **ALWAYS include inline code for CODE and TEST steps**: Every CODE and
-    TEST step MUST include a `content:` block with the complete file source.
-    This is MANDATORY — it eliminates a separate Coder LLM call per step.
-    Use the exact format:
+19. **Inline code for CODE and TEST steps — two formats**:
+
+    **For MODIFYING an existing file** (the file appears in [FILES TO MODIFY]):
+    Use an `edit:` block with find/replace pairs. This is PREFERRED — it is
+    smaller, surgical, and cannot accidentally change unrelated code.
+    Format:
+      edit:
+      <<<FIND>>>
+      <exact text to find — copy verbatim from the source above>
+      <<<REPLACE>>>
+      <replacement text>
+      <<<END>>>
+    You may include multiple FIND/REPLACE/END sequences in one `edit:` block
+    for multiple changes to the same file.
+    RULES:
+    - The <<<FIND>>> text must be an exact substring of the current file.
+      Copy it character-for-character from the [FILES TO MODIFY] source.
+      Do NOT add, remove, or alter ANY characters — including comments,
+      whitespace, blank lines, or code — while writing the FIND block.
+      If the source has no comment on a line, the FIND block must have no
+      comment on that line. If you cannot reproduce a section verbatim,
+      make the FIND block smaller (fewer lines) so it stays exact.
+    - Change ONLY what the 'Agent directive' requires. Do NOT alter anything
+      else in the file (no comments, no renaming, no restructuring).
+    - NEVER invent or "clean up" code in the FIND block. It is a literal
+      copy — not a paraphrase or improved version of the original.
+
+    **For CREATING a new file** (file does not exist yet):
+    Use a `content:` block with the complete file source. This is MANDATORY
+    for new files — zero Coder LLM calls needed.
+    Format:
       content:
       ```<lang>
       <full file content>
@@ -738,7 +949,8 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
-- [ ] Every CODE and TEST step has a content: block with complete file source
+- [ ] Every CODE step that modifies an existing file uses an edit: block (NOT content:)
+- [ ] Every CODE/TEST step that creates a new file has a content: block with complete source
 - [ ] No two steps have the same target: file (consolidate into one step)
 - [ ] If step B imports from step A's target file, B depends on A
 - [ ] No vague steps — each step is specific and actionable

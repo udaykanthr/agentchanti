@@ -323,6 +323,10 @@ def _run_task_impl(
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
+    # Propagate task briefing to memory so all downstream agents can use it
+    _briefing_text = getattr(planner, '_task_briefing', '')
+    if _briefing_text:
+        memory._task_briefing = _briefing_text
 
     # Plan
     plan = planner.process(task, context=planner_context)

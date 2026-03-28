@@ -82,6 +82,65 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+def _find_tests_impacted_by_sources(
+    modified_sources: list[str],
+    all_test_files: dict[str, str],
+    exclude: str,
+    already_queued: set[str],
+    kb_context_builder=None,
+) -> list[str]:
+    """Return test files (not already queued) that import any of the modified source files.
+
+    Prefers the KB code graph (``CodeGraph.impact_analysis``) when available —
+    it already tracks IMPORTS edges via tree-sitter parsing so no re-scanning is
+    needed.  Falls back to a lightweight regex scan only when the graph is absent
+    (e.g. KB not initialised for this project).
+    """
+    candidates: set[str] = set()
+
+    graph = getattr(kb_context_builder, "_graph", None) if kb_context_builder else None
+
+    if graph is not None:
+        # Graph path: reverse-BFS over IMPORTS edges for each changed source.
+        for src in modified_sources:
+            for affected in graph.impact_analysis(src):
+                if _is_test_file(affected):
+                    candidates.add(affected)
+    else:
+        # Fallback: stem-match imports in test file content via regex.
+        import re as _re
+        _JS_IMPORT_RE = _re.compile(
+            r'''(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))''')
+        _PY_IMPORT_RE = _re.compile(
+            r'(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))')
+
+        src_stems: set[str] = set()
+        for src in modified_sources:
+            stem = src.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+            src_stems.add(stem)
+
+        for tpath, tcontent in all_test_files.items():
+            imports: set[str] = set()
+            for m in _JS_IMPORT_RE.finditer(tcontent):
+                rel = m.group(1) or m.group(2)
+                if rel:
+                    imports.add(rel)
+            for m in _PY_IMPORT_RE.finditer(tcontent):
+                mod = m.group(1) or m.group(2)
+                if mod:
+                    imports.add(mod.replace('.', '/'))
+            for imp in imports:
+                imp_stem = imp.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+                if imp_stem in src_stems:
+                    candidates.add(tpath)
+                    break
+
+    return [
+        t for t in candidates
+        if t != exclude and t not in already_queued
+    ]
+
+
 # ── External service dependency detection ─────────────────────
 # Patterns that indicate the command failed because an external
 # service (database, cache, message broker, etc.) is unavailable.
@@ -680,6 +739,156 @@ def _execute_step(step_idx: int, step_text: str, *,
                 plan_step=plan_step)
 
         elif step_type == "CODE":
+            # ── Inline edit fast path ──
+            # If the planner provided find/replace edit blocks, apply them
+            # surgically to the existing files and promote the result into
+            # inline_code so the existing quality gate handles it naturally.
+            # Falls through to coder if any edit fails to apply.
+            if (plan_step is not None
+                    and plan_step.inline_edits
+                    and not plan_step.inline_code):
+                _edit_subproject = _detect_subproject_root(memory)
+                _edit_all_ok = True
+
+                for _edit_fpath, _edit_pairs in plan_step.inline_edits.items():
+                    import os as _os_edit
+                    _resolved = _edit_fpath
+                    if _edit_subproject and not _edit_fpath.startswith(_edit_subproject):
+                        _candidate = f"{_edit_subproject}/{_edit_fpath}"
+                        if _os_edit.path.exists(_candidate):
+                            _resolved = _candidate
+
+                    if not _os_edit.path.exists(_resolved):
+                        _logger.warning(
+                            "[InlineEdit] Target not found: %s — skipping edit path",
+                            _resolved,
+                        )
+                        _edit_all_ok = False
+                        break
+
+                    try:
+                        with open(_resolved, "r", encoding="utf-8") as _ef:
+                            _cur = _ef.read()
+                    except OSError as _oe:
+                        _logger.warning("[InlineEdit] Cannot read %s: %s", _resolved, _oe)
+                        _edit_all_ok = False
+                        break
+
+                    # Pre-validate: log which FIND strings won't match so the
+                    # cause is visible before any edits are attempted.
+                    for _pi, (_find_pre, _) in enumerate(_edit_pairs):
+                        if _find_pre not in _cur:
+                            _find_lines_pre = [l.strip() for l in _find_pre.splitlines() if l.strip()]
+                            _cur_stripped = [l.strip() for l in _cur.splitlines()]
+                            _n_pre = len(_find_lines_pre)
+                            _pre_fuzzy = any(
+                                _cur_stripped[_li:_li + _n_pre] == _find_lines_pre
+                                for _li in range(max(0, len(_cur_stripped) - _n_pre + 1))
+                            )
+                            if not _pre_fuzzy:
+                                _logger.warning(
+                                    "[InlineEdit] FIND block #%d in %s will not match "
+                                    "(neither exact nor fuzzy). Likely cause: planner "
+                                    "hallucinated content not present in the file. "
+                                    "First non-matching line: %r",
+                                    _pi + 1, _resolved,
+                                    next(
+                                        (l for l in _find_lines_pre if l not in _cur_stripped),
+                                        "<all lines present but sequence mismatch>",
+                                    ),
+                                )
+
+                    _patched = _cur
+                    for _find_str, _repl_str in _edit_pairs:
+                        # Skip pairs where the find string has no real file
+                        # content (e.g. leftover ---file-content-end--- marker
+                        # accidentally flushed as a phantom edit pair).
+                        _find_meaningful_lines = [
+                            l for l in _find_str.splitlines()
+                            if l.strip() and not l.strip().startswith("---")
+                        ]
+                        if not _find_meaningful_lines:
+                            _logger.debug(
+                                "[InlineEdit] Skipping empty/marker-only FIND pair in %s",
+                                _resolved,
+                            )
+                            continue
+                        if _find_str in _patched:
+                            _patched = _patched.replace(_find_str, _repl_str, 1)
+                            _logger.debug("[InlineEdit] Exact match applied in %s", _resolved)
+                        else:
+                            # Fuzzy fallback: normalize whitespace per-line and
+                            # try to locate the find block in the file.
+                            # Works for both single-line and multi-line finds.
+                            _find_lines_stripped = [l.strip() for l in _find_str.splitlines() if l.strip()]
+                            _file_lns = _patched.splitlines(keepends=True)
+                            _file_stripped = [l.strip() for l in _file_lns]
+                            _n_find = len(_find_lines_stripped)
+                            _fuzzy_hit = False
+                            if _n_find > 0:
+                                for _li in range(len(_file_lns) - _n_find + 1):
+                                    if _file_stripped[_li:_li + _n_find] == _find_lines_stripped:
+                                        # Determine base indent from first matched line
+                                        _indent = len(_file_lns[_li]) - len(_file_lns[_li].lstrip())
+                                        _repl_lines = _repl_str.splitlines()
+                                        _last_orig_newline = _file_lns[_li + _n_find - 1].endswith("\n")
+                                        _replacement = (
+                                            "\n".join(
+                                                (" " * _indent + rl.lstrip()) if rl.strip() else rl
+                                                for rl in _repl_lines
+                                            )
+                                            + ("\n" if _last_orig_newline else "")
+                                        )
+                                        _file_lns[_li:_li + _n_find] = [_replacement]
+                                        _patched = "".join(_file_lns)
+                                        _fuzzy_hit = True
+                                        _logger.debug(
+                                            "[InlineEdit] Fuzzy match applied in %s (lines %d-%d)",
+                                            _resolved, _li + 1, _li + _n_find,
+                                        )
+                                        break
+                            if not _fuzzy_hit:
+                                _logger.warning(
+                                    "[InlineEdit] find string not found in %s — "
+                                    "falling through to coder",
+                                    _resolved,
+                                )
+                                _edit_all_ok = False
+                                break
+
+                    if not _edit_all_ok:
+                        break
+                    # Promote the patched content into inline_code so the
+                    # existing quality gate below handles writing + validation.
+                    plan_step.inline_code[_resolved] = _patched
+                    _logger.info(
+                        "[InlineEdit] Promoted patched %s -> inline_code", _resolved,
+                    )
+
+                if not _edit_all_ok:
+                    # If some blocks applied before the failure, write the
+                    # partial result to disk so the coder sees the already-
+                    # patched file rather than the original.  This avoids the
+                    # coder regenerating hunks that were already correct, and
+                    # prevents line-number drift that causes its diff to fail.
+                    if _patched != _cur:
+                        try:
+                            with open(_resolved, "w", encoding="utf-8") as _wf:
+                                _wf.write(_patched)
+                            memory.update({_resolved: _patched})
+                            _logger.info(
+                                "[InlineEdit] Partial edits written to %s "
+                                "before falling through to coder",
+                                _resolved,
+                            )
+                        except OSError as _we:
+                            _logger.warning(
+                                "[InlineEdit] Could not write partial edits to %s: %s",
+                                _resolved, _we,
+                            )
+                    plan_step.inline_code.clear()
+                    _logger.info("[InlineEdit] Falling through to coder (edit failed)")
+
             # ── Inline code fast path ──
             # If the planner already provided complete code in the plan,
             # write it directly — zero Coder LLM calls needed.
@@ -1686,7 +1895,14 @@ def run_final_test_verification(
 
         failing_imports = _extract_failing_test_imports(output, all_files)
 
+        _fv_briefing = getattr(memory, '_task_briefing', '')
+        _fv_briefing_block = (
+            "TASK BRIEFING (overall goal — respect Preserve and Key constraint):\n"
+            f"{_fv_briefing}\n\n"
+        ) if _fv_briefing else ""
+
         fix_prompt = (
+            f"{_fv_briefing_block}"
             f"Task: {task}\n\n"
             f"All individual test steps passed, but running the full test suite together "
             f"revealed a cross-step regression: a source fix for one test broke another.\n\n"
@@ -1698,12 +1914,37 @@ def run_final_test_verification(
             + kb_instructions
             + "\n\nFix the source file(s) so ALL tests pass."
             + "\n\nIMPORTANT: Preserve ALL existing public symbols (classes, functions, constants) — only add or modify, never remove."
-            + "\n\nOutput ONLY the complete fixed file(s) using this exact format — no prose, no explanation:\n"
-            + "#### [FILE]: path/to/file.py\n```python\n...full file content...\n```"
+            + "\n\nPrefer CHUNK FORMAT for surgical fixes:\n"
+            + "#### [EDIT]: path/to/file.py:function_name (lines start-end)\n```\n// replacement chunk\n```\n"
+            + "Use full-file [FILE]: format only when the whole file must be rewritten."
         )
         try:
             fix_response = coder.llm_client.generate_response(fix_prompt)
-            fix_files = executor.parse_code_blocks(fix_response)
+            # Try chunk edits first (surgical), fall back to full-file
+            fix_files = {}
+            try:
+                from ..editing.chunk_editor import ChunkEditor as _FvCE
+                _fv_ce = _FvCE()
+                _fv_edits = _fv_ce.parse_chunk_response(fix_response)
+                if _fv_edits:
+                    for _fv_edit in _fv_edits:
+                        _fv_fp = _fv_edit.file_path
+                        _fv_existing = memory.get(_fv_fp)
+                        if _fv_existing is None:
+                            try:
+                                with open(_fv_fp, "r", encoding="utf-8", errors="replace") as _f:
+                                    _fv_existing = _f.read()
+                            except OSError:
+                                pass
+                        if _fv_existing:
+                            try:
+                                fix_files[_fv_fp] = _fv_ce.apply_chunk_edits(_fv_existing, [_fv_edit])
+                            except Exception:
+                                pass
+            except ImportError:
+                pass
+            if not fix_files:
+                fix_files = executor.parse_code_blocks(fix_response)
             if not fix_files:
                 fix_files = executor.parse_code_blocks_fuzzy(fix_response)
             # Strictly filter: only apply fixes to non-test source files
@@ -1887,7 +2128,12 @@ def run_bulk_test_execution_and_fix(
 
     lang_tag = lang or "python"
 
-    for test_path in failed_files:
+    # Use an index-based loop so we can append newly-impacted test files
+    # to failed_files mid-iteration without losing them.
+    fix_idx = 0
+    while fix_idx < len(failed_files):
+        test_path = failed_files[fix_idx]
+        fix_idx += 1
         basename = test_path.rsplit('/', 1)[-1]
         print(f"  [BulkTest] Fixing {basename}...")
 
@@ -1931,7 +2177,14 @@ def run_bulk_test_execution_and_fix(
                 except Exception:
                     pass
 
+            _bt_briefing = getattr(memory, '_task_briefing', '')
+            _bt_briefing_block = (
+                "TASK BRIEFING (overall goal — respect Preserve and Key constraint):\n"
+                f"{_bt_briefing}\n\n"
+            ) if _bt_briefing else ""
+
             fix_prompt = (
+                f"{_bt_briefing_block}"
                 f"Task: {task}\n\n"
                 f"Test file `{test_path}` failed. Fix it so the tests pass.\n\n"
                 f"Error output:\n{file_error}\n\n"
@@ -1939,13 +2192,40 @@ def run_bulk_test_execution_and_fix(
                 f"{kb_instructions}\n\n"
                 "You may fix the test file itself OR fix a source file it imports — "
                 "whichever is correct.  Do NOT remove any existing tests.\n\n"
-                "Output ONLY the complete fixed file(s) using this exact format:\n"
-                f"#### [FILE]: path/to/file\n```{lang_tag}\n...full content...\n```"
+                "CRITICAL: Do NOT remove or comment out the tested component/feature.\n\n"
+                "Prefer CHUNK FORMAT for surgical fixes:\n"
+                f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
+                f"```{lang_tag}\n// replacement chunk\n```\n"
+                "Use full-file [FILE]: format only when the whole file must be rewritten."
             )
 
             try:
                 fix_response = coder.llm_client.generate_response(fix_prompt)
-                fix_files = executor.parse_code_blocks(fix_response)
+                # Try chunk edits first (surgical), fall back to full-file
+                fix_files = {}
+                try:
+                    from ..editing.chunk_editor import ChunkEditor as _BtCE
+                    _bt_ce = _BtCE()
+                    _bt_edits = _bt_ce.parse_chunk_response(fix_response)
+                    if _bt_edits:
+                        for _bt_edit in _bt_edits:
+                            _bt_fp = _bt_edit.file_path
+                            _bt_existing = memory.get(_bt_fp)
+                            if _bt_existing is None:
+                                try:
+                                    with open(_bt_fp, "r", encoding="utf-8", errors="replace") as _f:
+                                        _bt_existing = _f.read()
+                                except OSError:
+                                    pass
+                            if _bt_existing:
+                                try:
+                                    fix_files[_bt_fp] = _bt_ce.apply_chunk_edits(_bt_existing, [_bt_edit])
+                                except Exception:
+                                    pass
+                except ImportError:
+                    pass
+                if not fix_files:
+                    fix_files = executor.parse_code_blocks(fix_response)
                 if not fix_files:
                     fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
@@ -1969,6 +2249,39 @@ def run_bulk_test_execution_and_fix(
                 print(f"  [BulkTest] {basename} fixed ✔")
                 _p, _t, _ = _parse_test_counts(current_output)
                 display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+
+                # Check if any source files were modified and find other test
+                # files that import them — they may have been broken by the fix.
+                if fix_files:
+                    modified_sources = [f for f in fix_files if not _is_test_file(f)]
+                    if modified_sources:
+                        already_queued = set(failed_files)
+                        impacted = _find_tests_impacted_by_sources(
+                            modified_sources,
+                            test_files,
+                            exclude=test_path,
+                            already_queued=already_queued,
+                            kb_context_builder=kb_context_builder,
+                        )
+                        for rt in impacted:
+                            rt_cmd = _build_scoped_test_cmd(
+                                base_cmd, {rt: ""}, subproject_cwd)
+                            ok_rt, out_rt = executor.run_command(
+                                rt_cmd, cwd=subproject_cwd)
+                            if not ok_rt:
+                                rt_base = rt.rsplit('/', 1)[-1]
+                                _logger.warning(
+                                    "[BulkTest] %s broke after fix to %s — queuing",
+                                    rt_base, modified_sources,
+                                )
+                                print(
+                                    f"  [BulkTest] {rt_base} impacted by source "
+                                    f"change — queuing fix..."
+                                )
+                                failed_files.append(rt)
+                                _p_rt, _t_rt, _f_rt = _parse_test_counts(out_rt)
+                                display.record_test_result(
+                                    rt, passed=_p_rt, total=_t_rt, failures=_f_rt)
                 break
             _logger.warning(
                 "[BulkTest] %s still failing (attempt %d/%d)",

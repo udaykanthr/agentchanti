@@ -395,6 +395,7 @@ def analyze_task_for_planner(
     passing_files: list[str] | None = None,
     failing_files: list[str] | None = None,
     editable_contracts: dict[str, dict] | None = None,
+    package_docs: str | None = None,
 ) -> str:
     """LLM-based pre-planning analysis grounded in actual project files and test state.
 
@@ -500,6 +501,14 @@ def analyze_task_for_planner(
     sections = "\n\n".join(
         s for s in [file_section, test_section, contract_section] if s)
 
+    # Inject pre-fetched package docs so the briefing's Agent directive
+    # uses the correct current API rather than LLM training-data guesses.
+    _pkg_docs_section = (
+        "PACKAGE DOCUMENTATION (authoritative — use EXACTLY these import paths "
+        "and APIs in the Agent directive, overriding any training-data knowledge):\n"
+        f"{package_docs}\n"
+    ) if package_docs else ""
+
     prompt = f"""\
 You are a software project analyst preparing a briefing for an AI coding agent.
 The agent will plan and execute code changes to accomplish the user's task.
@@ -510,7 +519,7 @@ USER TASK:
 {task}
 
 {sections}
-
+{_pkg_docs_section}
 Answer these questions concisely and precisely:
 1. What is the real goal of this task (one sentence)?
 2. Which existing files need to be modified?  Name them specifically.
@@ -523,6 +532,16 @@ Answer these questions concisely and precisely:
    handlers are NOT part of this task and must be kept exactly as they are?
    Be specific — list concrete things (e.g. "snake renders as filled rectangles",
    "ArrowKey events still work alongside WASD", "GRID_SIZE constant is exported").
+8. Which NEW packages must be installed for this task that are NOT already present
+   in the project's dependencies (check package.json / requirements.txt in the
+   source files above)?  List bare package names only (e.g. "animejs", "lodash"),
+   comma-separated.  Write NONE if every dependency is already installed.
+9. What is the MINIMAL surgical change required?  Be as specific as possible:
+   name the exact attribute, property, CSS class string, or value to add/change.
+   Do NOT describe general restructuring approaches — point to the exact edit
+   (e.g. "add 'mx-auto max-w-7xl' to the className of the <div> wrapping <Routes>
+   in App.jsx" rather than "potentially adjust the flex container").
+   The coder must make ONLY this change and nothing else.
 
 Respond in this EXACT format — no extra text, no markdown outside the block:
 TASK BRIEFING:
@@ -533,7 +552,8 @@ Do not touch: <file paths or patterns that must not change>
 Expected output: <observable result when done>
 Key constraint: <the one rule the agent must not break>
 Preserve: <concrete list of existing behaviors/APIs the coder must not break>
-Agent directive: <one concrete instruction for the planner>
+Agent directive: <the exact minimal change required — specific attribute/class/value, not a general approach>
+New packages: <comma-separated package names, or NONE>
 """
     try:
         response = llm_client.generate_response(prompt)
