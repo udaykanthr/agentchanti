@@ -2710,6 +2710,19 @@ def _build_scoped_test_cmd(
         # Go test uses package paths, not file paths — skip scoping
         return base_cmd
 
+    # Django's manage.py test requires dotted module names, not file paths.
+    # Convert e.g. "tests/test_items_api.py" → "tests.test_items_api"
+    if "manage.py test" in base_lower:
+        dotted: list[str] = []
+        for p in scoped_paths:
+            # strip leading ./
+            while p.startswith("./") or p.startswith(".\\"):
+                p = p[2:]
+            if p.endswith(".py"):
+                p = p[:-3]
+            dotted.append(p.replace("/", ".").replace("\\", "."))
+        return f"{base_cmd} {' '.join(dotted)}"
+
     # For all other runners, append file paths
     path_args = " ".join(scoped_paths)
     return f"{base_cmd} {path_args}"

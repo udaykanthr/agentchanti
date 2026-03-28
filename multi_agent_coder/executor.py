@@ -594,8 +594,22 @@ class Executor:
                     init_dirs.add(d)
                     d = os.path.dirname(d)
 
-        # Auto-create missing __init__.py so directories are importable packages
+        # Auto-create missing __init__.py so directories are importable packages.
+        # Skip directories that are Django project roots (contain manage.py) —
+        # making the project root a Python package causes Django's test runner to
+        # import everything as <project>.app.* instead of app.*, breaking model
+        # app_label resolution and test discovery.
+        django_roots: set[str] = set()
+        for d in init_dirs:
+            if os.path.isfile(os.path.join(d, "manage.py")):
+                django_roots.add(d)
+
         for dirpath in sorted(init_dirs):
+            if dirpath in django_roots:
+                log.debug(
+                    f"[Executor] Skipping __init__.py for Django project root: {dirpath}/"
+                )
+                continue
             init_path = os.path.join(dirpath, "__init__.py")
             if not os.path.exists(init_path):
                 with open(init_path, "w", encoding="utf-8") as f:

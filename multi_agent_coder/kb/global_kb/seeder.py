@@ -1223,6 +1223,30 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="django,tests,import,tests.py,startapp,__init__,namespace,package,python,ImportError",
     ),
+    # ── Django test runner given a file path instead of dotted module ────
+    ErrorFix(
+        error_type="DjangoTestLabelIsFilePath",
+        language="python",
+        pattern=r"One of the test labels is a path to a file:.*which is not supported",
+        cause="Django's test runner (manage.py test) does not accept filesystem paths "
+              "as test labels. It requires dotted module names (e.g. 'tests.test_views') "
+              "or app labels (e.g. 'myapp'). Passing 'tests/test_views.py' triggers "
+              "RuntimeError. This is an agent runner issue — do NOT modify manage.py.",
+        fix_template="FIX: Convert the file path to a dotted module name before passing it "
+                     "to manage.py test.\n\n"
+                     "WRONG:\n"
+                     "  python manage.py test tests/test_items_api.py\n\n"
+                     "CORRECT:\n"
+                     "  python manage.py test tests.test_items_api\n\n"
+                     "Rule: strip .py extension, replace / with ., strip leading ./\n"
+                     "  tests/test_foo.py       → tests.test_foo\n"
+                     "  ./service/tests/test_views.py → service.tests.test_views\n\n"
+                     "To run the whole test suite without scoping:\n"
+                     "  python manage.py test\n\n"
+                     "NEVER modify manage.py to work around this — fix the test label instead.",
+        severity="error",
+        tags="django,manage.py,test,label,file,path,dotted,module,RuntimeError,python",
+    ),
     # ── Django makemigrations: No installed app with label 'X' ──────────
     ErrorFix(
         error_type="DjangoNoInstalledAppWithLabel",
