@@ -235,6 +235,47 @@ class PlannerAgent(Agent):
         if relevant or test_analysis:
             try:
                 from ..orchestrator.test_analyzer import analyze_task_for_planner
+                import os as _os
+
+                # Build behavioral contracts for each editable file:
+                #   source  — full content from source_files (richer than skeleton)
+                #   tests   — content of any passing test files whose name matches
+                #             the source file basename (e.g. SnakeGame → SnakeGame.test.jsx)
+                # When no test file exists, source content alone forms the contract.
+                _contracts: dict[str, dict] = {}
+                _MAX_SRC_CHARS = 6000   # cap per file to stay within prompt budget
+
+                for _fpath, _reason, _skeleton in relevant:
+                    _entry: dict = {}
+
+                    # Full source content (truncated if large)
+                    if source_files and _fpath in source_files:
+                        _src = source_files[_fpath]
+                        _entry["source"] = (
+                            _src[:_MAX_SRC_CHARS]
+                            + ("\n... (truncated)" if len(_src) > _MAX_SRC_CHARS else "")
+                        )
+                    else:
+                        _entry["source"] = _skeleton  # fallback to skeleton
+
+                    # Matching test files — name-based matching
+                    _entry["tests"] = {}
+                    _src_base = _os.path.splitext(
+                        _os.path.basename(_fpath))[0].lower()
+                    if baseline_passing_files and source_files:
+                        for _tpath in baseline_passing_files:
+                            _tbase = _os.path.basename(_tpath).lower()
+                            # Match: SnakeGame.jsx ↔ SnakeGame.test.jsx / snakegame.spec.ts
+                            if _src_base in _tbase and _tpath in source_files:
+                                _tcontent = source_files[_tpath]
+                                _entry["tests"][_tpath] = (
+                                    _tcontent[:_MAX_SRC_CHARS]
+                                    + ("\n... (truncated)"
+                                       if len(_tcontent) > _MAX_SRC_CHARS else "")
+                                )
+
+                    _contracts[_fpath] = _entry
+
                 _briefing = analyze_task_for_planner(
                     task=task,
                     relevant_files=relevant,           # (path, reason, skeleton) tuples
@@ -242,6 +283,7 @@ class PlannerAgent(Agent):
                     llm_client=self.llm_client,
                     passing_files=baseline_passing_files,
                     failing_files=baseline_failing_files,
+                    editable_contracts=_contracts,
                 )
                 if _briefing:
                     parts.insert(
@@ -252,6 +294,8 @@ class PlannerAgent(Agent):
                         "CRITICAL: The briefing above was produced by an independent analyst\n"
                         "who read your task against the actual project files and live test results.\n"
                         "Your plan MUST follow the 'Agent directive' line exactly.\n"
+                        "The 'Preserve:' line lists behaviors the coder must NOT break — treat\n"
+                        "each item as a hard constraint that applies to every CODE step you generate.\n"
                         "Do not second-guess the file list or add steps the briefing does not call for.",
                     )
                     _logger.info("[PreAnalysis] Task briefing injected.")

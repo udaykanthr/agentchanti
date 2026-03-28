@@ -394,6 +394,7 @@ def analyze_task_for_planner(
     llm_client,
     passing_files: list[str] | None = None,
     failing_files: list[str] | None = None,
+    editable_contracts: dict[str, dict] | None = None,
 ) -> str:
     """LLM-based pre-planning analysis grounded in actual project files and test state.
 
@@ -405,6 +406,14 @@ def analyze_task_for_planner(
     from ``perform_baseline_test_analysis``.  Passing them explicitly (rather
     than extracting from the text blob) ensures the full list always reaches
     the interpreter regardless of how long the analysis text is.
+
+    *editable_contracts* maps each editable file path to a dict with:
+      - "source": full (or truncated) source content
+      - "tests":  dict of {test_path: test_content} for matching test files
+                  (empty dict when no test files exist for this source)
+    This lets the interpreter derive a "Preserve" list — behaviors the coder
+    must not break — from both the explicit test assertions AND the implicit
+    contract embedded in the source code itself.
 
     Returns a ``TASK BRIEFING`` block string, or empty string on failure.
     The caller (``PlannerAgent.pre_analyze``) injects it as the first thing
@@ -455,13 +464,47 @@ def analyze_task_for_planner(
 
     test_section = "\n".join(test_section_lines) if len(test_section_lines) > 1 else ""
 
-    sections = "\n\n".join(s for s in [file_section, test_section] if s)
+    # Build the behavioral contract section for each editable file.
+    # Source content gives the implicit contract (exports, state, event handlers,
+    # rendered structure).  Test content gives the explicit assertions.
+    # Both are included so the interpreter can derive a precise Preserve list.
+    contract_section = ""
+    if editable_contracts:
+        contract_parts: list[str] = [
+            "CURRENT BEHAVIORAL CONTRACT FOR FILES BEING MODIFIED:",
+            "(Read these carefully — the coder must preserve all behaviors NOT",
+            " mentioned in the task, whether covered by tests or not.)",
+        ]
+        for fpath, entry in editable_contracts.items():
+            contract_parts.append(f"\n{'='*60}")
+            contract_parts.append(f"FILE: {fpath}")
+
+            src = entry.get("source", "")
+            if src:
+                contract_parts.append("-- Source (current implementation) --")
+                contract_parts.append(src)
+
+            tests = entry.get("tests", {})
+            if tests:
+                for tpath, tcontent in tests.items():
+                    contract_parts.append(f"-- Test assertions: {tpath} --")
+                    contract_parts.append(tcontent)
+            else:
+                contract_parts.append(
+                    "-- No test file found for this source. "
+                    "Derive preserved behaviors from the source above. --"
+                )
+
+        contract_section = "\n".join(contract_parts)
+
+    sections = "\n\n".join(
+        s for s in [file_section, test_section, contract_section] if s)
 
     prompt = f"""\
 You are a software project analyst preparing a briefing for an AI coding agent.
 The agent will plan and execute code changes to accomplish the user's task.
 Your job is to determine — based on the ACTUAL current project state below —
-exactly what needs to change and what must not be touched.
+exactly what needs to change, what must be preserved, and what must not be touched.
 
 USER TASK:
 {task}
@@ -475,6 +518,11 @@ Answer these questions concisely and precisely:
 4. Which files must NOT be touched and why?
 5. What does a successful result look like?  (observable outcome, not process steps)
 6. What is the single most important constraint the coding agent must respect?
+7. Looking at the source implementation and test assertions for the files being
+   modified: which existing behaviors, APIs, exports, rendered elements, or event
+   handlers are NOT part of this task and must be kept exactly as they are?
+   Be specific — list concrete things (e.g. "snake renders as filled rectangles",
+   "ArrowKey events still work alongside WASD", "GRID_SIZE constant is exported").
 
 Respond in this EXACT format — no extra text, no markdown outside the block:
 TASK BRIEFING:
@@ -484,6 +532,7 @@ Create: <specific new file paths, or NONE>
 Do not touch: <file paths or patterns that must not change>
 Expected output: <observable result when done>
 Key constraint: <the one rule the agent must not break>
+Preserve: <concrete list of existing behaviors/APIs the coder must not break>
 Agent directive: <one concrete instruction for the planner>
 """
     try:

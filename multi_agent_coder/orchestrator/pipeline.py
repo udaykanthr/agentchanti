@@ -1805,6 +1805,7 @@ def run_bulk_test_execution_and_fix(
         _extract_file_specific_errors,
         _extract_imported_sources,
         _ANSI_RE,
+        _parse_test_counts,
     )
 
     all_files = memory.all_files()
@@ -1863,6 +1864,9 @@ def run_bulk_test_execution_and_fix(
     if ok:
         _logger.info("[BulkTest] All tests passed on first run.")
         print("  [BulkTest] All tests passed.")
+        # Record every test file as passed
+        for fpath in test_files:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
         return True, ""
 
     _logger.warning("[BulkTest] Tests failed:\n%s", output[:1000])
@@ -1871,6 +1875,15 @@ def run_bulk_test_execution_and_fix(
     failed_files = _parse_failed_test_files(output, list(test_files.keys()))
     _logger.info("[BulkTest] Failed test files: %s", failed_files)
     print(f"  [BulkTest] {len(failed_files)} test file(s) failed — fixing one at a time...")
+
+    # Show initial pass/fail state in TEST RESULTS immediately
+    _failed_set = set(failed_files)
+    for fpath in test_files:
+        if fpath in _failed_set:
+            _p, _t, _f = _parse_test_counts(output)
+            display.record_test_result(fpath, passed=_p, total=_t, failures=_f)
+        else:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
 
     lang_tag = lang or "python"
 
@@ -1954,11 +1967,16 @@ def run_bulk_test_execution_and_fix(
             if ok_single:
                 _logger.info("[BulkTest] %s now passes.", basename)
                 print(f"  [BulkTest] {basename} fixed ✔")
+                _p, _t, _ = _parse_test_counts(current_output)
+                display.record_test_result(test_path, passed=_p, total=_t, failures=[])
                 break
             _logger.warning(
                 "[BulkTest] %s still failing (attempt %d/%d)",
                 basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
             )
+            # Update TEST RESULTS with latest counts on each fix attempt
+            _p, _t, _f = _parse_test_counts(current_output)
+            display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
         else:
             print(f"  [BulkTest] {basename} could not be fixed after "
                   f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
@@ -1968,7 +1986,19 @@ def run_bulk_test_execution_and_fix(
     if ok_final:
         _logger.info("[BulkTest] Final run-all passed.")
         print("  [BulkTest] All tests pass after fixes.")
+        # Mark all files as passed in TEST RESULTS
+        for fpath in test_files:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
         return True, ""
+
+    # Update remaining failures with final output
+    still_failing = set(_parse_failed_test_files(output_final, list(test_files.keys())))
+    for fpath in test_files:
+        if fpath in still_failing:
+            _p, _t, _f = _parse_test_counts(output_final)
+            display.record_test_result(fpath, passed=_p, total=_t, failures=_f)
+        else:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
 
     error_msg = (
         f"Bulk test execution failed: some test file(s) still failing "
