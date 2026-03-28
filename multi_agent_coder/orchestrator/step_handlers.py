@@ -921,8 +921,10 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         re.compile(r'rails\s+new\s+(\S+)'),
         # cargo new <dir>
         re.compile(r'cargo\s+new\s+(\S+)'),
-        # django-admin startproject <dir>
-        re.compile(r'django-admin\s+startproject\s+(\S+)'),
+        # mkdir <dir> && ... django  (Django scaffold creates dir separately)
+        re.compile(r'mkdir\s+(-p\s+)?(\S+)\s*&&.*django'),
+        # django-admin startproject <name> <dir>  (explicit target dir)
+        re.compile(r'django-admin\s+startproject\s+\S+\s+(\S+)'),
     ]
 
     for fpath, content in all_files.items():
@@ -933,7 +935,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         for pattern in _PROJECT_CREATE_PATTERNS:
             m = pattern.search(first_line)
             if m:
-                candidate = m.group(1).strip().rstrip('/')
+                candidate = m.group(m.lastindex).strip().rstrip('/')
                 # Skip if the command used ./ (current directory)
                 if candidate in ('.', './', ''):
                     continue
@@ -968,6 +970,30 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
             "Memory keys: %s",
             list(all_files.keys())[:10],
         )
+        # Last-resort: scan immediate subdirectories on disk for project
+        # manifests. Catches Django projects created with:
+        #   mkdir <dir> && cd <dir> && django-admin startproject config .
+        # where the CMD pattern couldn't extract the directory name.
+        _fs_manifests = (
+            'manage.py', 'package.json', 'requirements.txt',
+            'go.mod', 'Cargo.toml', 'Gemfile', 'pyproject.toml',
+        )
+        try:
+            for _entry in sorted(os.scandir('.'), key=lambda e: e.name):
+                if not _entry.is_dir() or _entry.name.startswith('.'):
+                    continue
+                if _entry.name in _internal:
+                    continue
+                for _manifest in _fs_manifests:
+                    if os.path.isfile(os.path.join(_entry.name, _manifest)):
+                        log.info(
+                            "[SubProject] Detected sub-project root via "
+                            "filesystem scan (%s): %s/",
+                            _manifest, _entry.name,
+                        )
+                        return _entry.name
+        except OSError:
+            pass
         return None
 
     # Directories that are NOT sub-project roots — they are conventional

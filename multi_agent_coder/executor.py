@@ -471,6 +471,9 @@ class Executor:
         'Pipfile', 'Pipfile.lock', 'poetry.lock',
         'requirements.txt',
         '.agentchanti.yaml', '.agentchanti.yml',
+        # Django / framework entry points — overwriting strips imports and
+        # the if __name__ == '__main__' guard, causing silent no-op execution
+        'manage.py', 'wsgi.py', 'asgi.py',
     }
 
     # Common mojibake patterns: UTF-8 bytes misinterpreted as Latin-1/cp1252.
@@ -599,6 +602,33 @@ class Executor:
                     f.write("")
                 log.info(f"Auto-created: {init_path}")
                 written.append(init_path)
+
+            # Remove any same-named .py stub that would shadow the package.
+            # E.g. Django's `startapp` creates `tests.py`; if the agent later
+            # writes files under `tests/`, both `tests.py` and `tests/` exist in
+            # the same directory and Python's import system raises:
+            #   ImportError: 'tests' module incorrectly imported from '…/tests'
+            # Removing the stub (it is always empty or contains a comment only)
+            # resolves the conflict without any data loss.
+            pkg_name = os.path.basename(dirpath)
+            parent_dir = os.path.dirname(dirpath)
+            shadow_stub = os.path.join(parent_dir, pkg_name + ".py")
+            if os.path.isfile(shadow_stub):
+                try:
+                    with open(shadow_stub, encoding="utf-8") as _f:
+                        stub_content = _f.read().strip()
+                    # Only remove if the file is a placeholder (empty or pure comments)
+                    non_comment_lines = [
+                        ln for ln in stub_content.splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+                    if not non_comment_lines:
+                        os.remove(shadow_stub)
+                        log.info(
+                            f"Removed stub {shadow_stub} — shadowed by package {dirpath}/"
+                        )
+                except OSError:
+                    pass
 
         return written
 

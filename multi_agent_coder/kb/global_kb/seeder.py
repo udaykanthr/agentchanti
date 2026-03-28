@@ -1136,6 +1136,119 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="element,type,invalid,undefined,import,export,default,named,mixed,react,component,testing,javascript,typescript",
     ),
     # ── Django test client — ALLOWED_HOSTS missing 'testserver' ──────────
+    # ── Production code importing from test modules ───────────────────────
+    ErrorFix(
+        error_type="DjangoProductionImportsTests",
+        language="python",
+        pattern=r"ImportError: cannot import name '(\w+)' from '[\w\.]*\.tests'",
+        cause="A production file (views.py, models.py, urls.py, etc.) contains an import "
+              "from a test module (e.g. 'from .tests import ItemAPITest'). "
+              "Test classes must never be imported into production code. "
+              "This is a code generation hallucination — the LLM invented the import "
+              "to 'avoid an orphaned export', which is not a real Django requirement.",
+        fix_template="CRITICAL — THIS IS A BUG IN THE PRODUCTION FILE, NOT IN THE TEST FILE.\n\n"
+                     "FIX: Remove the test import from the production file entirely.\n\n"
+                     "STEPS:\n"
+                     "1. Open the production file named in the traceback "
+                     "(e.g. views.py, urls.py, models.py).\n"
+                     "2. Delete every line that imports from a test module:\n"
+                     "   REMOVE: from .tests import ItemAPITest\n"
+                     "   REMOVE: from myapp.tests import ...\n"
+                     "   REMOVE: import tests\n"
+                     "3. Do NOT modify the test file or tests/__init__.py to fix this.\n"
+                     "4. Do NOT add re-exports to tests/__init__.py.\n"
+                     "5. Production files (views, models, urls, admin, serializers) "
+                     "must NEVER import test classes or test utilities.\n\n"
+                     "RULE: If the import path contains '.tests' or ends in 'tests', "
+                     "it belongs only in test files. Remove it from production code.",
+        severity="error",
+        tags="django,import,tests,views,production,ImportError,circular,hallucination,python",
+    ),
+    # ── Django manage.py stripped of imports / entry point ───────────────
+    ErrorFix(
+        error_type="DjangoManagePySilentExit",
+        language="python",
+        pattern=r"",  # detected by symptom, not error text
+        cause="manage.py was overwritten by the agent with only the main() function body, "
+              "losing `import os`, `import sys`, and the `if __name__ == '__main__': main()` "
+              "entry point. Python imports the file, defines the function, and exits silently — "
+              "no output, no error, exit code 0. Every manage.py command appears to do nothing.",
+        fix_template="FIX: Restore the missing scaffolding in manage.py.\n\n"
+                     "The file must have this structure:\n\n"
+                     "#!/usr/bin/env python\n"
+                     "\"\"\"Django's command-line utility for administrative tasks.\"\"\"\n"
+                     "import os\n"
+                     "import sys\n\n\n"
+                     "def main():\n"
+                     "    \"\"\"Run administrative tasks.\"\"\"\n"
+                     "    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<config>.settings')\n"
+                     "    try:\n"
+                     "        from django.core.management import execute_from_command_line\n"
+                     "    except ImportError as exc:\n"
+                     "        raise ImportError(\n"
+                     "            \"Couldn't import Django...\"\n"
+                     "        ) from exc\n"
+                     "    execute_from_command_line(sys.argv)\n\n\n"
+                     "if __name__ == '__main__':\n"
+                     "    main()\n\n"
+                     "RULE: NEVER overwrite manage.py. It is a Django framework entry point. "
+                     "If you need to customise argument handling, do it inside main() only — "
+                     "never remove the imports or the if __name__ guard.",
+        severity="critical",
+        tags="django,manage.py,silent,exit,import,os,sys,__main__,entrypoint,python",
+    ),
+    # ── Django tests/ directory vs tests.py stub conflict ────────────────
+    ErrorFix(
+        error_type="DjangoTestsModuleIncorrectlyImported",
+        language="python",
+        pattern=r"'tests' module incorrectly imported from '.*'",
+        cause="Django's `startapp` command creates a stub `tests.py` file. "
+              "If the agent also created a `tests/` subdirectory (e.g. `tests/test_views.py`), "
+              "both `tests.py` and `tests/` exist in the same app directory. "
+              "Python's import system raises 'incorrectly imported' because `tests/` "
+              "is treated as a namespace package (no __init__.py) OR because `tests.py` "
+              "conflicts with the `tests/` package. "
+              "This is always caused by the startapp stub not being removed.",
+        fix_template="FIX: Remove the conflicting stub and ensure __init__.py exists.\n\n"
+                     "STEP 1 — Delete the stub file created by startapp:\n"
+                     "  rm <appname>/tests.py\n"
+                     "(e.g. rm myapp/tests.py)\n\n"
+                     "STEP 2 — Ensure the tests directory has __init__.py:\n"
+                     "  touch <appname>/tests/__init__.py\n"
+                     "(e.g. touch myapp/tests/__init__.py)\n\n"
+                     "STEP 3 — Re-run the test suite:\n"
+                     "  python manage.py test\n\n"
+                     "NOTE: Do NOT move or rename test files — just create __init__.py "
+                     "and remove the conflicting stub.",
+        severity="error",
+        tags="django,tests,import,tests.py,startapp,__init__,namespace,package,python,ImportError",
+    ),
+    # ── Django admin list_display field does not exist on model ─────────
+    ErrorFix(
+        error_type="DjangoAdminListDisplayInvalidField",
+        language="python",
+        pattern=r"admin\.E108.*list_display\[\d+\].*refers to '(\w+)'.*not a callable or attribute",
+        cause="The admin class has a field name in `list_display` that does not exist on the "
+              "linked model. This is a hallucination — the LLM assumed a field (e.g. `created_at`, "
+              "`updated_at`, `status`) would be on the model, but it was never defined there. "
+              "Django's system check raises admin.E108 and refuses to start the test runner.",
+        fix_template="FIX: Reconcile list_display with the actual model fields.\n\n"
+                     "STEP 1 — Read the model definition to see which fields actually exist:\n"
+                     "  Open <appname>/models.py and list all field names on the relevant model.\n\n"
+                     "STEP 2 — Choose ONE of the following options:\n\n"
+                     "  Option A (preferred when the field is genuinely needed):\n"
+                     "    Add the missing field to the model:\n"
+                     "      created_at = models.DateTimeField(auto_now_add=True)\n"
+                     "    Then run: python manage.py makemigrations && python manage.py migrate\n\n"
+                     "  Option B (preferred when it was a hallucination):\n"
+                     "    Remove the non-existent field name from list_display in admin.py.\n"
+                     "    Only keep field names that are confirmed to exist on the model.\n\n"
+                     "RULE: NEVER add a field to list_display that is not already defined in "
+                     "models.py. Read models.py first, then write admin.py.",
+        severity="error",
+        tags="django,admin,E108,list_display,field,model,hallucination,SystemCheckError,python",
+    ),
+    # ── Django test client — ALLOWED_HOSTS missing 'testserver' ──────────
     ErrorFix(
         error_type="DjangoDisallowedHostTestServer",
         language="python",
@@ -2502,6 +2615,52 @@ class MyModelTest(TestCase):
         obj = MyModel.objects.create(name="test")
         self.assertEqual(obj.name, "test")
 ```
+
+## Rule 8: NEVER import test classes into production files
+
+Production files (`views.py`, `models.py`, `urls.py`, `admin.py`, `serializers.py`)
+must NEVER import from test modules. This is always a code generation error.
+
+WRONG — remove this from any production file immediately:
+```python
+# views.py
+from .tests import ItemAPITest          # ← WRONG
+from myapp.tests import SomeTestClass   # ← WRONG
+```
+
+If you see `ImportError: cannot import name '...' from '...tests'` originating
+from a production file, delete the offending import line. Do NOT fix the test
+module or add re-exports — the import should not exist at all.
+
+## Rule 9: admin.py list_display must only reference fields that exist on the model
+
+NEVER add a field name to `list_display` in `admin.py` unless that field is
+explicitly defined in the corresponding model in `models.py`.
+
+Common hallucinated fields that trigger `admin.E108`:
+- `created_at` / `updated_at` — only present if explicitly added with `DateTimeField`
+- `status` — only present if explicitly added with `CharField` or `IntegerField`
+- `is_active`, `slug`, `description` — same rule applies
+
+WRONG — assumes the model has `created_at`:
+```python
+class ItemAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'created_at']  # admin.E108 if model lacks created_at
+```
+
+CORRECT — only list fields confirmed in models.py:
+```python
+# models.py has: id, name, price — nothing else
+class ItemAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'price']
+```
+
+If `created_at` tracking is genuinely needed, add it to the model first:
+```python
+# models.py
+created_at = models.DateTimeField(auto_now_add=True)
+```
+Then run `makemigrations` + `migrate` before referencing it in admin.
 
 ## Rule 7: When tests fail with SOURCE_BUG triage — diagnose before fixing
 
