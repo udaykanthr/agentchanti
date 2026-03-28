@@ -573,6 +573,7 @@ def main():
                 log.warning("[Planning] Baseline test analysis failed: %s", _test_exc)
 
         # Pre-analysis: map relevant files, classify intent, enrich context
+        _pre_mem_local = locals().get('_pre_memory')
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -580,6 +581,10 @@ def main():
             knowledge_base=knowledge_base,
             test_analysis=test_analysis,
             language=language,
+            baseline_passing_files=getattr(
+                _pre_mem_local, '_tester_baseline_passing_files', None),
+            baseline_failing_files=getattr(
+                _pre_mem_local, '_tester_baseline_failing_files', None),
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
@@ -595,6 +600,22 @@ def main():
             )
             plan = planner.process(args.task, context=planner_context)
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
+
+            # ── Planner no-op signal ──
+            # If the planner determined the task is already satisfied it
+            # emits ==DONE== instead of steps.  Honour that and exit cleanly.
+            if "==DONE==" in plan:
+                _done_reason = ""
+                for _line in plan.splitlines():
+                    if _line.startswith("reason:"):
+                        _done_reason = _line[len("reason:"):].strip()
+                        break
+                _done_msg = _done_reason or "Task already satisfied — no changes needed."
+                log.info("[Plan] Planner signalled ==DONE==: %s", _done_msg)
+                display.show_status(_done_msg)
+                display.finish()
+                print(f"\n  ✓ {_done_msg}\n")
+                return
 
             # ── 10. Parse steps + dependencies ──
             from .plan_step import (

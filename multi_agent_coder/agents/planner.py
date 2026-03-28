@@ -192,7 +192,9 @@ class PlannerAgent(Agent):
                     kb_context_builder=None,
                     knowledge_base=None,
                     test_analysis: str | None = None,
-                    language: str | None = None) -> str:
+                    language: str | None = None,
+                    baseline_passing_files: list[str] | None = None,
+                    baseline_failing_files: list[str] | None = None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -238,6 +240,8 @@ class PlannerAgent(Agent):
                     relevant_files=relevant,           # (path, reason, skeleton) tuples
                     test_analysis=test_analysis or "",
                     llm_client=self.llm_client,
+                    passing_files=baseline_passing_files,
+                    failing_files=baseline_failing_files,
                 )
                 if _briefing:
                     parts.insert(
@@ -485,6 +489,16 @@ these agents to succeed on the first attempt.
 ═══════ OUTPUT FORMAT ═══════
 Output your plan using this EXACT line-based format. Each step starts with
 a --STEP header line followed by metadata lines and a description.
+
+IMPORTANT: If the TASK BRIEFING says the task is already satisfied (e.g.
+"Already satisfied: Yes", "Required changes: NONE", or "Agent directive"
+says no changes are needed), output ONLY this — no steps, no explanation:
+
+==DONE==
+reason: <one sentence explaining why no action is needed>
+==END==
+
+Otherwise, output steps using the format below:
 
 ==PLAN==
 

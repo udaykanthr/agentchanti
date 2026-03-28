@@ -270,8 +270,34 @@ def perform_baseline_test_analysis(
     _baseline_failing_files: list[str] = []
     _baseline_passing_files: list[str] = []
 
+    # Pattern covering common test file conventions across languages
+    _TEST_FILE_PAT = re.compile(
+        r'(?:'
+        r'\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$'   # JS/TS
+        r'|__tests__/.*\.[jt]sx?$'                         # Jest __tests__ dir
+        r'|_test\.py$|test_[^/]+\.py$'                     # Python
+        r'|_test\.go$'                                      # Go
+        r'|_spec\.rb$'                                      # Ruby
+        r')',
+        re.I,
+    )
+
     if success:
+        # Scan memory to identify every test file that is currently passing.
+        # This list is included in the analysis so the task interpreter and
+        # planner know EXACTLY which files must not be touched.
+        _all_mem_files = memory.all_files()
+        _baseline_passing_files = sorted(
+            fp for fp in _all_mem_files.keys()
+            if _TEST_FILE_PAT.search(fp)
+        )
+
         analysis_lines.append("- All existing tests are currently PASSING.")
+        if _baseline_passing_files:
+            analysis_lines.append("- PASSING TEST FILES (must NOT be modified):")
+            for fp in _baseline_passing_files:
+                analysis_lines.append(f"  - {fp}")
+
         if _is_test_fix:
             analysis_lines.append("- DIRECTIVE: Test environment is HEALTHY. Do NOT add setup or fix steps for tests.")
             analysis_lines.append("  Do NOT modify vitest.config, jest.config, setup files, or any test file.")
@@ -366,6 +392,8 @@ def analyze_task_for_planner(
     relevant_files: list[tuple[str, str, str]],
     test_analysis: str,
     llm_client,
+    passing_files: list[str] | None = None,
+    failing_files: list[str] | None = None,
 ) -> str:
     """LLM-based pre-planning analysis grounded in actual project files and test state.
 
@@ -373,8 +401,10 @@ def analyze_task_for_planner(
     by the keyword/KB pre-filter — only the files already deemed relevant to
     the task, not the entire project.  This keeps the prompt focused.
 
-    *test_analysis* is the raw PRE-EXECUTION ANALYSIS text from
-    ``perform_baseline_test_analysis`` (pass/fail state, error output, etc.).
+    *passing_files* / *failing_files* are the complete per-file test results
+    from ``perform_baseline_test_analysis``.  Passing them explicitly (rather
+    than extracting from the text blob) ensures the full list always reaches
+    the interpreter regardless of how long the analysis text is.
 
     Returns a ``TASK BRIEFING`` block string, or empty string on failure.
     The caller (``PlannerAgent.pre_analyze``) injects it as the first thing
@@ -393,23 +423,37 @@ def analyze_task_for_planner(
             + "\n".join(file_lines)
         )
 
-    # Summarise the test state concisely for the prompt
-    test_section = ""
-    if test_analysis:
-        # Extract just the key lines (pass/fail summary + failing file names)
-        # to avoid flooding the prompt with full error output
-        summary_lines = []
+    # Build the test state section.
+    # Use explicit file lists when provided (complete, no truncation risk).
+    # Fall back to extracting key lines from the text blob.
+    test_section_lines: list[str] = ["CURRENT TEST STATE (live test run seconds ago):"]
+
+    if passing_files is not None or failing_files is not None:
+        # Explicit structured data — always complete
+        if failing_files:
+            test_section_lines.append(
+                f"FAILING ({len(failing_files)} file(s)) — these need fixing:")
+            for fp in failing_files:
+                test_section_lines.append(f"  FAIL: {fp}")
+        else:
+            test_section_lines.append("All tests PASSING — 0 failures.")
+
+        if passing_files:
+            test_section_lines.append(
+                f"PASSING ({len(passing_files)} file(s)) — must NOT be modified:")
+            for fp in passing_files:
+                test_section_lines.append(f"  PASS: {fp}")
+    elif test_analysis:
+        # Fallback: extract key lines from the raw text, but do NOT cap the
+        # count — we need every file name to reach the interpreter.
         for line in test_analysis.splitlines():
             stripped = line.strip()
-            if stripped.startswith(("- ", "DIRECTIVE", "BROKEN", "HEALTHY",
-                                    "PRE-EXECUTION", "Baseline:")):
-                summary_lines.append(stripped)
-            if len(summary_lines) >= 10:
-                break
-        test_section = (
-            "CURRENT TEST STATE (from a live test run done seconds ago):\n"
-            + "\n".join(summary_lines)
-        )
+            if stripped.startswith(("- ", "  - ", "DIRECTIVE", "BROKEN",
+                                    "HEALTHY", "PRE-EXECUTION", "Baseline:",
+                                    "PASSING TEST FILES", "ACTUAL ERROR")):
+                test_section_lines.append(stripped)
+
+    test_section = "\n".join(test_section_lines) if len(test_section_lines) > 1 else ""
 
     sections = "\n\n".join(s for s in [file_section, test_section] if s)
 
