@@ -1236,6 +1236,11 @@ def _make_cmd_idempotent(
     if m:
         venv_dir = m.group(1)
         if os.path.isdir(os.path.join(root, venv_dir)):
+            # Strip just the venv creation segment; keep the rest of a && chain
+            segments = [s.strip() for s in stripped.split('&&')]
+            remaining = [s for s in segments if not re.match(r'^python3?\s+-m\s+venv\s+', s)]
+            if remaining:
+                return ' && '.join(remaining), f"virtualenv '{venv_dir}' already exists, skipping creation"
             return None, f"virtualenv '{venv_dir}' already exists, skipping creation"
         return cmd, ""
 

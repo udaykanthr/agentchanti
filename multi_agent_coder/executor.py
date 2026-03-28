@@ -692,6 +692,22 @@ class Executor:
         )
         return any(re.search(p, cmd) for p in patterns)
 
+    # ── POSIX shell compatibility rewrites ──
+
+    @staticmethod
+    def _rewrite_for_posix_sh(cmd: str) -> str:
+        """Rewrite bash-specific constructs so they work under /bin/sh.
+
+        subprocess uses /bin/sh by default on POSIX systems.  ``source`` is a
+        bash builtin and not available in sh; replace it with ``.`` which is
+        the POSIX-standard equivalent.
+        """
+        # Replace `source <path>` with `. <path>` (handles leading spaces/&&)
+        rewritten = re.sub(r'(?<![.\w])source\s+', '. ', cmd)
+        if rewritten != cmd:
+            log.info("[Executor] Rewrote 'source' → '.' for /bin/sh compatibility")
+        return rewritten
+
     # ── Unix → Windows command translation ──
 
     @staticmethod
@@ -830,6 +846,10 @@ class Executor:
             cmd = Executor._sanitize_unicode(cmd)
             log.info(f"[Executor] Running {'background ' if background else ''}command: {cmd}"
                      f"{f' (cwd={cwd})' if cwd else ''}")
+            # Fix bash-only constructs (source → .) so /bin/sh can run them
+            if os.name != 'nt':
+                cmd = Executor._rewrite_for_posix_sh(cmd)
+
             # Translate Unix commands to Windows cmd.exe equivalents
             if os.name == 'nt':
                 cmd = Executor._rewrite_unix_cmd_for_windows(cmd)
