@@ -749,6 +749,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and not plan_step.inline_code):
                 _edit_subproject = _detect_subproject_root(memory)
                 _edit_all_ok = True
+                _patched = None
+                _cur = None
 
                 for _edit_fpath, _edit_pairs in plan_step.inline_edits.items():
                     import os as _os_edit
@@ -871,7 +873,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                     # patched file rather than the original.  This avoids the
                     # coder regenerating hunks that were already correct, and
                     # prevents line-number drift that causes its diff to fail.
-                    if _patched != _cur:
+                    if _patched is not None and _cur is not None and _patched != _cur:
                         try:
                             with open(_resolved, "w", encoding="utf-8") as _wf:
                                 _wf.write(_patched)
@@ -2074,6 +2076,14 @@ def run_bulk_test_execution_and_fix(
 
     fw = get_test_framework(lang) if lang else get_test_framework("python")
     base_cmd = fw["command"]
+
+    # Django project detection: prefer manage.py test over pytest
+    import os as _os_bt
+    if (not lang or lang == "python") and _os_bt.path.isfile(
+        _os_bt.path.join(subproject_cwd, "manage.py")
+    ):
+        base_cmd = "python manage.py test"
+        _logger.info("[BulkTest] Django project detected — using 'python manage.py test'")
 
     # Vitest override (mirrors run_final_test_verification detection logic)
     if "jest" in base_cmd.lower():

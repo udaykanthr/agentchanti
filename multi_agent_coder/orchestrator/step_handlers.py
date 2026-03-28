@@ -3105,14 +3105,16 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             coder_analysis = project_context.format_for_coder()
             if coder_analysis:
                 context_prefix = coder_analysis + "\n\n"
-        if project_profile is not None:
+        kb_ctx = getattr(memory, '_kb_context', '')
+        if kb_ctx:
+            context_prefix += kb_ctx + "\n\n"
+        elif project_profile is not None:
+            # Only inject profile directly when it wasn't already included in
+            # _kb_context (pipeline.py always puts the profile there first).
             try:
                 context_prefix += project_profile.format_for_prompt() + "\n\n"
             except Exception:
                 pass
-        kb_ctx = getattr(memory, '_kb_context', '')
-        if kb_ctx:
-            context_prefix += kb_ctx + "\n\n"
         # Inject explicitly-fetched behavioral instructions for JS/TS
         # ONLY when batch_search didn't already include them (trimmed or
         # missed by vector search).  This avoids bloating the prompt and
@@ -3170,14 +3172,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             for fpath, content in plan_ctx.items():
                 context += f"\n\n#### [FILE]: {fpath}\n```\n{content}\n```"
             # Slim skeletons for other files in memory (so LLM knows what exists)
-            from .memory import _extract_file_skeleton
+            # Uses cached skeletons — avoids re-running regex on every retry.
             slim_parts: list[str] = []
             for fpath, content in memory.all_files().items():
                 if fpath in plan_ctx:
                     continue
                 if fpath.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
                     continue
-                skeleton = _extract_file_skeleton(content, fpath)
+                skeleton = memory.get_skeleton(fpath, content)
                 if skeleton:
                     slim_parts.append(skeleton)
                 else:
@@ -3962,6 +3964,17 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     lang_tag = get_code_block_lang(language) if language else "python"
     fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")
     test_cmd = fw["command"]
+
+    # Django project detection: manage.py test is the canonical runner for Django.
+    # It handles test DB setup/teardown and settings without requiring pytest.
+    if (language == "python" or not language) and os.path.isfile(
+        os.path.join(subproject_cwd, "manage.py")
+    ):
+        test_cmd = "python manage.py test"
+        log.info(
+            f"Step {step_idx+1}: Django project detected (manage.py present) "
+            f"— overriding test command to 'python manage.py test'"
+        )
 
     # Ensure the test runner binary is installed before attempting to run tests
     parts = test_cmd.split()

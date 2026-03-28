@@ -1135,6 +1135,31 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="element,type,invalid,undefined,import,export,default,named,mixed,react,component,testing,javascript,typescript",
     ),
+    # ── Django test client — ALLOWED_HOSTS missing 'testserver' ──────────
+    ErrorFix(
+        error_type="DjangoDisallowedHostTestServer",
+        language="python",
+        pattern=r"DisallowedHost: Invalid HTTP_HOST header: 'testserver'",
+        cause="Django's test client sends requests with HTTP_HOST: 'testserver' by default. "
+              "If 'testserver' is not listed in ALLOWED_HOSTS, Django rejects the request "
+              "with a 400 response instead of routing it normally. "
+              "This is the most common Django test client setup mistake.",
+        fix_template="Add 'testserver' to ALLOWED_HOSTS in the project settings file.\n\n"
+                     "STEP 1 — Find the correct settings file before editing.\n"
+                     "Django projects often use a non-standard layout. Check which path exists:\n"
+                     "  - <project_root>/config/settings.py   ← common with 'config' project name\n"
+                     "  - <project_root>/settings.py\n"
+                     "  - <project_root>/<appname>/settings.py\n"
+                     "NEVER create a new settings.py. Edit the one that already contains INSTALLED_APPS.\n\n"
+                     "STEP 2 — Update ALLOWED_HOSTS in the settings file you found:\n"
+                     "  ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1']\n\n"
+                     "STEP 3 — Verify DJANGO_SETTINGS_MODULE in your test setup points to the same file.\n"
+                     "Example: if settings is at config/settings.py and tests run from the directory\n"
+                     "containing config/, set:\n"
+                     "  os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'",
+        severity="error",
+        tags="django,allowed_hosts,testserver,DisallowedHost,test,client,400,python",
+    ),
     ErrorFix(
         error_type="ThreeJsWebGLContextError",
         language="javascript",
@@ -2375,6 +2400,119 @@ Named export → named import: `import { Dashboard } from './Dashboard'`
 ## Rule 6: Avoid mixed default and named exports for the same component
 
 Use `export default` for the main component. Named exports for helpers/constants only.
+""",
+    },
+    "django-test-generation-instructions.md": {
+        "title": "Django Test Generation Instructions",
+        "tags": "django, testing, pytest, test-generation, behavioral, instructions, python, allowed_hosts, template, settings",
+        "content": """## Overview
+
+When generating or fixing tests for Django projects, follow these rules to avoid
+the most common failure patterns. These apply to both pytest-django and unittest-style tests.
+
+## Rule 1: READ the template before asserting its text content
+
+NEVER assume what a Django template renders. Before writing any assertion on
+response content or template text (e.g. `assert b"Welcome" in resp.content`),
+read the actual template file to find the exact text.
+
+WRONG — assumes text that may not be in the template:
+```python
+assert b"Welcome to My Django Homepage" in resp.content
+```
+
+CORRECT — read the template first, then assert what is actually there:
+```python
+# First, read myapp/templates/myapp/home.html to see exact <h1> text
+assert b"Welcome to My Django App" in resp.content  # ← from actual template
+```
+
+## Rule 2: File path assertions must be relative to the test cwd
+
+Tests run from the directory that contains `manage.py` (the sub-project root).
+When asserting a file's existence with `Path("...")`, use a path relative to
+that directory — do NOT prefix it with the sub-project directory name.
+
+WRONG — double-prefix when cwd is already `my_django_project/`:
+```python
+template_path = Path("my_django_project/myapp/templates/myapp/home.html")
+assert template_path.exists()  # fails — resolves to my_django_project/my_django_project/...
+```
+
+CORRECT — relative to cwd (`my_django_project/`):
+```python
+template_path = Path("myapp/templates/myapp/home.html")
+assert template_path.exists()
+```
+
+## Rule 3: ALLOWED_HOSTS must include 'testserver'
+
+Django's test client sends requests with `HTTP_HOST: testserver`. If `testserver`
+is not in `ALLOWED_HOSTS`, the response is 400 — not 200 or 404.
+
+ALWAYS include `'testserver'` when writing or modifying `ALLOWED_HOSTS`:
+```python
+ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1']
+```
+
+If a test returns 400 unexpectedly, check `ALLOWED_HOSTS` before debugging views or URLs.
+
+## Rule 4: Locate the correct settings file before editing
+
+Django projects often use a non-standard layout. The settings file is NOT always
+`settings.py` at the project root. Common locations:
+
+| Layout | Settings path |
+|--------|---------------|
+| `django-admin startproject config .` | `config/settings.py` |
+| `django-admin startproject myapp .` | `myapp/settings.py` |
+| Flat layout | `settings.py` |
+
+**Before editing settings**, grep for `INSTALLED_APPS` to find the real file:
+```bash
+grep -r "INSTALLED_APPS" . --include="*.py" -l
+```
+
+NEVER create a new `settings.py`. NEVER edit a settings file that has fewer than
+~20 lines — it is likely not the real settings file.
+
+## Rule 5: DJANGO_SETTINGS_MODULE must match the real module path
+
+The module path is determined by where `manage.py` is relative to the Python path.
+If `manage.py` is at `my_django_project/manage.py` and settings is at
+`my_django_project/config/settings.py`, then tests running from `my_django_project/`
+should set:
+```python
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+```
+
+NOT `my_django_project.config.settings` — that double-prefixes the package.
+
+## Rule 6: Use Django's TestCase or pytest-django for database tests
+
+If your test accesses the database, use `django.test.TestCase` (which wraps each
+test in a transaction and rolls back) or `@pytest.mark.django_db` with pytest-django.
+Plain `pytest` functions do NOT have database access by default.
+
+```python
+from django.test import TestCase
+
+class MyModelTest(TestCase):
+    def test_create(self):
+        obj = MyModel.objects.create(name="test")
+        self.assertEqual(obj.name, "test")
+```
+
+## Rule 7: When tests fail with SOURCE_BUG triage — diagnose before fixing
+
+If a test failure is triaged as SOURCE_BUG, verify before modifying source files:
+1. Is the assertion text correct? (Rule 1 — read the template)
+2. Is the path correct? (Rule 2 — relative to cwd)
+3. Is ALLOWED_HOSTS correct? (Rule 3)
+4. Are you editing the right settings file? (Rule 4)
+
+A mismatch between what the test asserts and what the source renders is often a
+TEST_BUG, not a SOURCE_BUG — the test was generated with assumed content.
 """,
     },
 }

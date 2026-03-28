@@ -254,6 +254,14 @@ def perform_baseline_test_analysis(
     fw = get_test_framework(language or "python", test_runner=test_runner)
     test_cmd = fw["command"]
 
+    # Django project detection: prefer manage.py test over pytest
+    import os as _os_ta
+    if (not language or language == "python") and _os_ta.path.isfile(
+        _os_ta.path.join(subproject_cwd, "manage.py")
+    ):
+        test_cmd = "python manage.py test"
+        _logger.info("Baseline: Django project detected — using 'python manage.py test'")
+
     _logger.info("Performing pre-execution baseline test analysis via %s", test_cmd)
 
     # 1. Run baseline tests
