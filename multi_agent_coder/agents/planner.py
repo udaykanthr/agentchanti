@@ -114,6 +114,7 @@ def _find_relevant_files(task: str, source_files: dict[str, str] | None,
     Returns list of (path, reason, skeleton) tuples.
     """
     results: list[tuple[str, str, str]] = []
+    seen_paths: set[str] = set()
 
     # Strategy 1: KB semantic search (best quality)
     if kb_context_builder is not None:
@@ -125,14 +126,15 @@ def _find_relevant_files(task: str, source_files: dict[str, str] | None,
                     if fpath in source_files:
                         skeleton = _build_file_skeleton(source_files[fpath])
                         results.append((fpath, "KB semantic match", skeleton))
-            if results:
-                return results
+                        seen_paths.add(fpath)
         except Exception as e:
             _logger.debug(f"[PreAnalysis] KB search failed: {e}")
 
-    # Strategy 2: Keyword matching against file paths and content
+    # Strategy 2: Keyword matching — always runs to catch filename-specific
+    # matches that semantic search may miss (e.g. "SnakeGame" in task vs
+    # App.jsx routing wrapper ranked higher by embeddings).
+    # Results are merged with KB results, deduplicated, capped at max_files.
     if source_files:
-        # Extract meaningful keywords from task (skip common words)
         stop_words = {
             "the", "a", "an", "to", "in", "for", "of", "and", "or", "is",
             "it", "on", "at", "by", "with", "from", "as", "be", "this",
@@ -162,8 +164,10 @@ def _find_relevant_files(task: str, source_files: dict[str, str] | None,
 
             scored.sort(key=lambda x: -x[1])
             for fpath, score in scored[:max_files]:
-                skeleton = _build_file_skeleton(source_files[fpath])
-                results.append((fpath, f"keyword match (score={score})", skeleton))
+                if fpath not in seen_paths and len(results) < max_files:
+                    skeleton = _build_file_skeleton(source_files[fpath])
+                    results.append((fpath, f"keyword match (score={score})", skeleton))
+                    seen_paths.add(fpath)
 
     return results
 

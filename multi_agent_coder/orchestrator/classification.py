@@ -22,6 +22,9 @@ _TEST_CMD_RE = re.compile(
     r'|go\s+test|cargo\s+test'
     r'|python\s+-m\s+pytest'
     r'|npx\s+vitest|npx\s+jest'
+    r'|run\s+(?:the\s+)?test(?:s|\s+suite)\b'  # "run tests", "run the test suite"
+    r'|execute\s+(?:the\s+)?tests?\b'           # "execute tests", "execute the tests"
+    r'|validate\s+(?:the\s+)?(?:test|component)'# "validate the components and test setup"
     r')(?![-\w]*[-])',          # reject jest-dom, vitest-dev, etc.
     re.IGNORECASE,
 )

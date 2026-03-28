@@ -449,10 +449,13 @@ def analyze_task_for_planner(
             test_section_lines.append("All tests PASSING — 0 failures.")
 
         if passing_files:
+            # Summarise rather than enumerate — the full list is already in the
+            # baseline analysis block that the planner sees; duplicating every
+            # path here just wastes tokens without adding new information.
             test_section_lines.append(
-                f"PASSING ({len(passing_files)} file(s)) — must NOT be modified:")
-            for fp in passing_files:
-                test_section_lines.append(f"  PASS: {fp}")
+                f"PASSING ({len(passing_files)} file(s)) — must NOT be modified "
+                f"(full list in baseline analysis above)."
+            )
     elif test_analysis:
         # Fallback: extract key lines from the raw text, but do NOT cap the
         # count — we need every file name to reach the interpreter.
@@ -523,8 +526,15 @@ USER TASK:
 Answer these questions concisely and precisely:
 1. What is the real goal of this task (one sentence)?
 2. Which existing files need to be modified?  Name them specifically.
+   IMPORTANT: Prefer the innermost component that directly owns/renders the
+   visual element mentioned in the task (e.g. if the task says "snake game
+   background", look inside the SnakeGame component — NOT the routing wrapper
+   that mounts it).  A wrapping div's background is NOT the same as the game
+   board/canvas background drawn inside the component itself.
 3. Which new files (if any) need to be created?
-4. Which files must NOT be touched and why?
+4. Which files must NOT be touched?  Give a compact summary (e.g. "all test
+   files — N currently passing" or a glob pattern) rather than listing every
+   individual path.  The exact file list is already in the baseline analysis.
 5. What does a successful result look like?  (observable outcome, not process steps)
 6. What is the single most important constraint the coding agent must respect?
 7. Looking at the source implementation and test assertions for the files being
@@ -542,13 +552,16 @@ Answer these questions concisely and precisely:
    (e.g. "add 'mx-auto max-w-7xl' to the className of the <div> wrapping <Routes>
    in App.jsx" rather than "potentially adjust the flex container").
    The coder must make ONLY this change and nothing else.
+   IMPORTANT: If the task refers to a visual element rendered INSIDE a component
+   (e.g. "game area", "canvas", "board"), the directive must target that component's
+   own file — not a wrapper or routing file that merely mounts the component.
 
 Respond in this EXACT format — no extra text, no markdown outside the block:
 TASK BRIEFING:
 Goal: <one sentence>
 Modify: <specific file paths, or NONE>
 Create: <specific new file paths, or NONE>
-Do not touch: <file paths or patterns that must not change>
+Do not touch: <compact summary or glob pattern — do NOT list individual paths>
 Expected output: <observable result when done>
 Key constraint: <the one rule the agent must not break>
 Preserve: <concrete list of existing behaviors/APIs the coder must not break>
