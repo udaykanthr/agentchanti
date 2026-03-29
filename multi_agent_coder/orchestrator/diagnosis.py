@@ -149,6 +149,64 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
 
+    # ── Django TemplateDoesNotExist → INSTALLED_APPS hint ─────────────────
+    # When Django raises TemplateDoesNotExist the most common root cause is a
+    # new app that was never added to INSTALLED_APPS (APP_DIRS=True only scans
+    # installed apps).  Detect this and inject both the error app name and the
+    # current settings.py so the LLM can produce a targeted fix.
+    _tpl_dne_m = re.search(
+        r'TemplateDoesNotExist[^\n]*?([\w/.-]+/[\w.-]+\.html)',
+        error_info or "",
+    )
+    if _tpl_dne_m:
+        _missing_tpl = _tpl_dne_m.group(1)          # e.g. "homepage/index.html"
+        _app_name = _missing_tpl.split("/")[0]       # e.g. "homepage"
+        # Locate settings.py — look in memory first, then disk
+        _settings_content: str | None = None
+        _settings_path: str | None = None
+        for _fpath, _fcontent in memory.all_files().items():
+            if _fpath.endswith("settings.py") and "INSTALLED_APPS" in _fcontent:
+                _settings_content = _fcontent
+                _settings_path = _fpath
+                break
+        if _settings_content is None:
+            _search_root = subproject or "."
+            for _dirpath, _dirnames, _filenames in os.walk(_search_root):
+                _dirnames[:] = [d for d in _dirnames
+                                if d not in ("venv", ".venv", "node_modules",
+                                             "__pycache__", ".git")]
+                if "settings.py" in _filenames:
+                    _candidate = os.path.join(_dirpath, "settings.py")
+                    try:
+                        with open(_candidate, encoding="utf-8") as _sf:
+                            _sc = _sf.read()
+                        if "INSTALLED_APPS" in _sc:
+                            _settings_content = _sc
+                            _settings_path = _candidate
+                            break
+                    except OSError:
+                        pass
+        if _settings_content and _settings_path:
+            _app_in_settings = (
+                f"'{_app_name}'" in _settings_content
+                or f'"{_app_name}"' in _settings_content
+            )
+            if not _app_in_settings:
+                prompt += (
+                    f"\nDJANGO INSTALLED_APPS WARNING:\n"
+                    f"The error is `TemplateDoesNotExist: {_missing_tpl}`. "
+                    f"The app '{_app_name}' is NOT listed in INSTALLED_APPS in "
+                    f"`{_settings_path}`. With APP_DIRS=True Django only searches "
+                    f"templates inside installed apps — add '{_app_name}' to "
+                    f"INSTALLED_APPS to fix the template lookup.\n\n"
+                    f"#### [FILE]: {_settings_path}\n"
+                    f"```python\n{_settings_content}\n```\n\n"
+                )
+                log.info(
+                    "Step %d: Injected INSTALLED_APPS hint for missing app '%s'",
+                    step_idx + 1, _app_name,
+                )
+
     # ── CSS conflict injection ──────────────────────────────────────────────
     # If the step involves a styling/colour change, inject any global CSS files
     # whose selectors may override the component-level change.  This is the
@@ -532,7 +590,25 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         cwd_note = f" (in {fix_cwd}/)" if fix_cwd else ""
         display.step_info(step_idx, f"Running fix: {cmd}{cwd_note}")
         log.info(f"Step {step_idx+1}: Running fix command: {cmd}{cwd_note}")
-        success, output = executor.run_command(cmd, cwd=fix_cwd)
+
+        # Detect long-running server commands so they are started as background
+        # processes rather than blocking until the 120 s timeout expires.
+        _BACKGROUND_PATTERNS = (
+            r'\bmanage\.py\s+runserver\b',
+            r'\bnpm\s+(start|run\s+dev|run\s+start)\b',
+            r'\byarn\s+(start|dev)\b',
+            r'\bpnpm\s+(start|dev)\b',
+            r'\bnpx\s+.*dev\b',
+            r'\bgunicorn\b',
+            r'\buvicorn\b',
+            r'\bflask\s+run\b',
+            r'\bfastapi\s+run\b',
+        )
+        _run_as_bg = any(
+            _re_fix.search(p, cmd, _re_fix.IGNORECASE)
+            for p in _BACKGROUND_PATTERNS
+        )
+        success, output = executor.run_command(cmd, cwd=fix_cwd, background=_run_as_bg)
         if output:
             truncated = output[:4000] if len(output) > 4000 else output
             memory.update({

@@ -323,6 +323,18 @@ def _run_task_impl(
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
+
+    # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
+    _llm_detected = getattr(planner, '_detected_language', None)
+    if _llm_detected and _llm_detected != language:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "Language corrected by LLM during pre-analysis: %s → %s",
+            language, _llm_detected,
+        )
+        language = _llm_detected
+        coder.role = f"Write clean {get_language_name(language)} code for a single step."
+
     # Propagate task briefing to memory so all downstream agents can use it
     _briefing_text = getattr(planner, '_task_briefing', '')
     if _briefing_text:

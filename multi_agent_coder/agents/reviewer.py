@@ -110,6 +110,10 @@ KNOWN PROJECT FILES:
    - JS/TS: `require()` vs `import` mismatch with module type?
      (CommonJS vs ES Modules)
    - Mismatched test framework calls (e.g. using `jest.fn()` in a mocha project).
+   - **Django apps**: If a new Django app directory is created (contains `views.py`,
+     `models.py`, or `apps.py`), it MUST be listed in `INSTALLED_APPS` in
+     `settings.py`. A missing entry causes `TemplateDoesNotExist` and app
+     registry failures. Flag if `settings.py` is shown and the app is absent.
 
 4. **RUNTIME ERRORS**:
    - Undefined variables, wrong argument counts, type mismatches.

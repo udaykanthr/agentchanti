@@ -208,6 +208,7 @@ def detect_language(directory: str = ".") -> str:
         ("requirements.txt", "python"),
         ("setup.py", "python"),
         ("pyproject.toml", "python"),
+        ("manage.py", "python"),   # Django projects
         ("pom.xml", "java"),
         ("build.gradle", "java"),
         ("Gemfile", "ruby"),
@@ -215,21 +216,31 @@ def detect_language(directory: str = ".") -> str:
     ]
 
     # 1. Root-level manifests are the strongest signal.
+    # Collect all matches — if multiple languages found, they conflict and we
+    # fall through to extension counting rather than picking the wrong one.
+    root_langs: list[str] = []
     for manifest, lang in _MANIFEST_LANGS:
         if os.path.isfile(os.path.join(directory, manifest)):
-            return lang
+            if lang not in root_langs:
+                root_langs.append(lang)
+    if len(root_langs) == 1:
+        return root_langs[0]
+    # Multiple manifests → ambiguous; fall through to extension counting.
+    # (Zero manifests also falls through.)
 
     # 2. One level deep — covers sub-projects (e.g. responsive-app/package.json).
-    try:
-        for entry in sorted(os.listdir(directory)):
-            subdir = os.path.join(directory, entry)
-            if not os.path.isdir(subdir) or entry in _SKIP_DIRS:
-                continue
-            for manifest, lang in _MANIFEST_LANGS:
-                if os.path.isfile(os.path.join(subdir, manifest)):
-                    return lang
-    except OSError:
-        pass
+    # Only used when root level was unambiguous-free.
+    if not root_langs:
+        try:
+            for entry in sorted(os.listdir(directory)):
+                subdir = os.path.join(directory, entry)
+                if not os.path.isdir(subdir) or entry in _SKIP_DIRS:
+                    continue
+                for manifest, lang in _MANIFEST_LANGS:
+                    if os.path.isfile(os.path.join(subdir, manifest)):
+                        return lang
+        except OSError:
+            pass
 
     # 3. Fallback: extension counting (original behaviour).
     ext_counts: Counter = Counter()
@@ -355,5 +366,73 @@ def detect_test_runner(directory: str | None = None) -> str | None:
                 return "jest"
         except (json.JSONDecodeError, OSError):
             pass
+
+    return None
+
+
+def detect_language_llm(
+    file_paths: list[str],
+    task: str,
+    llm_client,
+    current_language: str | None = None,
+) -> str | None:
+    """Ask the LLM to determine the primary programming language of the project.
+
+    Uses a representative sample of file paths and the task description as
+    evidence.  Returns a language key (e.g. ``"python"``) or ``None`` if the
+    LLM response cannot be mapped to a known language.
+
+    Intended to be called during pre-analysis when the heuristic detection may
+    have picked the wrong language (e.g. a ``go.mod`` in a Django project).
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # Build a representative sample — cap at 40 paths to keep the prompt small.
+    # Prefer well-known manifest/config filenames first.
+    _PRIORITY_NAMES = {
+        "manage.py", "settings.py", "requirements.txt", "setup.py",
+        "pyproject.toml", "package.json", "go.mod", "Cargo.toml",
+        "pom.xml", "build.gradle", "Gemfile", "composer.json",
+    }
+    prioritised = sorted(
+        file_paths,
+        key=lambda p: (os.path.basename(p) not in _PRIORITY_NAMES, p),
+    )
+    sample = prioritised[:40]
+
+    known_langs = ", ".join(sorted(set(EXTENSION_MAP.values()) | set(_LANGUAGE_NAMES)))
+    current_hint = (
+        f"\nCurrent auto-detected language (may be wrong): {current_language}"
+        if current_language else ""
+    )
+
+    prompt = (
+        "You are a language detection expert. Given the file paths of a software "
+        "project and a task description, identify the PRIMARY programming language "
+        "of the project.\n"
+        f"{current_hint}\n\n"
+        "File paths:\n"
+        + "\n".join(f"  {p}" for p in sample)
+        + f"\n\nTask: {task}\n\n"
+        f"Known language keys: {known_langs}\n\n"
+        "Reply with ONLY the language key (e.g. python, javascript, go, rust, java). "
+        "No explanation, no punctuation — just the single language key."
+    )
+
+    try:
+        response = llm_client.generate_response(prompt).strip().lower()
+        # Strip any stray punctuation/words the LLM may add
+        response = response.split()[0].rstrip(".,;:")
+        # Map common aliases
+        _ALIASES = {"py": "python", "js": "javascript", "ts": "typescript",
+                    "golang": "go", "c#": "csharp", "c++": "cpp"}
+        response = _ALIASES.get(response, response)
+        if response in _LANGUAGE_NAMES or response in set(EXTENSION_MAP.values()):
+            _log.info("[LangDetect] LLM identified language: %s", response)
+            return response
+        _log.warning("[LangDetect] LLM returned unrecognised language: %r", response)
+    except Exception as exc:
+        _log.warning("[LangDetect] LLM language detection failed: %s", exc)
 
     return None

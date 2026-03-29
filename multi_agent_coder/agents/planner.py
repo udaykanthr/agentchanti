@@ -204,8 +204,35 @@ class PlannerAgent(Agent):
 
         Runs BEFORE process(). Returns a context string to prepend to
         the existing planner context. Returns empty string if nothing useful.
+
+        Side-effect: sets ``self._detected_language`` when the LLM disagrees
+        with the heuristic language — callers can read this to override the
+        language for subsequent agents.
         """
         parts: list[str] = []
+
+        # 0. LLM-based language detection — runs before anything else so the
+        # corrected language can be used by the rest of the pipeline.
+        # Only triggers when we have file paths to reason about.
+        self._detected_language: str | None = None
+        if source_files:
+            try:
+                from ..language import detect_language_llm
+                _llm_lang = detect_language_llm(
+                    file_paths=list(source_files.keys()),
+                    task=task,
+                    llm_client=self.llm_client,
+                    current_language=language,
+                )
+                if _llm_lang and _llm_lang != language:
+                    _logger.info(
+                        "[PreAnalysis] LLM corrected language: %s → %s",
+                        language, _llm_lang,
+                    )
+                    self._detected_language = _llm_lang
+                    language = _llm_lang  # use corrected language for this analysis
+            except Exception as _ld_exc:
+                _logger.debug("[PreAnalysis] LLM language detection skipped: %s", _ld_exc)
 
         # 1. Task intent classification
         intent = _classify_task_intent(task)

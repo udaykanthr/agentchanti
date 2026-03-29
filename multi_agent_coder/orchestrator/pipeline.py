@@ -75,10 +75,20 @@ _TEST_DIR_RE = re.compile(
 )
 
 
+_SOURCE_EXTS = frozenset({
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".go", ".rb", ".java", ".rs", ".cs", ".cpp", ".c", ".php",
+})
+
 def _is_test_file(file_path: str) -> bool:
     """Return True if *file_path* looks like a test file."""
     import os
     basename = os.path.basename(file_path)
+    _, ext = os.path.splitext(basename)
+    # Never treat non-source files (HTML, CSS, JSON, …) as test files even
+    # when they live inside a __tests__ directory.
+    if ext.lower() not in _SOURCE_EXTS:
+        return False
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
@@ -1985,25 +1995,276 @@ def run_final_test_verification(
 _MAX_BULK_TEST_FIX_ATTEMPTS = 3
 
 
-def _parse_failed_test_files(output: str, known_test_files: list[str]) -> list[str]:
+def _resolve_django_failed_files(
+    output: str,
+    subproject_cwd: str | None = None,
+) -> list[str]:
+    """Resolve Django ERROR:/FAIL: module paths from test output to file paths.
+
+    Django test output reports failures as:
+        ERROR: test_foo (app.tests.MyClass.test_foo)
+        FAIL:  test_bar (app.tests.test_views.MyClass.test_bar)
+
+    This extracts the dotted module path inside the parentheses, converts it
+    to a file path (e.g. ``app/tests.py`` or ``app/tests/test_views.py``),
+    and checks whether that file exists on disk.  Returns paths relative to
+    the project root (prefixed with *subproject_cwd* when given).
+
+    Useful when the failing test file was NOT written during the current
+    session (not in *known_test_files*) so the normal matcher misses it.
+    """
+    import os as _os
+    from .step_handlers import _ANSI_RE
+    clean = _ANSI_RE.sub('', output)
+    base = subproject_cwd.rstrip("/\\") if subproject_cwd else "."
+
+    # Extract all dotted module paths from Django ERROR/FAIL lines
+    modules = re.findall(
+        r'(?:ERROR|FAIL):\s+\S+\s+\(([^)]+)\)',
+        clean,
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for dotted in modules:
+        parts = dotted.split('.')
+        # Try progressively shorter prefixes: the class name and method name
+        # are the last 1-2 parts; the module is the remainder.
+        # e.g. home.tests.HomePageTests.test_foo → try home/tests.py first
+        for n in range(len(parts) - 1, 0, -1):
+            candidate_rel = '/'.join(parts[:n]) + '.py'
+            candidate_abs = _os.path.join(base, candidate_rel)
+            if _os.path.isfile(candidate_abs):
+                # Return relative to project root (not subproject)
+                full_rel = (
+                    subproject_cwd.rstrip('/\\') + '/' + candidate_rel
+                    if subproject_cwd and subproject_cwd != '.'
+                    else candidate_rel
+                )
+                if full_rel not in seen:
+                    seen.add(full_rel)
+                    resolved.append(full_rel)
+                break
+
+    return resolved
+
+
+def _django_settings_context(subproject_cwd: str | None) -> str:
+    """Return a source context block containing Django settings.py and the
+    actual ROOT_URLCONF file for the project.
+
+    When the LLM only sees app-level urls.py files it cannot tell that
+    ROOT_URLCONF = "pkg.urls" resolves to ``pkg/urls.py`` — a different file
+    from the one it has been editing.  Injecting both files into the fix prompt
+    lets the LLM find and fix the real URLconf instead of a decoy.
+
+    Returns an empty string when the project is not Django or files can't be
+    found.
+    """
+    import os as _os
+    import re as _re
+
+    base = subproject_cwd or "."
+
+    # Resolve the REAL settings file via DJANGO_SETTINGS_MODULE in manage.py.
+    # Django projects often have TWO settings.py files: a root-level stub
+    # (ignored by Django) and the real one inside the project package, e.g.
+    # bootstrap_homepage/bootstrap_homepage/settings.py.  Reading manage.py
+    # is the only reliable way to know which one Django actually loads.
+    settings_path: str | None = None
+    manage_py = _os.path.join(base, "manage.py")
+    if _os.path.isfile(manage_py):
+        try:
+            with open(manage_py, "r", encoding="utf-8", errors="replace") as _mf:
+                manage_content = _mf.read()
+            _dsm_m = _re.search(
+                r"DJANGO_SETTINGS_MODULE['\"]?\s*,\s*['\"]([^'\"]+)['\"]",
+                manage_content,
+            )
+            if _dsm_m:
+                # e.g. "bootstrap_homepage.settings" → bootstrap_homepage/settings.py
+                _module = _dsm_m.group(1)
+                _rel = _module.replace(".", _os.sep) + ".py"
+                _candidate = _os.path.join(base, _rel)
+                if _os.path.isfile(_candidate):
+                    settings_path = _candidate
+        except OSError:
+            pass
+
+    # Fallback: root-level settings.py (simple single-file layout)
+    if settings_path is None:
+        _fallback = _os.path.join(base, "settings.py")
+        if _os.path.isfile(_fallback):
+            settings_path = _fallback
+
+    if settings_path is None:
+        return ""
+
+    try:
+        with open(settings_path, "r", encoding="utf-8", errors="replace") as _f:
+            settings_content = _f.read()
+    except OSError:
+        return ""
+
+    ctx = (
+        f"#### [FILE]: {settings_path}\n"
+        f"```python\n{settings_content}\n```\n\n"
+        "NOTE: ROOT_URLCONF above defines the actual Django URL entry point — "
+        "make sure you edit THAT file, not a same-named file at a different path.\n\n"
+    )
+
+    # Resolve ROOT_URLCONF to a file path and include its current content
+    m = _re.search(r'ROOT_URLCONF\s*=\s*["\']([^"\']+)["\']', settings_content)
+    if m:
+        module = m.group(1)  # e.g. "bootstrap_homepage.urls"
+        rel_path = module.replace(".", _os.sep) + ".py"  # bootstrap_homepage/urls.py
+        urlconf_abs = _os.path.join(base, rel_path)
+        if _os.path.isfile(urlconf_abs):
+            # Express the path relative to the project root for the LLM
+            urlconf_rel = _os.path.join(
+                subproject_cwd.rstrip("/\\"), rel_path
+            ) if subproject_cwd else rel_path
+            try:
+                with open(urlconf_abs, "r", encoding="utf-8", errors="replace") as _uf:
+                    urlconf_content = _uf.read()
+                ctx += (
+                    f"#### [FILE]: {urlconf_rel}\n"
+                    f"```python\n{urlconf_content}\n```\n\n"
+                    f"NOTE: This is the ROOT_URLCONF file ({module}). "
+                    "It must include your app's URLs for reverse() to work.\n\n"
+                )
+            except OSError:
+                pass
+
+    return ctx
+
+
+def _fix_django_startup_crashes(
+    output: str,
+    subproject_cwd: str | None,
+    executor,
+) -> str:
+    """Detect and self-heal Django test-runner startup crashes.
+
+    Returns the output of a fresh test run if a fix was applied, otherwise
+    returns the original *output* unchanged.
+
+    Currently handles:
+    - ``tests.py`` stub + ``tests/`` package coexistence:
+      Django raises ``ImportError: 'tests' module incorrectly imported from …``
+      when both exist in the same app directory.  Fix: delete the ``.py`` stub.
+    """
+    import os
+
+    # Pattern: Django incorrectly-imported module conflict
+    _conflict_re = re.compile(
+        r"ImportError: '(\w+)' module incorrectly imported from '([^']+)'",
+        re.IGNORECASE,
+    )
+    m = _conflict_re.search(output)
+    if not m:
+        return output
+
+    module_name = m.group(1)          # e.g. "tests"
+    package_dir = m.group(2)          # e.g. "/abs/path/to/homepage/tests"
+
+    # The conflicting stub is <parent_dir>/<module_name>.py
+    parent_dir = os.path.dirname(package_dir)
+    stub_rel_candidates = [
+        os.path.join(parent_dir, f"{module_name}.py"),
+    ]
+    if subproject_cwd:
+        stub_rel_candidates.append(
+            os.path.join(subproject_cwd, parent_dir, f"{module_name}.py")
+        )
+
+    deleted: list[str] = []
+    for stub_path in stub_rel_candidates:
+        if os.path.isfile(stub_path):
+            try:
+                os.remove(stub_path)
+                deleted.append(stub_path)
+                _logger.info(
+                    "[BulkTest] Removed conflicting stub '%s' "
+                    "(shadowed by '%s/' package)",
+                    stub_path, package_dir,
+                )
+            except OSError as exc:
+                _logger.warning(
+                    "[BulkTest] Could not remove stub '%s': %s", stub_path, exc
+                )
+
+    if not deleted:
+        # Couldn't find the stub on disk — log the full error tail so
+        # the diagnostic LLM gets the actual ImportError text
+        _logger.warning(
+            "[BulkTest] Django startup crash (could not auto-fix):\n%s",
+            output[-2000:],
+        )
+        return output
+
+    # Re-run to get fresh output after the fix
+    from .step_handlers import get_test_framework, detect_language_from_files
+    ok, new_output = executor.run_command("python manage.py test", cwd=subproject_cwd)
+    _logger.info(
+        "[BulkTest] Post-stub-removal run: exit=%s", "0" if ok else "1"
+    )
+    return new_output
+
+
+def _parse_failed_test_files(
+    output: str,
+    known_test_files: list[str],
+    subproject_cwd: str | None = None,
+) -> list[str]:
     """Parse test runner output to find which test files failed.
 
-    Matches FAIL lines from vitest/jest/pytest against the known test files
-    written during the session.  Returns a list of matching file paths.
+    Matches FAIL lines from vitest/jest/pytest/Django against the known test
+    files written during the session, then also resolves Django module paths
+    to files on disk (catching failures in pre-existing test files that were
+    not written this session).
     """
     from .step_handlers import _ANSI_RE
     clean = _ANSI_RE.sub('', output)
     failed: list[str] = []
+    failed_set: set[str] = set()
+
     for fpath in known_test_files:
         basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
-        # vitest/jest: " FAIL src/__tests__/Foo.test.jsx"
-        # pytest:      "FAILED tests/test_foo.py::test_bar"
+        stem = basename[:-3] if basename.endswith(".py") else basename
+
+        # vitest/jest:  " FAIL src/__tests__/Foo.test.jsx"
+        # pytest:       "FAILED tests/test_foo.py::test_bar"
         if re.search(
             r'(?:^|\s)(?:FAIL(?:ED)?)\s.*' + re.escape(basename),
             clean,
             re.MULTILINE | re.IGNORECASE,
         ):
-            failed.append(fpath)
+            if fpath not in failed_set:
+                failed.append(fpath)
+                failed_set.add(fpath)
+            continue
+
+        # Django manage.py test:
+        #   "ERROR: test_foo (app.tests.test_views.MyTestCase.test_foo)"
+        #   "FAIL: test_foo (app.tests.test_views.MyTestCase.test_foo)"
+        if re.search(
+            r'(?:^|\s)(?:ERROR|FAIL):\s+\S+\s+\([^)]*\b' + re.escape(stem) + r'\b',
+            clean,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            if fpath not in failed_set:
+                failed.append(fpath)
+                failed_set.add(fpath)
+
+    # Also resolve Django module paths to actual files on disk — catches
+    # failures in pre-existing test files not written during this session.
+    for extra in _resolve_django_failed_files(output, subproject_cwd):
+        if extra not in failed_set:
+            failed.append(extra)
+            failed_set.add(extra)
+
     # Fallback: if we couldn't identify specific files but tests failed,
     # treat all known test files as candidates
     if not failed and output:
@@ -2122,8 +2383,17 @@ def run_bulk_test_execution_and_fix(
 
     _logger.warning("[BulkTest] Tests failed:\n%s", output[:1000])
 
+    # ── Startup crash detection (Django only) ──────────────────────────────
+    # Django raises ImportError / ModuleNotFoundError at collection time when
+    # there is a `tests.py` stub AND a `tests/` package in the same directory.
+    # This crashes the whole run before any test executes, so _parse_failed_test_files
+    # returns the unhelpful fallback (all known files).  Detect the pattern and
+    # self-heal before falling into the per-file fix loop.
+    if "manage.py" in base_cmd:
+        output = _fix_django_startup_crashes(output, subproject_cwd, executor)
+
     # ── Step 2: Fix one failing test file at a time ──
-    failed_files = _parse_failed_test_files(output, list(test_files.keys()))
+    failed_files = _parse_failed_test_files(output, list(test_files.keys()), subproject_cwd)
     _logger.info("[BulkTest] Failed test files: %s", failed_files)
     print(f"  [BulkTest] {len(failed_files)} test file(s) failed — fixing one at a time...")
 
@@ -2154,10 +2424,19 @@ def run_bulk_test_execution_and_fix(
             file_error = _extract_file_specific_errors(
                 current_output, test_path, max_chars=3000)
             if not file_error:
-                file_error = current_output[:3000]
+                # Take the tail (where tracebacks and ImportErrors appear)
+                # rather than the head (which is often setup noise).
+                file_error = current_output[-3000:]
 
             # Build source context for this test file
             current_content = memory.all_files().get(test_path, "")
+            if not current_content:
+                # Pre-existing file not tracked in session memory — read from disk
+                try:
+                    with open(test_path, "r", encoding="utf-8", errors="replace") as _tf:
+                        current_content = _tf.read()
+                except OSError:
+                    pass
             imported_sources = _extract_imported_sources(
                 {test_path: current_content}, memory)
 
@@ -2168,6 +2447,10 @@ def run_bulk_test_execution_and_fix(
                 source_ctx += (
                     f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
                 )
+
+            # For Django projects inject settings.py + the real ROOT_URLCONF so
+            # the LLM can see the correct file to edit instead of guessing.
+            source_ctx += _django_settings_context(subproject_cwd)
 
             # Optionally inject KB guidance
             kb_instructions = ""
@@ -2203,6 +2486,12 @@ def run_bulk_test_execution_and_fix(
                 "You may fix the test file itself OR fix a source file it imports — "
                 "whichever is correct.  Do NOT remove any existing tests.\n\n"
                 "CRITICAL: Do NOT remove or comment out the tested component/feature.\n\n"
+                "IMPORTANT — before modifying any template or source file to satisfy "
+                "an assertContains/assertIn/assertEqual test:\n"
+                "1. Read the EXACT string literal from the test assertion above.\n"
+                "2. Copy that exact string (correct case, spacing, punctuation) into "
+                "   the template or source file.\n"
+                "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
                 "Prefer CHUNK FORMAT for surgical fixes:\n"
                 f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
                 f"```{lang_tag}\n// replacement chunk\n```\n"
@@ -2305,19 +2594,178 @@ def run_bulk_test_execution_and_fix(
                   f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
 
     # ── Step 3: Final run-all to confirm everything passes ──
-    ok_final, output_final = executor.run_command(base_cmd, cwd=subproject_cwd)
-    if ok_final:
-        _logger.info("[BulkTest] Final run-all passed.")
-        print("  [BulkTest] All tests pass after fixes.")
-        # Mark all files as passed in TEST RESULTS
-        for fpath in test_files:
-            display.record_test_result(fpath, passed=1, total=1, failures=[])
-        return True, ""
+    # If the run-all surfaces new failures (e.g. a pre-existing test file that
+    # wasn't in the per-file fix queue, or a Django ERROR: that the initial
+    # parse missed), feed them back into the fix loop rather than giving up.
+    _MAX_RUNALL_ROUNDS = 2
+    for _round in range(_MAX_RUNALL_ROUNDS):
+        ok_final, output_final = executor.run_command(base_cmd, cwd=subproject_cwd)
+        if ok_final:
+            _logger.info("[BulkTest] Final run-all passed.")
+            print("  [BulkTest] All tests pass after fixes.")
+            for fpath in test_files:
+                display.record_test_result(fpath, passed=1, total=1, failures=[])
+            return True, ""
 
-    # Update remaining failures with final output
-    still_failing = set(_parse_failed_test_files(output_final, list(test_files.keys())))
+        # Parse failures from the full run — includes files not in the original
+        # per-file fix queue (e.g. pre-existing tests, Django ERROR: lines).
+        if "manage.py" in base_cmd:
+            output_final = _fix_django_startup_crashes(output_final, subproject_cwd, executor)
+        still_failing = _parse_failed_test_files(output_final, list(test_files.keys()), subproject_cwd)
+        _logger.warning(
+            "[BulkTest] Run-all round %d/%d failed. Still failing: %s",
+            _round + 1, _MAX_RUNALL_ROUNDS, still_failing,
+        )
+
+        # Find files that weren't already fixed in the per-file loop
+        already_fixed = set(failed_files)
+        new_failures = [f for f in still_failing if f not in already_fixed]
+
+        if not new_failures:
+            # Same files are still broken — no point retrying
+            break
+
+        print(
+            f"  [BulkTest] Run-all found {len(new_failures)} additional "
+            f"failing file(s) — fixing..."
+        )
+        # Append to failed_files and re-run the fix loop for just the new ones
+        fix_start = len(failed_files)
+        for nf in new_failures:
+            if nf not in set(failed_files):
+                failed_files.append(nf)
+                _p_nf, _t_nf, _f_nf = _parse_test_counts(output_final)
+                display.record_test_result(nf, passed=_p_nf, total=_t_nf, failures=_f_nf)
+
+        current_output = output_final
+        while fix_idx < len(failed_files):
+            test_path = failed_files[fix_idx]
+            fix_idx += 1
+            basename = test_path.rsplit('/', 1)[-1]
+            print(f"  [BulkTest] Fixing {basename} (from run-all)...")
+
+            for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
+                file_error = _extract_file_specific_errors(
+                    current_output, test_path, max_chars=3000)
+                if not file_error:
+                    # Take the tail (where tracebacks and ImportErrors appear)
+                    # rather than the head (which is often setup noise).
+                    file_error = current_output[-3000:]
+
+                current_content = memory.all_files().get(test_path, "")
+                if not current_content:
+                    # Pre-existing file not tracked in session memory — read from disk
+                    try:
+                        with open(test_path, "r", encoding="utf-8", errors="replace") as _tf2:
+                            current_content = _tf2.read()
+                    except OSError:
+                        pass
+                imported_sources = _extract_imported_sources(
+                    {test_path: current_content}, memory)
+                source_ctx = (
+                    f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
+                )
+                for fp, cnt in imported_sources.items():
+                    source_ctx += (
+                        f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
+                    )
+                source_ctx += _django_settings_context(subproject_cwd)
+
+                _bt_briefing = getattr(memory, '_task_briefing', '')
+                _bt_briefing_block = (
+                    "TASK BRIEFING (overall goal):\n"
+                    f"{_bt_briefing}\n\n"
+                ) if _bt_briefing else ""
+
+                fix_prompt = (
+                    f"{_bt_briefing_block}"
+                    f"Task: {task}\n\n"
+                    f"Test file `{test_path}` failed in the full test suite. "
+                    f"Fix it so the tests pass.\n\n"
+                    f"Error output:\n{file_error}\n\n"
+                    f"Relevant files:\n{source_ctx}\n\n"
+                    "You may fix the test file itself OR fix a source file it imports — "
+                    "whichever is correct.  Do NOT remove any existing tests.\n\n"
+                    "IMPORTANT — before modifying any template or source file to satisfy "
+                    "an assertContains/assertIn/assertEqual test:\n"
+                    "1. Read the EXACT string literal from the test assertion above.\n"
+                    "2. Copy that exact string (correct case, spacing, punctuation) into "
+                    "   the template or source file.\n"
+                    "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
+                    "Prefer CHUNK FORMAT for surgical fixes:\n"
+                    f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
+                    f"```{lang_tag}\n// replacement chunk\n```\n"
+                    "Use full-file [FILE]: format only when the whole file must be rewritten."
+                )
+
+                try:
+                    fix_response = coder.llm_client.generate_response(fix_prompt)
+                    fix_files = {}
+                    try:
+                        from ..editing.chunk_editor import ChunkEditor as _BtCE2
+                        _bt_ce2 = _BtCE2()
+                        _bt_edits2 = _bt_ce2.parse_chunk_response(fix_response)
+                        if _bt_edits2:
+                            for _bt_edit2 in _bt_edits2:
+                                _bt_fp2 = _bt_edit2.file_path
+                                _bt_existing2 = memory.get(_bt_fp2)
+                                if _bt_existing2 is None:
+                                    try:
+                                        with open(_bt_fp2, "r", encoding="utf-8",
+                                                  errors="replace") as _f2:
+                                            _bt_existing2 = _f2.read()
+                                    except OSError:
+                                        pass
+                                if _bt_existing2:
+                                    try:
+                                        fix_files[_bt_fp2] = _bt_ce2.apply_chunk_edits(
+                                            _bt_existing2, [_bt_edit2])
+                                    except Exception:
+                                        pass
+                    except ImportError:
+                        pass
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    if fix_files:
+                        executor.write_files(fix_files)
+                        memory.update(fix_files)
+                        _logger.info(
+                            "[BulkTest] Applied fixes for %s: %s",
+                            basename, list(fix_files.keys()),
+                        )
+                except Exception as exc:
+                    _logger.warning(
+                        "[BulkTest] Fix generation failed for %s: %s", basename, exc)
+                    break
+
+                single_cmd = _build_scoped_test_cmd(
+                    base_cmd, {test_path: ""}, subproject_cwd)
+                ok_single, current_output = executor.run_command(
+                    single_cmd, cwd=subproject_cwd)
+                if ok_single:
+                    _logger.info("[BulkTest] %s now passes.", basename)
+                    print(f"  [BulkTest] {basename} fixed ✔")
+                    _p, _t, _ = _parse_test_counts(current_output)
+                    display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+                    break
+                _logger.warning(
+                    "[BulkTest] %s still failing (attempt %d/%d)",
+                    basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+                )
+                _p, _t, _f = _parse_test_counts(current_output)
+                display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
+            else:
+                print(f"  [BulkTest] {basename} could not be fixed after "
+                      f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
+
+        current_output = output_final  # reset for next round's error extraction
+
+    # All rounds exhausted — update display and report failure
+    still_failing_final = set(_parse_failed_test_files(output_final, list(test_files.keys()), subproject_cwd))
     for fpath in test_files:
-        if fpath in still_failing:
+        if fpath in still_failing_final:
             _p, _t, _f = _parse_test_counts(output_final)
             display.record_test_result(fpath, passed=_p, total=_t, failures=_f)
         else:

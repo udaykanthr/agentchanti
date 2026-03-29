@@ -599,12 +599,25 @@ class Executor:
         # making the project root a Python package causes Django's test runner to
         # import everything as <project>.app.* instead of app.*, breaking model
         # app_label resolution and test discovery.
+        # Also skip asset directories (templates/, static/, media/) — they are
+        # never Python packages and adding __init__.py there breaks Django's
+        # template/static file loaders and can corrupt the import system.
+        _ASSET_DIR_RE = re.compile(
+            r'(?:^|[/\\])(?:templates|static|media|assets|public|dist|build)'
+            r'(?:[/\\]|$)',
+            re.IGNORECASE,
+        )
         django_roots: set[str] = set()
         for d in init_dirs:
             if os.path.isfile(os.path.join(d, "manage.py")):
                 django_roots.add(d)
 
         for dirpath in sorted(init_dirs):
+            if _ASSET_DIR_RE.search(dirpath.replace(os.sep, "/")):
+                log.debug(
+                    f"[Executor] Skipping __init__.py for asset dir: {dirpath}/"
+                )
+                continue
             if dirpath in django_roots:
                 log.debug(
                     f"[Executor] Skipping __init__.py for Django project root: {dirpath}/"

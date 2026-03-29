@@ -591,6 +591,17 @@ def main():
             planner_context = analysis_context + "\n\n" + planner_context
             log.info("[Planning] Pre-analysis context injected")
 
+        # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
+        _llm_detected = getattr(planner, '_detected_language', None)
+        if _llm_detected and _llm_detected != language:
+            log.info(
+                "Language corrected by LLM during pre-analysis: %s → %s (%s)",
+                language, _llm_detected, get_language_name(_llm_detected),
+            )
+            language = _llm_detected
+            # Re-describe coder agent role with the corrected language
+            coder.role = f"Write clean {get_language_name(language)} code for a single step."
+
         MAX_PLAN_RETRIES = 3
         plan = None
         raw_steps = None

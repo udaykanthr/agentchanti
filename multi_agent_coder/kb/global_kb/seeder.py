@@ -1247,6 +1247,39 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="django,manage.py,test,label,file,path,dotted,module,RuntimeError,python",
     ),
+    # ── Django TemplateDoesNotExist / app not in INSTALLED_APPS ─────────
+    ErrorFix(
+        error_type="DjangoTemplateDoesNotExistWrongSettings",
+        language="python",
+        pattern=r"TemplateDoesNotExist",
+        cause="Two common causes: (1) The app is missing from INSTALLED_APPS in the settings "
+              "file that Django actually loads. Django projects created with 'django-admin "
+              "startproject' have TWO settings files: a root-level stub (e.g. settings.py at "
+              "the project root) that is NOT used, and the real settings inside the project "
+              "package (e.g. <project>/<project>/settings.py) which DJANGO_SETTINGS_MODULE "
+              "in manage.py points to. Editing the wrong settings file has no effect. "
+              "(2) The template directory structure is wrong — APP_DIRS=True requires templates "
+              "to be at <app>/templates/<app>/<template>.html.",
+        fix_template="STEP 1 — Find the REAL settings file:\n"
+                     "  grep -n 'DJANGO_SETTINGS_MODULE' manage.py\n"
+                     "  # e.g. → 'bootstrap_homepage.settings'\n"
+                     "  # Real file: bootstrap_homepage/bootstrap_homepage/settings.py\n"
+                     "  # NOT:       bootstrap_homepage/settings.py (root stub)\n\n"
+                     "STEP 2 — Add the app to INSTALLED_APPS in the REAL settings file:\n"
+                     "  INSTALLED_APPS = [\n"
+                     "      ...\n"
+                     "      'home',   # the missing app\n"
+                     "  ]\n\n"
+                     "STEP 3 — Verify template path structure:\n"
+                     "  With APP_DIRS=True the template must be at:\n"
+                     "    <app>/templates/<app>/<name>.html\n"
+                     "  e.g. home/templates/home/index.html (loaded as 'home/index.html')\n\n"
+                     "RULE: ALWAYS check manage.py for DJANGO_SETTINGS_MODULE before editing "
+                     "any settings.py. There may be two settings files — only one is real.",
+        severity="error",
+        tags="django,TemplateDoesNotExist,INSTALLED_APPS,settings,manage.py,"
+             "DJANGO_SETTINGS_MODULE,two-settings,APP_DIRS,template,python",
+    ),
     # ── Django makemigrations: No installed app with label 'X' ──────────
     ErrorFix(
         error_type="DjangoNoInstalledAppWithLabel",
@@ -1283,6 +1316,28 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "DJANGO_SETTINGS_MODULE points to. There may be two settings files.",
         severity="error",
         tags="django,makemigrations,migrate,INSTALLED_APPS,app,label,settings,nested,layout,python",
+    ),
+    # ── Django STATICFILES_DIRS pointing to non-existent directory ──────
+    ErrorFix(
+        error_type="DjangoStaticfilesDirsNotExist",
+        language="python",
+        pattern=r"(?:STATICFILES_DIRS.*does not exist|ValueError.*STATICFILES_DIRS|"
+                r"TemplateDoesNotExist|django\.core\.exceptions\.ImproperlyConfigured.*static)",
+        cause="settings.py sets STATICFILES_DIRS to a directory that does not exist on disk "
+              "(e.g. BASE_DIR / 'static'). Django's staticfiles finder raises an error during "
+              "request handling in DEBUG mode, which can manifest as TemplateDoesNotExist or "
+              "a 500 error on the first request.",
+        fix_template="FIX: Guard STATICFILES_DIRS so it only includes directories that exist:\n\n"
+                     "import os\n"
+                     "_extra_static = BASE_DIR / 'static'\n"
+                     "STATICFILES_DIRS = [_extra_static] if os.path.isdir(_extra_static) else []\n\n"
+                     "OR create the missing directory:\n"
+                     "  mkdir -p <project_root>/static\n\n"
+                     "RULE: Never set STATICFILES_DIRS to a path that the project does not "
+                     "actually create. Always guard with an existence check or create the dir "
+                     "in the setup steps.",
+        severity="error",
+        tags="django,static,STATICFILES_DIRS,TemplateDoesNotExist,ImproperlyConfigured,settings,python",
     ),
     # ── Django admin list_display field does not exist on model ─────────
     ErrorFix(
@@ -2023,9 +2078,106 @@ HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
 
 ## Verification
 
-After applying one of these fixes, your Three.js components should render without 
-throwing the WebGL context error, allowing you to test other aspects of the component 
+After applying one of these fixes, your Three.js components should render without
+throwing the WebGL context error, allowing you to test other aspects of the component
 (props, headings, UI elements).
+""",
+    },
+    "django-page-creation-pattern.md": {
+        "title": "Django Page Creation Pattern",
+        "tags": "django, view, url, template, page, routing, INSTALLED_APPS, python",
+        "content": """## Overview
+
+Creating a new page in a Django project requires three coordinated changes.
+Missing any one of them results in a 404 or TemplateDoesNotExist error.
+
+## Required Steps (all three are mandatory)
+
+### 1. View function — `<app>/views.py`
+
+```python
+from django.shortcuts import render
+
+def login(request):
+    return render(request, "myapp/login.html")
+
+def signup(request):
+    return render(request, "myapp/signup.html")
+```
+
+**Never** wrap `render()` in a bare `try/except Exception` — it silently hides
+template errors and serves a broken fallback instead of a visible error page.
+
+### 2. URL pattern — project `urls.py` or app `urls.py`
+
+Add a `path()` entry for every new view:
+
+```python
+# project urls.py
+from django.urls import path, include
+from myapp import views
+
+urlpatterns = [
+    path("login/", views.login, name="login"),
+    path("signup/", views.signup, name="signup"),
+]
+```
+
+Or use `include()` to delegate to the app's own `urls.py`:
+
+```python
+# myapp/urls.py
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path("login/", views.login, name="login"),
+    path("signup/", views.signup, name="signup"),
+]
+```
+
+### 3. Template file — `<app>/templates/<app>/<page>.html`
+
+Django's `APP_DIRS=True` setting only searches templates inside **installed**
+apps.  The correct path is:
+
+```
+myapp/templates/myapp/login.html
+myapp/templates/myapp/signup.html
+```
+
+## INSTALLED_APPS — mandatory for new apps
+
+If the app is new (not yet in `settings.py`), add it to `INSTALLED_APPS` **in
+the same plan**:
+
+```python
+INSTALLED_APPS = [
+    ...
+    "myapp",   # ← required or templates/models/static files are invisible
+]
+```
+
+Forgetting this causes `TemplateDoesNotExist` even when the template file
+exists on disk.
+
+## Anti-Patterns
+
+| Anti-pattern | Problem |
+|---|---|
+| Create template only, no view | 404 — no route to render it |
+| Create view only, no URL pattern | 404 — URL resolver never reaches the view |
+| View + URL but no `INSTALLED_APPS` entry | `TemplateDoesNotExist` |
+| `try: render(...) except Exception: return HttpResponse(...)` | Silently hides real errors |
+
+## Checklist
+
+When adding any new Django page, verify **all** of the following:
+
+- [ ] View function added to `views.py`
+- [ ] `path()` entry added to `urls.py`
+- [ ] Template file created at `<app>/templates/<app>/<name>.html`
+- [ ] App listed in `INSTALLED_APPS` (if app is new)
 """,
     },
 }
@@ -2733,6 +2885,46 @@ If a test failure is triaged as SOURCE_BUG, verify before modifying source files
 
 A mismatch between what the test asserts and what the source renders is often a
 TEST_BUG, not a SOURCE_BUG — the test was generated with assumed content.
+
+## Rule 10: Use the simple app label in imports and INSTALLED_APPS
+
+When `manage.py startapp home` is run inside a project called `bootstrap_homepage`,
+the app lives at `bootstrap_homepage/home/` but is importable as just `home`
+(because manage.py adds `bootstrap_homepage/` to sys.path).
+
+**INSTALLED_APPS** — use the simple label, not the project-prefixed path:
+```python
+# CORRECT
+INSTALLED_APPS = [..., "home"]
+
+# WRONG — Django cannot find this module; causes AppRegistryNotReady / LookupError
+INSTALLED_APPS = [..., "bootstrap_homepage.home"]
+```
+
+**Test imports** — import from the app directly:
+```python
+# CORRECT
+from home import views
+from home.views import index
+
+# WRONG — raises ModuleNotFoundError
+from bootstrap_homepage.home import views
+```
+
+**unittest.mock patch paths** — patch where the name is looked up (in the
+module that uses it), using the simple label:
+```python
+# CORRECT — patches render in the home.views namespace
+with patch("home.views.render") as mock_render:
+    ...
+
+# WRONG — patches a module path that does not exist
+with patch("bootstrap_homepage.home.views.render") as mock_render:
+    ...
+```
+
+**Rule**: always check the app directory name on disk and use that as-is.
+If `home/` is a sibling of `manage.py`, the import is `from home import ...`.
 """,
     },
 }

@@ -110,9 +110,32 @@ _IMPORT_PATTERNS = [
 # Response parsing patterns
 # Note: chunk names can be multi-word (e.g. "function HeroBanner", "class MyApp")
 # so we use [^(]+? instead of \S+ to capture everything up to the opening paren.
+
+# Matches EDIT markers with an explicit numeric line range (most precise form).
+# The "lines?" keyword is optional — LLMs often omit it.
+# Examples:
+#   #### [EDIT]: foo.py (1-200)
+#   #### [EDIT]: foo.py:python (lines 5-30)
+#   #### [EDIT]: foo.py:python:my_func (lines 5-30)
 _EDIT_MARKER = re.compile(
-    r"####\s*\[EDIT\]:\s*(\S+?)(?::([^(]+?))?\s*\(lines?\s*(\d+)\s*-\s*(\d+)\)",
+    r"####\s*\[EDIT\]:\s*(\S+?)(?::([^(]+?))?\s*\((?:lines?\s*)?(\d+)\s*-\s*(\d+)\)",
 )
+
+# Matches EDIT/NEW markers that signal a full-file replacement with no numeric range.
+# LLMs use many variants for "replace the whole file":
+#   #### [EDIT]: foo.py:python              (no parens at all)
+#   #### [EDIT]: foo.py (new file)
+#   #### [EDIT]: foo.py:python (full-file replacement)
+#   #### [EDIT]: foo.py:python (full file)
+#   #### [EDIT]: foo.py:python (replace)
+# We match these ONLY when there is no numeric range (to avoid shadowing _EDIT_MARKER).
+_EDIT_FULL_FILE_MARKER = re.compile(
+    r"####\s*\[EDIT\]:\s*(\S+?)(?::([^(\n]+?))?"
+    r"(?:\s*\((?:new\s+file|full[- ]?file[^)]*|replace[^)]*)\))?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
 _NEW_MARKER = re.compile(
     r"####\s*\[NEW\]:\s*(\S+)\s*\(after\s+line\s+(\d+)\)",
 )
@@ -407,9 +430,10 @@ class ChunkEditor:
         i = 0
         while i < len(lines):
             line = lines[i]
+            line_stripped = line.strip()
 
-            # Check for [EDIT] marker
-            edit_match = _EDIT_MARKER.match(line.strip())
+            # Check for [EDIT] marker with explicit numeric line range (most precise).
+            edit_match = _EDIT_MARKER.match(line_stripped)
             if edit_match:
                 fpath = edit_match.group(1)
                 chunk_name = (edit_match.group(2) or "").strip()
@@ -429,8 +453,34 @@ class ChunkEditor:
                     i = end_i
                     continue
 
+            # Full-file EDIT variants — no numeric range present.
+            # Matches: "#### [EDIT]: file:lang", "#### [EDIT]: file (new file)",
+            # "#### [EDIT]: file:lang (full-file replacement)", etc.
+            # Guard: only fires when _EDIT_MARKER didn't already match this line,
+            # and only when the line actually starts with #### [EDIT]: to avoid
+            # false positives on prose lines.
+            if (not edit_match
+                    and line_stripped.startswith("####")
+                    and "[EDIT]:" in line_stripped):
+                full_match = _EDIT_FULL_FILE_MARKER.match(line_stripped)
+                if full_match:
+                    fpath = full_match.group(1)
+                    code, end_i = self._extract_code_block(lines, i + 1)
+                    if code is not None:
+                        logger.debug(
+                            "[ChunkEditor] Full-file replacement for %s", fpath)
+                        edits.append(ChunkEditResponse(
+                            file_path=fpath,
+                            chunk_id="top_level",
+                            line_start=1,
+                            line_end=999999,
+                            new_content=code,
+                        ))
+                        i = end_i
+                        continue
+
             # Check for [NEW] marker
-            new_match = _NEW_MARKER.match(line.strip())
+            new_match = _NEW_MARKER.match(line_stripped)
             if new_match:
                 fpath = new_match.group(1)
                 after_line = int(new_match.group(2))
@@ -483,14 +533,32 @@ class ChunkEditor:
 
         for start, end, edit in resolved_edits:
             new_lines = edit.new_content.splitlines(True)
+            # Strip leading unified-diff hunk markers (@@…@@) that the LLM
+            # sometimes emits when it confuses chunk format with patch format.
+            # A file starting with "@@ " is invalid Python/JS/HTML.
+            if new_lines and re.match(r'^@@\s', new_lines[0]):
+                logger.warning(
+                    "[ChunkEditor] Stripping diff hunk marker from start of '%s'",
+                    edit.file_path,
+                )
+                new_lines = [
+                    l for l in new_lines
+                    if not re.match(r'^@@\s', l) and not re.match(r'^[-+]{3}\s', l)
+                ]
             # Ensure last line has newline
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines[-1] += "\n"
 
             if edit.is_new:
-                # Insert after the specified line
-                insert_pos = min(edit.insert_after, len(lines))
-                lines[insert_pos:insert_pos] = new_lines
+                if edit.insert_after == 0 and lines:
+                    # "after line 0" on an existing file means full replacement,
+                    # not prepend — avoids duplicate content when the LLM uses
+                    # [NEW] to rewrite a file that already has content.
+                    lines[:] = new_lines
+                else:
+                    # Insert after the specified line
+                    insert_pos = min(edit.insert_after, len(lines))
+                    lines[insert_pos:insert_pos] = new_lines
             else:
                 # Replace line range (1-indexed to 0-indexed)
                 s = max(0, start - 1)

@@ -216,6 +216,18 @@ def _extract_commands_from_text(text: str, *, code_blocks_only: bool = False) ->
             if cleaned and cleaned not in seen:
                 commands.append(cleaned)
                 seen.add(cleaned)
+        # Blocks with shell control flow (if/for/while/case) must also run as
+        # a single unit — splitting them loses variable assignments and breaks
+        # elif/else/fi/done/esac structure.
+        elif re.search(
+            r'^\s*(if\s|for\s|while\s|case\s|until\s|\bfi\b|\bdone\b|\besac\b)',
+            block,
+            re.MULTILINE,
+        ):
+            cleaned = _cleanup_shell_command(block)
+            if cleaned and cleaned not in seen:
+                commands.append(cleaned)
+                seen.add(cleaned)
         else:
             commands.extend(process_block(block))
 
