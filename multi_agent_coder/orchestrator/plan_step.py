@@ -1685,3 +1685,125 @@ def is_structured_plan(text: str) -> bool:
         if _STEP_RE.match(line.strip()):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Manifest reclassification — CODE → CMD for protected manifest files
+# ---------------------------------------------------------------------------
+
+# Manifest basenames that are protected from direct LLM overwrite.
+# Keep in sync with Executor._PROTECTED_FILENAMES.
+_MANIFEST_BASENAMES: frozenset = frozenset({
+    'package.json', 'requirements.txt', 'Cargo.toml', 'go.mod',
+    'Gemfile', 'composer.json', 'Pipfile', 'pyproject.toml', 'setup.py',
+})
+
+# Manifest basename → package-manager install prefix
+_MANIFEST_PM_PREFIX: dict = {
+    'package.json':    'npm install',
+    'requirements.txt': 'pip install',
+    'Cargo.toml':      'cargo add',
+    'go.mod':          'go get',
+    'Gemfile':         'bundle add',
+    'composer.json':   'composer require',
+    'Pipfile':         'pipenv install',
+    'pyproject.toml':  'pip install',
+    'setup.py':        'pip install',
+}
+
+# package.json fields that are metadata, not dependency names
+_PKG_JSON_NON_DEP_FIELDS = frozenset({
+    'name', 'version', 'description', 'main', 'module', 'browser',
+    'type', 'author', 'license', 'homepage', 'repository', 'bugs',
+    'private', 'engines', 'os', 'cpu',
+})
+
+
+def _extract_packages_from_inline_edits(step: 'PlanStep') -> list:
+    """Return package names added by the step's inline find/replace edits."""
+    import os as _os
+    packages: list = []
+    for fpath, pairs in (step.inline_edits or {}).items():
+        basename = _os.path.basename(fpath)
+        for find_str, replace_str in pairs:
+            find_lines = {l.strip().rstrip(',') for l in find_str.splitlines() if l.strip()}
+            for raw_line in replace_str.splitlines():
+                stripped = raw_line.strip().rstrip(',')
+                if not stripped or stripped in find_lines:
+                    continue
+                if basename == 'package.json':
+                    # Match: "animejs": "^4.2.0"
+                    m = re.match(r'^"([^"]+)"\s*:\s*"[^"]*"$', stripped)
+                    if m and m.group(1) not in _PKG_JSON_NON_DEP_FIELDS:
+                        packages.append(m.group(1))
+                elif basename in ('requirements.txt', 'Pipfile', 'pyproject.toml', 'setup.py'):
+                    # Match: animejs==4.2.0  or  animejs>=3
+                    m = re.match(r'^([A-Za-z0-9_.-]+)', stripped)
+                    if m and not stripped.startswith('#') and not stripped.startswith('['):
+                        packages.append(m.group(1))
+                elif basename == 'Cargo.toml':
+                    # Match: animejs = "4.2.0"  (skip section headers)
+                    if not stripped.startswith('[') and '=' in stripped:
+                        pkg_name = stripped.split('=')[0].strip()
+                        if re.match(r'^[a-zA-Z0-9_-]+$', pkg_name):
+                            packages.append(pkg_name)
+                elif basename == 'go.mod':
+                    # Match: require github.com/foo/bar v1.2.3
+                    m = re.match(r'^(?:require\s+)?(\S+/\S+)\s+v', stripped)
+                    if m:
+                        packages.append(m.group(1))
+    return packages
+
+
+def reclassify_manifest_steps(plan_steps: list) -> list:
+    """Convert CODE steps whose targets are *only* dependency manifest files into
+    CMD package-manager install steps.
+
+    Rationale: The executor's protected-file guard blocks direct overwrites of
+    ``package.json``, ``requirements.txt``, etc.  Converting to ``npm install``
+    (or the ecosystem equivalent) lets the package manager do the safe, atomic
+    update and actually installs the package into ``node_modules`` /
+    ``site-packages``.  The guard still exists as a safety net for any stray
+    LLM-generated writes that slip through.
+
+    Steps where no packages can be detected from the inline edits are left
+    unchanged so they fall through to the normal CODE path (which will log a
+    warning about the protected write).
+    """
+    import os as _os
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    for step in plan_steps:
+        if step.step_type != "CODE":
+            continue
+        if not step.target_files:
+            continue
+
+        basenames = [_os.path.basename(f) for f in step.target_files]
+        if not all(b in _MANIFEST_BASENAMES for b in basenames):
+            continue  # at least one non-manifest target — leave as CODE
+
+        packages = _extract_packages_from_inline_edits(step)
+
+        if not packages:
+            _log.debug(
+                "[PlanStep] Step %s targets manifest(s) only but no packages "
+                "detected from inline edits — leaving as CODE", step.id,
+            )
+            continue
+
+        primary = basenames[0]
+        prefix = _MANIFEST_PM_PREFIX.get(primary, 'pip install')
+        install_cmd = f"{prefix} {' '.join(packages)}"
+
+        _log.info(
+            "[PlanStep] Step %s reclassified CODE→CMD "
+            "(manifest-only target): %s", step.id, install_cmd,
+        )
+        step.step_type = "CMD"
+        step.command = install_cmd
+        step.inline_edits = {}
+        step.inline_code = {}
+
+    return plan_steps

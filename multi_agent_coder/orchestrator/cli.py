@@ -35,7 +35,7 @@ from ..plugins.registry import PluginRegistry
 from .memory import FileMemory
 from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
 from .plan_step import build_waves as _build_plan_waves
-from ..agents.analyser import build_project_context, AnalyseAgent
+from ..agents.analyser import build_project_context, AnalyseAgent, parse_briefing_packages
 
 
 def _rematch_plan_steps(new_steps, old_plan_steps, dependencies):
@@ -624,6 +624,7 @@ def main():
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
+                reclassify_manifest_steps,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -711,6 +712,12 @@ def main():
             plan_steps_parsed = from_legacy_steps(steps, dependencies)
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
+
+        # Reclassify CODE steps targeting only protected dependency manifests
+        # (package.json, requirements.txt, etc.) as CMD install steps.
+        plan_steps_parsed = reclassify_manifest_steps(plan_steps_parsed)
+        steps = steps_as_text_list(plan_steps_parsed)
+        dependencies = steps_dependencies_dict(plan_steps_parsed)
 
         # ── 11. Plan approval loop ──
         if args.auto:
@@ -881,6 +888,14 @@ def main():
                             analyse_exc)
         else:
             log.info("[Analysis] LLM enrichment skipped (analyser_enabled: false)")
+
+    # Inject packages from the task briefing's "New packages:" line so that
+    # _ensure_packages_installed installs them before the first CODE step —
+    # even when the plan has no explicit CMD install step.
+    for _pkg in parse_briefing_packages(getattr(memory, '_task_briefing', '')):
+        if _pkg not in project_context.required_packages:
+            project_context.required_packages.append(_pkg)
+            log.info("[PreAnalysis] Briefing package injected: %s", _pkg)
 
     # ── 12. Build execution waves ──
     # Use phase-aware wave builder when structured plan steps are available.
