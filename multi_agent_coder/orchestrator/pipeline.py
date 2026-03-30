@@ -16,6 +16,8 @@ from .step_handlers import (
     _handle_cmd_step, _handle_code_step, _handle_test_step,
     _handle_search_step,
     _build_scoped_test_cmd,
+    _detect_subproject_root,
+    _prefix_subproject_paths,
     MAX_STEP_RETRIES,
 )
 from .diagnosis import _diagnose_failure, _apply_fix
@@ -24,6 +26,30 @@ _logger = logging.getLogger(__name__)
 
 
 MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
+
+
+def _try_trivial_close(
+    partial: dict[str, str],
+    language: str | None,
+) -> dict[str, str] | None:
+    """Attempt to close trivially truncated inline code without LLM.
+
+    If each file in *partial* has ≤2 unmatched opening braces and ≤2
+    unmatched opening parens, append the missing closing tokens.
+    Returns the closed dict on success, or None if any file is too
+    complex to close deterministically.
+    """
+    result: dict[str, str] = {}
+    for path, content in partial.items():
+        open_braces = content.count('{') - content.count('}')
+        open_parens = content.count('(') - content.count(')')
+        # Only attempt closure when the gap is tiny (likely a cut-off tail)
+        if open_braces < 0 or open_parens < 0 or open_braces > 2 or open_parens > 2:
+            return None
+        tail = ('}\n' * open_braces) + (')\n' * open_parens)
+        result[path] = content + ('\n' + tail if tail else '')
+    return result
+
 
 # ── Test file detection ───────────────────────────────────────
 # Patterns that indicate a file is a test file (used for CODE→TEST
@@ -49,11 +75,80 @@ _TEST_DIR_RE = re.compile(
 )
 
 
+_SOURCE_EXTS = frozenset({
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".go", ".rb", ".java", ".rs", ".cs", ".cpp", ".c", ".php",
+})
+
 def _is_test_file(file_path: str) -> bool:
     """Return True if *file_path* looks like a test file."""
     import os
     basename = os.path.basename(file_path)
+    _, ext = os.path.splitext(basename)
+    # Never treat non-source files (HTML, CSS, JSON, …) as test files even
+    # when they live inside a __tests__ directory.
+    if ext.lower() not in _SOURCE_EXTS:
+        return False
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
+
+
+def _find_tests_impacted_by_sources(
+    modified_sources: list[str],
+    all_test_files: dict[str, str],
+    exclude: str,
+    already_queued: set[str],
+    kb_context_builder=None,
+) -> list[str]:
+    """Return test files (not already queued) that import any of the modified source files.
+
+    Prefers the KB code graph (``CodeGraph.impact_analysis``) when available —
+    it already tracks IMPORTS edges via tree-sitter parsing so no re-scanning is
+    needed.  Falls back to a lightweight regex scan only when the graph is absent
+    (e.g. KB not initialised for this project).
+    """
+    candidates: set[str] = set()
+
+    graph = getattr(kb_context_builder, "_graph", None) if kb_context_builder else None
+
+    if graph is not None:
+        # Graph path: reverse-BFS over IMPORTS edges for each changed source.
+        for src in modified_sources:
+            for affected in graph.impact_analysis(src):
+                if _is_test_file(affected):
+                    candidates.add(affected)
+    else:
+        # Fallback: stem-match imports in test file content via regex.
+        import re as _re
+        _JS_IMPORT_RE = _re.compile(
+            r'''(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))''')
+        _PY_IMPORT_RE = _re.compile(
+            r'(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))')
+
+        src_stems: set[str] = set()
+        for src in modified_sources:
+            stem = src.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+            src_stems.add(stem)
+
+        for tpath, tcontent in all_test_files.items():
+            imports: set[str] = set()
+            for m in _JS_IMPORT_RE.finditer(tcontent):
+                rel = m.group(1) or m.group(2)
+                if rel:
+                    imports.add(rel)
+            for m in _PY_IMPORT_RE.finditer(tcontent):
+                mod = m.group(1) or m.group(2)
+                if mod:
+                    imports.add(mod.replace('.', '/'))
+            for imp in imports:
+                imp_stem = imp.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+                if imp_stem in src_stems:
+                    candidates.add(tpath)
+                    break
+
+    return [
+        t for t in candidates
+        if t != exclude and t not in already_queued
+    ]
 
 
 # ── External service dependency detection ─────────────────────
@@ -153,6 +248,180 @@ def _detect_system_level_failure(error_info: str) -> str | None:
     return None
 
 
+def _infer_test_file_path(src_path: str, language: str | None) -> str:
+    """Return the conventional test-file path for *src_path*.
+
+    Examples:
+        src/components/Footer.jsx  ->  src/components/__tests__/Footer.test.jsx
+        src/utils/math.ts          ->  src/utils/__tests__/math.test.ts
+        api/views.py               ->  api/tests/test_views.py
+    """
+    src_dir = src_path.rsplit("/", 1)[0] if "/" in src_path else "."
+    basename = src_path.rsplit("/", 1)[-1]
+    stem, _, ext = basename.rpartition(".")
+
+    _ext_map: dict[str, str] = {
+        "jsx": "test.jsx", "tsx": "test.tsx",
+        "js": "test.js",   "ts": "test.ts",
+        "py": "py",        "rb": "spec.rb",
+    }
+    test_suffix = _ext_map.get(ext, f"test.{ext}")
+
+    if ext == "py":
+        return f"{src_dir}/tests/test_{stem}.{test_suffix}"
+    return f"{src_dir}/__tests__/{stem}.{test_suffix}"
+
+
+def _source_covered_by_test_step(
+    src_path: str,
+    test_step: "PlanStep",
+) -> bool:
+    """Return True if *test_step* explicitly references *src_path*.
+
+    Checks plan-declared imports and inline test-file content so that
+    both plan-parsed and LLM-inlined test specs are handled.
+    """
+    src_basename = src_path.rsplit("/", 1)[-1]
+    src_stem = src_basename.rsplit(".", 1)[0]
+
+    # Plan-declared imports (e.g. imports: src/components/Footer.jsx:default)
+    for imp_path in (test_step.imports_from or {}):
+        if src_stem in imp_path or src_basename in imp_path or src_path in imp_path:
+            return True
+
+    # Inline test code content
+    for content in (test_step.inline_code or {}).values():
+        if src_stem in content or src_basename in content:
+            return True
+
+    return False
+
+
+def _generate_test_coverage_for_inline_changes(
+    *,
+    uncovered_files: list[str],
+    before_files: dict[str, str],
+    memory: "FileMemory",
+    executor,
+    coder,
+    display: "CLIDisplay",
+    step_idx: int,
+    language: str | None,
+    plan_step: "PlanStep | None",
+) -> None:
+    """Ask the coder LLM to generate/update test files for source files
+    that have no corresponding TEST step in the plan.
+
+    Called from the Tier A inline-code path when reviewer is skipped because
+    a TEST step follows — but the specific source files changed here are NOT
+    imported by any of those TEST steps.  Without this function those changes
+    would reach the bulk test run untested.
+
+    For each uncovered source file:
+      1. Find the best matching test file already in memory (by imports or name).
+      2. Ask the LLM to add tests for the new/changed behaviour (diff context).
+      3. Write the result to memory — it will be executed by run_bulk_test_execution_and_fix.
+    """
+    from ..language import get_code_block_lang
+
+    all_files = memory.all_files()
+    lang_tag = get_code_block_lang(language) if language else "python"
+
+    for src_path in uncovered_files:
+        old_content = before_files.get(src_path, "")
+        new_content = all_files.get(src_path, "")
+        if not new_content:
+            continue
+
+        src_basename = src_path.rsplit("/", 1)[-1]
+        src_stem = src_basename.rsplit(".", 1)[0]
+
+        # ── Find best existing test file ──
+        existing_test_path: str | None = None
+        existing_test_content: str = ""
+        for fpath, content in all_files.items():
+            if not _is_test_file(fpath):
+                continue
+            if src_stem in content or src_basename in content:
+                existing_test_path = fpath
+                existing_test_content = content
+                break
+
+        target_test_path = existing_test_path or _infer_test_file_path(src_path, language)
+        action = "update" if existing_test_path else "create"
+
+        display.step_info(
+            step_idx,
+            f"[Inline] No test coverage for {src_basename} — "
+            f"{'updating' if action == 'update' else 'generating'} "
+            f"{target_test_path.rsplit('/', 1)[-1]}...",
+        )
+        _logger.info(
+            "[Inline] Generating test coverage for uncovered source %s -> %s",
+            src_path, target_test_path,
+        )
+
+        ctx = ""
+        if existing_test_content:
+            ctx = (
+                f"Existing test file (DO NOT remove any existing tests):\n"
+                f"#### [FILE]: {existing_test_path}\n"
+                f"```{lang_tag}\n{existing_test_content}\n```\n\n"
+            )
+
+        old_block = ""
+        if old_content:
+            old_block = (
+                f"Previous version of source (for reference — only test "
+                f"new/changed behaviour):\n"
+                f"```{lang_tag}\n{old_content}\n```\n\n"
+            )
+
+        prompt = (
+            f"Source file `{src_path}` was just written/updated and has "
+            f"no corresponding test step in the plan.\n\n"
+            f"New source content:\n"
+            f"#### [FILE]: {src_path}\n```{lang_tag}\n{new_content}\n```\n\n"
+            f"{old_block}"
+            f"{ctx}"
+            f"{'Add tests for the new or changed behaviour to the existing test file.'  if action == 'update' else 'Create a new test file covering the key functionality.'}\n\n"
+            f"Requirements:\n"
+            f"- Target file: `{target_test_path}`\n"
+            f"- Do NOT remove existing tests\n"
+            f"- Only test observable behaviour, not implementation details\n\n"
+            f"Output ONLY the complete test file:\n"
+            f"#### [FILE]: {target_test_path}\n```{lang_tag}\n...full content...\n```"
+        )
+
+        try:
+            response = coder.llm_client.generate_response(prompt)
+            gen_files = executor.parse_code_blocks(response)
+            if not gen_files:
+                gen_files = executor.parse_code_blocks_fuzzy(response)
+            # Accept only test files
+            gen_files = {p: c for p, c in gen_files.items() if _is_test_file(p)}
+            if gen_files:
+                executor.write_files(gen_files)
+                memory.update(gen_files)
+                _logger.info(
+                    "[Inline] Test coverage written for %s: %s",
+                    src_path, list(gen_files.keys()),
+                )
+                display.step_info(
+                    step_idx,
+                    f"[Inline] Test coverage written: "
+                    f"{', '.join(p.rsplit('/', 1)[-1] for p in gen_files)}",
+                )
+            else:
+                _logger.warning(
+                    "[Inline] LLM produced no test files for %s", src_path
+                )
+        except Exception as exc:
+            _logger.warning(
+                "[Inline] Test coverage generation failed for %s: %s", src_path, exc
+            )
+
+
 def build_step_waves(steps: list[str], dependencies: dict[int, set[int]]) -> list[list[int]]:
     """Group step indices into execution waves using topological ordering.
 
@@ -233,16 +502,47 @@ def _execute_step(step_idx: int, step_text: str, *,
                 )
 
         # 3. KB context (Phase 4 — symbols, error fixes, patterns)
+        #
+        # Use a clean short description as the KB search query.
+        # step_text may contain inline code blocks from the plan (e.g. a full
+        # JSX component), which explodes the keyword-score denominator and
+        # dilutes all meaningful matches.  plan_step.description is the
+        # one-line human description; fall back to the first line of step_text.
+        _kb_query = (
+            (plan_step.description if plan_step and plan_step.description else None)
+            or step_text.split("\n")[0].strip()
+        )
+        # Augment _kb_query with project tech stack so framework docs are
+        # found for steps whose description doesn't mention the framework
+        # by name (e.g. "Replace main.jsx" doesn't mention "tailwindcss").
+        # Uses installed_packages from knowledge_base (already in memory —
+        # no I/O or LLM calls) filtered to recognised tech keywords only.
+        if knowledge_base is not None:
+            try:
+                _pk = knowledge_base.load()
+                _pkgs = getattr(_pk, "installed_packages", [])
+                if _pkgs:
+                    from ..orchestrator.plan_optimizer import _TECH_KEYWORDS
+                    _tech_hits = _TECH_KEYWORDS.findall(" ".join(_pkgs[:50]))
+                    _query_lower = _kb_query.lower()
+                    _tech_extras = [
+                        t for t in dict.fromkeys(t.lower() for t in _tech_hits)
+                        if t.lower() not in _query_lower
+                    ][:8]
+                    if _tech_extras:
+                        _kb_query = f"{_kb_query} {' '.join(_tech_extras)}"
+            except Exception:
+                pass
         if kb_context_builder is not None:
             try:
                 from ..kb.context_builder import ContextBuilder
                 kb_ctx = kb_context_builder.build_context(
-                    task_description=step_text,
+                    task_description=_kb_query,
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 4000) if cfg else 4000,
                     language=getattr(project_context, "language", None) if project_context else None,
                 )
-                if kb_ctx.kb_available or kb_ctx.behavioral_instructions:
+                if kb_ctx.kb_available or kb_ctx.behavioral_instructions or kb_ctx.global_patterns:
                     kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
                     if kb_text:
                         context_parts.append(kb_text)
@@ -286,7 +586,7 @@ def _execute_step(step_idx: int, step_text: str, *,
             try:
                 changed = list(memory.all_files().keys())[:10]
                 relevant_files = kb_context_builder.get_relevant_files(
-                    task_description=step_text,
+                    task_description=_kb_query,
                     changed_files=changed,
                     max_files=15,
                 )
@@ -449,6 +749,158 @@ def _execute_step(step_idx: int, step_text: str, *,
                 plan_step=plan_step)
 
         elif step_type == "CODE":
+            # ── Inline edit fast path ──
+            # If the planner provided find/replace edit blocks, apply them
+            # surgically to the existing files and promote the result into
+            # inline_code so the existing quality gate handles it naturally.
+            # Falls through to coder if any edit fails to apply.
+            if (plan_step is not None
+                    and plan_step.inline_edits
+                    and not plan_step.inline_code):
+                _edit_subproject = _detect_subproject_root(memory)
+                _edit_all_ok = True
+                _patched = None
+                _cur = None
+
+                for _edit_fpath, _edit_pairs in plan_step.inline_edits.items():
+                    import os as _os_edit
+                    _resolved = _edit_fpath
+                    if _edit_subproject and not _edit_fpath.startswith(_edit_subproject):
+                        _candidate = f"{_edit_subproject}/{_edit_fpath}"
+                        if _os_edit.path.exists(_candidate):
+                            _resolved = _candidate
+
+                    if not _os_edit.path.exists(_resolved):
+                        _logger.warning(
+                            "[InlineEdit] Target not found: %s — skipping edit path",
+                            _resolved,
+                        )
+                        _edit_all_ok = False
+                        break
+
+                    try:
+                        with open(_resolved, "r", encoding="utf-8") as _ef:
+                            _cur = _ef.read()
+                    except OSError as _oe:
+                        _logger.warning("[InlineEdit] Cannot read %s: %s", _resolved, _oe)
+                        _edit_all_ok = False
+                        break
+
+                    # Pre-validate: log which FIND strings won't match so the
+                    # cause is visible before any edits are attempted.
+                    for _pi, (_find_pre, _) in enumerate(_edit_pairs):
+                        if _find_pre not in _cur:
+                            _find_lines_pre = [l.strip() for l in _find_pre.splitlines() if l.strip()]
+                            _cur_stripped = [l.strip() for l in _cur.splitlines()]
+                            _n_pre = len(_find_lines_pre)
+                            _pre_fuzzy = any(
+                                _cur_stripped[_li:_li + _n_pre] == _find_lines_pre
+                                for _li in range(max(0, len(_cur_stripped) - _n_pre + 1))
+                            )
+                            if not _pre_fuzzy:
+                                _logger.warning(
+                                    "[InlineEdit] FIND block #%d in %s will not match "
+                                    "(neither exact nor fuzzy). Likely cause: planner "
+                                    "hallucinated content not present in the file. "
+                                    "First non-matching line: %r",
+                                    _pi + 1, _resolved,
+                                    next(
+                                        (l for l in _find_lines_pre if l not in _cur_stripped),
+                                        "<all lines present but sequence mismatch>",
+                                    ),
+                                )
+
+                    _patched = _cur
+                    for _find_str, _repl_str in _edit_pairs:
+                        # Skip pairs where the find string has no real file
+                        # content (e.g. leftover ---file-content-end--- marker
+                        # accidentally flushed as a phantom edit pair).
+                        _find_meaningful_lines = [
+                            l for l in _find_str.splitlines()
+                            if l.strip() and not l.strip().startswith("---")
+                        ]
+                        if not _find_meaningful_lines:
+                            _logger.debug(
+                                "[InlineEdit] Skipping empty/marker-only FIND pair in %s",
+                                _resolved,
+                            )
+                            continue
+                        if _find_str in _patched:
+                            _patched = _patched.replace(_find_str, _repl_str, 1)
+                            _logger.debug("[InlineEdit] Exact match applied in %s", _resolved)
+                        else:
+                            # Fuzzy fallback: normalize whitespace per-line and
+                            # try to locate the find block in the file.
+                            # Works for both single-line and multi-line finds.
+                            _find_lines_stripped = [l.strip() for l in _find_str.splitlines() if l.strip()]
+                            _file_lns = _patched.splitlines(keepends=True)
+                            _file_stripped = [l.strip() for l in _file_lns]
+                            _n_find = len(_find_lines_stripped)
+                            _fuzzy_hit = False
+                            if _n_find > 0:
+                                for _li in range(len(_file_lns) - _n_find + 1):
+                                    if _file_stripped[_li:_li + _n_find] == _find_lines_stripped:
+                                        # Determine base indent from first matched line
+                                        _indent = len(_file_lns[_li]) - len(_file_lns[_li].lstrip())
+                                        _repl_lines = _repl_str.splitlines()
+                                        _last_orig_newline = _file_lns[_li + _n_find - 1].endswith("\n")
+                                        _replacement = (
+                                            "\n".join(
+                                                (" " * _indent + rl.lstrip()) if rl.strip() else rl
+                                                for rl in _repl_lines
+                                            )
+                                            + ("\n" if _last_orig_newline else "")
+                                        )
+                                        _file_lns[_li:_li + _n_find] = [_replacement]
+                                        _patched = "".join(_file_lns)
+                                        _fuzzy_hit = True
+                                        _logger.debug(
+                                            "[InlineEdit] Fuzzy match applied in %s (lines %d-%d)",
+                                            _resolved, _li + 1, _li + _n_find,
+                                        )
+                                        break
+                            if not _fuzzy_hit:
+                                _logger.warning(
+                                    "[InlineEdit] find string not found in %s — "
+                                    "falling through to coder",
+                                    _resolved,
+                                )
+                                _edit_all_ok = False
+                                break
+
+                    if not _edit_all_ok:
+                        break
+                    # Promote the patched content into inline_code so the
+                    # existing quality gate below handles writing + validation.
+                    plan_step.inline_code[_resolved] = _patched
+                    _logger.info(
+                        "[InlineEdit] Promoted patched %s -> inline_code", _resolved,
+                    )
+
+                if not _edit_all_ok:
+                    # If some blocks applied before the failure, write the
+                    # partial result to disk so the coder sees the already-
+                    # patched file rather than the original.  This avoids the
+                    # coder regenerating hunks that were already correct, and
+                    # prevents line-number drift that causes its diff to fail.
+                    if _patched is not None and _cur is not None and _patched != _cur:
+                        try:
+                            with open(_resolved, "w", encoding="utf-8") as _wf:
+                                _wf.write(_patched)
+                            memory.update({_resolved: _patched})
+                            _logger.info(
+                                "[InlineEdit] Partial edits written to %s "
+                                "before falling through to coder",
+                                _resolved,
+                            )
+                        except OSError as _we:
+                            _logger.warning(
+                                "[InlineEdit] Could not write partial edits to %s: %s",
+                                _resolved, _we,
+                            )
+                    plan_step.inline_code.clear()
+                    _logger.info("[InlineEdit] Falling through to coder (edit failed)")
+
             # ── Inline code fast path ──
             # If the planner already provided complete code in the plan,
             # write it directly — zero Coder LLM calls needed.
@@ -456,7 +908,59 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and plan_step.inline_code
                     and len(plan_step.inline_code) > 0):
                 display.step_info(step_idx, "Writing inline code from plan (0 LLM calls)")
-                _inline_files = plan_step.inline_code
+                _inline_files = dict(plan_step.inline_code)
+                _inline_subproject = _detect_subproject_root(memory)
+                # Fallback: if memory-based detection failed (e.g. no source
+                # files in memory yet, so _detect_subproject_root bails early),
+                # infer from the CMD-output entries that ARE in memory.
+                if not _inline_subproject:
+                    import re as _re
+                    _mem_all = memory.all_files()
+                    _scaffold_pats = [
+                        _re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
+                        _re.compile(r'create-react-app\s+(\S+)'),
+                        _re.compile(r'ng\s+new\s+(\S+)'),
+                    ]
+                    import os as _os
+                    for _fpath, _content in _mem_all.items():
+                        if not _fpath.startswith('_cmd_output/'):
+                            continue
+                        _first = _content.split('\n')[0] if _content else ''
+                        for _pat in _scaffold_pats:
+                            _m = _pat.search(_first)
+                            if _m:
+                                _cand = _m.group(1).strip().rstrip('/')
+                                if _cand and _os.path.isdir(_cand):
+                                    _inline_subproject = _cand
+                                    _logger.info(
+                                        "[Inline] Subproject from CMD "
+                                        "fallback: %s/", _cand)
+                                    break
+                        if _inline_subproject:
+                            break
+                _logger.debug(
+                    "[Inline] subproject=%r inline_keys=%r",
+                    _inline_subproject, list(_inline_files.keys()),
+                )
+                if _inline_subproject:
+                    _inline_files = _prefix_subproject_paths(
+                        _inline_files, _inline_subproject, memory)
+
+                # Gate: strip any pseudo-diff markers the planner may have emitted
+                from .dependency_check import clean_diff_markers as _clean_diff
+                _inline_files = {
+                    path: _clean_diff(content)
+                    for path, content in _inline_files.items()
+                }
+
+                # Capture which targets already exist before overwriting
+                import os as _os_inline
+                _existing_inline_targets = {
+                    p for p in _inline_files if _os_inline.path.exists(p)
+                }
+
                 executor.write_files(_inline_files)
                 memory.update(_inline_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -465,38 +969,343 @@ def _execute_step(step_idx: int, step_text: str, *,
                     len(_inline_files), plan_step.id,
                     list(_inline_files.keys()),
                 )
-            else:
-                # Extract code graph from kb_context_builder if available
-                _graph = code_graph
-                if _graph is None and kb_context_builder is not None:
-                    _graph = getattr(kb_context_builder, "_graph", None)
 
-                # Look ahead: skip LLM review if a TEST step follows
+                # Deterministic KB content-fix gate for inline code.
+                #
+                # The planner generates inline code WITH full KB context
+                # (e.g. Tailwind v4 docs), so its output is typically correct.
+                # Sending it to an LLM reviewer is counterproductive — local
+                # models apply outdated training-data bias and "fix" correct
+                # code back to v3 patterns.  Instead, apply the same
+                # deterministic _apply_content_fixes() rules used in
+                # _handle_code_step — these catch known LLM mistakes (e.g.
+                # @tailwind directives, wrong plugin names) without LLM calls.
+                from .step_handlers import _apply_content_fixes
+                _cf = getattr(memory, "_content_fixes", None)
+                if _cf:
+                    _fixed_inline = _apply_content_fixes(_inline_files, _cf)
+                    _changed = [
+                        p for p in _inline_files
+                        if _fixed_inline.get(p) != _inline_files.get(p)
+                    ]
+                    if _changed:
+                        executor.write_files(
+                            {p: _fixed_inline[p] for p in _changed})
+                        memory.update(
+                            {p: _fixed_inline[p] for p in _changed})
+                        display.step_info(
+                            step_idx,
+                            f"[Inline] Content fixes applied to "
+                            f"{len(_changed)} file(s): "
+                            f"{', '.join(_changed)}",
+                        )
+                    else:
+                        _logger.debug(
+                            "[Inline] Content fixes checked — "
+                            "no corrections needed"
+                        )
+
+                # ── Inline code quality gate (Phase 1) ──
+                # The planner wrote this code WITH full KB context, so it is
+                # typically correct.  We avoid unconditional reviewer LLM calls
+                # and instead apply a tiered gate:
+                #
+                #   Tier A: TEST-step lookahead — tests will validate; skip all.
+                #   Tier B: Static lint + import checks (free, no LLM).
+                #           Fail → fall back to Coder+Reviewer loop.
+                #   Tier C: Existing-file rewrite + full review mode → run
+                #           Reviewer LLM to verify the overwrite is correct.
+                #           Fail → fall back to Coder+Reviewer loop.
+                #   Tier D: All clear → done.  The post-step dependency check
+                #           (run_dependency_check at line ~830) already handles
+                #           orphaned exports and wiring via its own LLM fix path.
+                _has_test_after_inline = False
                 if all_plan_steps is not None:
-                    _has_test_after = any(
+                    _has_test_after_inline = any(
                         s.step_type == "TEST" for s in all_plan_steps
                         if s.index > step_idx
                     )
-                else:
-                    _test_keywords = re.compile(
-                        r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
-                        re.IGNORECASE,
-                    )
-                    _has_test_after = any(
-                        _test_keywords.search(steps[j])
-                        for j in range(step_idx + 1, len(steps))
+
+                if _has_test_after_inline:
+                    # Tier A: TEST follows — tests will validate, skip review.
+                    _logger.info(
+                        "[Inline] Skipping review for step %s — TEST step follows",
+                        plan_step.id if plan_step else step_idx,
                     )
 
-                success, error_info = _handle_code_step(
-                    step_text, coder, reviewer, executor,
-                    task, memory, display, step_idx, language=language, cfg=cfg,
-                    auto=auto, code_graph=_graph,
-                    project_profile=project_profile,
-                    skip_review=_has_test_after,
-                    project_context=project_context,
-                    plan_step=plan_step,
-                    all_plan_steps=all_plan_steps,
-                    kb_context_builder=kb_context_builder)
+                    # ── Coverage gap check ──
+                    # A TEST step exists somewhere after this CODE step, but it
+                    # may not import the specific source files written here.
+                    # Identify any source files that no future TEST step covers
+                    # and proactively generate/update their test files so the
+                    # bulk run at end-of-pipeline exercises the new changes.
+                    _inline_sources = [
+                        p for p in _inline_files if not _is_test_file(p)
+                    ]
+                    if _inline_sources and all_plan_steps is not None:
+                        _covered: set[str] = set()
+                        for _ts in all_plan_steps:
+                            if _ts.index <= step_idx or _ts.step_type != "TEST":
+                                continue
+                            for _sp in _inline_sources:
+                                if _source_covered_by_test_step(_sp, _ts):
+                                    _covered.add(_sp)
+                        _uncovered = [p for p in _inline_sources if p not in _covered]
+                        if _uncovered:
+                            _logger.info(
+                                "[Inline] Source files with no TEST-step coverage: %s",
+                                _uncovered,
+                            )
+                            _generate_test_coverage_for_inline_changes(
+                                uncovered_files=_uncovered,
+                                before_files=_before_files or {},
+                                memory=memory,
+                                executor=executor,
+                                coder=coder,
+                                display=display,
+                                step_idx=step_idx,
+                                language=language,
+                                plan_step=plan_step,
+                            )
+                else:
+                    # Tier B: Static lint + import checks
+                    from .step_handlers import _quick_offline_lint, _validate_import_paths
+                    _inline_lint = _quick_offline_lint(_inline_files)
+                    _inline_import_errs = _validate_import_paths(_inline_files, memory)
+                    _inline_static_errs = (
+                        (_inline_lint + "\n" + _inline_import_errs).strip()
+                        if _inline_import_errs else _inline_lint
+                    )
+                    if _inline_static_errs:
+                        display.step_info(
+                            step_idx,
+                            "[Inline] Static errors found — falling back to Coder+Reviewer loop",
+                        )
+                        _logger.info(
+                            "[Inline] Static check failed for step %s — "
+                            "falling back to _handle_code_step: %s",
+                            plan_step.id if plan_step else step_idx,
+                            _inline_static_errs[:200],
+                        )
+                        _graph_inline = code_graph
+                        if _graph_inline is None and kb_context_builder is not None:
+                            _graph_inline = getattr(kb_context_builder, "_graph", None)
+                        success, error_info = _handle_code_step(
+                            step_text, coder, reviewer, executor,
+                            task, memory, display, step_idx,
+                            language=language, cfg=cfg,
+                            auto=auto, code_graph=_graph_inline,
+                            project_profile=project_profile,
+                            skip_review=_has_test_after_inline,
+                            project_context=project_context,
+                            plan_step=plan_step,
+                            all_plan_steps=all_plan_steps,
+                            kb_context_builder=kb_context_builder,
+                        )
+                    else:
+                        # Tier C: Existing-file rewrite — run Reviewer when in
+                        # full review mode so overwritten files are verified.
+                        _inline_review_mode = "static"
+                        if cfg is not None:
+                            _inline_review_mode = getattr(
+                                cfg, "REVIEW_MODE", "static"
+                            )
+                        _should_review_inline = (
+                            _inline_review_mode == "full"
+                            and bool(_existing_inline_targets)
+                        )
+                        if _should_review_inline:
+                            display.step_info(
+                                step_idx,
+                                f"[Inline] Reviewing overwrite of "
+                                f"{len(_existing_inline_targets)} existing "
+                                f"file(s) via Reviewer...",
+                            )
+                            _inline_review_code = "\n\n".join(
+                                f"#### {p}\n```\n{_inline_files[p]}\n```"
+                                for p in _existing_inline_targets
+                                if p in _inline_files
+                            )
+                            _kb_ctx_inline = getattr(memory, "_kb_context", "")
+                            _reviewer_kb_inline = (
+                                f"\n\n[KB Documentation — trust this over your "
+                                f"training data]\n{_kb_ctx_inline}\n"
+                                if _kb_ctx_inline else ""
+                            )
+                            _inline_review_resp = reviewer.process(
+                                f"Review this inline code for the step: "
+                                f"{step_text}\n\n{_inline_review_code}",
+                                context=(
+                                    f"Step: {step_text}\n"
+                                    f"This code replaces existing file(s). "
+                                    f"Verify the replacement is complete and "
+                                    f"correct."
+                                    f"{_reviewer_kb_inline}"
+                                ),
+                                language=language,
+                            )
+                            _inline_review_lower = (
+                                _inline_review_resp or ""
+                            ).lower()
+                            _inline_approved = any(
+                                phrase in _inline_review_lower for phrase in (
+                                    "code looks good", "looks good",
+                                    "no issues", "no critical issues",
+                                    "no bugs found", "code is correct",
+                                    "functionally correct", "lgtm",
+                                )
+                            )
+                            if _inline_approved:
+                                display.step_info(
+                                    step_idx,
+                                    "[Inline] Reviewer approved existing-file "
+                                    "rewrite ✔",
+                                )
+                                _logger.info(
+                                    "[Inline] Reviewer approved inline rewrite "
+                                    "for step %s",
+                                    plan_step.id if plan_step else step_idx,
+                                )
+                            else:
+                                display.step_info(
+                                    step_idx,
+                                    "[Inline] Reviewer flagged issues — "
+                                    "falling back to Coder+Reviewer loop",
+                                )
+                                _logger.info(
+                                    "[Inline] Reviewer rejected inline rewrite "
+                                    "for step %s — falling back: %s",
+                                    plan_step.id if plan_step else step_idx,
+                                    (_inline_review_resp or "")[:200],
+                                )
+                                _graph_inline = code_graph
+                                if _graph_inline is None and kb_context_builder is not None:
+                                    _graph_inline = getattr(
+                                        kb_context_builder, "_graph", None
+                                    )
+                                success, error_info = _handle_code_step(
+                                    step_text, coder, reviewer, executor,
+                                    task, memory, display, step_idx,
+                                    language=language, cfg=cfg,
+                                    auto=auto, code_graph=_graph_inline,
+                                    project_profile=project_profile,
+                                    skip_review=_has_test_after_inline,
+                                    project_context=project_context,
+                                    plan_step=plan_step,
+                                    all_plan_steps=all_plan_steps,
+                                    kb_context_builder=kb_context_builder,
+                                )
+                        else:
+                            # Tier D: Static clean, no existing-file rewrite
+                            # concern — accept inline code as-is.
+                            # Dependency wiring (orphaned exports) is handled
+                            # by run_dependency_check after this block.
+                            _logger.info(
+                                "[Inline] Static checks passed for step %s — "
+                                "accepted (0 reviewer LLM calls)",
+                                plan_step.id if plan_step else step_idx,
+                            )
+            else:
+                # ── No inline code (or inline was truncated) ──
+                # Phase 2: If the planner's inline code was truncated (token
+                # limit), _partial_inline_code holds what was written before
+                # the cut-off.  Two strategies:
+                #
+                #   1. Trivial close: if unmatched braces/parens are small
+                #      (≤2 each), close them deterministically — 0 LLM calls.
+                #   2. Partial hint: inject the partial code into coder context
+                #      so the coder completes rather than regenerates cold.
+                #      Skip reviewer (static-only) since the base was planner-
+                #      written and only the tail needs filling.
+                _partial = getattr(plan_step, '_partial_inline_code', None) if plan_step else None
+                _used_trivial_close = False
+
+                if _partial:
+                    _closed = _try_trivial_close(_partial, language)
+                    if _closed is not None:
+                        # Strategy 1: lint first, write only if clean
+                        from .dependency_check import clean_diff_markers as _clean_diff_trunc
+                        _closed = {p: _clean_diff_trunc(c) for p, c in _closed.items()}
+                        from .step_handlers import _quick_offline_lint, _validate_import_paths
+                        _trunc_lint = _quick_offline_lint(_closed)
+                        _trunc_imp = _validate_import_paths(_closed, memory)
+                        if not _trunc_lint and not _trunc_imp:
+                            # Lint clean — write and accept
+                            _trunc_subproject = _detect_subproject_root(memory)
+                            if _trunc_subproject:
+                                _closed = _prefix_subproject_paths(
+                                    _closed, _trunc_subproject, memory)
+                            executor.write_files(_closed)
+                            memory.update(_closed)
+                            display.step_tokens(step_idx, 0, 0)
+                            display.step_info(
+                                step_idx,
+                                "[Inline/trunc] Trivially closed truncated code (0 LLM calls)",
+                            )
+                            _logger.info(
+                                "[Inline/trunc] Step %s: trivial close succeeded for %s",
+                                plan_step.id if plan_step else step_idx,
+                                list(_closed.keys()),
+                            )
+                            _used_trivial_close = True
+                            success, error_info = True, ""
+                        else:
+                            _logger.info(
+                                "[Inline/trunc] Trivial close lint failed for step %s "
+                                "— falling through to coder with partial hint",
+                                plan_step.id if plan_step else step_idx,
+                            )
+
+                if _partial and not _used_trivial_close:
+                    # Strategy 2: inject partial code as completion hint
+                    _logger.info(
+                        "[Inline/trunc] Step %s: using partial code as coder hint (%d file(s))",
+                        plan_step.id if plan_step else step_idx,
+                        len(_partial),
+                    )
+                    display.step_info(
+                        step_idx,
+                        "[Inline/trunc] Completing truncated inline code via coder hint",
+                    )
+
+                if not _used_trivial_close:
+                    # Extract code graph from kb_context_builder if available
+                    _graph = code_graph
+                    if _graph is None and kb_context_builder is not None:
+                        _graph = getattr(kb_context_builder, "_graph", None)
+
+                    # Look ahead: skip LLM review if a TEST step follows OR
+                    # if we are completing partial planner code (base was correct)
+                    if all_plan_steps is not None:
+                        _has_test_after = any(
+                            s.step_type == "TEST" for s in all_plan_steps
+                            if s.index > step_idx
+                        )
+                    else:
+                        _test_keywords = re.compile(
+                            r'\b(test|spec|unit.test|integration.test|jest|vitest|pytest|rspec)\b',
+                            re.IGNORECASE,
+                        )
+                        _has_test_after = any(
+                            _test_keywords.search(steps[j])
+                            for j in range(step_idx + 1, len(steps))
+                        )
+
+                    # Partial hint: skip reviewer — coder is only completing tail
+                    _skip_review_for_partial = bool(_partial and not _used_trivial_close)
+
+                    success, error_info = _handle_code_step(
+                        step_text, coder, reviewer, executor,
+                        task, memory, display, step_idx, language=language, cfg=cfg,
+                        auto=auto, code_graph=_graph,
+                        project_profile=project_profile,
+                        skip_review=_has_test_after or _skip_review_for_partial,
+                        project_context=project_context,
+                        plan_step=plan_step,
+                        all_plan_steps=all_plan_steps,
+                        kb_context_builder=kb_context_builder,
+                        partial_inline_code=_partial,
+                    )
 
         elif step_type == "TEST":
             # ── Inline test fast path ──
@@ -506,7 +1315,23 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and plan_step.inline_code
                     and len(plan_step.inline_code) > 0):
                 display.step_info(step_idx, "Writing inline test code from plan (0 LLM calls)")
-                _inline_test_files = plan_step.inline_code
+                _inline_test_files = dict(plan_step.inline_code)
+                _inline_test_subproject = _detect_subproject_root(memory)
+                _logger.debug(
+                    "[Inline/test] subproject=%r inline_keys=%r",
+                    _inline_test_subproject, list(_inline_test_files.keys()),
+                )
+                if _inline_test_subproject:
+                    _inline_test_files = _prefix_subproject_paths(
+                        _inline_test_files, _inline_test_subproject, memory)
+
+                # Gate: strip any pseudo-diff markers
+                from .dependency_check import clean_diff_markers as _clean_diff_t
+                _inline_test_files = {
+                    path: _clean_diff_t(content)
+                    for path, content in _inline_test_files.items()
+                }
+
                 executor.write_files(_inline_test_files)
                 memory.update(_inline_test_files)
                 display.step_tokens(step_idx, 0, 0)
@@ -514,6 +1339,36 @@ def _execute_step(step_idx: int, step_text: str, *,
                     "[PlanStep] Inline test code: wrote %d file(s) for step %s: %s",
                     len(_inline_test_files), plan_step.id,
                     list(_inline_test_files.keys()),
+                )
+
+                # Deterministic KB content-fix gate (e.g. jest-dom → jest-dom/vitest)
+                from .step_handlers import _apply_content_fixes as _acf_test
+                _cf_test = getattr(memory, "_content_fixes", None)
+                if _cf_test:
+                    _fixed_test = _acf_test(_inline_test_files, _cf_test)
+                    _changed_test = [
+                        p for p in _inline_test_files
+                        if _fixed_test.get(p) != _inline_test_files.get(p)
+                    ]
+                    if _changed_test:
+                        executor.write_files(
+                            {p: _fixed_test[p] for p in _changed_test})
+                        memory.update(
+                            {p: _fixed_test[p] for p in _changed_test})
+                        display.step_info(
+                            step_idx,
+                            f"[Inline/test] Content fixes applied to "
+                            f"{len(_changed_test)} file(s)",
+                        )
+
+                # Defer test execution — all TEST steps write their files
+                # first; a single bulk run happens after all waves complete.
+                # This avoids redundant parallel runs when multiple TEST steps
+                # are in the same wave and prevents source-fixes for one test
+                # from breaking another test that hasn't run yet.
+                display.step_info(
+                    step_idx,
+                    "[Inline/test] Test files written — execution deferred to bulk run",
                 )
             else:
                 success, error_info = _handle_test_step(
@@ -562,6 +1417,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         step_idx, step_text, new_or_changed,
                         dep_before, dep_after,
                         memory, llm_client, executor, display, language, cfg,
+                        all_plan_steps=all_plan_steps,
                     )
                     if integration_fixes:
                         executor.write_files(integration_fixes)
@@ -964,18 +1820,35 @@ def run_final_test_verification(
     fw = get_test_framework(lang) if lang else get_test_framework("python")
     base_cmd = fw["command"]
 
-    # Vitest override: if any test file imports from 'vitest', prefer vitest
+    # Vitest override: check imports, config files, and package.json
     if "jest" in base_cmd.lower():
+        # 1. Explicit vitest imports (works when globals:false)
         uses_vitest = any(
             "from 'vitest'" in c or 'from "vitest"' in c
             for c in test_files.values()
         )
+        # 2. vitest.config.* present in session memory (covers globals:true setups)
+        if not uses_vitest:
+            _vitest_configs = (
+                "vitest.config.js", "vitest.config.ts",
+                "vitest.config.mjs", "vitest.config.mts",
+            )
+            uses_vitest = any(
+                any(f.endswith(cfg) for cfg in _vitest_configs)
+                for f in all_files
+            )
+        # 3. vitest listed in package.json (covers installed-but-config-not-in-memory)
+        if not uses_vitest:
+            pkg_content = next(
+                (c for f, c in all_files.items() if f.endswith("package.json")),
+                "",
+            )
+            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
         if uses_vitest:
             base_cmd = "npx vitest run"
-            _logger.info("[FinalVerify] Overriding to vitest (detected vitest imports)")
+            _logger.info("[FinalVerify] Overriding to vitest (detected vitest config/package)")
 
-    # Detect subproject root (reuse step_handlers helper)
-    from .step_handlers import _detect_subproject_root
+    # Detect subproject root
     subproject_cwd = _detect_subproject_root(memory)
 
     test_cmd = _build_scoped_test_cmd(base_cmd, test_files, subproject_cwd)
@@ -1024,6 +1897,7 @@ def run_final_test_verification(
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
                     language=language,
+                    step_type="TEST",
                 )
                 kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
                 if kb_text:
@@ -1033,7 +1907,14 @@ def run_final_test_verification(
 
         failing_imports = _extract_failing_test_imports(output, all_files)
 
+        _fv_briefing = getattr(memory, '_task_briefing', '')
+        _fv_briefing_block = (
+            "TASK BRIEFING (overall goal — respect Preserve and Key constraint):\n"
+            f"{_fv_briefing}\n\n"
+        ) if _fv_briefing else ""
+
         fix_prompt = (
+            f"{_fv_briefing_block}"
             f"Task: {task}\n\n"
             f"All individual test steps passed, but running the full test suite together "
             f"revealed a cross-step regression: a source fix for one test broke another.\n\n"
@@ -1045,12 +1926,38 @@ def run_final_test_verification(
             + kb_instructions
             + "\n\nFix the source file(s) so ALL tests pass."
             + "\n\nIMPORTANT: Preserve ALL existing public symbols (classes, functions, constants) — only add or modify, never remove."
-            + "\n\nOutput ONLY the complete fixed file(s) using this exact format — no prose, no explanation:\n"
-            + "#### [FILE]: path/to/file.py\n```python\n...full file content...\n```"
+            + "\n\nCRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!"
+            + "\n\nPrefer CHUNK FORMAT for surgical fixes:\n"
+            + "#### [EDIT]: path/to/file.py:function_name (lines start-end)\n```\n// replacement chunk\n```\n"
+            + "Use full-file [FILE]: format only when the whole file must be rewritten."
         )
         try:
             fix_response = coder.llm_client.generate_response(fix_prompt)
-            fix_files = executor.parse_code_blocks(fix_response)
+            # Try chunk edits first (surgical), fall back to full-file
+            fix_files = {}
+            try:
+                from ..editing.chunk_editor import ChunkEditor as _FvCE
+                _fv_ce = _FvCE()
+                _fv_edits = _fv_ce.parse_chunk_response(fix_response)
+                if _fv_edits:
+                    for _fv_edit in _fv_edits:
+                        _fv_fp = _fv_edit.file_path
+                        _fv_existing = memory.get(_fv_fp)
+                        if _fv_existing is None:
+                            try:
+                                with open(_fv_fp, "r", encoding="utf-8", errors="replace") as _f:
+                                    _fv_existing = _f.read()
+                            except OSError:
+                                pass
+                        if _fv_existing:
+                            try:
+                                fix_files[_fv_fp] = _fv_ce.apply_chunk_edits(_fv_existing, [_fv_edit])
+                            except Exception:
+                                pass
+            except ImportError:
+                pass
+            if not fix_files:
+                fix_files = executor.parse_code_blocks(fix_response)
             if not fix_files:
                 fix_files = executor.parse_code_blocks_fuzzy(fix_response)
             # Strictly filter: only apply fixes to non-test source files
@@ -1079,4 +1986,798 @@ def run_final_test_verification(
         f"did not all pass together after source fixes.\n{last_output[:600]}"
     )
     print(f"  [FinalVerify] FAILED — cross-step regression detected.")
+    return False, error_msg
+
+
+# ---------------------------------------------------------------------------
+# Bulk test execution and per-file fix (replaces per-step inline test runs)
+# ---------------------------------------------------------------------------
+
+_MAX_BULK_TEST_FIX_ATTEMPTS = 3
+
+
+def _resolve_django_failed_files(
+    output: str,
+    subproject_cwd: str | None = None,
+) -> list[str]:
+    """Resolve Django ERROR:/FAIL: module paths from test output to file paths.
+
+    Django test output reports failures as:
+        ERROR: test_foo (app.tests.MyClass.test_foo)
+        FAIL:  test_bar (app.tests.test_views.MyClass.test_bar)
+
+    This extracts the dotted module path inside the parentheses, converts it
+    to a file path (e.g. ``app/tests.py`` or ``app/tests/test_views.py``),
+    and checks whether that file exists on disk.  Returns paths relative to
+    the project root (prefixed with *subproject_cwd* when given).
+
+    Useful when the failing test file was NOT written during the current
+    session (not in *known_test_files*) so the normal matcher misses it.
+    """
+    import os as _os
+    from .step_handlers import _ANSI_RE
+    clean = _ANSI_RE.sub('', output)
+    base = subproject_cwd.rstrip("/\\") if subproject_cwd else "."
+
+    # Extract all dotted module paths from Django ERROR/FAIL lines
+    modules = re.findall(
+        r'(?:ERROR|FAIL):\s+\S+\s+\(([^)]+)\)',
+        clean,
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for dotted in modules:
+        parts = dotted.split('.')
+        # Try progressively shorter prefixes: the class name and method name
+        # are the last 1-2 parts; the module is the remainder.
+        # e.g. home.tests.HomePageTests.test_foo → try home/tests.py first
+        for n in range(len(parts) - 1, 0, -1):
+            candidate_rel = '/'.join(parts[:n]) + '.py'
+            candidate_abs = _os.path.join(base, candidate_rel)
+            if _os.path.isfile(candidate_abs):
+                # Return relative to project root (not subproject)
+                full_rel = (
+                    subproject_cwd.rstrip('/\\') + '/' + candidate_rel
+                    if subproject_cwd and subproject_cwd != '.'
+                    else candidate_rel
+                )
+                if full_rel not in seen:
+                    seen.add(full_rel)
+                    resolved.append(full_rel)
+                break
+
+    return resolved
+
+
+def _django_settings_context(subproject_cwd: str | None) -> str:
+    """Return a source context block containing Django settings.py and the
+    actual ROOT_URLCONF file for the project.
+
+    When the LLM only sees app-level urls.py files it cannot tell that
+    ROOT_URLCONF = "pkg.urls" resolves to ``pkg/urls.py`` — a different file
+    from the one it has been editing.  Injecting both files into the fix prompt
+    lets the LLM find and fix the real URLconf instead of a decoy.
+
+    Returns an empty string when the project is not Django or files can't be
+    found.
+    """
+    import os as _os
+    import re as _re
+
+    base = subproject_cwd or "."
+
+    # Resolve the REAL settings file via DJANGO_SETTINGS_MODULE in manage.py.
+    # Django projects often have TWO settings.py files: a root-level stub
+    # (ignored by Django) and the real one inside the project package, e.g.
+    # bootstrap_homepage/bootstrap_homepage/settings.py.  Reading manage.py
+    # is the only reliable way to know which one Django actually loads.
+    settings_path: str | None = None
+    manage_py = _os.path.join(base, "manage.py")
+    if _os.path.isfile(manage_py):
+        try:
+            with open(manage_py, "r", encoding="utf-8", errors="replace") as _mf:
+                manage_content = _mf.read()
+            _dsm_m = _re.search(
+                r"DJANGO_SETTINGS_MODULE['\"]?\s*,\s*['\"]([^'\"]+)['\"]",
+                manage_content,
+            )
+            if _dsm_m:
+                # e.g. "bootstrap_homepage.settings" → bootstrap_homepage/settings.py
+                _module = _dsm_m.group(1)
+                _rel = _module.replace(".", _os.sep) + ".py"
+                _candidate = _os.path.join(base, _rel)
+                if _os.path.isfile(_candidate):
+                    settings_path = _candidate
+        except OSError:
+            pass
+
+    # Fallback: root-level settings.py (simple single-file layout)
+    if settings_path is None:
+        _fallback = _os.path.join(base, "settings.py")
+        if _os.path.isfile(_fallback):
+            settings_path = _fallback
+
+    if settings_path is None:
+        return ""
+
+    try:
+        with open(settings_path, "r", encoding="utf-8", errors="replace") as _f:
+            settings_content = _f.read()
+    except OSError:
+        return ""
+
+    ctx = (
+        f"#### [FILE]: {settings_path}\n"
+        f"```python\n{settings_content}\n```\n\n"
+        "NOTE: ROOT_URLCONF above defines the actual Django URL entry point — "
+        "make sure you edit THAT file, not a same-named file at a different path.\n\n"
+    )
+
+    # Resolve ROOT_URLCONF to a file path and include its current content
+    m = _re.search(r'ROOT_URLCONF\s*=\s*["\']([^"\']+)["\']', settings_content)
+    if m:
+        module = m.group(1)  # e.g. "bootstrap_homepage.urls"
+        rel_path = module.replace(".", _os.sep) + ".py"  # bootstrap_homepage/urls.py
+        urlconf_abs = _os.path.join(base, rel_path)
+        if _os.path.isfile(urlconf_abs):
+            # Express the path relative to the project root for the LLM
+            urlconf_rel = _os.path.join(
+                subproject_cwd.rstrip("/\\"), rel_path
+            ) if subproject_cwd else rel_path
+            try:
+                with open(urlconf_abs, "r", encoding="utf-8", errors="replace") as _uf:
+                    urlconf_content = _uf.read()
+                ctx += (
+                    f"#### [FILE]: {urlconf_rel}\n"
+                    f"```python\n{urlconf_content}\n```\n\n"
+                    f"NOTE: This is the ROOT_URLCONF file ({module}). "
+                    "It must include your app's URLs for reverse() to work.\n\n"
+                )
+            except OSError:
+                pass
+
+    return ctx
+
+
+def _fix_django_startup_crashes(
+    output: str,
+    subproject_cwd: str | None,
+    executor,
+) -> str:
+    """Detect and self-heal Django test-runner startup crashes.
+
+    Returns the output of a fresh test run if a fix was applied, otherwise
+    returns the original *output* unchanged.
+
+    Currently handles:
+    - ``tests.py`` stub + ``tests/`` package coexistence:
+      Django raises ``ImportError: 'tests' module incorrectly imported from …``
+      when both exist in the same app directory.  Fix: delete the ``.py`` stub.
+    """
+    import os
+
+    # Pattern: Django incorrectly-imported module conflict
+    _conflict_re = re.compile(
+        r"ImportError: '(\w+)' module incorrectly imported from '([^']+)'",
+        re.IGNORECASE,
+    )
+    m = _conflict_re.search(output)
+    if not m:
+        return output
+
+    module_name = m.group(1)          # e.g. "tests"
+    package_dir = m.group(2)          # e.g. "/abs/path/to/homepage/tests"
+
+    # The conflicting stub is <parent_dir>/<module_name>.py
+    parent_dir = os.path.dirname(package_dir)
+    stub_rel_candidates = [
+        os.path.join(parent_dir, f"{module_name}.py"),
+    ]
+    if subproject_cwd:
+        stub_rel_candidates.append(
+            os.path.join(subproject_cwd, parent_dir, f"{module_name}.py")
+        )
+
+    deleted: list[str] = []
+    for stub_path in stub_rel_candidates:
+        if os.path.isfile(stub_path):
+            try:
+                os.remove(stub_path)
+                deleted.append(stub_path)
+                _logger.info(
+                    "[BulkTest] Removed conflicting stub '%s' "
+                    "(shadowed by '%s/' package)",
+                    stub_path, package_dir,
+                )
+            except OSError as exc:
+                _logger.warning(
+                    "[BulkTest] Could not remove stub '%s': %s", stub_path, exc
+                )
+
+    if not deleted:
+        # Couldn't find the stub on disk — log the full error tail so
+        # the diagnostic LLM gets the actual ImportError text
+        _logger.warning(
+            "[BulkTest] Django startup crash (could not auto-fix):\n%s",
+            output[-2000:],
+        )
+        return output
+
+    # Re-run to get fresh output after the fix
+    from .step_handlers import get_test_framework, detect_language_from_files
+    ok, new_output = executor.run_command("python manage.py test", cwd=subproject_cwd)
+    _logger.info(
+        "[BulkTest] Post-stub-removal run: exit=%s", "0" if ok else "1"
+    )
+    return new_output
+
+
+def _parse_failed_test_files(
+    output: str,
+    known_test_files: list[str],
+    subproject_cwd: str | None = None,
+) -> list[str]:
+    """Parse test runner output to find which test files failed.
+
+    Matches FAIL lines from vitest/jest/pytest/Django against the known test
+    files written during the session, then also resolves Django module paths
+    to files on disk (catching failures in pre-existing test files that were
+    not written this session).
+    """
+    from .step_handlers import _ANSI_RE
+    clean = _ANSI_RE.sub('', output)
+    failed: list[str] = []
+    failed_set: set[str] = set()
+
+    for fpath in known_test_files:
+        basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+        stem = basename[:-3] if basename.endswith(".py") else basename
+
+        # vitest/jest:  " FAIL src/__tests__/Foo.test.jsx"
+        # pytest:       "FAILED tests/test_foo.py::test_bar"
+        if re.search(
+            r'(?:^|\s)(?:FAIL(?:ED)?)\s.*' + re.escape(basename),
+            clean,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            if fpath not in failed_set:
+                failed.append(fpath)
+                failed_set.add(fpath)
+            continue
+
+        # Django manage.py test:
+        #   "ERROR: test_foo (app.tests.test_views.MyTestCase.test_foo)"
+        #   "FAIL: test_foo (app.tests.test_views.MyTestCase.test_foo)"
+        if re.search(
+            r'(?:^|\s)(?:ERROR|FAIL):\s+\S+\s+\([^)]*\b' + re.escape(stem) + r'\b',
+            clean,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            if fpath not in failed_set:
+                failed.append(fpath)
+                failed_set.add(fpath)
+
+    # Also resolve Django module paths to actual files on disk — catches
+    # failures in pre-existing test files not written during this session.
+    for extra in _resolve_django_failed_files(output, subproject_cwd):
+        if extra not in failed_set:
+            failed.append(extra)
+            failed_set.add(extra)
+
+    # Fallback: if we couldn't identify specific files but tests failed,
+    # treat all known test files as candidates
+    if not failed and output:
+        failed = list(known_test_files)
+    return failed
+
+
+def run_bulk_test_execution_and_fix(
+    *,
+    memory: FileMemory,
+    executor,
+    coder,
+    display: CLIDisplay,
+    language: str | None,
+    task: str,
+    cfg=None,
+    project_context=None,
+    kb_context_builder=None,
+) -> tuple[bool, str]:
+    """Run all session test files in a single bulk execution, then fix failures
+    one test file at a time.
+
+    This replaces the per-step inline test runs that used to fire immediately
+    after each TEST step wrote its files.  By deferring execution until all
+    test files are written:
+
+      - Parallel TEST steps in the same wave no longer race to run the full
+        suite simultaneously.
+      - A source-file fix for one failing test cannot break another test
+        before it has been verified.
+      - Total LLM calls are reduced because a single diagnosis loop handles
+        all failures rather than one loop per step.
+
+    Fix strategy: run all tests → collect failed files → for each failed file
+    ask the coder to fix it (or its imported source) → re-run that single file
+    → move to the next.  A final run-all confirms everything passes.
+
+    Returns ``(success, error_info)``.
+    """
+    from ..language import get_test_framework, detect_language_from_files
+    from .step_handlers import (
+        _extract_file_specific_errors,
+        _extract_imported_sources,
+        _ANSI_RE,
+        _parse_test_counts,
+    )
+
+    all_files = memory.all_files()
+    test_files = {
+        fpath: content
+        for fpath, content in all_files.items()
+        if _is_test_file(fpath) and not fpath.startswith("_")
+    }
+
+    if not test_files:
+        _logger.info("[BulkTest] No test files found — skipping bulk run.")
+        return True, ""
+
+    _logger.info(
+        "[BulkTest] Running bulk test execution on %d file(s): %s",
+        len(test_files), list(test_files.keys()),
+    )
+    print(f"\n  [BulkTest] Running all {len(test_files)} test file(s)...")
+
+    # Detect test command
+    subproject_cwd = _detect_subproject_root(memory)
+    lang = language
+    if lang is None:
+        lang = detect_language_from_files(list(test_files.keys()))
+
+    fw = get_test_framework(lang) if lang else get_test_framework("python")
+    base_cmd = fw["command"]
+
+    # Django project detection: prefer manage.py test over pytest
+    import os as _os_bt
+    if (not lang or lang == "python") and _os_bt.path.isfile(
+        _os_bt.path.join(subproject_cwd, "manage.py")
+    ):
+        base_cmd = "python manage.py test"
+        _logger.info("[BulkTest] Django project detected — using 'python manage.py test'")
+
+    # Vitest override (mirrors run_final_test_verification detection logic)
+    if "jest" in base_cmd.lower():
+        uses_vitest = any(
+            "from 'vitest'" in c or 'from "vitest"' in c
+            for c in test_files.values()
+        )
+        if not uses_vitest:
+            _vitest_cfgs = (
+                "vitest.config.js", "vitest.config.ts",
+                "vitest.config.mjs", "vitest.config.mts",
+            )
+            uses_vitest = any(
+                any(f.endswith(vc) for vc in _vitest_cfgs)
+                for f in all_files
+            )
+        if not uses_vitest:
+            pkg_content = next(
+                (c for f, c in all_files.items() if f.endswith("package.json")),
+                "",
+            )
+            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
+        if uses_vitest:
+            base_cmd = "npx vitest run"
+            _logger.info("[BulkTest] Overriding to vitest")
+
+    # ── Step 1: Run all tests ──
+    ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
+    if ok:
+        _logger.info("[BulkTest] All tests passed on first run.")
+        print("  [BulkTest] All tests passed.")
+        # Record every test file as passed
+        for fpath in test_files:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
+        return True, ""
+
+    _logger.warning("[BulkTest] Tests failed:\n%s", output[:1000])
+
+    # ── Startup crash detection (Django only) ──────────────────────────────
+    # Django raises ImportError / ModuleNotFoundError at collection time when
+    # there is a `tests.py` stub AND a `tests/` package in the same directory.
+    # This crashes the whole run before any test executes, so _parse_failed_test_files
+    # returns the unhelpful fallback (all known files).  Detect the pattern and
+    # self-heal before falling into the per-file fix loop.
+    if "manage.py" in base_cmd:
+        output = _fix_django_startup_crashes(output, subproject_cwd, executor)
+
+    # ── Step 2: Fix one failing test file at a time ──
+    failed_files = _parse_failed_test_files(output, list(test_files.keys()), subproject_cwd)
+    _logger.info("[BulkTest] Failed test files: %s", failed_files)
+    print(f"  [BulkTest] {len(failed_files)} test file(s) failed — fixing one at a time...")
+
+    # Show initial pass/fail state in TEST RESULTS immediately
+    _failed_set = set(failed_files)
+    for fpath in test_files:
+        if fpath in _failed_set:
+            _p, _t, _f = _parse_test_counts(output)
+            display.record_test_result(fpath, passed=_p, total=_t, failures=_f)
+        else:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
+
+    lang_tag = lang or "python"
+
+    # Use an index-based loop so we can append newly-impacted test files
+    # to failed_files mid-iteration without losing them.
+    fix_idx = 0
+    while fix_idx < len(failed_files):
+        test_path = failed_files[fix_idx]
+        fix_idx += 1
+        basename = test_path.rsplit('/', 1)[-1]
+        print(f"  [BulkTest] Fixing {basename}...")
+
+        current_output = output  # use full output for first attempt
+
+        for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
+            # Extract error relevant to this file
+            file_error = _extract_file_specific_errors(
+                current_output, test_path, max_chars=3000)
+            if not file_error:
+                # Take the tail (where tracebacks and ImportErrors appear)
+                # rather than the head (which is often setup noise).
+                file_error = current_output[-3000:]
+
+            # Build source context for this test file
+            current_content = memory.all_files().get(test_path, "")
+            if not current_content:
+                # Pre-existing file not tracked in session memory — read from disk
+                try:
+                    with open(test_path, "r", encoding="utf-8", errors="replace") as _tf:
+                        current_content = _tf.read()
+                except OSError:
+                    pass
+            imported_sources = _extract_imported_sources(
+                {test_path: current_content}, memory)
+
+            source_ctx = (
+                f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
+            )
+            for fp, cnt in imported_sources.items():
+                source_ctx += (
+                    f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
+                )
+
+            # For Django projects inject settings.py + the real ROOT_URLCONF so
+            # the LLM can see the correct file to edit instead of guessing.
+            source_ctx += _django_settings_context(subproject_cwd)
+
+            # Optionally inject KB guidance
+            kb_instructions = ""
+            if kb_context_builder is not None:
+                try:
+                    from ..kb.context_builder import ContextBuilder
+                    kb_ctx = kb_context_builder.build_context(
+                        task_description=task,
+                        current_file=test_path,
+                        max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
+                        language=lang,
+                        step_type="TEST",
+                    )
+                    kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
+                    if kb_text:
+                        kb_instructions = f"\n\nKnowledge base guidance:\n{kb_text}"
+                except Exception:
+                    pass
+
+            _bt_briefing = getattr(memory, '_task_briefing', '')
+            _bt_briefing_block = (
+                "TASK BRIEFING (overall goal — respect Preserve and Key constraint):\n"
+                f"{_bt_briefing}\n\n"
+            ) if _bt_briefing else ""
+
+            fix_prompt = (
+                f"{_bt_briefing_block}"
+                f"Task: {task}\n\n"
+                f"Test file `{test_path}` failed. Fix it so the tests pass.\n\n"
+                f"Error output:\n{file_error}\n\n"
+                f"Relevant files:\n{source_ctx}"
+                f"{kb_instructions}\n\n"
+                "You may fix the test file itself OR fix a source file it imports — "
+                "whichever is correct.  Do NOT remove any existing tests.\n\n"
+                "CRITICAL: Do NOT remove or comment out the tested component/feature.\n\n"
+                "IMPORTANT — before modifying any template or source file to satisfy "
+                "an assertContains/assertIn/assertEqual test:\n"
+                "1. Read the EXACT string literal from the test assertion above.\n"
+                "2. Copy that exact string (correct case, spacing, punctuation) into "
+                "   the template or source file.\n"
+                "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
+                "CRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!\n\n"
+                "Prefer CHUNK FORMAT for surgical fixes:\n"
+                f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
+                f"```{lang_tag}\n// replacement chunk\n```\n"
+                "Use full-file [FILE]: format only when the whole file must be rewritten."
+            )
+
+            try:
+                fix_response = coder.llm_client.generate_response(fix_prompt)
+                # Try chunk edits first (surgical), fall back to full-file
+                fix_files = {}
+                try:
+                    from ..editing.chunk_editor import ChunkEditor as _BtCE
+                    _bt_ce = _BtCE()
+                    _bt_edits = _bt_ce.parse_chunk_response(fix_response)
+                    if _bt_edits:
+                        for _bt_edit in _bt_edits:
+                            _bt_fp = _bt_edit.file_path
+                            _bt_existing = memory.get(_bt_fp)
+                            if _bt_existing is None:
+                                try:
+                                    with open(_bt_fp, "r", encoding="utf-8", errors="replace") as _f:
+                                        _bt_existing = _f.read()
+                                except OSError:
+                                    pass
+                            if _bt_existing:
+                                try:
+                                    fix_files[_bt_fp] = _bt_ce.apply_chunk_edits(_bt_existing, [_bt_edit])
+                                except Exception:
+                                    pass
+                except ImportError:
+                    pass
+                if not fix_files:
+                    fix_files = executor.parse_code_blocks(fix_response)
+                if not fix_files:
+                    fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                if fix_files:
+                    executor.write_files(fix_files)
+                    memory.update(fix_files)
+                    _logger.info(
+                        "[BulkTest] Applied fixes for %s: %s",
+                        basename, list(fix_files.keys()),
+                    )
+            except Exception as exc:
+                _logger.warning("[BulkTest] Fix generation failed for %s: %s", basename, exc)
+                break
+
+            # Re-run this single file
+            single_cmd = _build_scoped_test_cmd(
+                base_cmd, {test_path: ""}, subproject_cwd)
+            ok_single, current_output = executor.run_command(
+                single_cmd, cwd=subproject_cwd)
+            if ok_single:
+                _logger.info("[BulkTest] %s now passes.", basename)
+                print(f"  [BulkTest] {basename} fixed ✔")
+                _p, _t, _ = _parse_test_counts(current_output)
+                display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+
+                # Check if any source files were modified and find other test
+                # files that import them — they may have been broken by the fix.
+                if fix_files:
+                    modified_sources = [f for f in fix_files if not _is_test_file(f)]
+                    if modified_sources:
+                        already_queued = set(failed_files)
+                        impacted = _find_tests_impacted_by_sources(
+                            modified_sources,
+                            test_files,
+                            exclude=test_path,
+                            already_queued=already_queued,
+                            kb_context_builder=kb_context_builder,
+                        )
+                        for rt in impacted:
+                            rt_cmd = _build_scoped_test_cmd(
+                                base_cmd, {rt: ""}, subproject_cwd)
+                            ok_rt, out_rt = executor.run_command(
+                                rt_cmd, cwd=subproject_cwd)
+                            if not ok_rt:
+                                rt_base = rt.rsplit('/', 1)[-1]
+                                _logger.warning(
+                                    "[BulkTest] %s broke after fix to %s — queuing",
+                                    rt_base, modified_sources,
+                                )
+                                print(
+                                    f"  [BulkTest] {rt_base} impacted by source "
+                                    f"change — queuing fix..."
+                                )
+                                failed_files.append(rt)
+                                _p_rt, _t_rt, _f_rt = _parse_test_counts(out_rt)
+                                display.record_test_result(
+                                    rt, passed=_p_rt, total=_t_rt, failures=_f_rt)
+                break
+            _logger.warning(
+                "[BulkTest] %s still failing (attempt %d/%d)",
+                basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+            )
+            # Update TEST RESULTS with latest counts on each fix attempt
+            _p, _t, _f = _parse_test_counts(current_output)
+            display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
+        else:
+            print(f"  [BulkTest] {basename} could not be fixed after "
+                  f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
+
+    # ── Step 3: Final run-all to confirm everything passes ──
+    # If the run-all surfaces new failures (e.g. a pre-existing test file that
+    # wasn't in the per-file fix queue, or a Django ERROR: that the initial
+    # parse missed), feed them back into the fix loop rather than giving up.
+    _MAX_RUNALL_ROUNDS = 2
+    for _round in range(_MAX_RUNALL_ROUNDS):
+        ok_final, output_final = executor.run_command(base_cmd, cwd=subproject_cwd)
+        if ok_final:
+            _logger.info("[BulkTest] Final run-all passed.")
+            print("  [BulkTest] All tests pass after fixes.")
+            for fpath in test_files:
+                display.record_test_result(fpath, passed=1, total=1, failures=[])
+            return True, ""
+
+        # Parse failures from the full run — includes files not in the original
+        # per-file fix queue (e.g. pre-existing tests, Django ERROR: lines).
+        if "manage.py" in base_cmd:
+            output_final = _fix_django_startup_crashes(output_final, subproject_cwd, executor)
+        still_failing = _parse_failed_test_files(output_final, list(test_files.keys()), subproject_cwd)
+        _logger.warning(
+            "[BulkTest] Run-all round %d/%d failed. Still failing: %s",
+            _round + 1, _MAX_RUNALL_ROUNDS, still_failing,
+        )
+
+        # Find files that weren't already fixed in the per-file loop
+        already_fixed = set(failed_files)
+        new_failures = [f for f in still_failing if f not in already_fixed]
+
+        if not new_failures:
+            # Same files are still broken — no point retrying
+            break
+
+        print(
+            f"  [BulkTest] Run-all found {len(new_failures)} additional "
+            f"failing file(s) — fixing..."
+        )
+        # Append to failed_files and re-run the fix loop for just the new ones
+        fix_start = len(failed_files)
+        for nf in new_failures:
+            if nf not in set(failed_files):
+                failed_files.append(nf)
+                _p_nf, _t_nf, _f_nf = _parse_test_counts(output_final)
+                display.record_test_result(nf, passed=_p_nf, total=_t_nf, failures=_f_nf)
+
+        current_output = output_final
+        while fix_idx < len(failed_files):
+            test_path = failed_files[fix_idx]
+            fix_idx += 1
+            basename = test_path.rsplit('/', 1)[-1]
+            print(f"  [BulkTest] Fixing {basename} (from run-all)...")
+
+            for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
+                file_error = _extract_file_specific_errors(
+                    current_output, test_path, max_chars=3000)
+                if not file_error:
+                    # Take the tail (where tracebacks and ImportErrors appear)
+                    # rather than the head (which is often setup noise).
+                    file_error = current_output[-3000:]
+
+                current_content = memory.all_files().get(test_path, "")
+                if not current_content:
+                    # Pre-existing file not tracked in session memory — read from disk
+                    try:
+                        with open(test_path, "r", encoding="utf-8", errors="replace") as _tf2:
+                            current_content = _tf2.read()
+                    except OSError:
+                        pass
+                imported_sources = _extract_imported_sources(
+                    {test_path: current_content}, memory)
+                source_ctx = (
+                    f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
+                )
+                for fp, cnt in imported_sources.items():
+                    source_ctx += (
+                        f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
+                    )
+                source_ctx += _django_settings_context(subproject_cwd)
+
+                _bt_briefing = getattr(memory, '_task_briefing', '')
+                _bt_briefing_block = (
+                    "TASK BRIEFING (overall goal):\n"
+                    f"{_bt_briefing}\n\n"
+                ) if _bt_briefing else ""
+
+                fix_prompt = (
+                    f"{_bt_briefing_block}"
+                    f"Task: {task}\n\n"
+                    f"Test file `{test_path}` failed in the full test suite. "
+                    f"Fix it so the tests pass.\n\n"
+                    f"Error output:\n{file_error}\n\n"
+                    f"Relevant files:\n{source_ctx}\n\n"
+                    "You may fix the test file itself OR fix a source file it imports — "
+                    "whichever is correct.  Do NOT remove any existing tests.\n\n"
+                    "IMPORTANT — before modifying any template or source file to satisfy "
+                    "an assertContains/assertIn/assertEqual test:\n"
+                    "1. Read the EXACT string literal from the test assertion above.\n"
+                    "2. Copy that exact string (correct case, spacing, punctuation) into "
+                    "   the template or source file.\n"
+                    "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
+                    "CRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!\n\n"
+                    "Prefer CHUNK FORMAT for surgical fixes:\n"
+                    f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
+                    f"```{lang_tag}\n// replacement chunk\n```\n"
+                    "Use full-file [FILE]: format only when the whole file must be rewritten."
+                )
+
+                try:
+                    fix_response = coder.llm_client.generate_response(fix_prompt)
+                    fix_files = {}
+                    try:
+                        from ..editing.chunk_editor import ChunkEditor as _BtCE2
+                        _bt_ce2 = _BtCE2()
+                        _bt_edits2 = _bt_ce2.parse_chunk_response(fix_response)
+                        if _bt_edits2:
+                            for _bt_edit2 in _bt_edits2:
+                                _bt_fp2 = _bt_edit2.file_path
+                                _bt_existing2 = memory.get(_bt_fp2)
+                                if _bt_existing2 is None:
+                                    try:
+                                        with open(_bt_fp2, "r", encoding="utf-8",
+                                                  errors="replace") as _f2:
+                                            _bt_existing2 = _f2.read()
+                                    except OSError:
+                                        pass
+                                if _bt_existing2:
+                                    try:
+                                        fix_files[_bt_fp2] = _bt_ce2.apply_chunk_edits(
+                                            _bt_existing2, [_bt_edit2])
+                                    except Exception:
+                                        pass
+                    except ImportError:
+                        pass
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    if fix_files:
+                        executor.write_files(fix_files)
+                        memory.update(fix_files)
+                        _logger.info(
+                            "[BulkTest] Applied fixes for %s: %s",
+                            basename, list(fix_files.keys()),
+                        )
+                except Exception as exc:
+                    _logger.warning(
+                        "[BulkTest] Fix generation failed for %s: %s", basename, exc)
+                    break
+
+                single_cmd = _build_scoped_test_cmd(
+                    base_cmd, {test_path: ""}, subproject_cwd)
+                ok_single, current_output = executor.run_command(
+                    single_cmd, cwd=subproject_cwd)
+                if ok_single:
+                    _logger.info("[BulkTest] %s now passes.", basename)
+                    print(f"  [BulkTest] {basename} fixed ✔")
+                    _p, _t, _ = _parse_test_counts(current_output)
+                    display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+                    break
+                _logger.warning(
+                    "[BulkTest] %s still failing (attempt %d/%d)",
+                    basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+                )
+                _p, _t, _f = _parse_test_counts(current_output)
+                display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
+            else:
+                print(f"  [BulkTest] {basename} could not be fixed after "
+                      f"{_MAX_BULK_TEST_FIX_ATTEMPTS} attempt(s).")
+
+        current_output = output_final  # reset for next round's error extraction
+
+    # All rounds exhausted — update display and report failure
+    still_failing_final = set(_parse_failed_test_files(output_final, list(test_files.keys()), subproject_cwd))
+    for fpath in test_files:
+        if fpath in still_failing_final:
+            _p, _t, _f = _parse_test_counts(output_final)
+            display.record_test_result(fpath, passed=_p, total=_t, failures=_f)
+        else:
+            display.record_test_result(fpath, passed=1, total=1, failures=[])
+
+    error_msg = (
+        f"Bulk test execution failed: some test file(s) still failing "
+        f"after per-file fix attempts.\n{output_final[:600]}"
+    )
+    _logger.warning("[BulkTest] Final run-all failed:\n%s", output_final[:600])
+    print("  [BulkTest] FAILED — some tests still failing after fixes.")
     return False, error_msg

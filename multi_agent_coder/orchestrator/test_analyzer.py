@@ -139,6 +139,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
         r'|expect\(|Expected\b|Received\b|Difference:'
         r'|×\s|✕\s|✗\s|FAIL\b|FAILED\b'
         r'|Unable to find|TestingLibraryElementError'
+        r'|Transform failed|PARSE_ERROR|Unterminated'
+        r'|╭─\[|─{3,}'  # Vite/OXC error box: "╭─[ file.jsx:132:27 ]"
         r'|\d+\s*\|)',  # source pointer lines like "  29 | expect(...)"
         re.IGNORECASE)
 
@@ -164,6 +166,23 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
         if current_file and _KEEP.search(stripped):
             per_file[current_file].append(stripped)
 
+    # Detect transform errors — the actual broken file is the SOURCE file
+    # referenced in the Vite/OXC error box "╭─[ path/file.jsx:line:col ]",
+    # NOT the test file that imports it.  Append a clear directive so the
+    # planner doesn't rewrite the test file instead of fixing the source.
+    _transform_source_re = re.compile(
+        r'(?:╭─\[\s*|File:\s*)([^\s:\]]+\.[jt]sx?):(\d+)', re.IGNORECASE)
+    transform_source_hint: str = ""
+    if re.search(r'Transform failed|PARSE_ERROR', clean, re.IGNORECASE):
+        m = _transform_source_re.search(clean)
+        if m:
+            src_file, src_line = m.group(1), m.group(2)
+            transform_source_hint = (
+                f"\nNOTE: This is a TRANSFORM error — the syntax problem is in the SOURCE FILE "
+                f"'{src_file}' at line {src_line}, NOT in the test file. "
+                f"Fix the source file '{src_file}' to resolve the parse error."
+            )
+
     # Also do a fallback scan: if we couldn't attribute errors to files,
     # collect all error-like lines as a generic block
     result: dict[str, str] = {}
@@ -172,6 +191,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
             text = '\n'.join(err_lines[:15])  # cap at 15 lines
             if len(text) > max_chars_per_file:
                 text = text[:max_chars_per_file] + '\n... [truncated]'
+            if transform_source_hint:
+                text += transform_source_hint
             result[basename] = text
 
     # Fallback: if no file-specific errors found, extract generic error lines
@@ -187,6 +208,8 @@ def _extract_per_file_errors(output: str, failed_basenames: set[str],
             text = '\n'.join(generic_errors)
             if len(text) > max_chars_per_file:
                 text = text[:max_chars_per_file] + '\n... [truncated]'
+            if transform_source_hint:
+                text += transform_source_hint
             for basename in failed_basenames:
                 result[basename] = text
 
@@ -231,6 +254,14 @@ def perform_baseline_test_analysis(
     fw = get_test_framework(language or "python", test_runner=test_runner)
     test_cmd = fw["command"]
 
+    # Django project detection: prefer manage.py test over pytest
+    import os as _os_ta
+    if (not language or language == "python") and _os_ta.path.isfile(
+        _os_ta.path.join(subproject_cwd, "manage.py")
+    ):
+        test_cmd = "python manage.py test"
+        _logger.info("Baseline: Django project detected — using 'python manage.py test'")
+
     _logger.info("Performing pre-execution baseline test analysis via %s", test_cmd)
 
     # 1. Run baseline tests
@@ -243,8 +274,38 @@ def perform_baseline_test_analysis(
     # task (allow updating passing tests to cover new code).
     _is_test_fix = task_intent in ("test", "bug_fix")
 
+    # Track file lists for callers (e.g. task interpretation LLM)
+    _baseline_failing_files: list[str] = []
+    _baseline_passing_files: list[str] = []
+
+    # Pattern covering common test file conventions across languages
+    _TEST_FILE_PAT = re.compile(
+        r'(?:'
+        r'\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$'   # JS/TS
+        r'|__tests__/.*\.[jt]sx?$'                         # Jest __tests__ dir
+        r'|_test\.py$|test_[^/]+\.py$'                     # Python
+        r'|_test\.go$'                                      # Go
+        r'|_spec\.rb$'                                      # Ruby
+        r')',
+        re.I,
+    )
+
     if success:
+        # Scan memory to identify every test file that is currently passing.
+        # This list is included in the analysis so the task interpreter and
+        # planner know EXACTLY which files must not be touched.
+        _all_mem_files = memory.all_files()
+        _baseline_passing_files = sorted(
+            fp for fp in _all_mem_files.keys()
+            if _TEST_FILE_PAT.search(fp)
+        )
+
         analysis_lines.append("- All existing tests are currently PASSING.")
+        if _baseline_passing_files:
+            analysis_lines.append("- PASSING TEST FILES (must NOT be modified):")
+            for fp in _baseline_passing_files:
+                analysis_lines.append(f"  - {fp}")
+
         if _is_test_fix:
             analysis_lines.append("- DIRECTIVE: Test environment is HEALTHY. Do NOT add setup or fix steps for tests.")
             analysis_lines.append("  Do NOT modify vitest.config, jest.config, setup files, or any test file.")
@@ -258,6 +319,8 @@ def perform_baseline_test_analysis(
         # 2. Identify failed/passing files
         all_files = memory.all_files()
         failed_paths, passing_paths = _identify_test_files(output, all_files, language=language)
+        _baseline_failing_files = list(failed_paths)
+        _baseline_passing_files = list(passing_paths)
         total_fails = _count_test_failures(output)
 
         # Collect failed basenames for error extraction
@@ -325,4 +388,202 @@ def perform_baseline_test_analysis(
     summary = "\n".join(analysis_lines)
     memory._tester_pre_analysis_done = True
     memory._tester_pre_analysis_summary = summary
+    memory._tester_baseline_success = success
+    # Store file lists so callers can build richer task interpretations
+    memory._tester_baseline_failing_files = _baseline_failing_files
+    memory._tester_baseline_passing_files = _baseline_passing_files
     return summary
+
+
+def analyze_task_for_planner(
+    task: str,
+    relevant_files: list[tuple[str, str, str]],
+    test_analysis: str,
+    llm_client,
+    passing_files: list[str] | None = None,
+    failing_files: list[str] | None = None,
+    editable_contracts: dict[str, dict] | None = None,
+    package_docs: str | None = None,
+) -> str:
+    """LLM-based pre-planning analysis grounded in actual project files and test state.
+
+    *relevant_files* is a list of ``(path, reason, skeleton)`` tuples produced
+    by the keyword/KB pre-filter — only the files already deemed relevant to
+    the task, not the entire project.  This keeps the prompt focused.
+
+    *passing_files* / *failing_files* are the complete per-file test results
+    from ``perform_baseline_test_analysis``.  Passing them explicitly (rather
+    than extracting from the text blob) ensures the full list always reaches
+    the interpreter regardless of how long the analysis text is.
+
+    *editable_contracts* maps each editable file path to a dict with:
+      - "source": full (or truncated) source content
+      - "tests":  dict of {test_path: test_content} for matching test files
+                  (empty dict when no test files exist for this source)
+    This lets the interpreter derive a "Preserve" list — behaviors the coder
+    must not break — from both the explicit test assertions AND the implicit
+    contract embedded in the source code itself.
+
+    Returns a ``TASK BRIEFING`` block string, or empty string on failure.
+    The caller (``PlannerAgent.pre_analyze``) injects it as the first thing
+    the planner sees.
+    """
+    # Build the file context from pre-filtered relevant files only
+    file_section = ""
+    if relevant_files:
+        file_lines = []
+        for fpath, reason, skeleton in relevant_files:
+            file_lines.append(f"### {fpath}  ({reason})")
+            if skeleton:
+                file_lines.append(f"```\n{skeleton}\n```")
+        file_section = (
+            "RELEVANT PROJECT FILES (pre-filtered to match the task):\n"
+            + "\n".join(file_lines)
+        )
+
+    # Build the test state section.
+    # Use explicit file lists when provided (complete, no truncation risk).
+    # Fall back to extracting key lines from the text blob.
+    test_section_lines: list[str] = ["CURRENT TEST STATE (live test run seconds ago):"]
+
+    if passing_files is not None or failing_files is not None:
+        # Explicit structured data — always complete
+        if failing_files:
+            test_section_lines.append(
+                f"FAILING ({len(failing_files)} file(s)) — these need fixing:")
+            for fp in failing_files:
+                test_section_lines.append(f"  FAIL: {fp}")
+        else:
+            test_section_lines.append("All tests PASSING — 0 failures.")
+
+        if passing_files:
+            # Summarise rather than enumerate — the full list is already in the
+            # baseline analysis block that the planner sees; duplicating every
+            # path here just wastes tokens without adding new information.
+            test_section_lines.append(
+                f"PASSING ({len(passing_files)} file(s)) — must NOT be modified "
+                f"(full list in baseline analysis above)."
+            )
+    elif test_analysis:
+        # Fallback: extract key lines from the raw text, but do NOT cap the
+        # count — we need every file name to reach the interpreter.
+        for line in test_analysis.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("- ", "  - ", "DIRECTIVE", "BROKEN",
+                                    "HEALTHY", "PRE-EXECUTION", "Baseline:",
+                                    "PASSING TEST FILES", "ACTUAL ERROR")):
+                test_section_lines.append(stripped)
+
+    test_section = "\n".join(test_section_lines) if len(test_section_lines) > 1 else ""
+
+    # Build the behavioral contract section for each editable file.
+    # Source content gives the implicit contract (exports, state, event handlers,
+    # rendered structure).  Test content gives the explicit assertions.
+    # Both are included so the interpreter can derive a precise Preserve list.
+    contract_section = ""
+    if editable_contracts:
+        contract_parts: list[str] = [
+            "CURRENT BEHAVIORAL CONTRACT FOR FILES BEING MODIFIED:",
+            "(Read these carefully — the coder must preserve all behaviors NOT",
+            " mentioned in the task, whether covered by tests or not.)",
+        ]
+        for fpath, entry in editable_contracts.items():
+            contract_parts.append(f"\n{'='*60}")
+            contract_parts.append(f"FILE: {fpath}")
+
+            src = entry.get("source", "")
+            if src:
+                contract_parts.append("-- Source (current implementation) --")
+                contract_parts.append(src)
+
+            tests = entry.get("tests", {})
+            if tests:
+                for tpath, tcontent in tests.items():
+                    contract_parts.append(f"-- Test assertions: {tpath} --")
+                    contract_parts.append(tcontent)
+            else:
+                contract_parts.append(
+                    "-- No test file found for this source. "
+                    "Derive preserved behaviors from the source above. --"
+                )
+
+        contract_section = "\n".join(contract_parts)
+
+    sections = "\n\n".join(
+        s for s in [file_section, test_section, contract_section] if s)
+
+    # Inject pre-fetched package docs so the briefing's Agent directive
+    # uses the correct current API rather than LLM training-data guesses.
+    _pkg_docs_section = (
+        "PACKAGE DOCUMENTATION (authoritative — use EXACTLY these import paths "
+        "and APIs in the Agent directive, overriding any training-data knowledge):\n"
+        f"{package_docs}\n"
+    ) if package_docs else ""
+
+    prompt = f"""\
+You are a software project analyst preparing a briefing for an AI coding agent.
+The agent will plan and execute code changes to accomplish the user's task.
+Your job is to determine — based on the ACTUAL current project state below —
+exactly what needs to change, what must be preserved, and what must not be touched.
+
+USER TASK:
+{task}
+
+{sections}
+{_pkg_docs_section}
+Answer these questions concisely and precisely:
+1. What is the real goal of this task (one sentence)?
+2. Which existing files need to be modified?  Name them specifically.
+   IMPORTANT: Prefer the innermost component that directly owns/renders the
+   visual element mentioned in the task (e.g. if the task says "snake game
+   background", look inside the SnakeGame component — NOT the routing wrapper
+   that mounts it).  A wrapping div's background is NOT the same as the game
+   board/canvas background drawn inside the component itself.
+3. Which new files (if any) need to be created?
+4. Which files must NOT be touched?  Give a compact summary (e.g. "all test
+   files — N currently passing" or a glob pattern) rather than listing every
+   individual path.  The exact file list is already in the baseline analysis.
+5. What does a successful result look like?  (observable outcome, not process steps)
+6. What is the single most important constraint the coding agent must respect?
+7. Looking at the source implementation and test assertions for the files being
+   modified: which existing behaviors, APIs, exports, rendered elements, or event
+   handlers are NOT part of this task and must be kept exactly as they are?
+   Be specific — list concrete things (e.g. "snake renders as filled rectangles",
+   "ArrowKey events still work alongside WASD", "GRID_SIZE constant is exported").
+8. Which NEW packages must be installed for this task that are NOT already present
+   in the project's dependencies (check package.json / requirements.txt in the
+   source files above)?  List bare package names only (e.g. "animejs", "lodash"),
+   comma-separated.  Write NONE if every dependency is already installed.
+9. What is the MINIMAL surgical change required?  Be as specific as possible:
+   name the exact attribute, property, CSS class string, or value to add/change.
+   Do NOT describe general restructuring approaches — point to the exact edit
+   (e.g. "add 'mx-auto max-w-7xl' to the className of the <div> wrapping <Routes>
+   in App.jsx" rather than "potentially adjust the flex container").
+   The coder must make ONLY this change and nothing else.
+   IMPORTANT: If the task refers to a visual element rendered INSIDE a component
+   (e.g. "game area", "canvas", "board"), the directive must target that component's
+   own file — not a wrapper or routing file that merely mounts the component.
+
+Respond in this EXACT format — no extra text, no markdown outside the block:
+TASK BRIEFING:
+Goal: <one sentence>
+Modify: <specific file paths, or NONE>
+Create: <specific new file paths, or NONE>
+Do not touch: <compact summary or glob pattern — do NOT list individual paths>
+Expected output: <observable result when done>
+Key constraint: <the one rule the agent must not break>
+Preserve: <concrete list of existing behaviors/APIs the coder must not break>
+Agent directive: <the exact minimal change required — specific attribute/class/value, not a general approach>
+New packages: <comma-separated package names, or NONE>
+"""
+    try:
+        response = llm_client.generate_response(prompt)
+        if "TASK BRIEFING:" in response and "Agent directive:" in response:
+            _logger.info("[TaskBriefing] LLM briefing:\n%s", response)
+            return response.strip()
+        _logger.warning(
+            "[TaskBriefing] LLM response missing expected structure, skipping.")
+        return ""
+    except Exception as exc:
+        _logger.warning("[TaskBriefing] LLM call failed: %s", exc)
+        return ""

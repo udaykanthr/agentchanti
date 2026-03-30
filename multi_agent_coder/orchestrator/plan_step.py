@@ -51,6 +51,11 @@ class PlanStep:
     status: str = "pending"                     # pending, in_progress, completed, failed, skipped
     actual_exports: list[str] = field(default_factory=list)  # filled after step execution
     inline_code: dict[str, str] = field(default_factory=dict)  # file -> code from plan
+    inline_edits: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # file -> [(find, replace), ...]
+    kb_docs: list[str] = field(default_factory=list)  # KB doc titles used when writing inline code
+
+    # Which files should import this step's target file (plan-declared or derived)
+    imported_by: list[str] = field(default_factory=list)
 
     # Legacy compat: 0-based integer index assigned after parsing
     index: int = -1
@@ -72,6 +77,12 @@ class PlanStep:
         }
         if self.inline_code:
             d["inline_code"] = dict(self.inline_code)
+        if self.inline_edits:
+            d["inline_edits"] = {k: list(v) for k, v in self.inline_edits.items()}
+        if self.kb_docs:
+            d["kb_docs"] = list(self.kb_docs)
+        if self.imported_by:
+            d["imported_by"] = list(self.imported_by)
         return d
 
     @classmethod
@@ -89,6 +100,9 @@ class PlanStep:
             status=d.get("status", "pending"),
             actual_exports=d.get("actual_exports", []),
             inline_code=d.get("inline_code", {}),
+            inline_edits={k: [tuple(p) for p in v] for k, v in d.get("inline_edits", {}).items()},
+            kb_docs=d.get("kb_docs", []),
+            imported_by=d.get("imported_by", []),
             index=d.get("index", -1),
         )
 
@@ -286,8 +300,63 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
     in_markdown_fence = False  # track ```...``` inside inline blocks
 
+    # edit: block state
+    in_edit_block = False       # between edit: and <<<END>>>
+    _edit_section = "find"      # "find" or "replace"
+    _edit_find_lines: list[str] = []
+    _edit_replace_lines: list[str] = []
+    _edit_target: Optional[str] = None  # file path for current edit block
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
+
+        # ── Edit block handling (find/replace patches) ──
+        # Format:
+        #   edit:
+        #   <<<FIND>>>
+        #   old text
+        #   <<<REPLACE>>>
+        #   new text
+        #   <<<END>>>
+        if in_edit_block:
+            _lnorm = line.upper().replace(" ", "")
+            # Structural markers (new step header or plan end) terminate the
+            # edit block — fall through to be processed normally.
+            if line.upper() in ("==END==",) or _STEP_RE.match(line):
+                in_edit_block = False
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                _edit_target = None
+                # Fall through to process this line as a step header / ==END==
+            elif _lnorm in ("<<<FIND>>>", "<<FIND>>", "<FIND>"):
+                _edit_section = "find"
+                _edit_find_lines = []
+                continue
+            elif _lnorm in ("<<<REPLACE>>>", "<<REPLACE>>", "<REPLACE>"):
+                _edit_section = "replace"
+                _edit_replace_lines = []
+                continue
+            elif _lnorm in ("<<<END>>>", "<<END>>", "<END>", "<<<EDITEND>>>"):
+                # Commit this find/replace pair
+                if current is not None and (_edit_find_lines or _edit_replace_lines):
+                    _find_str = "\n".join(_edit_find_lines)
+                    _repl_str = "\n".join(_edit_replace_lines)
+                    _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+                    if _tgt:
+                        current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
+                # Stay in edit block — there may be more <<<FIND>>>...<<<END>>> pairs.
+                # The block ends naturally when a new --STEP header or ==END== is seen.
+                _edit_section = "find"
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                continue
+            else:
+                # Accumulate lines
+                if _edit_section == "find":
+                    _edit_find_lines.append(raw_line)
+                else:
+                    _edit_replace_lines.append(raw_line)
+                continue
 
         # ── Inline code block handling ──
         # Accept multiple LLM output variants:
@@ -311,11 +380,13 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         if in_code_block:
             # Structural markers end the code block implicitly
             # (handles LLM omitting ---file-content-end---)
+            # Mark as truncated — proper close uses ---file-content-end---
             if line.upper() in ("==END==",) or _STEP_RE.match(line):
                 in_code_block = False
                 in_markdown_fence = False
                 if current is not None and code_lines:
                     _assign_inline_code(current, code_lines)
+                    current._inline_truncated = True  # type: ignore[attr-defined]
                 code_lines = []
                 # Fall through to process this line normally
             else:
@@ -323,7 +394,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 if line.startswith("```"):
                     in_markdown_fence = not in_markdown_fence
                     continue
-                code_lines.append(raw_line)  # preserve original indentation
+                # Strip "> " prefix from code lines — the LLM sometimes
+                # carries over the CMD "> command" format into code blocks
+                code_line = raw_line
+                if code_line.lstrip().startswith("> "):
+                    code_line = code_line.lstrip()[2:]
+                code_lines.append(code_line)  # preserve original indentation
                 continue
 
         # Skip plan boundary markers
@@ -359,6 +435,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Command line (for CMD steps)
         if line.startswith("> "):
             cmd_text = line[2:].strip()
+            # Strip backtick wrapping added by LLMs (e.g. `> `npm install`` -> `npm install`)
+            if len(cmd_text) >= 2 and cmd_text[0] == "`" and cmd_text[-1] == "`":
+                cmd_text = cmd_text[1:-1]
             # Skip markdown metadata annotations that the LLM sometimes
             # prefixes with ">" (e.g. "> **produces:** ..." or "> **note:** ...")
             _bare = cmd_text.lstrip("*_ \t")
@@ -386,11 +465,22 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                                 file_path.strip(), []
                             ).append(symbol.strip())
                 continue
+            elif _bare_lower.startswith("imported_by:"):
+                raw = _bare[12:].strip()
+                if raw and raw.lower() != "none":
+                    current.imported_by = [f.strip() for f in raw.split(",") if f.strip()]
+                continue
             elif _bare_lower.startswith("content:"):
-                # Inline code block follows as a ``` fence — enter code-block mode
+                # Inline code block follows — enter code-block mode
                 in_code_block = True
                 in_markdown_fence = False
                 code_lines = []
+                rest = _bare[8:].strip()
+                # Strip opening markdown fence (```jsx, ```, etc.)
+                if rest.startswith("```"):
+                    rest = rest[3:].lstrip("abcdefghijklmnopqrstuvwxyz").strip()
+                if rest:
+                    code_lines.append(rest)
                 continue
             elif _bare_lower.startswith("produces:"):
                 raw = _bare[9:].strip()
@@ -405,6 +495,22 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 _bare_lower.startswith(p) for p in _meta_prefixes
             ):
                 continue  # metadata annotation, not a shell command
+            # Check for "content:" appearing mid-line (e.g.
+            # "> prop-types:default content: ```" where content: is not
+            # at the start).  Only trigger when followed by ``` or nothing.
+            _content_pos = _bare_lower.find(" content:")
+            if _content_pos >= 0:
+                _after = _bare[_content_pos + 9:].strip()
+                if not _after or _after.startswith("```"):
+                    in_code_block = True
+                    in_markdown_fence = False
+                    code_lines = []
+                    if _after.startswith("```"):
+                        _after = _after[3:].lstrip(
+                            "abcdefghijklmnopqrstuvwxyz").strip()
+                    if _after:
+                        code_lines.append(_after)
+                    continue
             # Join multiple commands per step with && so all run sequentially
             if current.command:
                 current.command = current.command + " && " + cmd_text
@@ -443,13 +549,93 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 produced = [f.strip() for f in raw.split(",") if f.strip()]
                 current.target_files.extend(produced)
 
-        # Description line (anything else)
+        # KB docs declared by planner for reviewer context
+        elif line.lower().startswith("kb_docs:"):
+            raw = line[8:].strip()
+            if raw and raw.lower() != "none":
+                current.kb_docs = [t.strip() for t in raw.split(",") if t.strip()]
+
+        # imported_by: which files should import this step's target file
+        elif line.lower().startswith("imported_by:"):
+            raw = line[12:].strip()
+            if raw and raw.lower() != "none":
+                current.imported_by = [f.strip() for f in raw.split(",") if f.strip()]
+
+        # edit: block — find/replace patch for an existing file.
+        # Supports optional "edit: path/to/file" to specify a different target.
+        elif line.lower().startswith("edit:"):
+            rest = line[5:].strip()
+            # If a file path is given on the same line, use it; otherwise use
+            # the step's first target file (resolved when <<<END>>> is hit).
+            if rest and not rest.startswith("<<<"):
+                _edit_target = rest
+            else:
+                _edit_target = None
+            in_edit_block = True
+            _edit_section = "find"
+            _edit_find_lines = []
+            _edit_replace_lines = []
+
+        # Inline code block via bare "Content:" keyword (no "> " prefix).
+        # The "> content:" variant is already handled inside the "> " branch
+        # above.  Here we catch the unindented form that the planner sometimes
+        # emits when the step has a pre-written code body.
+        elif line.lower().startswith("content:"):
+            in_code_block = True
+            in_markdown_fence = False
+            code_lines = []
+            rest = line[8:].strip()  # anything after "Content:" on the same line
+            # Strip opening markdown fence (```jsx, ```, etc.)
+            if rest.startswith("```"):
+                rest = rest[3:].lstrip("abcdefghijklmnopqrstuvwxyz").strip()
+            if rest:
+                code_lines.append(rest)
+
+        # Description line (anything else) — but check for mid-line content:
         elif not line.startswith("=="):
+            _lower_line = line.lower()
+            _cpos = _lower_line.find(" content:")
+            if _cpos >= 0:
+                _after_c = line[_cpos + 9:].strip()
+                if not _after_c or _after_c.startswith("```"):
+                    # Split: text before content: goes to description,
+                    # everything after enters code block mode
+                    before = line[:_cpos].strip()
+                    if before:
+                        desc_lines.append(before)
+                    in_code_block = True
+                    in_markdown_fence = False
+                    code_lines = []
+                    if _after_c.startswith("```"):
+                        _after_c = _after_c[3:].lstrip(
+                            "abcdefghijklmnopqrstuvwxyz").strip()
+                    if _after_c:
+                        code_lines.append(_after_c)
+                    continue
             desc_lines.append(line)
 
-    # Flush any open inline code block
+    # Flush any open edit block (LLM omitted the final <<<END>>>).
+    if in_edit_block and current is not None and (_edit_find_lines or _edit_replace_lines):
+        _find_str = "\n".join(_edit_find_lines)
+        _repl_str = "\n".join(_edit_replace_lines)
+        # Skip if the find string is only file-content markers (e.g.
+        # ---file-content-end--- accumulated after the last <<<END>>>).
+        _find_meaningful = [
+            l for l in _edit_find_lines
+            if l.strip() and not l.strip().startswith("---")
+        ]
+        if _find_meaningful:
+            _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+            if _tgt:
+                current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
+
+    # Flush any open inline code block.
+    # If the code block was never closed (no ---file-content-end---, ==END==,
+    # or next --STEP marker), the LLM output was truncated.  Assign what we
+    # have but mark the step so validate_plan() can clear it.
     if in_code_block and current is not None and code_lines:
         _assign_inline_code(current, code_lines)
+        current._inline_truncated = True  # type: ignore[attr-defined]
 
     # Flush last step
     if current is not None:
@@ -461,7 +647,146 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     for idx, step in enumerate(steps):
         step.index = idx
 
+    # Derive imported_by from imports_from relationships across all steps.
+    # This is free (no LLM cost) and ensures that when step B declares
+    # imports_from step A's target file, step A gets imported_by = step B's target.
+    _derive_imported_by(steps)
+
+    # For steps that still have no imported_by after derivation, infer it from
+    # the plan structure (entry-point files in later waves).  Works even when the
+    # planner forgets to add a wiring step or an explicit imported_by: line.
+    _infer_missing_imported_by(steps)
+
     return steps
+
+
+def _derive_imported_by(steps: list[PlanStep]) -> None:
+    """Populate ``imported_by`` on each step from other steps' ``imports_from``.
+
+    For every consumer step that declares ``imports_from: {file: [symbols]}``,
+    find the producer step whose ``target_files`` includes *file* and add the
+    consumer's target files to the producer's ``imported_by`` list.
+
+    This is zero-cost (no LLM) and fires automatically after parsing so that
+    DepCheck can use ``plan_step.imported_by`` instead of guessing heuristically.
+    Explicit ``imported_by:`` lines in the plan take precedence (they are set
+    first during parsing; derivation only appends new entries, never clears them).
+    """
+    import os as _os
+
+    # Build file → step map (normalized paths + basenames for fuzzy lookup)
+    file_to_step: dict[str, PlanStep] = {}
+    for step in steps:
+        for tf in step.target_files:
+            norm = tf.replace("\\", "/")
+            file_to_step[norm] = step
+            file_to_step[_os.path.basename(norm)] = step
+
+    for consumer_step in steps:
+        consumer_files = consumer_step.target_files
+        if not consumer_files:
+            continue
+        for src_file in consumer_step.imports_from:
+            src_norm = src_file.replace("\\", "/")
+            src_basename = _os.path.basename(src_norm)
+            producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
+            if producer is None:
+                continue
+            for cf in consumer_files:
+                if cf not in producer.imported_by:
+                    producer.imported_by.append(cf)
+
+
+# Entry-point file basenames that commonly import/mount other components.
+# Ordered from most-specific to least-specific.
+_ENTRY_POINT_BASENAMES = (
+    "main.tsx", "main.ts", "main.jsx", "main.js",
+    "App.tsx", "App.ts", "App.jsx", "App.js",
+    "index.tsx", "index.ts", "index.jsx", "index.js",
+    "router.tsx", "router.ts", "router.jsx", "router.js",
+    "__init__.py", "main.py", "app.py", "index.py",
+)
+
+
+def _infer_missing_imported_by(steps: list[PlanStep]) -> None:
+    """For CODE steps with exports but no ``imported_by``, infer the consumer
+    from other plan steps whose target files look like entry-points or whose
+    wave number is later.
+
+    Strategy (in order, first match wins):
+    1. Another step in a later wave whose target is an entry-point file and
+       that step's description mentions the orphaned step's exported symbol
+       or file stem.
+    2. Any step in a later wave whose target is an entry-point file.
+    3. Any step in a later wave that has no ``imports_from`` declared
+       (likely a wiring/mounting step with incomplete metadata).
+
+    Only fires when ``imported_by`` is still empty after ``_derive_imported_by``
+    — i.e. the planner neither added a wiring step nor wrote ``imported_by:``.
+    Operates purely on plan metadata, zero LLM cost.
+    """
+    import os as _os
+
+    def _wave(step: PlanStep) -> int:
+        """Return the wave number from the step id (e.g. '3.1' → 3)."""
+        try:
+            return int(step.id.split(".")[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def _is_entry_point(path: str) -> bool:
+        base = _os.path.basename(path).lower()
+        return base in {ep.lower() for ep in _ENTRY_POINT_BASENAMES}
+
+    for step in steps:
+        # Only care about CODE steps with exports and no consumer yet
+        if step.step_type not in ("CODE", "UNCLASSIFIED"):
+            continue
+        if not step.exports or step.imported_by:
+            continue
+        if not step.target_files:
+            continue
+
+        step_wave = _wave(step)
+        exported_lower = {e.lower() for e in step.exports}
+        stem_lower = {
+            _os.path.splitext(_os.path.basename(tf))[0].lower()
+            for tf in step.target_files
+        }
+
+        # Collect candidate steps: later wave, has target files
+        candidates = [
+            s for s in steps
+            if _wave(s) > step_wave and s.target_files and s is not step
+        ]
+
+        # Strategy 1: entry-point target + description mentions our symbol/stem
+        for cand in candidates:
+            if not any(_is_entry_point(tf) for tf in cand.target_files):
+                continue
+            desc_lower = cand.description.lower()
+            if exported_lower & set(desc_lower.split()) or stem_lower & set(desc_lower.split()):
+                step.imported_by = list(cand.target_files[:1])
+                break
+
+        if step.imported_by:
+            continue
+
+        # Strategy 2: any entry-point target in a later wave
+        for cand in candidates:
+            ep_targets = [tf for tf in cand.target_files if _is_entry_point(tf)]
+            if ep_targets:
+                step.imported_by = [ep_targets[0]]
+                break
+
+        if step.imported_by:
+            continue
+
+        # Strategy 3: a later step with no imports_from (likely incomplete wiring step)
+        for cand in candidates:
+            if not cand.imports_from and cand.step_type in ("CODE", "UNCLASSIFIED"):
+                step.imported_by = list(cand.target_files[:1])
+                break
 
 
 # File header comment pattern for splitting multi-file inline code blocks
@@ -527,7 +852,7 @@ def _match_target(name: str, targets: list[str]) -> Optional[str]:
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_plan(steps: list[PlanStep]) -> list[str]:
+def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> list[str]:
     """Validate a parsed plan for structural correctness.
 
     Returns a list of error messages (empty = valid).
@@ -562,6 +887,139 @@ def validate_plan(steps: list[PlanStep]) -> list[str]:
                 if not producers:
                     # Not an error — could be an existing project file
                     pass
+
+    # Check inline code for truncation: if the parser never saw a closing
+    # marker (---file-content-end---, ==END==, or next --STEP), the LLM
+    # output was cut off.  Preserve the partial code as a hint for the coder
+    # (so it can complete rather than regenerate from scratch), then clear
+    # inline_code so the normal coder path handles full generation.
+    import os as _os
+    for step in steps:
+        if not step.inline_code:
+            continue
+        if getattr(step, "_inline_truncated", False):
+            # Preserve partial content as a completion hint before clearing
+            step._partial_inline_code = dict(step.inline_code)  # type: ignore[attr-defined]
+            step.inline_code.clear()
+            errors.append(
+                f"Step {step.id}: inline code was truncated (no closing marker) "
+                f"— preserved as partial hint, coder will complete it"
+            )
+            continue
+
+    # Check inline code imports: if inline code contains local imports
+    # (e.g. import './Hero.css'), verify that some step produces the file.
+    # When a dangling import is found, clear the entire step's inline_code
+    # so the regular coder path handles it — the coder can generate both the
+    # component AND the missing file with full KB/memory context.
+    import re as _re
+
+    # Language-specific local import patterns (group 1 = the import path)
+    _IMPORT_PATTERNS: dict[str, list[_re.Pattern]] = {
+        # JS/TS: import X from './Y'  |  import './Y'
+        "js": [
+            _re.compile(r"""(?:import\s+.*?from\s+|import\s+)['"](\.[^'"]+)['"]"""),
+            _re.compile(r"""@import\s+['"](\.[^'"]+)['"]"""),   # CSS @import
+            _re.compile(r"""require\s*\(\s*['"](\.[^'"]+)['"]\s*\)"""),  # CJS require
+        ],
+        # Python: from .module import X  |  from . import module
+        "py": [
+            _re.compile(r"""from\s+(\.[\w.]+)\s+import"""),
+        ],
+        # Go: import "./pkg"  |  in import block
+        "go": [
+            _re.compile(r"""(?:import\s+|")(\./[^"]+)"""),
+        ],
+        # Rust: mod submodule;  (local module declaration)
+        "rs": [
+            _re.compile(r"""mod\s+(\w+)\s*;"""),
+        ],
+    }
+
+    # Map file extensions to pattern keys
+    _EXT_TO_PATTERN_KEY = {
+        ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+        ".ts": "js", ".tsx": "js",
+        ".css": "js",   # CSS uses @import
+        ".py": "py",
+        ".go": "go",
+        ".rs": "rs",
+    }
+
+    # Extension candidates per language when import has no extension
+    _EXT_CANDIDATES = {
+        "js": [".js", ".jsx", ".ts", ".tsx", ".css", ".mjs"],
+        "py": [".py"],
+        "go": [".go"],
+        "rs": [".rs"],
+    }
+
+    for step in steps:
+        if not step.inline_code:
+            continue
+        has_dangling = False
+        for fpath, code in step.inline_code.items():
+            if has_dangling:
+                break
+            ext = _os.path.splitext(fpath)[1].lower()
+            pattern_key = _EXT_TO_PATTERN_KEY.get(ext)
+            if not pattern_key:
+                continue
+            patterns = _IMPORT_PATTERNS.get(pattern_key, [])
+            file_dir = _os.path.dirname(fpath)
+            for pat in patterns:
+                if has_dangling:
+                    break
+                for m in pat.finditer(code):
+                    imp_path = m.group(1)
+                    # Python relative imports use dots: from .models import X
+                    if pattern_key == "py" and imp_path.startswith("."):
+                        # Convert .models to ./models for path resolution
+                        dotless = imp_path.lstrip(".")
+                        depth = len(imp_path) - len(dotless)
+                        base = file_dir
+                        for _ in range(depth - 1):
+                            base = _os.path.dirname(base)
+                        imp_path = "./" + dotless.replace(".", "/")
+                    # Rust mod X; → ./X.rs or ./X/mod.rs
+                    if pattern_key == "rs":
+                        imp_path = "./" + imp_path
+                    resolved = _os.path.normpath(
+                        _os.path.join(file_dir, imp_path)
+                    ).replace("\\", "/")
+                    candidates = [resolved]
+                    if not _os.path.splitext(resolved)[1]:
+                        for cand_ext in _EXT_CANDIDATES.get(pattern_key, []):
+                            candidates.append(resolved + cand_ext)
+                        # Rust: mod X → X/mod.rs
+                        if pattern_key == "rs":
+                            candidates.append(resolved + "/mod.rs")
+                    is_produced = any(
+                        c in produced_files or any(
+                            c == tf or tf.endswith("/" + _os.path.basename(c))
+                            for tf in produced_files
+                        )
+                        for c in candidates
+                    )
+                    if is_produced:
+                        continue
+                    if any(
+                        _os.path.basename(c) in _os.path.basename(tf)
+                        for c in candidates for tf in produced_files
+                    ):
+                        continue
+                    # Also accept files that already exist on disk
+                    _base = working_dir or _os.getcwd()
+                    if any(_os.path.exists(_os.path.join(_base, c)) for c in candidates):
+                        continue
+                    has_dangling = True
+                    break
+        if has_dangling:
+            step.inline_code.clear()
+            errors.append(
+                f"Step {step.id}: inline code imports a file no step produces "
+                f"— cleared inline_code, will use coder LLM call instead"
+            )
 
     # Check for circular dependencies
     if _has_cycle(steps):
@@ -704,7 +1162,18 @@ def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
             continue
         for s in phase_steps:
             if s.step_type == "CMD":
-                continue  # CMD steps don't auto-depend on other CMDs here
+                # Chain CMD steps sequentially within the same phase to
+                # prevent parallel package-manager operations (npm/pip/yarn)
+                # targeting the same directory — causes ENOTEMPTY on Windows.
+                # Always enforce this: even if a CMD step already has explicit
+                # deps (e.g. depends:1.1), it must also wait for the immediately
+                # preceding CMD step so installs don't run concurrently.
+                preceding = [cid for cid in cmd_ids_in_phase if cid < s.id]
+                if preceding:
+                    prev_cmd = preceding[-1]
+                    if prev_cmd not in s.depends_on:
+                        s.depends_on = list(s.depends_on) + [prev_cmd]
+                continue
             if s.depends_on:
                 continue  # already has explicit deps — don't override
             # Add any CMD steps whose ID sorts before this step's ID
@@ -1170,6 +1639,9 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
         # ── Command line (> cmd) ── works both inside and outside fences
         if line.startswith("> "):
             cmd_text = line[2:].strip()
+            # Strip backtick wrapping added by LLMs (e.g. `> `npm install`` -> `npm install`)
+            if len(cmd_text) >= 2 and cmd_text[0] == "`" and cmd_text[-1] == "`":
+                cmd_text = cmd_text[1:-1]
             _bare = cmd_text.lstrip("*_ \t")
             _meta_prefixes = ("produces:", "note:", "output:", "creates:",
                               "result:", "generates:", "returns:")
@@ -1213,3 +1685,125 @@ def is_structured_plan(text: str) -> bool:
         if _STEP_RE.match(line.strip()):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Manifest reclassification — CODE → CMD for protected manifest files
+# ---------------------------------------------------------------------------
+
+# Manifest basenames that are protected from direct LLM overwrite.
+# Keep in sync with Executor._PROTECTED_FILENAMES.
+_MANIFEST_BASENAMES: frozenset = frozenset({
+    'package.json', 'requirements.txt', 'Cargo.toml', 'go.mod',
+    'Gemfile', 'composer.json', 'Pipfile', 'pyproject.toml', 'setup.py',
+})
+
+# Manifest basename → package-manager install prefix
+_MANIFEST_PM_PREFIX: dict = {
+    'package.json':    'npm install',
+    'requirements.txt': 'pip install',
+    'Cargo.toml':      'cargo add',
+    'go.mod':          'go get',
+    'Gemfile':         'bundle add',
+    'composer.json':   'composer require',
+    'Pipfile':         'pipenv install',
+    'pyproject.toml':  'pip install',
+    'setup.py':        'pip install',
+}
+
+# package.json fields that are metadata, not dependency names
+_PKG_JSON_NON_DEP_FIELDS = frozenset({
+    'name', 'version', 'description', 'main', 'module', 'browser',
+    'type', 'author', 'license', 'homepage', 'repository', 'bugs',
+    'private', 'engines', 'os', 'cpu',
+})
+
+
+def _extract_packages_from_inline_edits(step: 'PlanStep') -> list:
+    """Return package names added by the step's inline find/replace edits."""
+    import os as _os
+    packages: list = []
+    for fpath, pairs in (step.inline_edits or {}).items():
+        basename = _os.path.basename(fpath)
+        for find_str, replace_str in pairs:
+            find_lines = {l.strip().rstrip(',') for l in find_str.splitlines() if l.strip()}
+            for raw_line in replace_str.splitlines():
+                stripped = raw_line.strip().rstrip(',')
+                if not stripped or stripped in find_lines:
+                    continue
+                if basename == 'package.json':
+                    # Match: "animejs": "^4.2.0"
+                    m = re.match(r'^"([^"]+)"\s*:\s*"[^"]*"$', stripped)
+                    if m and m.group(1) not in _PKG_JSON_NON_DEP_FIELDS:
+                        packages.append(m.group(1))
+                elif basename in ('requirements.txt', 'Pipfile', 'pyproject.toml', 'setup.py'):
+                    # Match: animejs==4.2.0  or  animejs>=3
+                    m = re.match(r'^([A-Za-z0-9_.-]+)', stripped)
+                    if m and not stripped.startswith('#') and not stripped.startswith('['):
+                        packages.append(m.group(1))
+                elif basename == 'Cargo.toml':
+                    # Match: animejs = "4.2.0"  (skip section headers)
+                    if not stripped.startswith('[') and '=' in stripped:
+                        pkg_name = stripped.split('=')[0].strip()
+                        if re.match(r'^[a-zA-Z0-9_-]+$', pkg_name):
+                            packages.append(pkg_name)
+                elif basename == 'go.mod':
+                    # Match: require github.com/foo/bar v1.2.3
+                    m = re.match(r'^(?:require\s+)?(\S+/\S+)\s+v', stripped)
+                    if m:
+                        packages.append(m.group(1))
+    return packages
+
+
+def reclassify_manifest_steps(plan_steps: list) -> list:
+    """Convert CODE steps whose targets are *only* dependency manifest files into
+    CMD package-manager install steps.
+
+    Rationale: The executor's protected-file guard blocks direct overwrites of
+    ``package.json``, ``requirements.txt``, etc.  Converting to ``npm install``
+    (or the ecosystem equivalent) lets the package manager do the safe, atomic
+    update and actually installs the package into ``node_modules`` /
+    ``site-packages``.  The guard still exists as a safety net for any stray
+    LLM-generated writes that slip through.
+
+    Steps where no packages can be detected from the inline edits are left
+    unchanged so they fall through to the normal CODE path (which will log a
+    warning about the protected write).
+    """
+    import os as _os
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    for step in plan_steps:
+        if step.step_type != "CODE":
+            continue
+        if not step.target_files:
+            continue
+
+        basenames = [_os.path.basename(f) for f in step.target_files]
+        if not all(b in _MANIFEST_BASENAMES for b in basenames):
+            continue  # at least one non-manifest target — leave as CODE
+
+        packages = _extract_packages_from_inline_edits(step)
+
+        if not packages:
+            _log.debug(
+                "[PlanStep] Step %s targets manifest(s) only but no packages "
+                "detected from inline edits — leaving as CODE", step.id,
+            )
+            continue
+
+        primary = basenames[0]
+        prefix = _MANIFEST_PM_PREFIX.get(primary, 'pip install')
+        install_cmd = f"{prefix} {' '.join(packages)}"
+
+        _log.info(
+            "[PlanStep] Step %s reclassified CODE→CMD "
+            "(manifest-only target): %s", step.id, install_cmd,
+        )
+        step.step_type = "CMD"
+        step.command = install_cmd
+        step.inline_edits = {}
+        step.inline_code = {}
+
+    return plan_steps

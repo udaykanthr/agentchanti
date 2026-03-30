@@ -27,11 +27,12 @@ _logger = logging.getLogger(__name__)
 from .config import Config
 from .llm.ollama import OllamaClient
 from .llm.lm_studio import LMStudioClient
+from .llm import build_embed_client
 from .agents.planner import PlannerAgent
 from .agents.coder import CoderAgent
 from .agents.reviewer import ReviewerAgent
 from .agents.tester import TesterAgent
-from .agents.analyser import AnalyseAgent, ProjectContext, build_project_context
+from .agents.analyser import AnalyseAgent, ProjectContext, build_project_context, parse_briefing_packages
 from .executor import Executor
 from .embedding_store import EmbeddingStore
 from .cli_display import CLIDisplay, token_tracker, log
@@ -156,10 +157,11 @@ def _run_task_impl(
         scan_result, max_chars=cfg.PLANNER_CONTEXT_CHARS,
         source_files=source_files)
 
-    # Embedding store
+    # Embedding store — embed_client kept at top level for KB component reuse
+    embed_client = None if no_embeddings else build_embed_client(cfg)
     embed_store = None
-    if not no_embeddings:
-        embed_store = EmbeddingStore(llm_client, embed_model=embed_model)
+    if embed_client is not None:
+        embed_store = EmbeddingStore(embed_client, embed_model=embed_model)
 
     # Per-agent model helper
     def _make_llm(agent_name: str):
@@ -217,14 +219,18 @@ def _run_task_impl(
             from .kb.context_builder import ContextBuilder
             from .kb.runtime_watcher import RuntimeWatcher
 
-            # Smart startup check — handles global KB, local KB
-            KBStartupManager().run(project_root=os.getcwd(), api_client=llm_client)
+            # Use embed_client for KB vector ops; fall back to llm_client if unavailable
+            kb_api_client = embed_client or llm_client
 
-            kb_context_builder = ContextBuilder(project_root=os.getcwd(), api_client=llm_client)
+            # Smart startup check — handles global KB, local KB
+            KBStartupManager().run(project_root=os.getcwd(), api_client=kb_api_client)
+
+            kb_context_builder = ContextBuilder(project_root=os.getcwd(), api_client=kb_api_client)
             kb_runtime_watcher = RuntimeWatcher(
                 debounce_seconds=cfg.KB_WATCHER_DEBOUNCE_SECONDS,
             )
-            kb_runtime_watcher.start(project_root=os.getcwd(), api_client=llm_client)
+            kb_runtime_watcher.start(project_root=os.getcwd(), api_client=kb_api_client)
+            memory.watcher_created_files = kb_runtime_watcher.created_files
             _logger.info("[KB] Context builder and runtime watcher initialised")
         except Exception as kb_exc:
             _logger.warning("[KB] Initialisation failed (non-fatal): %s", kb_exc)
@@ -318,6 +324,22 @@ def _run_task_impl(
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
 
+    # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
+    _llm_detected = getattr(planner, '_detected_language', None)
+    if _llm_detected and _llm_detected != language:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "Language corrected by LLM during pre-analysis: %s → %s",
+            language, _llm_detected,
+        )
+        language = _llm_detected
+        coder.role = f"Write clean {get_language_name(language)} code for a single step."
+
+    # Propagate task briefing to memory so all downstream agents can use it
+    _briefing_text = getattr(planner, '_task_briefing', '')
+    if _briefing_text:
+        memory._task_briefing = _briefing_text
+
     # Plan
     plan = planner.process(task, context=planner_context)
 
@@ -327,6 +349,7 @@ def _run_task_impl(
         fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, parse_heuristic_plan, PlanStep,
+        reclassify_manifest_steps,
     )
     plan_steps: list[PlanStep] | None = None
 
@@ -397,6 +420,14 @@ def _run_task_impl(
             language=language)
         plan_steps = from_legacy_steps(steps, dependencies)
 
+    # Reclassify CODE steps targeting only protected dependency manifests
+    # (package.json, requirements.txt, etc.) as CMD install steps so the
+    # package manager does the safe, atomic update instead of the LLM write
+    # being silently blocked by the protected-file guard.
+    plan_steps = reclassify_manifest_steps(plan_steps)
+    steps = steps_as_text_list(plan_steps)
+    dependencies = steps_dependencies_dict(plan_steps)
+
     # ── Project analysis phase ──────────────────────────────────
     # Build structured ProjectContext from static analysis (zero LLM cost).
     # Optionally enrich with LLM for deeper success criteria and test hints.
@@ -406,6 +437,14 @@ def _run_task_impl(
         language=language,
         project_profile=project_profile,
     )
+
+    # Inject packages from the task briefing's "New packages:" line so that
+    # _ensure_packages_installed runs the actual install before the first CODE
+    # step — even when the plan has no explicit CMD install step.
+    for _pkg in parse_briefing_packages(_briefing_text):
+        if _pkg not in project_context_obj.required_packages:
+            project_context_obj.required_packages.append(_pkg)
+            _logger.info("[PreAnalysis] Briefing package injected: %s", _pkg)
 
     # LLM enrichment — adds deeper success criteria, assertion hints,
     # and testable unit identification.  Uses 1 LLM call.
@@ -515,12 +554,11 @@ def _run_task_impl(
         if not pipeline_success:
             break
 
-    # ── Final cross-step test verification ──
-    # Re-run all session test files together to catch regressions where a
-    # source fix in step N broke tests that already passed in step M.
+    # ── Bulk test execution + per-file fix ──
+    # All inline TEST steps deferred their runs — execute once here.
     if pipeline_success:
-        from .orchestrator.pipeline import run_final_test_verification
-        verif_ok, verif_err = run_final_test_verification(
+        from .orchestrator.pipeline import run_bulk_test_execution_and_fix
+        verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
             coder=coder,
@@ -533,7 +571,7 @@ def _run_task_impl(
         )
         if not verif_ok:
             pipeline_success = False
-            log.warning(f"[FinalVerify] Pipeline marked failed: {verif_err[:200]}")
+            log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
 
     # Stop KB runtime watcher
     if kb_runtime_watcher is not None:

@@ -23,18 +23,47 @@ class ReviewerAgent(Agent):
 You are reviewing a CODE DIFF for correctness. You see only the changed lines
 and their surrounding context. Language: {lang_name}
 
+──────── UNIFIED DIFF FORMAT ────────
+Lines starting with `-` were REMOVED from the old file.
+Lines starting with `+` were ADDED to the new file.
+Lines with no prefix are unchanged context lines.
+CRITICAL: If you see `-foo` and `+foo` with identical content, it means only
+whitespace/newline changed — there is NOT a duplicate. Do NOT flag a
+duplicate unless you see two `+` lines with the same content.
+
 ──────── FOCUS ON ────────
 1. Will the changes work correctly at runtime?
 2. Are imports/references still valid after these changes?
 3. Any type mismatches, missing error handling, or undefined variables
    in the CHANGED code?
 4. Do the changes match the stated task?
+5. If IMPORTER context is provided: does this change duplicate something
+   already present in the importer (e.g. Router, Provider, HOC wrapper)?
 
 ──────── DO NOT FLAG ────────
 - Code style, naming, or formatting
 - Unchanged code visible in context
 - Performance suggestions (unless it causes a bug)
 - Missing features not related to the task
+- Removed content when the step explicitly specifies the replacement
+  (e.g. step says "override with X" or shows exact target content —
+  the removal is intentional; only check that the replacement is correct)
+- A `-line` / `+line` pair with identical content — this is a
+  whitespace/newline-only change, NOT a duplicate statement
+
+──────── STEP INTENT RULE (CRITICAL) ────────
+If the step description explicitly states what the file should contain
+(e.g. shows exact code, says "replace with", "override", "set to"),
+then judge the change against that stated intent — NOT against what
+was removed. Removing previous content to produce the exact output
+the step requested is CORRECT. Do NOT fail for intentional replacement.
+
+──────── IMPORTER CONTEXT (if provided) ────────
+If [IMPORTER — read-only context] sections are present, use them to
+detect duplicates introduced by this change — e.g. wrapping a component
+in <BrowserRouter> when the importer already wraps it. Flag these as
+FAIL since they cause runtime errors. Do NOT flag anything else in the
+importer; it is read-only context, not under review.
 
 ──────── OUTPUT FORMAT ────────
 If changes are correct: Respond with EXACTLY: "Code looks good."
@@ -81,6 +110,10 @@ KNOWN PROJECT FILES:
    - JS/TS: `require()` vs `import` mismatch with module type?
      (CommonJS vs ES Modules)
    - Mismatched test framework calls (e.g. using `jest.fn()` in a mocha project).
+   - **Django apps**: If a new Django app directory is created (contains `views.py`,
+     `models.py`, or `apps.py`), it MUST be listed in `INSTALLED_APPS` in
+     `settings.py`. A missing entry causes `TemplateDoesNotExist` and app
+     registry failures. Flag if `settings.py` is shown and the app is absent.
 
 4. **RUNTIME ERRORS**:
    - Undefined variables, wrong argument counts, type mismatches.
@@ -105,6 +138,14 @@ IGNORE them — they are out of scope.
 - Missing edge-case tests (focus on whether EXISTING tests are correct)
 - Pre-existing issues in code NOT touched by this step
 - Formatting, whitespace, or comment style in unmodified code
+- Removed content when the step explicitly specifies the replacement
+
+──────── STEP INTENT RULE (CRITICAL) ────────
+If the step description explicitly states what the file should contain
+(e.g. shows exact code, says "replace with", "override", "set to"),
+then judge the change against that stated intent — NOT against what
+was removed. Removing previous content to produce the exact output
+the step requested is CORRECT. Do NOT fail for intentional replacement.
 
 ──────── OUTPUT FORMAT ────────
 If ALL mandatory checks pass and the code will work correctly:

@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "requests",
         "pyyaml",
+        "rich>=13.0",
         "textual",
         "pytest",
         # Phase 1 — Code Graph (Local KB)

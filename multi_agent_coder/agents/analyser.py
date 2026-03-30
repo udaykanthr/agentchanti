@@ -977,6 +977,27 @@ Output ONLY the JSON object.
         return ctx
 
 
+def parse_briefing_packages(briefing_text: str) -> list:
+    """Extract package names from the ``New packages:`` line of a task briefing.
+
+    Returns an empty list when the briefing is absent, empty, or says ``NONE``.
+    Used to seed ``ProjectContext.required_packages`` so that
+    ``_ensure_packages_installed`` runs the actual install before the first
+    CODE step — even when the plan contains no explicit CMD install step.
+    """
+    if not briefing_text:
+        return []
+    for line in briefing_text.splitlines():
+        if line.startswith("New packages:"):
+            pkg_str = line[len("New packages:"):].strip()
+            if pkg_str and pkg_str.upper() != "NONE":
+                return [
+                    p.strip() for p in pkg_str.split(",")
+                    if p.strip() and p.strip().upper() != "NONE"
+                ]
+    return []
+
+
 def _parse_json_response(response: str) -> dict:
     """Extract JSON from LLM response, handling markdown fences."""
     response = response.strip()

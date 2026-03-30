@@ -9,6 +9,52 @@ import threading
 import time as _time
 from datetime import datetime
 
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.padding import Padding
+    from rich import box as rich_box
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
+VERSION = "1.0"
+
+# ── Design tokens ─────────────────────────────────────────────────────────────
+# Centralised so tweaking palette only requires changes here.
+_CLR = {
+    "brand":    "bold yellow",       # ⚡ AgentChanti name
+    "brand_dim":"dim yellow",         # version / subtitle
+    "task":     "white",              # task description
+    "model":    "dim",                # model info
+    "done":     "bold green",         # ✔ success
+    "failed":   "bold red",           # ✘ failure
+    "active":   "bold bright_yellow", # ◉ active step / spinner
+    "pending":  "dim",                # ○ not started
+    "skipped":  "dim",                # – skipped
+    "badge_code":  "bold cyan",
+    "badge_cmd":   "bold magenta",
+    "badge_test":  "bold blue",
+    "badge_other": "dim",
+    "metric_label":  "dim",
+    "metric_value":  "bold white",
+    "metric_tokens": "cyan",
+    "metric_total":  "bold cyan",
+    "metric_cost":   "bold yellow",
+    "bar_filled":    "green",
+    "bar_empty":     "dim",
+    "bar_warn":      "yellow",        # partial pass (50-99 %)
+    "panel_border":  "yellow",        # header border
+    "section_border":"bright_black",  # section borders (subtle)
+    "fail_detail":   "dim red",
+}
+
+
+# ── Token Tracker ─────────────────────────────────────────────────────────────
 
 class TokenTracker:
     """Global tracker for token usage and cost across all LLM calls."""
@@ -23,7 +69,6 @@ class TokenTracker:
         self._lock = threading.Lock()
 
     def set_context(self, tokens: int) -> None:
-        """Pre-call: update context size with estimated prompt tokens (shown in status bar)."""
         with self._lock:
             self.current_context_size = tokens
 
@@ -38,20 +83,16 @@ class TokenTracker:
             self._calculate_cost(model_name, prompt_tokens, completion_tokens)
 
     def snapshot(self) -> tuple[int, int]:
-        """Return a thread-safe snapshot of (total_prompt_tokens, total_completion_tokens)."""
         with self._lock:
             return self.total_prompt_tokens, self.total_completion_tokens
 
     def _calculate_cost(self, model_name: str, prompt: int, completion: int):
-        # Simple match or regex match for pricing
         price_entry = None
         for pattern, prices in self.pricing.items():
             if pattern in model_name.lower():
                 price_entry = prices
                 break
-
         if price_entry:
-            # Pricing is per 1M tokens
             cost = (prompt * price_entry["input"] / 1_000_000) + \
                    (completion * price_entry["output"] / 1_000_000)
             with self._lock:
@@ -62,12 +103,13 @@ class TokenTracker:
         return self.total_prompt_tokens + self.total_completion_tokens
 
 
-# Global singleton (pricing will be injected during CLI init)
+# Global singleton
 token_tracker = TokenTracker()
 
 
+# ── Logger ────────────────────────────────────────────────────────────────────
+
 def setup_logger(log_dir: str = ".agentchanti/logs") -> logging.Logger:
-    """Creates a file logger. All verbose output goes here."""
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"agent_{timestamp}.log")
@@ -75,141 +117,734 @@ def setup_logger(log_dir: str = ".agentchanti/logs") -> logging.Logger:
     logger = logging.getLogger("multi_agent_coder")
     logger.setLevel(logging.DEBUG)
 
-    # File handler — captures everything
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(fh)
-
     return logger
 
 
-# Global logger instance
 log = setup_logger()
 
 
+# ── Sanitizers (kept for backward compatibility) ──────────────────────────────
+
+_GIBBERISH_RE = re.compile(
+    r'<\|[^|>]*\|?>|'
+    r'<<[^>]*>>|'
+    r'\[\|[^|\]]*\|?\]|'
+    r'<\/?s>|'
+    r'\[INST\]|\[\/INST\]|'
+    r'\[UNUSED_TOKEN_\d+\]'
+)
+_READABLE_RE = re.compile(r'[a-zA-Z0-9\s]')
+
+
+def _sanitize_line(text: str) -> str:
+    if not text:
+        return ""
+    original_len = len(text)
+    cleaned = _GIBBERISH_RE.sub('', text).strip()
+    if not cleaned:
+        return ""
+    if original_len > 10 and len(cleaned) / original_len < 0.4:
+        return ""
+    cleaned = cleaned.strip("'\"[](){}<>,;:|`").strip()
+    if not cleaned:
+        return ""
+    readable = len(_READABLE_RE.findall(cleaned))
+    if len(cleaned) > 3 and readable / len(cleaned) < 0.4:
+        return ""
+    return cleaned
+
+
+# ── Rich Live Renderable ──────────────────────────────────────────────────────
+
+class _LiveRenderable:
+    """Thin wrapper so Rich.Live can call back into CLIDisplay._build_panels()."""
+
+    def __init__(self, display: "CLIDisplay"):
+        self._d = display
+
+    def __rich_console__(self, console, options):
+        for renderable in self._d._build_panels():
+            yield renderable
+
+
+# ── Helper: format numbers ────────────────────────────────────────────────────
+
+def _fmt_k(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}K"
+    return str(n)
+
+
+def _fill_bar(fraction: float, width: int = 20,
+              filled_char: str = "▰", empty_char: str = "▱") -> tuple[str, str]:
+    """Return (filled_part, empty_part) strings for a progress bar."""
+    clamped = max(0.0, min(1.0, fraction))
+    n_filled = int(clamped * width)
+    n_empty = width - n_filled
+    return filled_char * n_filled, empty_char * n_empty
+
+
+def _format_elapsed(elapsed: float) -> str:
+    total = int(elapsed)
+    hours, remainder = divmod(total, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+# ── Main Display Class ────────────────────────────────────────────────────────
+
 class CLIDisplay:
-    """Manages the terminal CLI progress display."""
+    """Rich-based full-screen display for AgentChanti pipeline."""
 
     ICONS = {
-        "pending":  "○",
-        "active":   "◉",
-        "done":     "✔",
-        "failed":   "✘",
-        "skipped":  "–",
+        "pending": "·",
+        "active":  "▶",
+        "done":    "✓",
+        "failed":  "✗",
+        "skipped": "⊘",
     }
 
-    # Spinner frames for waiting animation (ASCII-safe for Windows cp1252)
-    _SPINNER_FRAMES = ["|", "/", "-", "\\"]
+    # Kept so external code that reads _GIBBERISH_RE / _READABLE_RE still works
+    _GIBBERISH_RE = _GIBBERISH_RE
+    _READABLE_RE  = _READABLE_RE
+
+    # Quarter-circle spinner — renders reliably across terminals
+    _SPINNER_FRAMES = "◐◓◑◒"
+    # Legacy list kept for any external references
     _WAITING_PHRASES = [
-        "Waiting for response",
-        "Still thinking",
-        "Processing",
-        "Working on it",
+        "Waiting for response", "Still thinking", "Processing", "Working on it",
     ]
 
     def __init__(self, task_description: str):
         self.task = task_description
         self.steps: list[dict] = []
-        self.current_step = -1
-        self.status_message = ""
-        self._refresh_size()
-        self._render_lock = threading.Lock()
-        self._last_stream_render: float = 0.0
-        self._header_end = 4  # compact header rows
-        self._left_pane_width = 24
+        self.current_step: int = -1
+        self.status_message: str = ""
+        self.start_time: float = _time.monotonic()
+        self.paused: bool = False
+
         self._llm_log: list[str] = []
-        # Spinner state
-        self._spinner_thread: threading.Thread | None = None
+        self._test_results: list[dict] = []   # [{file, passed, total, failures, duration}]
+        self._wave_info: tuple[int, int] = (0, 0)
+        self._model_info: str = ""
+        self._lock = threading.RLock()
+        self._last_stream_render: float = 0.0
+
+        # Backward-compat attributes that external code may read
+        self._header_end = 4
+        self._left_pane_width = 24
+        self.term_width = shutil.get_terminal_size((80, 24)).columns
+        self.term_height = shutil.get_terminal_size((80, 24)).lines
+
+        # Spinner background thread (kept for backward compat; also drives refresh)
         self._spinner_stop = threading.Event()
-        self._spinner_message: str = ""
-        self.start_time = _time.monotonic()
-        self.paused = False
+        self._spinner_thread: threading.Thread | None = None
 
-    def _refresh_size(self):
-        size = shutil.get_terminal_size((80, 24))
-        self.term_width = size.columns
-        self.term_height = size.lines
+        if _RICH_AVAILABLE:
+            self._console = Console()
+            self._renderable = _LiveRenderable(self)
+            self._live = Live(
+                self._renderable,
+                console=self._console,
+                refresh_per_second=8,
+                screen=True,
+                vertical_overflow="visible",
+            )
+            self._live.start()
+        else:
+            self._live = None
+            self._console = None
 
-    def _center(self, text: str) -> str:
-        """Center text within terminal width."""
-        return text.center(self.term_width)
+    # ── Spinner (background thread kept for backward compat) ──────────────────
 
-    def _wrap_task(self, text: str, width: int, max_lines: int = 2) -> list[str]:
-        """Wrap and truncate task description to fit within given width.
+    def _start_spinner(self, message: str = ""):
+        """Start background refresh thread (drives Live spinner animation)."""
+        self._stop_spinner()
+        self._spinner_stop.clear()
+        self._spinner_thread = threading.Thread(
+            target=self._spinner_loop, daemon=True)
+        self._spinner_thread.start()
 
-        Large prompts are pre-truncated so only the first ``max_lines``
-        worth of characters are processed.
+    def _stop_spinner(self):
+        if self._spinner_thread and self._spinner_thread.is_alive():
+            self._spinner_stop.set()
+            self._spinner_thread.join(timeout=1.0)
+        self._spinner_thread = None
+
+    def stop_spinner(self):
+        """Public: stop spinner (called before interactive prompts)."""
+        self._stop_spinner()
+
+    def _spinner_loop(self):
+        """Keeps Live refreshing during long-running steps."""
+        while not self._spinner_stop.is_set():
+            if not self.paused and self._live:
+                try:
+                    self._live.refresh()
+                except Exception:
+                    pass
+            self._spinner_stop.wait(0.15)
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def pause(self):
+        """Pause rendering for interactive prompts."""
+        self._stop_spinner()
+        with self._lock:
+            self.paused = True
+        if self._live:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+
+    def resume(self):
+        """Resume rendering after interactive prompts."""
+        with self._lock:
+            self.paused = False
+        if self._live:
+            try:
+                self._live.start()
+            except Exception:
+                pass
+        self.render()
+
+    def render(self):
+        """Trigger a display refresh."""
+        if self.paused or not self._live:
+            return
+        try:
+            self._live.refresh()
+        except Exception:
+            pass
+
+    # ── State setters ─────────────────────────────────────────────────────────
+
+    def set_model_info(self, model: str, provider: str):
+        """Set model/provider for display in header."""
+        with self._lock:
+            self._model_info = f"{model} ({provider})"
+        self.render()
+
+    def set_wave_info(self, current: int, total: int):
+        """Set current/total wave numbers for footer display."""
+        with self._lock:
+            self._wave_info = (current, total)
+        self.render()
+
+    def set_steps(self, step_texts: list[str]):
+        self._stop_spinner()
+        with self._lock:
+            self.steps = [
+                {"text": t, "status": "pending", "type": "?"}
+                for t in step_texts
+            ]
+        self.render()
+
+    def show_status(self, message: str):
+        """Show a planning/status message (before steps are loaded)."""
+        with self._lock:
+            self.status_message = message
+        self.render()
+        self._start_spinner(message)
+
+    def start_step(self, index: int, step_type: str = "?"):
+        with self._lock:
+            self.current_step = index
+            self.steps[index]["status"] = "active"
+            self.steps[index]["type"] = step_type
+            self.steps[index]["info"] = []
+            if "start_time" not in self.steps[index]:
+                self.steps[index]["start_time"] = _time.monotonic()
+            if "tokens" not in self.steps[index]:
+                self.steps[index]["tokens"] = {"sent": 0, "recv": 0}
+        self.render()
+
+    def step_info(self, index: int, message: str):
+        self._stop_spinner()
+        with self._lock:
+            if 0 <= index < len(self.steps):
+                info_list = self.steps[index].get("info", [])
+                if len(info_list) >= 5:
+                    info_list.pop(0)
+                info_list.append(message)
+                self.steps[index]["info"] = info_list
+        self.render()
+        if any(kw in message.lower() for kw in (
+            "generating", "coding", "classifying", "reviewing",
+            "analyzing", "requesting", "running", "installing",
+            "re-planning", "retrying", "searching", "sending",
+            "resolving", "diagnosing", "fixing", "auto-fixing",
+            "pre-install", "building", "processing", "waiting",
+            "loading", "applying", "scoping", "testing",
+        )):
+            self._start_spinner(message)
+
+    def step_tokens(self, index: int, sent: int, recv: int):
+        with self._lock:
+            if 0 <= index < len(self.steps):
+                t = self.steps[index].get("tokens", {"sent": 0, "recv": 0})
+                t["sent"] += sent
+                t["recv"] += recv
+                self.steps[index]["tokens"] = t
+        self.render()
+
+    def complete_step(self, index: int, status: str = "done"):
+        self._stop_spinner()
+        with self._lock:
+            self.steps[index]["status"] = status
+            if "start_time" in self.steps[index]:
+                self.steps[index]["duration"] = (
+                    _time.monotonic() - self.steps[index]["start_time"]
+                )
+        self.render()
+
+    def add_llm_log(self, text: str, source: str = ""):
+        added = False
+        with self._lock:
+            if source:
+                self._llm_log.append(f"[{source}]")
+            for line in text.splitlines():
+                cleaned = _sanitize_line(line.strip())
+                if cleaned:
+                    self._llm_log.append(cleaned)
+                    added = True
+            if added:
+                self._llm_log.append("")
+        if added:
+            self.render()
+
+    def record_test_result(self, file_path: str, passed: int, total: int,
+                           failures: list[dict] | None = None,
+                           duration: float = 0.0):
+        """Record a per-file test result for the TEST RESULTS panel.
+
+        *failures* is a list of dicts with keys ``name`` and ``message``.
+        Call this from step_handlers after each test file run.
         """
-        if width <= 0 or not text:
-            return []
-        # Collapse to a single line and pre-truncate to avoid processing
-        # extremely long prompt text (e.g. loaded from a file).
-        text = " ".join(text.split())
-        max_chars = max_lines * width + 20  # small slack for word-break
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        if not text:
-            return []
-        lines = []
-        remaining = text
-        for i in range(max_lines):
-            if not remaining:
-                break
-            if len(remaining) <= width:
-                lines.append(remaining)
-                break
-            if i == max_lines - 1:
-                lines.append(remaining[:max(0, width - 3)] + "...")
+        with self._lock:
+            # Update existing entry if same file re-runs (retries)
+            for existing in self._test_results:
+                if existing["file"] == file_path:
+                    existing["passed"] = passed
+                    existing["total"] = total
+                    existing["failures"] = failures or []
+                    existing["duration"] = duration
+                    break
             else:
-                cut = remaining.rfind(' ', 0, width)
-                if cut <= 0:
-                    cut = width
-                lines.append(remaining[:cut])
-                remaining = remaining[cut:].lstrip()
-        return lines
+                self._test_results.append({
+                    "file": file_path,
+                    "passed": passed,
+                    "total": total,
+                    "failures": failures or [],
+                    "duration": duration,
+                })
+        self.render()
 
-    # Regex to strip LLM special tokens: <|...|>, <|...|, <<...>>, [|...|] etc.
-    _GIBBERISH_RE = re.compile(
-        r'<\|[^|>]*\|?>|'       # <|token|> or <|token
-        r'<<[^>]*>>|'            # <<token>>
-        r'\[\|[^|\]]*\|?\]|'    # [|token|] or [|token]
-        r'<\/?s>|'               # <s> </s> (sentence tokens)
-        r'\[INST\]|\[\/INST\]|'  # [INST] [/INST] (Llama chat tokens)
-        r'\[UNUSED_TOKEN_\d+\]'  # [UNUSED_TOKEN_145] etc.
-    )
-    # Characters that count as "readable" for the gibberish ratio check
-    _READABLE_RE = re.compile(r'[a-zA-Z0-9\s]')
+    def update_streaming_progress(self, step_idx: int, tokens: int):
+        now = _time.monotonic()
+        if now - self._last_stream_render < 0.5:
+            return
+        self._last_stream_render = now
+        self.step_info(step_idx, f"Generating... ({tokens} tokens)")
+
+    def budget_check(self, limit: float) -> bool:
+        if limit > 0 and token_tracker.total_cost >= limit:
+            log.error(f"Budget exceeded: ${token_tracker.total_cost:.4f} >= ${limit:.2f}")
+            return True
+        return False
+
+    # ── Rich panel builders ───────────────────────────────────────────────────
+
+    def _spinner_char(self) -> str:
+        elapsed = _time.monotonic() - self.start_time
+        return self._SPINNER_FRAMES[int(elapsed * 8) % len(self._SPINNER_FRAMES)]
+
+    def _build_header(self) -> Panel:
+        task_preview = " ".join(self.task.split())
+        if len(task_preview) > 110:
+            task_preview = task_preview[:107] + "…"
+
+        # ── Line 1: brand + version + model ──
+        line1 = Text()
+        line1.append("⚡ ", style="yellow")
+        line1.append("AgentChanti", style=_CLR["brand"])
+        line1.append(f"  v{VERSION}", style=_CLR["brand_dim"])
+        if self._model_info:
+            line1.append("   ·   ", style="dim")
+            line1.append(self._model_info, style=_CLR["model"])
+
+        # ── Line 2: task description ──
+        line2 = Text()
+        line2.append("   ", style="")
+        line2.append(task_preview, style=_CLR["task"])
+
+        # ── Line 3: live metrics (replaces the separate footer panel) ──
+        t = token_tracker
+        elapsed   = _time.monotonic() - self.start_time
+        p, c      = t.snapshot()
+        total_tok = p + c
+
+        with self._lock:
+            steps     = list(self.steps)
+            wave_info = self._wave_info
+        done_steps  = sum(1 for s in steps if s["status"] in ("done", "skipped", "failed"))
+        total_steps = len(steps)
+
+        line3 = Text()
+        line3.append("   ", style="")           # align under ⚡
+        line3.append("⏱ ", style="dim")
+        line3.append(_format_elapsed(elapsed), style=_CLR["metric_value"])
+        line3.append("   ↑ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(p), style=_CLR["metric_tokens"])
+        line3.append("  ↓ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(c), style=_CLR["metric_tokens"])
+        line3.append("  Σ ", style=_CLR["metric_label"])
+        line3.append(_fmt_k(total_tok), style=_CLR["metric_total"])
+        line3.append(f"   {t.call_count} calls", style="dim")
+        if t.total_cost > 0:
+            line3.append("   ", style="")
+            line3.append(f"${t.total_cost:.4f}", style=_CLR["metric_cost"])
+        if total_steps:
+            line3.append(f"   ·   Steps {done_steps}/{total_steps}", style="dim")
+        if wave_info[1] > 0:
+            line3.append(f"  ·  Wave {wave_info[0]}/{wave_info[1]}", style="dim")
+
+        return Panel(
+            Group(line1, line2, line3),
+            border_style=_CLR["panel_border"],
+            box=rich_box.ROUNDED,
+            padding=(0, 1),
+        )
+
+    def _build_planning_section(self) -> Panel:
+        spin = self._spinner_char()
+        elapsed = _time.monotonic() - self.start_time
+        t = Text()
+        t.append(f" {spin} ", style=_CLR["active"])
+        if self.status_message:
+            t.append(f" {self.status_message}", style="white")
+        t.append(f"  ·  {_format_elapsed(elapsed)}", style="dim")
+
+        title = Text()
+        title.append("◈ ", style="dim cyan")
+        title.append("PLANNING", style="bold cyan")
+
+        return Panel(
+            t,
+            title=title,
+            title_align="left",
+            border_style=_CLR["section_border"],
+            box=rich_box.ROUNDED,
+            padding=(0, 2),
+        )
+
+    def _build_execution_section(self) -> Panel:
+        with self._lock:
+            steps = list(self.steps)
+            current = self.current_step
+
+        total = len(steps)
+        done = sum(1 for s in steps if s["status"] in ("done", "skipped", "failed"))
+        frac = done / total if total else 0
+        filled, empty = _fill_bar(frac, width=18)
+
+        # Determine visible window (keep active step in view)
+        MAX_VISIBLE = 18
+        start_row = 0
+        if total > MAX_VISIBLE:
+            pivot = current if current >= 0 else done
+            start_row = max(0, pivot - MAX_VISIBLE // 2)
+            start_row = min(start_row, total - MAX_VISIBLE)
+        visible_steps = list(enumerate(steps))[start_row:start_row + MAX_VISIBLE]
+
+        table = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+        table.add_column("icon",     width=3,  no_wrap=True)
+        table.add_column("type",     width=7,  no_wrap=True)
+        table.add_column("desc",     ratio=1)
+        table.add_column("activity", width=30, no_wrap=True)
+        table.add_column("time",     width=7,  no_wrap=True)
+        table.add_column("tokens",   width=15, no_wrap=True)
+
+        spin = self._spinner_char()
+
+        # Badge colours
+        _BADGE = {
+            "CODE": _CLR["badge_code"], "CMD": _CLR["badge_cmd"],
+            "TEST": _CLR["badge_test"], "SEARCH": "dim yellow",
+            "IGNORE": "dim",
+        }
+
+        for i, step in visible_steps:
+            status = step["status"]
+            icon_raw = self.ICONS.get(status, "·")
+            _ICON_STYLE = {
+                "pending": _CLR["pending"],
+                "active":  _CLR["active"],
+                "done":    _CLR["done"],
+                "failed":  _CLR["failed"],
+                "skipped": _CLR["skipped"],
+            }
+            icon = Text(f" {icon_raw}", style=_ICON_STYLE.get(status, "dim"))
+
+            # Type badge  TEST  CODE  CMD
+            stype = step.get("type", "?")
+            if stype and stype not in ("?", "UNCLASSIFIED"):
+                type_text = Text(f" {stype:<4} ", style=_BADGE.get(stype, "dim"))
+            else:
+                type_text = Text("")
+
+            # Description — active step uses brighter white
+            raw_desc = step.get("text", f"Step {i + 1}")
+            if status == "active":
+                desc = Text(raw_desc, style="bold white", no_wrap=True, overflow="ellipsis")
+            elif status == "done":
+                desc = Text(raw_desc, style="white", no_wrap=True, overflow="ellipsis")
+            elif status == "failed":
+                desc = Text(raw_desc, style="red", no_wrap=True, overflow="ellipsis")
+            else:
+                desc = Text(raw_desc, style="dim", no_wrap=True, overflow="ellipsis")
+
+            # Activity column — only for the active step
+            activity = Text("")
+            if status == "active":
+                step_elapsed = _time.monotonic() - step.get("start_time", _time.monotonic())
+                elapsed_str = _format_elapsed(step_elapsed)
+                info_list = step.get("info", [])
+                last_info = info_list[-1] if info_list else "working…"
+                if len(last_info) > 18:
+                    last_info = last_info[:15] + "…"
+                activity = Text()
+                activity.append(f"{spin} ", style=_CLR["active"])
+                activity.append(elapsed_str, style="dim yellow")
+                activity.append(f"  {last_info}", style="dim white")
+
+            # Duration (completed steps only)
+            time_text = Text("")
+            if status in ("done", "failed", "skipped") and "duration" in step:
+                time_text = Text(_format_elapsed(step["duration"]), style="dim")
+
+            # Per-step token counts
+            tokens_text = Text("")
+            tok = step.get("tokens")
+            if tok and (tok["sent"] or tok["recv"]):
+                tokens_text = Text()
+                tokens_text.append(f"↑{_fmt_k(tok['sent'])}", style=_CLR["metric_tokens"])
+                tokens_text.append(" ", style="")
+                tokens_text.append(f"↓{_fmt_k(tok['recv'])}", style="dim cyan")
+
+            table.add_row(icon, type_text, desc, activity, time_text, tokens_text)
+
+        # Title: section label + inline progress bar
+        title = Text()
+        title.append("▸ ", style="dim")
+        title.append("EXECUTION", style="bold white")
+        title.append("  ", style="")
+        title.append(filled, style=_CLR["bar_filled"])
+        title.append(empty,  style=_CLR["bar_empty"])
+        title.append(f"  {done}/{total}", style="dim")
+        if total > MAX_VISIBLE:
+            title.append(f"  ({start_row+1}–{start_row+len(visible_steps)})", style="dim")
+
+        return Panel(
+            table,
+            title=title,
+            title_align="left",
+            border_style=_CLR["section_border"],
+            box=rich_box.ROUNDED,
+            padding=(0, 0),
+        )
+
+    def _build_tests_section(self) -> Panel:
+        with self._lock:
+            results = list(self._test_results)
+
+        table = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+        table.add_column("icon",   width=3,  no_wrap=True)
+        table.add_column("badge",  width=7,  no_wrap=True)
+        table.add_column("file",   ratio=1)
+        table.add_column("bar",    width=13, no_wrap=True)
+        table.add_column("count",  width=7,  no_wrap=True)
+        table.add_column("pct",    width=5,  no_wrap=True)
+        table.add_column("time",   width=7,  no_wrap=True)
+
+        for result in results:
+            passed   = result.get("passed", 0)
+            total    = result.get("total", 0) or 1
+            duration = result.get("duration", 0.0)
+            fpath    = result.get("file", "?")
+            failures = result.get("failures", [])
+            failed   = total - passed
+            frac     = passed / total
+            pct      = int(frac * 100)
+
+            # Bar: ▰▰▰▰▰▱▱▱▱▱
+            filled, empty = _fill_bar(frac, width=10)
+            bar_t = Text()
+            if failed == 0:
+                bar_t.append(filled, style=_CLR["bar_filled"])
+                bar_t.append(empty,  style=_CLR["bar_empty"])
+                icon        = Text(" ✓", style=_CLR["done"])
+                badge       = Text(" PASS ", style="bold green")
+                file_style  = "green"
+                pct_style   = "green"
+            elif pct >= 50:
+                bar_t.append(filled, style=_CLR["bar_warn"])
+                bar_t.append(empty,  style="dim red")
+                icon        = Text(" ✗", style="bold yellow")
+                badge       = Text(" WARN ", style="bold yellow")
+                file_style  = "yellow"
+                pct_style   = "yellow"
+            else:
+                bar_t.append(filled, style="dim yellow")
+                bar_t.append(empty,  style=_CLR["failed"])
+                icon        = Text(" ✗", style=_CLR["failed"])
+                badge       = Text(" FAIL ", style="bold red")
+                file_style  = "red"
+                pct_style   = "red"
+
+            # Show only the filename; dim the directory prefix
+            if "/" in fpath or "\\" in fpath:
+                sep    = fpath.rfind("/") if "/" in fpath else fpath.rfind("\\")
+                prefix = fpath[:sep + 1]
+                fname  = fpath[sep + 1:]
+            else:
+                prefix = ""
+                fname  = fpath
+
+            file_text = Text(no_wrap=True, overflow="ellipsis")
+            if prefix:
+                file_text.append(prefix, style="dim")
+            file_text.append(fname, style=file_style)
+
+            table.add_row(
+                icon, badge, file_text, bar_t,
+                Text(f"{passed}/{total}", style="dim"),
+                Text(f"{pct}%",           style=pct_style),
+                Text(_format_elapsed(duration), style="dim"),
+            )
+
+            # Failure details (max 3 per file, indented)
+            for failure in failures[:3]:
+                name = failure.get("name", "")
+                msg  = failure.get("message", "")
+                if len(msg) > 50:
+                    msg = msg[:47] + "…"
+                detail = Text()
+                detail.append("     └─ ", style="dim")
+                detail.append(name, style="red")
+                if msg:
+                    detail.append(f"  {msg}", style=_CLR["fail_detail"])
+                table.add_row(
+                    Text(""), Text(""), detail,
+                    Text(""), Text(""), Text(""), Text(""),
+                )
+
+        title = Text()
+        title.append("◈ ", style="dim")
+        title.append("TEST RESULTS", style="bold white")
+
+        return Panel(
+            table,
+            title=title,
+            title_align="left",
+            border_style=_CLR["section_border"],
+            box=rich_box.ROUNDED,
+            padding=(0, 0),
+        )
+
+    def _build_panels(self) -> list:
+        """Assemble all Rich renderables for the current state."""
+        parts = []
+        parts.append(self._build_header())
+
+        with self._lock:
+            has_steps   = bool(self.steps)
+            has_status  = bool(self.status_message)
+            has_tests   = bool(self._test_results)
+
+        if has_steps:
+            parts.append(self._build_execution_section())
+        elif has_status:
+            parts.append(self._build_planning_section())
+
+        if has_tests:
+            parts.append(self._build_tests_section())
+
+        return parts
+
+    # ── Finish screen ─────────────────────────────────────────────────────────
+
+    def finish(self, success: bool = True):
+        """Show a final summary screen after pipeline completes."""
+        self._stop_spinner()
+        if self._live:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+
+        t = token_tracker
+        elapsed = _time.monotonic() - self.start_time
+
+        if _RICH_AVAILABLE:
+            console = Console()
+
+            status_text = Text()
+            if success:
+                status_text.append("  ✓  ", style="bold green")
+                status_text.append("All tasks completed successfully!", style="bold white")
+            else:
+                status_text.append("  ✗  ", style="bold red")
+                status_text.append("Some tasks failed — check logs for details.", style="bold white")
+
+            metrics = Text()
+            metrics.append("  Tokens  ", style="dim")
+            metrics.append(f"{t.total_tokens:,}", style="bold cyan")
+            metrics.append("  ·  ↑ ", style="dim")
+            metrics.append(f"{t.total_prompt_tokens:,}", style="cyan")
+            metrics.append("  ↓ ", style="dim")
+            metrics.append(f"{t.total_completion_tokens:,}", style="cyan")
+
+            time_line = Text()
+            time_line.append("  Time    ", style="dim")
+            time_line.append(_format_elapsed(elapsed), style="bold white")
+            if t.total_cost > 0:
+                time_line.append("   ·   Cost ", style="dim")
+                time_line.append(f"${t.total_cost:.4f}", style="bold yellow")
+
+            title = Text()
+            title.append("⚡ ", style="yellow")
+            title.append("AgentChanti", style="bold yellow")
+            title.append("  —  Done", style="dim")
+
+            summary = Group(Text(""), status_text, Text(""), metrics, time_line, Text(""))
+            console.print(Panel(summary, title=title, border_style="yellow",
+                                box=rich_box.ROUNDED, padding=(0, 2)))
+        else:
+            symbol = "✔" if success else "✘"
+            print(f"\n{symbol} Done  |  {_format_elapsed(elapsed)}"
+                  f"  |  Tokens: {t.total_tokens:,}"
+                  + (f"  |  Cost: ${t.total_cost:.4f}" if t.total_cost > 0 else ""))
+
+    # ── Static helpers (backward compat) ──────────────────────────────────────
 
     @classmethod
     def _sanitize_line(cls, text: str) -> str:
-        """Strip LLM special tokens and gibberish from a single line."""
-        if not text:
-            return ""
-        original_len = len(text)
-        # Remove known special token patterns
-        cleaned = cls._GIBBERISH_RE.sub('', text).strip()
-        if not cleaned:
-            return ""
-        # If most of the original was special tokens, the leftover is likely junk
-        if original_len > 10 and len(cleaned) / original_len < 0.4:
-            return ""
-        # Strip orphaned quotes/brackets left after token removal
-        cleaned = cleaned.strip("'\"[](){}<>,;:|`")
-        cleaned = cleaned.strip()
-        if not cleaned:
-            return ""
-        # Reject lines that are mostly non-readable characters
-        readable = len(cls._READABLE_RE.findall(cleaned))
-        if len(cleaned) > 3 and readable / len(cleaned) < 0.4:
-            return ""
-        return cleaned
+        return _sanitize_line(text)
 
     @staticmethod
     def extract_explanation(response: str) -> str:
-        """Extract non-code explanation text from an LLM response."""
         lines = response.splitlines()
         result = []
         in_code = False
@@ -218,582 +853,22 @@ class CLIDisplay:
             if stripped.startswith("```"):
                 in_code = not in_code
                 continue
-            if in_code:
+            if in_code or stripped.startswith("#### [FILE]:"):
                 continue
-            if stripped.startswith("#### [FILE]:"):
-                continue
-            cleaned = CLIDisplay._sanitize_line(stripped)
+            cleaned = _sanitize_line(stripped)
             if cleaned:
                 result.append(cleaned)
         return "\n".join(result)
 
-    def add_llm_log(self, text: str, source: str = ""):
-        """Add LLM thinking text to the log pane.
-
-        *source*: agent label e.g. 'Coder', 'Reviewer', 'Tester', 'Diagnosis'
-        """
-        added = False
-        if source:
-            self._llm_log.append(f"[{source}]")
-        for line in text.splitlines():
-            cleaned = self._sanitize_line(line.strip())
-            if cleaned:
-                self._llm_log.append(f"  {cleaned}" if source else cleaned)
-                added = True
-        if added:
-            self._llm_log.append("")  # blank separator
-            self.render()
-
-    def _build_log_lines(self, width: int, max_lines: int) -> list[str]:
-        """Build wrapped log lines for the right pane (auto-scroll to latest)."""
-        if width <= 0 or not self._llm_log:
-            return []
-        C = self.C_CYAN; G = self.C_GREEN; Y = self.C_YELLOW
-        RED = self.C_RED; O = self.C_ORANGE; D = self.C_DIM; R = self.C_RESET
-        _SRC_COLORS = {
-            "Coder": C, "Reviewer": G, "Tester": Y, "Diagnosis": RED,
-        }
-        wrapped: list[str] = []
-        for entry in self._llm_log:
-            if not entry:
-                wrapped.append("")
-                continue
-            # Color source header lines like "[Coder]"
-            if entry.startswith("[") and "]" in entry:
-                tag = entry[1:entry.index("]")]
-                color = _SRC_COLORS.get(tag, O)
-                wrapped.append(f"{color}▸ {entry}{R}")
-                continue
-            # Word-wrap regular lines
-            remaining = entry
-            while remaining and len(remaining) > width:
-                cut = remaining.rfind(' ', 0, width)
-                if cut <= 0:
-                    cut = width
-                wrapped.append(f"{D}{remaining[:cut]}{R}")
-                remaining = remaining[cut:].lstrip()
-            if remaining:
-                wrapped.append(f"{D}{remaining}{R}")
-        # Auto-scroll: show the last N lines
-        return wrapped[-max_lines:] if len(wrapped) > max_lines else wrapped
-
-    def _move_to(self, row: int):
-        """Move cursor to a specific row (1-indexed)."""
-        sys.stdout.write(f"\033[{row};1H")
-
-    def set_steps(self, step_texts: list[str]):
-        self._stop_spinner()
-        self.steps = [
-            {"text": t, "status": "pending", "type": "?"}
-            for t in step_texts
-        ]
-
-    # ── Color palette ──
-    C_ORANGE = "\033[38;5;208m"
-    C_CYAN   = "\033[38;5;81m"
-    C_GREEN  = "\033[38;5;114m"
-    C_RED    = "\033[38;5;203m"
-    C_YELLOW = "\033[38;5;221m"
-    C_DIM    = "\033[38;5;243m"
-    C_WHITE  = "\033[38;5;255m"
-    C_BOLD   = "\033[1m"
-    C_RESET  = "\033[0m"
-
-    def _ansi_center(self, text: str) -> str:
-        """Center text that contains ANSI codes within terminal width."""
-        vis_len = len(re.sub(r'\033\[[0-9;]*m', '', text))
-        pad = self.term_width - vis_len
-        if pad <= 0:
-            return text
-        lpad = pad // 2
-        return " " * lpad + text
-
-    # ── Spinner animation ──
-
-    def _start_spinner(self, message: str = ""):
-        """Start a background spinner animation for the current waiting state."""
-        self._stop_spinner()  # stop any existing one
-        self._spinner_stop.clear()
-        self._spinner_message = message
-        self._spinner_thread = threading.Thread(
-            target=self._spinner_loop, daemon=True)
-        self._spinner_thread.start()
-
-    def _stop_spinner(self):
-        """Stop the background spinner if running."""
-        if self._spinner_thread and self._spinner_thread.is_alive():
-            self._spinner_stop.set()
-            self._spinner_thread.join(timeout=1.0)
-        self._spinner_thread = None
-
-    def stop_spinner(self):
-        """Public: stop the spinner before interactive prompts."""
-        self._stop_spinner()
-
-    def pause(self):
-        """Pause all rendering. Use this during interactive prompts."""
-        with self._render_lock:  # Wait for any active render to finish
-            self.paused = True
-        self._stop_spinner()
-
-    def resume(self):
-        """Resume all rendering."""
-        with self._render_lock:
-            self.paused = False
-        self.render()
-
-    def _spinner_loop(self):
-        """Background loop that animates a spinner on the display."""
-        C = self.C_CYAN; D = self.C_DIM; Y = self.C_YELLOW; R = self.C_RESET
-        frame_idx = 0
-        start_time = _time.monotonic()
-
-        while not self._spinner_stop.is_set():
-            if self.paused:
-                self._spinner_stop.wait(0.5)
-                continue
-
-            elapsed = _time.monotonic() - start_time
-            time_str = self._format_elapsed(elapsed)
-
-            phrase_idx = int(elapsed // 8) % len(self._WAITING_PHRASES)
-            phrase = self._WAITING_PHRASES[phrase_idx]
-
-            spinner = self._SPINNER_FRAMES[frame_idx % len(self._SPINNER_FRAMES)]
-            dots = "." * ((frame_idx % 3) + 1)
-            base_msg = self._spinner_message or phrase
-            base_clean = base_msg.rstrip(". ")
-
-            anim_text = f"{Y}{spinner}{R} {C}{base_clean}{dots:<3}{R} {D}({time_str}){R}"
-
-            try:
-                with self._render_lock:
-                    self._refresh_size()
-                    header_end = self._header_end
-                    sep_row = self.term_height - 2
-
-                    if self.steps:
-                        # Two-pane mode: show spinner in right pane
-                        left_w = self._left_pane_width
-                        right_col = left_w + 3
-                        content_start = header_end + 3
-                        content_height = max(0, sep_row - content_start)
-                        spinner_row = content_start + content_height - 1
-
-                        if content_start < spinner_row < sep_row:
-                            sys.stdout.write(
-                                f"\033[{spinner_row};{right_col}H\033[K"
-                                f"{anim_text}")
-                            sys.stdout.flush()
-
-                    elif self.status_message:
-                        avail_height = sep_row - header_end
-                        mid_row = header_end + max(avail_height // 2 - 1, 1)
-                        spinner_row = mid_row + 1
-                        if spinner_row < sep_row:
-                            self._move_to(spinner_row)
-                            sys.stdout.write("\033[2K")
-                            sys.stdout.write(self._ansi_center(
-                                f"        {anim_text}"))
-                            sys.stdout.flush()
-            except (OSError, ValueError):
-                break
-
-            frame_idx += 1
-            self._spinner_stop.wait(0.15)
-
-    def _progress_bar_compact(self) -> str:
-        """Short progress bar for status line."""
-        total = len(self.steps)
-        done = sum(1 for s in self.steps if s["status"] in ("done", "skipped"))
-        pct = int((done / total) * 100) if total else 0
-        bar_len = 15
-        filled = int(bar_len * done / total) if total else 0
-        G = self.C_GREEN; D = self.C_DIM; R = self.C_RESET
-        bar = f"{G}{'█' * filled}{R}{D}{'░' * (bar_len - filled)}{R}"
-        return f"{bar} {pct}% ({done}/{total})"
-
-    def _vis_len(self, text: str) -> int:
-        """Visible length of text after stripping ANSI codes."""
-        return len(re.sub(r'\033\[[0-9;]*m', '', text))
-
     @staticmethod
     def _format_elapsed(elapsed: float) -> str:
-        """Format elapsed seconds as a compact time string with hour support."""
-        total = int(elapsed)
-        hours, remainder = divmod(total, 3600)
-        mins, secs = divmod(remainder, 60)
-        if hours:
-            return f"{hours}:{mins:02d}:{secs:02d}"
-        return f"{mins}:{secs:02d}" if mins else f"{secs}s"
+        return _format_elapsed(elapsed)
 
-    def _render_status_bar(self):
-        """Render a status bar: progress centered, tokens+cost right-aligned."""
-        w = self.term_width
-        t = token_tracker
-        D = self.C_DIM; W = self.C_WHITE; C = self.C_CYAN
-        G = self.C_GREEN; R = self.C_RESET
-        BG = "\033[48;5;236m"
-
-        # Build the two parts
-        progress = self._progress_bar_compact()
-
-        ctx = t.current_context_size
-        ctx_str = f"{ctx/1000:.1f}K".replace(".0K", "K") if ctx >= 1000 else str(ctx)
-        
-        elapsed = _time.monotonic() - self.start_time
-        time_str = self._format_elapsed(elapsed)
-
-        right = (f"{D}⏱ {R}{W}{time_str}{R} "
-                 f"{D}Ctx:{R}{W}{ctx_str}{R} "
-                 f"{D}↑{R}{W}{t.total_prompt_tokens:,}{R} "
-                 f"{D}↓{R}{W}{t.total_completion_tokens:,}{R} "
-                 f"{D}Σ{R}{C}{t.total_tokens:,}{R} "
-                 f"{D}{t.call_count} calls{R}")
-        if t.total_cost > 0:
-            right += f"  {G}${t.total_cost:.4f}{R}"
-
-        prog_vis = self._vis_len(progress)
-        right_vis = self._vis_len(right)
-
-        # Center the progress bar
-        prog_lpad = max(0, (w - prog_vis) // 2)
-        # Right-align token details (1 char margin)
-        right_start = max(prog_lpad + prog_vis + 1, w - right_vis - 1)
-        gap = max(1, right_start - prog_lpad - prog_vis)
-
-        line = " " * prog_lpad + progress + " " * gap + right
-        line_vis = self._vis_len(line)
-        # Pad to fill full width for background
-        line += " " * max(0, w - line_vis)
-
-        print(f"{BG}{line}{R}", end="")
-
-    def _build_step_lines(self) -> list[str]:
-        """Build compact step list: icon Task N  status."""
-        lines = []
-        D = self.C_DIM; W = self.C_WHITE
-        G = self.C_GREEN; RED = self.C_RED; Y = self.C_YELLOW
-        B = self.C_BOLD; R = self.C_RESET
-
-        for i, step in enumerate(self.steps):
-            icon_raw = self.ICONS.get(step["status"], "?")
-            icon_color = {"pending": D, "active": Y, "done": G,
-                          "failed": RED, "skipped": D}.get(step["status"], D)
-            icon = f"{icon_color}{icon_raw}{R}"
-
-            if i == self.current_step:
-                prefix = f" {Y}▸{R}"
-            else:
-                prefix = "  "
-
-            label = f"Task {i + 1}"
-            status = step["status"]
-            name_color = W if status != "pending" else D
-
-            if status == "pending":
-                status_text = ""
-            else:
-                sc = {"active": Y, "done": G, "failed": RED,
-                      "skipped": D}.get(status, D)
-                status_text = f" {sc}{status}{R}"
-
-                if status in ("done", "failed") and "duration" in step:
-                    dur_str = f" {self._format_elapsed(step['duration'])}"
-                    status_text += f"{D}{dur_str}{R}"
-
-            lines.append(f"{prefix} {icon} {name_color}{label}{R}{status_text}")
-        return lines
-
-    def render(self):
-        """Redraw the full CLI display with positioned sections."""
-        if self.paused:
-            return
-        with self._render_lock:
-            self._render_unlocked()
-
-    def _render_unlocked(self):
-        """Internal render (caller must hold _render_lock)."""
-        self._refresh_size()
-        w = self.term_width
-        h = self.term_height
-        O = self.C_ORANGE
-        D = self.C_DIM
-        W = self.C_WHITE
-        Y = self.C_YELLOW
-        R = self.C_RESET
-
-        # Clear screen using ANSI escape codes
-        # \033[H: move cursor back to top-left
-        # \033[2J: clear screen
-        # \033[3J: clear scrollback buffer
-        sys.stdout.write("\033[H\033[2J\033[3J")
-        sys.stdout.flush()
-
-        # ── TOP: Compact left-aligned brand + task description ──
-        brand_text = "Agent Chanti"
-        sub_text = "\u2501\u2501 Local Coder \u2501\u2501"
-        brand_col = max(len(brand_text), len(sub_text)) + 4
-
-        task_start = brand_col + 3
-        task_width = max(0, w - task_start - 1)
-        task_lines = self._wrap_task(self.task, task_width, max_lines=2)
-        t1 = task_lines[0] if len(task_lines) > 0 else ""
-        t2 = task_lines[1] if len(task_lines) > 1 else ""
-
-        self._move_to(1)
-        print(f"{O}{'═' * w}{R}")
-        gap1 = " " * max(1, brand_col - len(brand_text) - 2)
-        print(f"  {O}{self.C_BOLD}{brand_text}{R}{gap1}{D}\u2502{R} {W}{t1}{R}")
-        gap2 = " " * max(1, brand_col - len(sub_text) - 2)
-        print(f"  {D}{sub_text}{R}{gap2}{D}\u2502{R} {D}{t2}{R}")
-        print(f"{O}{'═' * w}{R}")
-
-        header_end = 4
-        self._header_end = header_end
-
-        # Reserve bottom: 1 line status bar + 1 separator
-        status_row = h - 1
-        sep_row = h - 2
-
-        left_w = self._left_pane_width
-        right_w = max(0, w - left_w - 3)  # 3 for " │ "
-
-        if not self.steps and self.status_message:
-            # No steps yet — show planning status centered
-            avail = sep_row - header_end
-            mid_row = header_end + max(avail // 2 - 1, 1)
-            self._move_to(mid_row)
-        else:
-            # ── CENTER: Two-pane layout ──
-            B = self.C_BOLD
-            pane_row = header_end + 1
-            self._move_to(pane_row)
-
-            # Pane headers
-            lh = f"  {B}{W}Steps{R}"
-            # Show active task description beside LLM Thinking header
-            active_desc = ""
-            if 0 <= self.current_step < len(self.steps):
-                active_desc = self.steps[self.current_step].get("text", "")
-            rh_label = "LLM Thinking"
-            if active_desc:
-                # Truncate to 1 line: reserve space for label + separator
-                sep = " \u2500 "
-                max_desc = right_w - len(rh_label) - len(sep)
-                if max_desc > 10:
-                    desc = " ".join(active_desc.split())
-                    if len(desc) > max_desc:
-                        desc = desc[:max(0, max_desc - 3)] + "..."
-                    rh = f"{B}{W}{rh_label}{R}{D}{sep}{Y}{desc}{R}"
-                else:
-                    rh = f"{B}{W}{rh_label}{R}"
-            else:
-                rh = f"{B}{W}{rh_label}{R}"
-            lh_pad = " " * max(0, left_w - 7)  # 7 = len("  Steps")
-            print(f"{lh}{lh_pad}{D}\u2502{R} {rh}")
-
-            # Pane separator line
-            hl = "\u2500"  # ─
-            print(f"{D}{hl * left_w}\u253c{hl * (w - left_w - 1)}{R}")
-
-            content_start = pane_row + 2
-            content_height = max(0, sep_row - content_start)
-
-            step_lines = self._build_step_lines()
-            log_lines = self._build_log_lines(right_w, content_height)
-
-            # Show scroll indicator if log overflows
-            has_more = len(self._llm_log) > 0 and len(log_lines) == content_height
-
-            for row_i in range(content_height):
-                self._move_to(content_start + row_i)
-
-                # Left pane
-                if row_i < len(step_lines):
-                    left = step_lines[row_i]
-                else:
-                    left = ""
-                lv = self._vis_len(left)
-                lpad = " " * max(0, left_w - lv)
-
-                # Right pane
-                if row_i < len(log_lines):
-                    right = log_lines[row_i]
-                else:
-                    right = ""
-
-                sys.stdout.write(f"{left}{lpad}{D}\u2502{R} {right}\033[K\n")
-
-            # Scroll indicator at bottom of right pane
-            if has_more:
-                ind_row = sep_row - 1
-                if ind_row > content_start:
-                    ind_text = f"{D}\u2500\u2500\u25bc\u2500\u2500{R}"
-                    ind_col = left_w + 3 + max(0, (right_w - 5) // 2)
-                    sys.stdout.write(f"\033[{ind_row};{ind_col}H{ind_text}")
-
-        # ── BOTTOM: Status bar (pinned) ──
-        self._move_to(sep_row)
-        print(f"{D}{'─' * w}{R}", end="")
-        self._move_to(status_row)
-        self._render_status_bar()
-
-        sys.stdout.flush()
-
-    def show_status(self, message: str):
-        """Show a status message in the center (before steps are loaded)."""
-        self.status_message = message
-        self.render()
-        self._start_spinner(message)
-
-    def start_step(self, index: int, step_type: str = "?"):
-        self.current_step = index
-        self.steps[index]["status"] = "active"
-        self.steps[index]["type"] = step_type
-        self.steps[index]["info"] = []
-        # Preserve original start_time and accumulated tokens on retries
-        if "start_time" not in self.steps[index]:
-            self.steps[index]["start_time"] = _time.monotonic()
-        if "tokens" not in self.steps[index]:
-            self.steps[index]["tokens"] = {"sent": 0, "recv": 0}
-        self.render()
-
-    def step_info(self, index: int, message: str):
-        """Add a log line to the current step's display."""
-        self._stop_spinner()
-        if 0 <= index < len(self.steps):
-            info_list = self.steps[index].get("info", [])
-            if len(info_list) >= 5:
-                info_list.pop(0)
-            info_list.append(message)
-            self.steps[index]["info"] = info_list
-        self.render()
-        # Restart spinner for messages that indicate waiting
-        if any(kw in message.lower() for kw in (
-            "generating", "coding", "classifying", "reviewing",
-            "analyzing", "requesting", "running", "installing",
-            "re-planning", "retrying", "searching", "sending",
-            "resolving", "diagnosing", "fixing", "auto-fixing",
-            "pre-install", "building", "processing", "waiting",
-            "loading", "applying", "scoping",
-        )):
-            self._start_spinner(message)
-
-    def step_tokens(self, index: int, sent: int, recv: int):
-        """Update token counts for the active step."""
-        if 0 <= index < len(self.steps):
-            t = self.steps[index].get("tokens", {"sent": 0, "recv": 0})
-            t["sent"] += sent
-            t["recv"] += recv
-            self.steps[index]["tokens"] = t
-        self.render()
-
-    def complete_step(self, index: int, status: str = "done"):
-        """Mark step as done/failed/skipped."""
-        self._stop_spinner()
-        self.steps[index]["status"] = status
-        if "start_time" in self.steps[index]:
-            duration = _time.monotonic() - self.steps[index]["start_time"]
-            self.steps[index]["duration"] = duration
-        self.render()
-
-    def finish(self, success: bool = True):
-        """Render a full completion screen with header and centred report."""
-        self._stop_spinner()
-        self._refresh_size()
-        w = self.term_width
-        h = self.term_height
-        O = self.C_ORANGE; D = self.C_DIM; W = self.C_WHITE
-        G = self.C_GREEN; RED = self.C_RED; C = self.C_CYAN
-        Y = self.C_YELLOW; B = self.C_BOLD; R = self.C_RESET
-
-        # ── Clear and redraw header ──
-        os.system('cls' if os.name == 'nt' else 'clear')
-
-        brand_text = "Agent Chanti"
-        sub_text = "\u2501\u2501 Local Coder \u2501\u2501"
-
-        self._move_to(1)
-        print(f"{O}{'═' * w}{R}")
-        print(self._ansi_center(f"{O}{B}{brand_text}{R}"))
-        print(self._ansi_center(f"{D}{sub_text}{R}"))
-        print(f"{O}{'═' * w}{R}")
-
-        header_end = 4
-
-        # ── Build report lines ──
-        t = token_tracker
-        report_lines: list[str] = []
-
-        # Line 1: success / fail status
-        if success:
-            status_line = f"{G}✔  All tasks completed successfully!{R}"
-        else:
-            status_line = f"{RED}✘  Some tasks failed. Check logs for details.{R}"
-        report_lines.append(status_line)
-
-        # Blank spacer
-        report_lines.append("")
-
-        # Line 2+: token & cost summary
-        token_line = (
-            f"{D}Total Tokens:{R} {C}{t.total_tokens:,}{R}    "
-            f"{D}Input Tokens:{R} {W}{t.total_prompt_tokens:,}{R}    "
-            f"{D}Output Tokens:{R} {W}{t.total_completion_tokens:,}{R}"
-        )
-        report_lines.append(token_line)
-
-        if t.total_cost > 0:
-            cost_line = f"{D}Estimated Cost:{R} {G}${t.total_cost:.4f}{R}"
-            report_lines.append(cost_line)
-
-        # ── Centre the block vertically in the remaining space ──
-        avail = h - header_end - 2  # leave 2 rows margin at bottom
-        block_height = len(report_lines)
-        start_row = header_end #+ max((avail - block_height) // 2, 1)
-
-        for i, line in enumerate(report_lines):
-            self._move_to(start_row + i)
-            sys.stdout.write("\033[2K")  # clear line
-            sys.stdout.write(self._ansi_center(line))
-
-        # Park cursor below the block
-        self._move_to(start_row + block_height + 1)
-        sys.stdout.flush()
-
-    def budget_check(self, limit: float) -> bool:
-        """Check if total cost exceeds limit. Returns True if over budget."""
-        if limit > 0 and token_tracker.total_cost >= limit:
-            with self._render_lock:
-                self._move_to(self.term_height - 3)
-                RED = self.C_RED; R = self.C_RESET
-                msg = f"{RED}⚠  BUDGET EXCEEDED (${token_tracker.total_cost:.4f} >= ${limit:.2f})  ⚠{R}"
-                print(self._ansi_center(msg))
-            return True
-        return False
-
-    # ── Interactive prompts (temporarily exit full-screen mode) ──
-
-    def update_streaming_progress(self, step_idx: int, tokens: int):
-        """Throttled progress update during streaming (max every 0.5s)."""
-        now = _time.monotonic()
-        if now - self._last_stream_render < 0.5:
-            return
-        self._last_stream_render = now
-        self.step_info(step_idx, f"Generating... ({tokens} tokens)")
+    # ── Interactive prompts ───────────────────────────────────────────────────
 
     @staticmethod
     def prompt_plan_approval(steps: list[str],
                              use_tui: bool = False) -> tuple[str, list[int], list[str] | None]:
-        """Show numbered steps and ask user to approve, replan, or edit.
-
-        Returns ``(action, removed_indices, edited_steps)`` where *action*
-        is ``"approve"``, ``"replan"``, or ``"edit"``.
-
-        The TUI editor (Textual-based) is always available via [E]dit.
-        A system text editor fallback is also available via [T]ext.
-        """
         print("\n" + "=" * 60)
         print("  PROPOSED PLAN")
         print("=" * 60)
@@ -810,23 +885,19 @@ class CLIDisplay:
             elif choice in ("r", "replan"):
                 return "replan", [], None
             elif choice in ("e", "edit"):
-                # Launch the Textual TUI editor
                 try:
                     from .tui_editor import launch_tui_editor
                     edited = launch_tui_editor(steps)
                     if edited:
                         return "edit", [], edited
-                    # TUI cancelled — fall through
                     print("  Edit cancelled or no changes.")
                 except Exception as e:
                     print(f"  TUI editor failed ({e}). Try [T] for text editor.")
                     log.warning(f"TUI editor exception: {e}")
-                # Re-show the menu
                 print()
                 print("  [A]pprove  |  [R]eplan  |  [E]dit (TUI)  |  [T]ext editor")
                 print()
             elif choice in ("t", "text"):
-                # System text editor (vi/nano/notepad)
                 edited = CLIDisplay._edit_plan_in_editor(steps)
                 if edited:
                     return "edit", [], edited
@@ -837,39 +908,22 @@ class CLIDisplay:
 
     @staticmethod
     def _edit_plan_in_editor(steps: list[str]) -> list[str] | None:
-        """Write *steps* to a temp file, open a system editor, and return
-        the modified steps after the user saves and closes the editor.
-
-        Uses ``notepad`` on Windows and ``vi`` on other operating systems.
-        Returns ``None`` if the resulting file is empty.
-        """
-        # Build file content with numbered steps
         content = "# Edit the plan below. One step per line.\n"
         content += "# Lines starting with '#' are ignored.\n"
         content += "# You may add, remove, or reorder steps.\n\n"
         for i, step in enumerate(steps, 1):
             content += f"{i}. {step}\n"
 
-        # Write to a temp file
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", prefix="plan_", delete=False, encoding="utf-8"
         )
         try:
             tmp.write(content)
             tmp.close()
-
-            # Choose editor based on OS
-            if os.name == "nt":
-                editor = "notepad"
-            else:
-                editor = os.environ.get("EDITOR", "vi")
-
+            editor = "notepad" if os.name == "nt" else os.environ.get("EDITOR", "vi")
             print(f"\n  Opening plan in {editor}...")
             print("  Save and close the editor when done.\n")
-
             subprocess.call([editor, tmp.name])
-
-            # Read back the edited file
             with open(tmp.name, "r", encoding="utf-8") as f:
                 edited_content = f.read()
         finally:
@@ -878,26 +932,18 @@ class CLIDisplay:
             except OSError:
                 pass
 
-        # Parse edited content into step list
         edited_steps: list[str] = []
         for line in edited_content.splitlines():
             line = line.strip()
-            # Skip empty lines and comments
             if not line or line.startswith("#"):
                 continue
-            # Strip leading number + dot  (e.g. "1. Do something" -> "Do something")
             line = re.sub(r"^\d+\.\s*", "", line)
             if line:
                 edited_steps.append(line)
-
         return edited_steps if edited_steps else None
 
     @staticmethod
     def prompt_resume(checkpoint_state: dict) -> bool:
-        """Show checkpoint info and ask whether to resume.
-
-        Returns ``True`` to resume, ``False`` to start fresh.
-        """
         print("\n" + "=" * 60)
         print("  CHECKPOINT FOUND")
         print("=" * 60)
@@ -921,11 +967,6 @@ class CLIDisplay:
 
     @staticmethod
     def prompt_git_action(action: str) -> str:
-        """Ask user about a git action.
-
-        *action* is ``"complete"`` (task succeeded) or ``"failed"`` (task failed).
-        Returns ``"commit"``, ``"rollback"``, or ``"skip"``.
-        """
         print("\n" + "=" * 60)
         if action == "complete":
             print("  TASK COMPLETED — Git Options")

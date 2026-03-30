@@ -126,6 +126,8 @@ class Executor:
         never write files outside the project directory.
         Returns empty string for clearly invalid/placeholder paths.
         """
+        # Normalise Unicode look-alike characters before any other processing
+        raw = Executor._sanitize_unicode(raw)
         # Reject anything with newlines (multi-line capture mistake)
         name = raw.split('\n')[0].strip()
         # Strip trailing parenthetical descriptions: "file.py (main file)"
@@ -469,6 +471,9 @@ class Executor:
         'Pipfile', 'Pipfile.lock', 'poetry.lock',
         'requirements.txt',
         '.agentchanti.yaml', '.agentchanti.yml',
+        # Django / framework entry points — overwriting strips imports and
+        # the if __name__ == '__main__' guard, causing silent no-op execution
+        'manage.py', 'wsgi.py', 'asgi.py',
     }
 
     # Common mojibake patterns: UTF-8 bytes misinterpreted as Latin-1/cp1252.
@@ -589,14 +594,68 @@ class Executor:
                     init_dirs.add(d)
                     d = os.path.dirname(d)
 
-        # Auto-create missing __init__.py so directories are importable packages
+        # Auto-create missing __init__.py so directories are importable packages.
+        # Skip directories that are Django project roots (contain manage.py) —
+        # making the project root a Python package causes Django's test runner to
+        # import everything as <project>.app.* instead of app.*, breaking model
+        # app_label resolution and test discovery.
+        # Also skip asset directories (templates/, static/, media/) — they are
+        # never Python packages and adding __init__.py there breaks Django's
+        # template/static file loaders and can corrupt the import system.
+        _ASSET_DIR_RE = re.compile(
+            r'(?:^|[/\\])(?:templates|static|media|assets|public|dist|build)'
+            r'(?:[/\\]|$)',
+            re.IGNORECASE,
+        )
+        django_roots: set[str] = set()
+        for d in init_dirs:
+            if os.path.isfile(os.path.join(d, "manage.py")):
+                django_roots.add(d)
+
         for dirpath in sorted(init_dirs):
+            if _ASSET_DIR_RE.search(dirpath.replace(os.sep, "/")):
+                log.debug(
+                    f"[Executor] Skipping __init__.py for asset dir: {dirpath}/"
+                )
+                continue
+            if dirpath in django_roots:
+                log.debug(
+                    f"[Executor] Skipping __init__.py for Django project root: {dirpath}/"
+                )
+                continue
             init_path = os.path.join(dirpath, "__init__.py")
             if not os.path.exists(init_path):
                 with open(init_path, "w", encoding="utf-8") as f:
                     f.write("")
                 log.info(f"Auto-created: {init_path}")
                 written.append(init_path)
+
+            # Remove any same-named .py stub that would shadow the package.
+            # E.g. Django's `startapp` creates `tests.py`; if the agent later
+            # writes files under `tests/`, both `tests.py` and `tests/` exist in
+            # the same directory and Python's import system raises:
+            #   ImportError: 'tests' module incorrectly imported from '…/tests'
+            # Removing the stub (it is always empty or contains a comment only)
+            # resolves the conflict without any data loss.
+            pkg_name = os.path.basename(dirpath)
+            parent_dir = os.path.dirname(dirpath)
+            shadow_stub = os.path.join(parent_dir, pkg_name + ".py")
+            if os.path.isfile(shadow_stub):
+                try:
+                    with open(shadow_stub, encoding="utf-8") as _f:
+                        stub_content = _f.read().strip()
+                    # Only remove if the file is a placeholder (empty or pure comments)
+                    non_comment_lines = [
+                        ln for ln in stub_content.splitlines()
+                        if ln.strip() and not ln.strip().startswith("#")
+                    ]
+                    if not non_comment_lines:
+                        os.remove(shadow_stub)
+                        log.info(
+                            f"Removed stub {shadow_stub} — shadowed by package {dirpath}/"
+                        )
+                except OSError:
+                    pass
 
         return written
 
@@ -608,6 +667,42 @@ class Executor:
         'Write-Output', 'Out-File', 'Set-Content', 'Get-Command',
         'Get-Process', 'Stop-Process', 'Get-Service', 'Resolve-Path',
     )
+
+    # Unicode look-alikes that LLMs sometimes emit instead of plain ASCII.
+    # Maps each offending codepoint to its ASCII replacement.
+    _UNICODE_REPLACEMENTS: list[tuple[str, str]] = [
+        # Hyphens / dashes → ASCII hyphen-minus
+        ("\u2011", "-"),   # NON-BREAKING HYPHEN
+        ("\u2013", "-"),   # EN DASH
+        ("\u2014", "-"),   # EM DASH
+        ("\u2212", "-"),   # MINUS SIGN
+        ("\u00ad", "-"),   # SOFT HYPHEN
+        ("\ufe58", "-"),   # SMALL EM DASH
+        ("\ufe63", "-"),   # SMALL HYPHEN-MINUS
+        ("\uff0d", "-"),   # FULLWIDTH HYPHEN-MINUS
+        # Curly / typographic quotes → straight ASCII quotes
+        ("\u2018", "'"),   # LEFT SINGLE QUOTATION MARK
+        ("\u2019", "'"),   # RIGHT SINGLE QUOTATION MARK
+        ("\u201c", '"'),   # LEFT DOUBLE QUOTATION MARK
+        ("\u201d", '"'),   # RIGHT DOUBLE QUOTATION MARK
+        ("\u00b4", "'"),   # ACUTE ACCENT
+        ("\u2032", "'"),   # PRIME
+    ]
+
+    @staticmethod
+    def _sanitize_unicode(text: str) -> str:
+        """Replace Unicode look-alike characters with plain ASCII equivalents.
+
+        LLMs occasionally emit typographic hyphens (U+2011, U+2013, U+2014)
+        or curly quotes instead of their ASCII counterparts.  On Windows this
+        creates directories / filenames with invisible Unicode characters that
+        differ from what the plan expected (the ``responsive‑web‑page`` vs
+        ``responsive-web-page`` problem).
+        """
+        for unicode_char, ascii_char in Executor._UNICODE_REPLACEMENTS:
+            if unicode_char in text:
+                text = text.replace(unicode_char, ascii_char)
+        return text
 
     @staticmethod
     def _needs_powershell(cmd: str) -> bool:
@@ -653,6 +748,22 @@ class Executor:
             r'\bng\s+new\b', r'\bexpo\s+init\b', r'\bcomposer\s+create-project\b',
         )
         return any(re.search(p, cmd) for p in patterns)
+
+    # ── POSIX shell compatibility rewrites ──
+
+    @staticmethod
+    def _rewrite_for_posix_sh(cmd: str) -> str:
+        """Rewrite bash-specific constructs so they work under /bin/sh.
+
+        subprocess uses /bin/sh by default on POSIX systems.  ``source`` is a
+        bash builtin and not available in sh; replace it with ``.`` which is
+        the POSIX-standard equivalent.
+        """
+        # Replace `source <path>` with `. <path>` (handles leading spaces/&&)
+        rewritten = re.sub(r'(?<![.\w])source\s+', '. ', cmd)
+        if rewritten != cmd:
+            log.info("[Executor] Rewrote 'source' → '.' for /bin/sh compatibility")
+        return rewritten
 
     # ── Unix → Windows command translation ──
 
@@ -789,8 +900,13 @@ class Executor:
         current working directory.
         """
         try:
+            cmd = Executor._sanitize_unicode(cmd)
             log.info(f"[Executor] Running {'background ' if background else ''}command: {cmd}"
                      f"{f' (cwd={cwd})' if cwd else ''}")
+            # Fix bash-only constructs (source → .) so /bin/sh can run them
+            if os.name != 'nt':
+                cmd = Executor._rewrite_for_posix_sh(cmd)
+
             # Translate Unix commands to Windows cmd.exe equivalents
             if os.name == 'nt':
                 cmd = Executor._rewrite_unix_cmd_for_windows(cmd)

@@ -16,6 +16,7 @@ _DEFAULTS = {
     "model": "deepseek-coder-v2-lite-instruct",
     "context_window": 8192,
     "embedding_model": "nomic-embed-text",
+    "embedding_provider": None,  # if set, overrides 'provider' for KB embeddings only
     "embedding_top_k": 5,
     "stream": True,
     "llm_max_retries": 3,
@@ -66,7 +67,7 @@ _DEFAULTS = {
     "editing_max_chunk_files": 3,
     "review_mode": "static",
     "dependency_check_enabled": True,
-    "analyser_enabled": True,
+    "analyser_enabled": False,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -156,6 +157,8 @@ class Config:
                                    _DEFAULTS["context_window"], cast=int)
         self.EMBEDDING_MODEL = _get("EMBEDDING_MODEL", "embedding_model",
                                     _DEFAULTS["embedding_model"])
+        self.EMBEDDING_PROVIDER = _get("EMBEDDING_PROVIDER", "embedding_provider",
+                                       _DEFAULTS["embedding_provider"]) or None
         self.EMBEDDING_TOP_K = _get("EMBEDDING_TOP_K", "embedding_top_k",
                                     _DEFAULTS["embedding_top_k"], cast=int)
 
@@ -398,6 +401,7 @@ class Config:
             "model": self.DEFAULT_MODEL,
             "context_window": self.CONTEXT_WINDOW,
             "embedding_model": self.EMBEDDING_MODEL,
+            "embedding_provider": self.EMBEDDING_PROVIDER,
             "embedding_top_k": self.EMBEDDING_TOP_K,
             "stream": self.STREAM_RESPONSES,
             "llm_max_retries": self.LLM_MAX_RETRIES,

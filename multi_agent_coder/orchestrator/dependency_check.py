@@ -15,6 +15,57 @@ from dataclasses import dataclass, field
 
 _logger = logging.getLogger(__name__)
 
+
+def clean_diff_markers(content: str) -> str:
+    """Strip pseudo-diff +/- markers from LLM output that should be clean code.
+
+    Local LLMs sometimes emit a diff-style response (lines prefixed with ``+``
+    for additions and ``-`` for removals) instead of complete file content.
+    This function detects that pattern and reconstructs clean source code:
+    - Lines starting with ``+`` (single, not ``++`` or ``+++``) → strip the ``+``
+    - Lines starting with ``-`` (single, not ``--`` or ``---``) → removed, skip
+    - Diff headers (``+++``, ``---``, ``@@``) → skip
+    - All other lines → kept as-is (context lines)
+
+    Only activates when >5% of non-empty lines carry diff markers to avoid
+    false positives on legitimate code that starts a line with ``+`` or ``-``.
+    """
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return content
+
+    non_empty = [l for l in lines if l.strip()]
+    if not non_empty:
+        return content
+
+    plus_count = sum(
+        1 for l in non_empty
+        if l.startswith("+") and not l.startswith("+++")
+    )
+    minus_count = sum(
+        1 for l in non_empty
+        if l.startswith("-") and not l.startswith("---")
+    )
+    diff_count = plus_count + minus_count
+    if diff_count == 0 or diff_count / len(non_empty) < 0.05:
+        return content
+
+    result: list[str] = []
+    for line in lines:
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue  # diff headers
+        elif line.startswith("+") and not line.startswith("++"):
+            result.append(line[1:])  # strip leading +
+        elif line.startswith("-") and not line.startswith("--"):
+            pass  # skip removed lines
+        else:
+            result.append(line)  # context line — keep as-is
+    cleaned = "".join(result)
+    _logger.debug("[clean_diff_markers] Stripped diff markers from content (%d→%d chars)",
+                  len(content), len(cleaned))
+    return cleaned
+
+
 # ── Extension → language family mapping ──────────────────────────
 
 _EXT_TO_LANG_FAMILY: dict[str, str] = {
@@ -737,6 +788,58 @@ def _guess_parent_file(
     return None
 
 
+def _llm_guess_parent_file(
+    new_file: str,
+    exported_symbols: list[str],
+    memory_files: dict[str, str],
+    llm_client,
+) -> str | None:
+    """Use a tiny LLM call to identify which file should import *new_file*.
+
+    Only called when both the plan map and the heuristic return ``None``.
+    Keeps the prompt minimal so even small models can answer reliably.
+    Returns a validated file path from *memory_files*, or ``None``.
+    """
+    # Exclude test files and the file itself from candidates
+    candidates = [
+        f for f in sorted(memory_files.keys())
+        if f != new_file and not _is_test_file(f)
+    ]
+    if not candidates:
+        return None
+
+    file_list = "\n".join(f"- {f}" for f in candidates)
+    sym_str = ", ".join(exported_symbols) if exported_symbols else os.path.basename(new_file)
+    prompt = (
+        f"Task: identify which file should import a new module.\n\n"
+        f"New file: {new_file}\n"
+        f"Exports: {sym_str}\n\n"
+        f"Existing project files:\n{file_list}\n\n"
+        f"Which ONE file from the list above should import '{os.path.basename(new_file)}'?\n"
+        f"Reply with ONLY the exact file path. No explanation."
+    )
+    try:
+        response = llm_client.generate_response(prompt).strip().strip("'\"` \n")
+        # Exact match
+        if response in memory_files:
+            return response
+        # Case-insensitive match
+        response_lower = response.lower()
+        for fpath in memory_files:
+            if fpath.lower() == response_lower:
+                return fpath
+        # Basename match as last resort
+        resp_base = os.path.basename(response).lower()
+        for fpath in memory_files:
+            if os.path.basename(fpath).lower() == resp_base:
+                return fpath
+        _logger.debug("[DepCheck] LLM parent guess '%s' not in project files", response)
+        return None
+    except Exception as exc:
+        _logger.debug("[DepCheck] LLM parent guess failed: %s", exc)
+        return None
+
+
 def _find_file_by_name(name: str, memory_files: dict[str, str]) -> str | None:
     """Find a file in memory whose stem matches *name* (case-insensitive)."""
     name_lower = name.lower()
@@ -755,6 +858,7 @@ def find_gaps(
     new_files: list[str],
     step_text: str,
     memory_files: dict[str, str],
+    plan_imported_by: dict[str, str] | None = None,
 ) -> list[IntegrationGap]:
     """Compare before/after snapshots to detect integration gaps.
 
@@ -804,7 +908,19 @@ def find_gaps(
                 break
 
         if not is_imported and len(after.file_deps) > 1:
-            likely_parent = _guess_parent_file(nf, step_text, memory_files)
+            # Priority order: plan declaration > heuristic (LLM fallback in caller)
+            nf_norm = nf.replace("\\", "/")
+            plan_parent = (plan_imported_by or {}).get(nf_norm)
+            if plan_parent is None:
+                # Also try basename match for plan map (sub-project path differences)
+                nf_base = os.path.basename(nf_norm)
+                for k, v in (plan_imported_by or {}).items():
+                    if os.path.basename(k) == nf_base:
+                        plan_parent = v
+                        break
+            likely_parent = plan_parent or _guess_parent_file(nf, step_text, memory_files)
+            if plan_parent:
+                _logger.debug("[DepCheck] Plan-declared parent for '%s': %s", nf, plan_parent)
             gaps.append(IntegrationGap(
                 gap_type="orphaned_export",
                 source_file=nf,
@@ -1053,6 +1169,7 @@ def run_dependency_check(
     display,
     language: str | None,
     cfg=None,
+    all_plan_steps=None,
 ) -> dict[str, str]:
     """Run post-step dependency validation and return fixes.
 
@@ -1073,10 +1190,30 @@ def run_dependency_check(
     if not new_files:
         return {}
 
+    # Build the set of all files this session plans to create (from plan steps).
+    # These are treated as "session files" even if not yet written to memory.
+    session_files: set[str] = set(memory_files.keys())
+    # Build plan_imported_by map: source_file → consumer_file (first declared wins)
+    # Uses PlanStep.imported_by which is auto-derived from imports_from relationships
+    # plus any explicit imported_by: lines the planner wrote.
+    plan_imported_by: dict[str, str] = {}
+    if all_plan_steps:
+        for ps in all_plan_steps:
+            for tf in (ps.target_files or []):
+                session_files.add(tf.replace("\\", "/"))
+            for consumer_file in (ps.imported_by or []):
+                for tf in (ps.target_files or []):
+                    norm_tf = tf.replace("\\", "/")
+                    if norm_tf not in plan_imported_by:
+                        plan_imported_by[norm_tf] = consumer_file
+
     # Detect gaps
     display.step_info(step_idx, "[DepCheck] Scanning dependencies...")
     try:
-        gaps = find_gaps(dep_before, dep_after, new_files, step_text, memory_files)
+        gaps = find_gaps(
+            dep_before, dep_after, new_files, step_text, memory_files,
+            plan_imported_by=plan_imported_by or None,
+        )
     except Exception as exc:
         _logger.warning("[DepCheck] Gap detection failed: %s", exc)
         return {}
@@ -1085,6 +1222,19 @@ def run_dependency_check(
         _logger.debug("[DepCheck] No integration gaps for step %d", step_idx + 1)
         display.step_info(step_idx, "[DepCheck] All dependencies connected.")
         return {}
+
+    # LLM fallback: for orphaned exports where both plan and heuristic returned None,
+    # make a small targeted LLM call to identify the correct parent file.
+    for gap in gaps:
+        if gap.gap_type == "orphaned_export" and gap.target_file is None:
+            _logger.debug("[DepCheck] Heuristic failed for '%s', trying LLM parent guess", gap.source_file)
+            nf_deps = dep_after.file_deps.get(gap.source_file)
+            symbols = nf_deps.exports[:5] if nf_deps else []
+            guessed = _llm_guess_parent_file(gap.source_file, symbols, memory_files, llm_client)
+            if guessed:
+                _logger.info("[DepCheck] LLM identified parent '%s' for '%s'", guessed, gap.source_file)
+                gap.target_file = guessed
+                gap.description += f" LLM-identified parent: '{guessed}'."
 
     # Report gaps
     display.step_info(
@@ -1115,25 +1265,71 @@ def run_dependency_check(
         display.step_info(step_idx, "[DepCheck] No parseable fixes in response")
         return {}
 
-    # Validate: only accept files relevant to the gaps
+    # Validate: only accept files relevant to the gaps.
+    # Three tiers:
+    #   1. Gap source/target files — always accepted
+    #   2. Session files (plan target_files + memory) — always accepted
+    #   3. Wiring files for watcher-created sources — if the runtime watcher
+    #      saw a gap source file being CREATED (not just modified) this session,
+    #      allow the dep-check to propose a new wiring file (e.g. App.jsx) in
+    #      the same project root, as long as the agent hasn't written it yet
     relevant_files: set[str] = set()
+    project_roots: set[str] = set()
     for gap in gaps:
         relevant_files.add(gap.source_file)
         if gap.target_file:
             relevant_files.add(gap.target_file)
+        root = gap.source_file.replace("\\", "/").split("/")[0]
+        if root:
+            project_roots.add(root)
+
+    # Files the runtime watcher saw being CREATED on disk this session
+    watcher_created: set[str] = getattr(memory, "watcher_created_files", set()) or set()
+    # Allow wiring files only when at least one orphaned-export source was
+    # freshly created by the agent (not just modified).
+    has_watcher_created_sources = any(
+        gap.gap_type == "orphaned_export" and any(
+            gap.source_file.replace("\\", "/").endswith(wf)
+            or wf.endswith(os.path.basename(gap.source_file))
+            for wf in watcher_created
+        )
+        for gap in gaps
+    )
 
     validated: dict[str, str] = {}
     for fpath, content in fix_files.items():
         matched = fpath
+        norm_matched = fpath.replace("\\", "/")
         if fpath not in memory_files:
             for known in memory_files:
                 if known.endswith(fpath) or fpath.endswith(os.path.basename(known)):
                     matched = known
+                    norm_matched = matched.replace("\\", "/")
                     break
-        if matched in relevant_files or matched in memory_files:
+        # Tier 1: gap source/target
+        if matched in relevant_files:
             validated[matched] = content
+            continue
+        # Tier 2: planned session file
+        is_session_file = norm_matched in session_files or any(
+            sf.endswith("/" + norm_matched) or norm_matched.endswith("/" + sf)
+            for sf in session_files
+        )
+        if is_session_file:
+            validated[matched] = content
+            _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            continue
+        # Tier 3: wiring file for watcher-created sources
+        in_project = any(norm_matched.startswith(root + "/") for root in project_roots)
+        not_yet_written = matched not in memory_files
+        if has_watcher_created_sources and in_project and not_yet_written:
+            validated[matched] = content
+            _logger.debug("[DepCheck] Accepted new wiring file from fix: %s", fpath)
         else:
             _logger.warning("[DepCheck] Ignoring unexpected file in fix: %s", fpath)
+
+    # Clean any pseudo-diff markers the LLM may have emitted
+    validated = {path: clean_diff_markers(content) for path, content in validated.items()}
 
     if validated:
         _logger.info("[DepCheck] Generated fixes for %d file(s)", len(validated))

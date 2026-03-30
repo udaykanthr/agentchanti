@@ -890,6 +890,11 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
 
     Returns the subdirectory name (e.g. ``my-app``) or ``None``.
     """
+    # ── Fast path: a prior scaffold CMD already identified the subproject ──
+    scaffolded = getattr(memory, '_scaffolded_subproject', None)
+    if scaffolded and os.path.isdir(scaffolded):
+        return scaffolded
+
     all_files = memory.all_files()
 
     # ── Fallback 0: Parse CMD outputs for project-creation commands ──
@@ -916,8 +921,10 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         re.compile(r'rails\s+new\s+(\S+)'),
         # cargo new <dir>
         re.compile(r'cargo\s+new\s+(\S+)'),
-        # django-admin startproject <dir>
-        re.compile(r'django-admin\s+startproject\s+(\S+)'),
+        # mkdir <dir> && ... django  (Django scaffold creates dir separately)
+        re.compile(r'mkdir\s+(-p\s+)?(\S+)\s*&&.*django'),
+        # django-admin startproject <name> <dir>  (explicit target dir)
+        re.compile(r'django-admin\s+startproject\s+\S+\s+(\S+)'),
     ]
 
     for fpath, content in all_files.items():
@@ -928,7 +935,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         for pattern in _PROJECT_CREATE_PATTERNS:
             m = pattern.search(first_line)
             if m:
-                candidate = m.group(1).strip().rstrip('/')
+                candidate = m.group(m.lastindex).strip().rstrip('/')
                 # Skip if the command used ./ (current directory)
                 if candidate in ('.', './', ''):
                     continue
@@ -957,6 +964,36 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         if not p.startswith(_internal) and '/' in p
     ]
     if not source_paths:
+        log.debug(
+            "[SubProject] No source files in memory — "
+            "Fallback 0 did not detect a scaffold cmd. "
+            "Memory keys: %s",
+            list(all_files.keys())[:10],
+        )
+        # Last-resort: scan immediate subdirectories on disk for project
+        # manifests. Catches Django projects created with:
+        #   mkdir <dir> && cd <dir> && django-admin startproject config .
+        # where the CMD pattern couldn't extract the directory name.
+        _fs_manifests = (
+            'manage.py', 'package.json', 'requirements.txt',
+            'go.mod', 'Cargo.toml', 'Gemfile', 'pyproject.toml',
+        )
+        try:
+            for _entry in sorted(os.scandir('.'), key=lambda e: e.name):
+                if not _entry.is_dir() or _entry.name.startswith('.'):
+                    continue
+                if _entry.name in _internal:
+                    continue
+                for _manifest in _fs_manifests:
+                    if os.path.isfile(os.path.join(_entry.name, _manifest)):
+                        log.info(
+                            "[SubProject] Detected sub-project root via "
+                            "filesystem scan (%s): %s/",
+                            _manifest, _entry.name,
+                        )
+                        return _entry.name
+        except OSError:
+            pass
         return None
 
     # Directories that are NOT sub-project roots — they are conventional
@@ -1096,8 +1133,23 @@ def _prefix_subproject_paths(files: dict[str, str],
             corrected[fpath] = content
             continue
 
-        # Already a known file in memory (exact match) — don't touch
+        # Already a known file in memory (exact match) — fpath does NOT
+        # start with prefix (that case was caught above).
         if fpath in known_paths:
+            # Tracked without the subproject prefix — check if the
+            # prefixed version exists in memory or on disk.  If so,
+            # the LLM wrote to the wrong (root-level) path in a
+            # previous step; redirect this write and clean up the stale
+            # memory entry so it no longer pollutes context.
+            new_path = prefix + fpath
+            if new_path in known_paths or os.path.isfile(new_path):
+                log.warning(f"[SubProject] Redirected stale root-level path: "
+                            f"'{fpath}' → '{new_path}'")
+                corrected[new_path] = content
+                memory.delete(fpath)
+                continue
+            # Legitimately at the project root (e.g. README.md written
+            # before the scaffold CMD ran) — leave unchanged.
             corrected[fpath] = content
             continue
 
@@ -1210,6 +1262,11 @@ def _make_cmd_idempotent(
     if m:
         venv_dir = m.group(1)
         if os.path.isdir(os.path.join(root, venv_dir)):
+            # Strip just the venv creation segment; keep the rest of a && chain
+            segments = [s.strip() for s in stripped.split('&&')]
+            remaining = [s for s in segments if not re.match(r'^python3?\s+-m\s+venv\s+', s)]
+            if remaining:
+                return ' && '.join(remaining), f"virtualenv '{venv_dir}' already exists, skipping creation"
             return None, f"virtualenv '{venv_dir}' already exists, skipping creation"
         return cmd, ""
 
@@ -1218,6 +1275,18 @@ def _make_cmd_idempotent(
         if os.path.isdir(os.path.join(root, ".git")):
             return None, "git repository already initialised"
         return cmd, ""
+
+    # ── mkdir / mkdir -p ──
+    # executor.write_files() calls os.makedirs(..., exist_ok=True) for every
+    # file it writes, so explicit mkdir steps are always redundant.  Skipping
+    # them also avoids Windows cmd.exe treating forward-slash paths (e.g.
+    # `mkdir src/components`) as invalid option flags.
+    # Handles compound commands like `cd myapp && mkdir src/components` by
+    # checking that every non-cd segment is a mkdir.
+    _segments = [s.strip() for s in stripped.split('&&')]
+    _non_cd = [s for s in _segments if not re.match(r'^cd\s+', s, re.IGNORECASE)]
+    if _non_cd and all(re.match(r'^mkdir\b', s, re.IGNORECASE) for s in _non_cd):
+        return None, "mkdir skipped — parent directories are created automatically on file write"
 
     # ── pip install <packages> ──
     m = re.match(
@@ -1596,7 +1665,12 @@ def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
 
         sent_before, recv_before = token_tracker.snapshot()
 
-        fix_response = coder.process(fix_prompt, context="", language=language)
+        _hazard_briefing = getattr(memory, '_task_briefing', '')
+        _hazard_context = (
+            "TASK BRIEFING (the overall goal — do not lose features listed under Preserve):\n"
+            f"{_hazard_briefing}\n"
+        ) if _hazard_briefing else ""
+        fix_response = coder.process(fix_prompt, context=_hazard_context, language=language)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before
@@ -2371,6 +2445,86 @@ def _auto_install_code_imports(
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
+def _parse_test_counts(output: str) -> tuple[int, int, list[dict]]:
+    """Parse test runner output into (passed, total, failures).
+
+    Works with pytest, Jest, Vitest, Go test, RSpec, and generic patterns.
+    *failures* is a list of ``{"name": str, "message": str}`` dicts (max 5).
+    """
+    if not output:
+        return 1, 1, []
+    clean = _ANSI_RE.sub('', output)
+
+    passed = failed = 0
+
+    # ── Jest / Vitest: "Tests: 5 failed, 3 passed, 8 total" ──
+    m = re.search(r'Tests:\s*(?:(\d+)\s+failed,\s*)?(\d+)\s+passed', clean)
+    if m:
+        failed = int(m.group(1) or 0)
+        passed = int(m.group(2))
+        total  = passed + failed
+        if total:
+            return passed, total, _extract_failure_names(clean)
+
+    # ── pytest: "3 passed, 2 failed" or "5 passed" ──
+    m_p = re.search(r'(\d+)\s+passed', clean)
+    m_f = re.search(r'(\d+)\s+failed', clean)
+    if m_p or m_f:
+        passed = int(m_p.group(1)) if m_p else 0
+        failed = int(m_f.group(1)) if m_f else 0
+        total  = passed + failed
+        if total:
+            return passed, total, _extract_failure_names(clean) if failed else []
+
+    # ── Vitest summary: "5 | 3 passed (8)" ──
+    m = re.search(r'(\d+)\s+passed\s*\((\d+)\)', clean)
+    if m:
+        passed = int(m.group(1))
+        total  = int(m.group(2))
+        failed = total - passed
+        return passed, total, _extract_failure_names(clean) if failed else []
+
+    # ── Go test: count PASS/FAIL lines ──
+    pass_count = len(re.findall(r'--- PASS:', clean))
+    fail_count = len(re.findall(r'--- FAIL:', clean))
+    if pass_count or fail_count:
+        return pass_count, pass_count + fail_count, _extract_failure_names(clean)
+
+    # ── RSpec: "5 examples, 2 failures" ──
+    m = re.search(r'(\d+)\s+example[s]?,\s*(\d+)\s+failure', clean)
+    if m:
+        total  = int(m.group(1))
+        failed = int(m.group(2))
+        return total - failed, total, _extract_failure_names(clean)
+
+    # ── Fallback: overall pass/fail ──
+    overall_pass = not re.search(r'\bFAIL\b|\bFAILED\b', clean, re.IGNORECASE)
+    return (1, 1, []) if overall_pass else (0, 1, _extract_failure_names(clean))
+
+
+def _extract_failure_names(clean: str) -> list[dict]:
+    """Pull up to 5 individual failing test names from stripped test output."""
+    names: list[dict] = []
+    _PATTERNS = [
+        re.compile(r'FAILED\s+([\w/:. -]+)'),          # pytest
+        re.compile(r'×\s+([\w/:. -]+)'),               # Vitest ×
+        re.compile(r'✕\s+([\w/:. -]+)'),               # Jest ✕
+        re.compile(r'✗\s+([\w/:. -]+)'),               # generic
+        re.compile(r'--- FAIL:\s+([\w/.]+)'),           # Go
+        re.compile(r'it\s+[\'"](.+?)[\'"].*failed'),   # Mocha/Jest
+    ]
+    seen: set[str] = set()
+    for pat in _PATTERNS:
+        for m in pat.finditer(clean):
+            name = m.group(1).strip()[:60]
+            if name and name not in seen:
+                seen.add(name)
+                names.append({"name": name, "message": ""})
+                if len(names) >= 5:
+                    return names
+    return names
+
+
 def _extract_test_error(output: str, max_chars: int = 1500) -> str:
     """Extract actionable error info from verbose test runner output.
 
@@ -2555,6 +2709,19 @@ def _build_scoped_test_cmd(
     if "go test" in base_lower:
         # Go test uses package paths, not file paths — skip scoping
         return base_cmd
+
+    # Django's manage.py test requires dotted module names, not file paths.
+    # Convert e.g. "tests/test_items_api.py" → "tests.test_items_api"
+    if "manage.py test" in base_lower:
+        dotted: list[str] = []
+        for p in scoped_paths:
+            # strip leading ./
+            while p.startswith("./") or p.startswith(".\\"):
+                p = p[2:]
+            if p.endswith(".py"):
+                p = p[:-3]
+            dotted.append(p.replace("/", ".").replace("\\", "."))
+        return f"{base_cmd} {' '.join(dotted)}"
 
     # For all other runners, append file paths
     path_args = " ".join(scoped_paths)
@@ -2870,7 +3037,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       project_context=None,
                       plan_step=None,
                       all_plan_steps=None,
-                      kb_context_builder=None) -> tuple[bool, str]:
+                      kb_context_builder=None,
+                      partial_inline_code: dict[str, str] | None = None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -2882,16 +3050,25 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             subproject_cwd=subproject_cwd, language=language,
         )
 
-    # Pre-fetch behavioral instructions for JS/TS code generation.
-    # Vector search may miss the React export-default doc, so fetch explicitly.
+    # Pre-fetch KB docs for code generation — scoped to behavioral +
+    # doc categories only (no patterns/ADRs) and filtered by relevance
+    # to the specific step description so that unrelated docs (e.g. test
+    # generation instructions for a CSS step) are excluded.
     _code_behavioral_ctx = ""
-    if language in ("javascript", "typescript") and kb_context_builder is not None:
+    if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component export default jsx tsx generate modify",
+                _step_query = (
+                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                    or step_text.split("\n")[0].strip()
+                )
+                _beh_results = _gstore.search(
+                    query=_step_query,
+                    categories=["behavioral", "doc"],
+                    top_k=4,
                     api_client=getattr(kb_context_builder, '_api_client', None),
+                    language=language,
                 )
                 if _beh_results:
                     _beh_parts = []
@@ -2901,7 +3078,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                             _beh_parts.append(content)
                     if _beh_parts:
                         _code_behavioral_ctx = (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            "\n[KB INSTRUCTIONS]\n"
                             + "\n".join(_beh_parts) + "\n"
                         )
         except Exception:
@@ -2915,8 +3092,22 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         _targets_hint = " ".join(plan_step.target_files)
         _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
 
-    # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
+    # Detect primary target file to see if we should force DiffEdit for non-AST
+    target_for_route = _detect_target_file(_edit_step_text, memory)
+    is_non_ast = False
+    if target_for_route:
+        ext = os.path.splitext(target_for_route)[1].lower()
+        if ext in {".html", ".css", ".scss", ".json", ".yaml", ".yml", ".md", ".txt"}:
+            is_non_ast = True
+
+    # --- Tier 1: Diff-aware editing ---
+    try_diff = False
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
+        try_diff = True
+    if is_non_ast:
+        try_diff = True
+
+    if try_diff:
         diff_result = _try_diff_edit(
             step_text=_edit_step_text, coder=coder, task=task,
             memory=memory, display=display, step_idx=step_idx,
@@ -2927,7 +3118,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             return diff_result
 
     # --- Tier 2: Chunk edit (regex-based, no KB graph needed) ---
-    if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True):
+    if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True) and not is_non_ast:
         chunk_result = _try_chunk_edit(
             step_text=_edit_step_text, coder=coder, reviewer=reviewer,
             executor=executor, task=task, memory=memory,
@@ -2936,6 +3127,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             project_profile=project_profile,
             project_context=project_context,
             kb_context_builder=kb_context_builder,
+            behavioral_ctx=_code_behavioral_ctx,
         )
         if chunk_result is not None:
             return chunk_result
@@ -2966,23 +3158,50 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             coder_analysis = project_context.format_for_coder()
             if coder_analysis:
                 context_prefix = coder_analysis + "\n\n"
-        if project_profile is not None:
+        kb_ctx = getattr(memory, '_kb_context', '')
+        if kb_ctx:
+            context_prefix += kb_ctx + "\n\n"
+        elif project_profile is not None:
+            # Only inject profile directly when it wasn't already included in
+            # _kb_context (pipeline.py always puts the profile there first).
             try:
                 context_prefix += project_profile.format_for_prompt() + "\n\n"
             except Exception:
                 pass
-        kb_ctx = getattr(memory, '_kb_context', '')
-        if kb_ctx:
-            context_prefix += kb_ctx + "\n\n"
         # Inject explicitly-fetched behavioral instructions for JS/TS
         # ONLY when batch_search didn't already include them (trimmed or
         # missed by vector search).  This avoids bloating the prompt and
         # ensures framework/library docs keep their higher priority.
         if (_code_behavioral_ctx
-                and "[BEHAVIORAL INSTRUCTIONS]" not in context_prefix):
+                and "[BEHAVIORAL INSTRUCTIONS]" not in context_prefix
+                and "[KB INSTRUCTIONS]" not in context_prefix):
             context_prefix += _code_behavioral_ctx + "\n\n"
 
+        # Inject task briefing (Preserve / Key constraint / Agent directive)
+        # so the coder never accidentally removes features or breaks contracts.
+        _task_briefing = getattr(memory, '_task_briefing', '')
+        if _task_briefing:
+            context_prefix += (
+                "TASK BRIEFING — follow the Preserve and Key constraint lines exactly:\n"
+                f"{_task_briefing}\n\n"
+            )
+
         context = context_prefix + f"Task: {task}"
+
+        # ── Partial inline code hint (truncation recovery) ──
+        # When the planner's inline code was cut off by a token limit,
+        # inject the partial content so the coder completes rather than
+        # regenerates the entire file from scratch.
+        if partial_inline_code:
+            _partial_hint = "\n\n[PARTIAL CODE — the planner started writing this; " \
+                            "complete it without restarting from scratch]\n"
+            for _ph_path, _ph_content in partial_inline_code.items():
+                _partial_hint += (
+                    f"\n#### [FILE]: {_ph_path}\n"
+                    f"```\n{_ph_content}\n```\n"
+                    f"^ This file is INCOMPLETE — output the full completed version.\n"
+                )
+            context += _partial_hint
 
         # ── Target file enforcement (full-file tier) ──
         # Explicitly tell the LLM which file to modify so it doesn't
@@ -3006,14 +3225,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             for fpath, content in plan_ctx.items():
                 context += f"\n\n#### [FILE]: {fpath}\n```\n{content}\n```"
             # Slim skeletons for other files in memory (so LLM knows what exists)
-            from .memory import _extract_file_skeleton
+            # Uses cached skeletons — avoids re-running regex on every retry.
             slim_parts: list[str] = []
             for fpath, content in memory.all_files().items():
                 if fpath in plan_ctx:
                     continue
                 if fpath.startswith(('_cmd_output/', '_fix_output/', '_search_context/')):
                     continue
-                skeleton = _extract_file_skeleton(content, fpath)
+                skeleton = memory.get_skeleton(fpath, content)
                 if skeleton:
                     slim_parts.append(skeleton)
                 else:
@@ -3216,6 +3435,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             log.info(f"Step {step_idx+1}: Static review passed (lint + imports OK)")
             return True, ""
 
+        # Skip LLM review if all files were already correct (coder produced no
+        # actual diffs). The reviewer would incorrectly FAIL on "no changes"
+        # even when the file already satisfies the task requirements.
+        if use_diff_review and "```diff" not in review_ctx:
+            display.step_info(step_idx, "File(s) already correct, no review needed ✔")
+            log.info(f"Step {step_idx+1}: Skipped LLM review — file(s) already correct")
+            return True, ""
+
         # Full LLM review path (review_mode == "full")
         display.step_info(step_idx, "Reviewing code...")
         sent_before, recv_before = token_tracker.snapshot()
@@ -3240,6 +3467,15 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                     "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
                     + "\n".join(f"- {c}" for c in criteria)
                 )
+
+        # Inject task briefing so the reviewer can catch regressions against
+        # the Preserve list (e.g. a feature accidentally removed by the coder).
+        _reviewer_briefing = getattr(memory, '_task_briefing', '')
+        if _reviewer_briefing:
+            criteria_ctx += (
+                "\n\nTASK BRIEFING — flag as FAIL if any Preserve item was broken:\n"
+                f"{_reviewer_briefing}"
+            )
 
         use_diff_review = cfg and getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True)
         if use_diff_review:
@@ -3782,6 +4018,17 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")
     test_cmd = fw["command"]
 
+    # Django project detection: manage.py test is the canonical runner for Django.
+    # It handles test DB setup/teardown and settings without requiring pytest.
+    if (language == "python" or not language) and os.path.isfile(
+        os.path.join(subproject_cwd, "manage.py")
+    ):
+        test_cmd = "python manage.py test"
+        log.info(
+            f"Step {step_idx+1}: Django project detected (manage.py present) "
+            f"— overriding test command to 'python manage.py test'"
+        )
+
     # Ensure the test runner binary is installed before attempting to run tests
     parts = test_cmd.split()
     runner = parts[0]
@@ -3985,21 +4232,40 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         step_idx=step_idx,
     )
 
+    # ── Skip test generation when all tests already pass ──
+    # If the baseline run succeeded (all tests green) and there are no
+    # new source files tracked in memory (i.e. this is a pure verification
+    # step, not a code-then-test step), skip the TesterAgent entirely and
+    # just run the test suite directly.
+    if getattr(memory, '_tester_baseline_success', False) and not memory.all_files():
+        display.step_info(step_idx, "All tests already passing — running suite directly (skipping generation).")
+        log.info(f"Step {step_idx+1}: Baseline passed and no new source files — skipping test generation.")
+        ok, out = executor.run_tests(test_cmd, cwd=subproject_cwd)
+        return ok, out
+
     feedback = ""
     last_test_output = ""
     prev_gen_error = None  # Track errors across gen attempts for early exit
     prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
-    # Pre-fetch behavioral instructions for JS/TS test generation.
-    # Vector search may miss these, so fetch them explicitly once.
+    # Pre-fetch KB docs for test generation — scoped to behavioral +
+    # doc categories and filtered by relevance to the specific step
+    # description so unrelated docs are excluded.
     _behavioral_ctx = ""
-    if language in ("javascript", "typescript") and kb_context_builder is not None:
+    if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component test generation testing-library",
+                _step_query = (
+                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                    or step_text.split("\n")[0].strip()
+                )
+                _beh_results = _gstore.search(
+                    query=_step_query,
+                    categories=["behavioral", "doc"],
+                    top_k=4,
                     api_client=getattr(kb_context_builder, '_api_client', None),
+                    language=language,
                 )
                 if _beh_results:
                     _beh_parts = []
@@ -4009,7 +4275,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                             _beh_parts.append(content)
                     if _beh_parts:
                         _behavioral_ctx = (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
+                            "\n[KB INSTRUCTIONS]\n"
                             + "\n".join(_beh_parts) + "\n"
                         )
         except Exception:
@@ -4033,7 +4299,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # only when batch_search didn't already include them (avoids
         # bloating prompt; framework/library docs keep higher priority).
         if (_behavioral_ctx
-                and "[BEHAVIORAL INSTRUCTIONS]" not in gen_context):
+                and "[BEHAVIORAL INSTRUCTIONS]" not in gen_context
+                and "[KB INSTRUCTIONS]" not in gen_context):
             gen_context += _behavioral_ctx + "\n\n"
         gen_context += f"Code:\n{code_summary}"
 
@@ -4247,9 +4514,19 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             last_test_output = output
 
             if success:
+                _t_passed, _t_total, _ = _parse_test_counts(output)
                 display.step_info(
-                    step_idx, f"{f_basename} passed ✔ ({file_idx}/{file_count})")
+                    step_idx,
+                    f"{f_basename} passed ✔  {_t_passed}/{_t_total}"
+                    f" ({file_idx}/{file_count})")
+                display.record_test_result(test_path, passed=_t_passed,
+                                           total=_t_total, failures=[])
                 continue
+
+            # Record initial failure immediately so TEST RESULTS panel appears
+            _t_passed0, _t_total0, _t_fails0 = _parse_test_counts(output)
+            display.record_test_result(test_path, passed=_t_passed0,
+                                       total=_t_total0, failures=_t_fails0)
 
             # ── System / env checks (shared across files, run once) ──
             from .pipeline import _detect_system_level_failure
@@ -4335,6 +4612,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                             task_description=step_text,
                             error_output=output,
                             max_tokens=2000,
+                            step_type="TEST",
                         )
                         if kb_ctx.error_fixes:
                             kb_fix_context = (
@@ -4344,11 +4622,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         pass
 
                 # Build focused fix context
+                # Prepend task context so the coder never "fixes" a test by
+                # removing the component under test or deleting assertions.
+                _task_context_header = f"TASK CONTEXT:\n{task}\n\n"
+                if pre_analysis_results:
+                    _task_context_header += f"{pre_analysis_results}\n\n"
+
                 if is_source_bug:
                     display.step_info(
                         step_idx,
                         f"Bug in SOURCE for {f_basename}, fixing source...")
                     fix_ctx = (
+                        f"{_task_context_header}"
                         f"Test command: `{single_cmd}`\n\n"
                         f"{error_detail}\n\n"
                         f"Source files under test:\n{source_ctx}\n\n"
@@ -4359,11 +4644,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         "The test has revealed a BUG IN THE SOURCE CODE.\n"
                         "Fix the SOURCE files to make the test pass.\n"
                         "Do NOT modify the test file.\n"
+                        "CRITICAL: Do NOT remove, comment out, or skip the tested component or feature. "
+                        "The task requires this functionality to exist and work correctly.\n"
                         f"{jsx_hint}"
                         "Return corrected source file(s) using "
                         "#### [FILE]: format.")
                 else:
                     fix_ctx = (
+                        f"{_task_context_header}"
                         f"Test command: `{single_cmd}`\n\n"
                         f"ERRORS for {test_path}:\n{error_detail}\n\n"
                         f"Test file to fix:\n"
@@ -4377,6 +4665,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         f"Fix ONLY the test file '{test_path}'.\n"
                         "Do NOT output any other test files or source files.\n"
                         "Focus on fixing ONLY the failing tests.\n"
+                        "CRITICAL: Do NOT remove, comment out, or skip tests for the component/feature "
+                        "mentioned in the task. If a test fails due to an integration issue (e.g. anime.js, "
+                        "a missing mock, or a changed API), FIX the test to correctly test the feature — "
+                        "do NOT delete the test or the component import.\n"
                         f"{jsx_hint}"
                         "Do NOT modify source files, package.json, or "
                         "config files. Do NOT add new dependencies.\n"
@@ -4385,22 +4677,53 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 if kb_fix_context:
                     fix_ctx += f"\n\n{kb_fix_context}"
 
-                sent_before, recv_before = token_tracker.snapshot()
-                fix_response = coder.process(
-                    fix_prompt, context=fix_ctx, language=language)
-                sent_after, recv_after = token_tracker.snapshot()
-                display.step_tokens(
-                    step_idx,
-                    sent_after - sent_before,
-                    recv_after - recv_before)
+                # ── Try surgical chunk-level fix first ──
+                # For both TEST_BUG and SOURCE_BUG, attempt to edit only the
+                # failing chunk(s) rather than rewriting the whole file.
+                # Falls back to full-file if ChunkEditor can't parse/apply.
+                _chunk_step_desc = fix_prompt + "\n\n" + error_detail
+                if is_source_bug:
+                    # Try chunk fix on each source file individually
+                    _chunk_fix_results: dict[str, str] = {}
+                    for _sfp, _sfc in single_imports.items():
+                        _res = _chunk_fix_file(
+                            _sfp, _sfc, _chunk_step_desc,
+                            coder.llm_client, language, memory,
+                            display, step_idx)
+                        if _res:
+                            _chunk_fix_results.update(_res)
+                    fix_files = _chunk_fix_results or None
+                else:
+                    fix_files = _chunk_fix_file(
+                        test_path, current_content, _chunk_step_desc,
+                        coder.llm_client, language, memory,
+                        display, step_idx)
 
-                explanation = CLIDisplay.extract_explanation(fix_response)
-                if explanation:
-                    display.add_llm_log(explanation, source="Coder")
-
-                fix_files = executor.parse_code_blocks(fix_response)
+                # Fall back to full-file if chunk fix didn't produce results
                 if not fix_files:
-                    fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    # Ensure _task_briefing is in the fallback context
+                    _briefing = getattr(memory, '_task_briefing', '')
+                    if _briefing and _briefing not in fix_ctx:
+                        fix_ctx = (
+                            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+                            f"{_briefing}\n\n"
+                        ) + fix_ctx
+                    sent_before, recv_before = token_tracker.snapshot()
+                    fix_response = coder.process(
+                        fix_prompt, context=fix_ctx, language=language)
+                    sent_after, recv_after = token_tracker.snapshot()
+                    display.step_tokens(
+                        step_idx,
+                        sent_after - sent_before,
+                        recv_after - recv_before)
+
+                    explanation = CLIDisplay.extract_explanation(fix_response)
+                    if explanation:
+                        display.add_llm_log(explanation, source="Coder")
+
+                    fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
                     fix_files = _strip_protected_files(fix_files)
                     fix_files = _normalize_fix_paths(fix_files, memory)
@@ -4432,10 +4755,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 last_test_output = output
 
                 if success:
+                    _t_passed, _t_total, _ = _parse_test_counts(output)
                     display.step_info(
                         step_idx,
-                        f"{f_basename} passed after fix ✔ "
-                        f"({file_idx}/{file_count})")
+                        f"{f_basename} passed after fix ✔  {_t_passed}/{_t_total}"
+                        f" ({file_idx}/{file_count})")
+                    display.record_test_result(test_path, passed=_t_passed,
+                                               total=_t_total, failures=[])
                     file_fixed = True
                     break
 
@@ -4456,6 +4782,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 log.warning(
                     f"Step {step_idx+1}: [{f_basename}] still failing "
                     f"after {MAX_STEP_RETRIES} fixes.")
+                _t_passed, _t_total, _fail_names = _parse_test_counts(output)
+                display.record_test_result(test_path, passed=_t_passed,
+                                           total=_t_total, failures=_fail_names)
 
         # ── Summary ──
         if not failed_files:
@@ -4480,6 +4809,88 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 # ---------------------------------------------------------------------------
 # Diff-aware editing (Phase 5)
 # ---------------------------------------------------------------------------
+
+def _chunk_fix_file(
+    file_path: str,
+    content: str,
+    step_description: str,
+    llm_client,
+    language: str | None,
+    memory: "FileMemory",
+    display: "CLIDisplay",
+    step_idx: int,
+) -> dict[str, str] | None:
+    """Try to fix a single file using chunk-level editing.
+
+    Sends only the chunks relevant to the error/fix description to the LLM,
+    then splices the result back — avoiding unintended changes to unrelated code.
+
+    Returns ``{file_path: new_content}`` on success, or ``None`` to signal
+    the caller should fall back to full-file editing.
+    """
+    try:
+        from ..editing.chunk_editor import ChunkEditor
+    except ImportError:
+        return None
+
+    chunk_editor = ChunkEditor()
+    chunks = chunk_editor.chunk_file(file_path, content)
+    if not chunks:
+        return None
+
+    targets = chunk_editor.identify_target_chunks(chunks, step_description)
+    if not targets:
+        # No targeted chunks found — send all non-import chunks but warn
+        targets = [c.chunk_id for c in chunks if c.chunk_type != "imports"]
+        if not targets:
+            return None
+
+    formatted = chunk_editor.format_chunks_for_prompt(chunks, targets)
+
+    _task_briefing = getattr(memory, '_task_briefing', '')
+    briefing_prefix = (
+        "TASK BRIEFING (respect Preserve and Key constraint — fix ONLY what the error requires):\n"
+        f"{_task_briefing}\n\n"
+    ) if _task_briefing else ""
+
+    prompt = briefing_prefix + _build_chunk_prompt(
+        step_description, formatted, "", language=language)
+
+    display.step_info(
+        step_idx,
+        f"[ChunkFix] {os.path.basename(file_path)}: {len(targets)} target chunk(s)...")
+
+    sent_before, recv_before = token_tracker.snapshot()
+    llm_response = llm_client.generate_response(prompt)
+    sent_after, recv_after = token_tracker.snapshot()
+    display.step_tokens(step_idx, sent_after - sent_before, recv_after - recv_before)
+
+    edits = chunk_editor.parse_chunk_response(llm_response)
+    if edits is None:
+        log.info("[ChunkFix] LLM used full-file format for %s, falling back", file_path)
+        return None
+    if not edits:
+        return None
+
+    file_chunks = [c for c in chunks if c.file_path == file_path]
+    try:
+        new_content = chunk_editor.apply_chunk_edits(
+            content, edits, known_chunks=file_chunks)
+    except Exception as exc:
+        log.warning("[ChunkFix] Failed to apply edits to %s: %s", file_path, exc)
+        return None
+
+    # Destructive edit guard: if output shrinks >75%, fall back
+    if content and len(content) > 200:
+        ratio = len(new_content) / len(content)
+        if ratio < 0.25:
+            log.warning(
+                "[ChunkFix] Destructive edit for %s (%.0f%% reduction), falling back",
+                file_path, (1 - ratio) * 100)
+            return None
+
+    return {file_path: new_content}
+
 
 def _try_diff_edit(
     *,
@@ -4527,25 +4938,58 @@ def _try_diff_edit(
     resolver = ScopeResolver(code_graph)
     scope = resolver.resolve(step_text, target_file, code_graph)
 
-    min_conf = getattr(cfg, "EDITING_MIN_CONFIDENCE", 0.60)
-    if scope.confidence < min_conf:
-        log.warning(
-            "[DiffEdit] Confidence %.2f < %.2f for %s, falling back",
-            scope.confidence, min_conf, target_file,
-        )
-        _log_fallback_metric(cfg, target_file, step_text, scope, "low_confidence")
-        return None
+    # Bypass slicing and confidence check for non-AST files
+    non_ast_exts = {".html", ".css", ".scss", ".json", ".yaml", ".yml", ".md", ".txt"}
+    ext = os.path.splitext(target_file)[1].lower()
+    is_non_ast = ext in non_ast_exts
 
-    # 2. Slice files
-    ctx_lines = getattr(cfg, "EDITING_CONTEXT_LINES", 5)
-    slicer = ContextSlicer()
+    if is_non_ast:
+        scope.confidence = 1.0
+        try:
+            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            content = memory.get(target_file, "")
 
-    scopes_map: dict = {}
-    for af in scope.affected_files:
-        scopes_map[af] = scope
+        line_count = len(content.splitlines())
+        formatted = f"=== FILE: {target_file} ({line_count} lines total) ===\n"
+        formatted += f"Language: {ext.lstrip('.')}\n\n"
+        formatted += content
+        if not content.endswith("\n") and content:
+            formatted += "\n"
+        formatted += f"=== END FILE ===\n"
+        
+        full_file_lines = line_count
+        sliced_lines = line_count
+    else:
+        min_conf = getattr(cfg, "EDITING_MIN_CONFIDENCE", 0.60)
+        if scope.confidence < min_conf:
+            log.warning(
+                "[DiffEdit] Confidence %.2f < %.2f for %s, falling back",
+                scope.confidence, min_conf, target_file,
+            )
+            _log_fallback_metric(cfg, target_file, step_text, scope, "low_confidence")
+            return None
 
-    slices = slicer.slice_files(scopes_map)
-    formatted = slicer.format_for_prompt(slices)
+        # 2. Slice files
+        ctx_lines = getattr(cfg, "EDITING_CONTEXT_LINES", 5)
+        slicer = ContextSlicer()
+
+        scopes_map: dict = {}
+        for af in scope.affected_files:
+            scopes_map[af] = scope
+
+        slices = slicer.slice_files(scopes_map)
+        formatted = slicer.format_for_prompt(slices)
+
+        # Compute token stats
+        full_file_lines = 0
+        sliced_lines = 0
+        for fslice in slices.values():
+            full_file_lines += fslice.total_lines
+            sliced_lines += sum(b.line_end - b.line_start + 1 for b in fslice.slices)
+            if fslice.imports_block:
+                sliced_lines += fslice.imports_block.count("\n") + 1
 
     # Prepend project orientation + knowledge context to sliced context
     prefix_parts = []
@@ -4557,17 +5001,14 @@ def _try_diff_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prefix_parts.append(kb_ctx)
+    _diff_briefing = getattr(memory, '_task_briefing', '')
+    if _diff_briefing:
+        prefix_parts.append(
+            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+            + _diff_briefing
+        )
     if prefix_parts:
         formatted = "\n\n".join(prefix_parts) + "\n\n" + formatted
-
-    # Compute token stats
-    full_file_lines = 0
-    sliced_lines = 0
-    for fslice in slices.values():
-        full_file_lines += fslice.total_lines
-        sliced_lines += sum(b.line_end - b.line_start + 1 for b in fslice.slices)
-        if fslice.imports_block:
-            sliced_lines += fslice.imports_block.count("\n") + 1
 
     display.step_info(step_idx, f"[DiffEdit] Sending {sliced_lines}/{full_file_lines} lines to LLM...")
 
@@ -4864,7 +5305,34 @@ Rules:
    Do NOT stop outputting after the function/class closing brace if the original chunk continues
    beyond it (e.g. `Foo.propTypes = ...`, `Foo.defaultProps = ...`, `export default Foo`).
    If those lines appear in the original chunk, reproduce them verbatim in your replacement.
+9. NEVER abbreviate code inside your chunk with comments like `// existing code` or `/* unchanged */`. Write out every line.
 """
+
+
+def _find_importers(fpath: str, memory: FileMemory) -> list[tuple[str, str]]:
+    """Return (path, content) pairs for files in memory that import *fpath*.
+
+    Used to give the reviewer visibility into how the changed file is consumed,
+    catching issues like duplicate Router/Provider wrapping.
+    """
+    basename = os.path.splitext(os.path.basename(fpath))[0]  # e.g. "App"
+    results: list[tuple[str, str]] = []
+    for mpath, mcontent in memory.all_files().items():
+        if mpath == fpath:
+            continue
+        # Quick check: does this file reference the changed file's basename?
+        if basename not in mcontent:
+            continue
+        # Confirm it's an actual import/require, not just a comment mention
+        if not re.search(
+            r'(import\b|require\s*\()',
+            mcontent,
+        ):
+            continue
+        results.append((mpath, mcontent))
+        if len(results) >= 3:  # cap to avoid bloating the prompt
+            break
+    return results
 
 
 def _build_review_context(
@@ -4872,7 +5340,7 @@ def _build_review_context(
     memory: FileMemory,
     step_text: str,
 ) -> str:
-    """Build a compact review context showing only what changed."""
+    """Build a compact review context showing what changed plus importer files."""
     import difflib
 
     parts: list[str] = []
@@ -4902,6 +5370,15 @@ def _build_review_context(
         else:
             parts.append(f"#### [NEW FILE]: {fpath}\n```\n{new_content}\n```")
 
+        # Inject files that import this file so the reviewer can catch
+        # duplicate wrappers (e.g. BrowserRouter in both App.jsx and main.jsx)
+        importers = _find_importers(fpath, memory)
+        for imp_path, imp_content in importers:
+            parts.append(
+                f"#### [IMPORTER — read-only context]: {imp_path}\n"
+                f"```\n{imp_content[:2000]}\n```"
+            )
+
     return "\n\n".join(parts)
 
 
@@ -4921,6 +5398,7 @@ def _try_chunk_edit(
     project_profile=None,
     project_context=None,
     kb_context_builder=None,
+    behavioral_ctx: str = "",
 ) -> tuple[bool, str] | None:
     """Attempt chunk-level editing. Returns (success, error) or None for fallback."""
     try:
@@ -5015,32 +5493,18 @@ def _try_chunk_edit(
     kb_ctx = getattr(memory, '_kb_context', '')
     if kb_ctx:
         prompt_prefix += kb_ctx + "\n\n"
-    # Explicit behavioral instructions for JS/TS chunk edits — only when
-    # batch_search didn't already include them (avoids bloating context
-    # and preserves framework/library doc priority).
-    if (language in ("javascript", "typescript")
-            and kb_context_builder is not None
-            and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix):
-        try:
-            _gstore = getattr(kb_context_builder, '_global_store', None)
-            if _gstore is not None:
-                _beh_results = _gstore.get_behavioral_instructions(
-                    "react component export default jsx tsx generate modify",
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                )
-                if _beh_results:
-                    _beh_parts = []
-                    for item in _beh_results:
-                        content = getattr(item, "content", "") or getattr(item, "title", "")
-                        if content:
-                            _beh_parts.append(content)
-                    if _beh_parts:
-                        prompt_prefix += (
-                            "\n[BEHAVIORAL INSTRUCTIONS]\n"
-                            + "\n".join(_beh_parts) + "\n\n"
-                        )
-        except Exception:
-            pass
+    # Reuse behavioral instructions already fetched by _handle_code_step
+    # (avoids a duplicate KB search call for the same step).
+    if (behavioral_ctx
+            and "[BEHAVIORAL INSTRUCTIONS]" not in prompt_prefix
+            and "[KB INSTRUCTIONS]" not in prompt_prefix):
+        prompt_prefix += behavioral_ctx + "\n\n"
+    _chunk_briefing = getattr(memory, '_task_briefing', '')
+    if _chunk_briefing:
+        prompt_prefix += (
+            "TASK BRIEFING (respect Preserve and Key constraint):\n"
+            f"{_chunk_briefing}\n\n"
+        )
 
     chunk_prompt = prompt_prefix + _build_chunk_prompt(
         step_text, formatted, slim_ctx, language=language,
@@ -5178,6 +5642,12 @@ def _try_chunk_edit(
         log.info("[ChunkEdit] Static review passed (lint + imports OK)")
         return True, ""
 
+    # Skip LLM review if all files were already correct (no actual diffs).
+    if "```diff" not in review_ctx:
+        display.step_info(step_idx, "File(s) already correct, no review needed ✔")
+        log.info("[ChunkEdit] Skipped LLM review — file(s) already correct")
+        return True, ""
+
     # Full LLM review path (review_mode == "full")
     reviewer_mode = "diff" if getattr(cfg, "EDITING_REVIEWER_DIFF_MODE", True) else "full"
 
@@ -5203,6 +5673,12 @@ def _try_chunk_edit(
                 "\n\nSUCCESS CRITERIA — reject if any are NOT met by the changes:\n"
                 + "\n".join(f"- {c}" for c in criteria)
             )
+    _chunk_reviewer_briefing = getattr(memory, '_task_briefing', '')
+    if _chunk_reviewer_briefing:
+        criteria_ctx += (
+            "\n\nTASK BRIEFING — flag as FAIL if any Preserve item was broken:\n"
+            f"{_chunk_reviewer_briefing}"
+        )
 
     review = reviewer.process(
         f"Review this code change for the step: {step_text}\n\n{review_ctx}",

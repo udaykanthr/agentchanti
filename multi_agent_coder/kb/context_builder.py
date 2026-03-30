@@ -188,6 +188,17 @@ class ContextBuilder:
     # Primary method
     # ------------------------------------------------------------------
 
+    # Category limits by step type — CMD steps only need install/setup
+    # guides; CODE/TEST steps get the full set.
+    _CATEGORY_LIMITS_BY_TYPE: dict[str, dict[str, int]] = {
+        "CMD": {"doc": 2, "behavioral": 0, "pattern": 0, "adr": 0},
+        "CODE": {"doc": 4, "behavioral": 3, "pattern": 2, "adr": 1},
+        "TEST": {"doc": 3, "behavioral": 3, "pattern": 1, "adr": 0},
+    }
+    _DEFAULT_CATEGORY_LIMITS: dict[str, int] = {
+        "doc": 4, "behavioral": 3, "pattern": 2, "adr": 1,
+    }
+
     def build_context(
         self,
         task_description: str,
@@ -195,6 +206,7 @@ class ContextBuilder:
         max_tokens: int = 4000,
         error_output: Optional[str] = None,
         language: Optional[str] = None,
+        step_type: Optional[str] = None,
     ) -> KBContext:
         """
         Build aggregated KB context for a single pipeline step.
@@ -212,6 +224,11 @@ class ContextBuilder:
             provided, this is used for error-fix lookups instead of
             the step description alone, enabling accurate matching
             during diagnosis.
+        step_type:
+            Pipeline step type (CMD, CODE, TEST, IGNORE).  When
+            provided, category limits are tuned per step type so
+            that CMD steps don't receive irrelevant coding patterns
+            or behavioral instructions.
 
         Returns
         -------
@@ -221,7 +238,9 @@ class ContextBuilder:
         t0 = time.perf_counter()
         ctx = KBContext()
 
-        # 1. Detect intent — if error_output is provided, force error intent
+        # 1. Detect intent — used for error-fix lookup (step 4) only.
+        # Category limits for the global KB search (step 5) are no longer
+        # gated on is_error so that framework docs reach every step.
         is_error = (
             bool(error_output)
             or self._detect_error_intent(task_description)
@@ -303,49 +322,84 @@ class ContextBuilder:
         # 5. Batched global KB search (Phase 3)
         # Single embedding + single vector scan for all categories,
         # saving 2 embedding API calls compared to separate searches.
+        # Category limits are tuned by step_type so CMD steps only
+        # receive setup/install docs, not coding patterns or behavioral
+        # instructions that waste tokens.
         if self._global_store is not None:
             try:
-                # Build category limits based on intent.
-                # During error diagnosis (is_error=True) skip generic doc
-                # search — the step description often matches irrelevant
-                # docs by keyword overlap (e.g. "install required packages"
-                # matches npm/Vitest setup guides).  Error-fix patterns are
-                # already handled by step 4 (search_errors) which uses the
-                # actual error output for matching.
-                category_limits: dict[str, int] = {}
-                if not is_error:
-                    category_limits["doc"] = 4
-                    category_limits["behavioral"] = 3
-                if is_review:
-                    category_limits["pattern"] = 3
-                    category_limits["adr"] = 3
+                category_limits: dict[str, int] = (
+                    self._CATEGORY_LIMITS_BY_TYPE.get(step_type, self._DEFAULT_CATEGORY_LIMITS)
+                    if step_type
+                    else self._DEFAULT_CATEGORY_LIMITS
+                ).copy()
 
-                if not category_limits:
-                    # Nothing to search — skip the vector call entirely
-                    buckets: dict = {}
-                else:
-                    buckets = self._global_store.batch_search(
-                        task_description,
-                        category_limits=category_limits,
-                        language=language,
-                        api_client=self._api_client,
-                    )
+                buckets = self._global_store.batch_search(
+                    task_description,
+                    category_limits=category_limits,
+                    language=language,
+                    api_client=self._api_client,
+                )
 
-                # Distribute results into ctx fields
+                # Distribute results into ctx fields — all categories
+                # contribute regardless of intent so that any relevant KB
+                # doc reaches every step and every agent.
+                # Build a NEW list to avoid shared-reference mutations.
                 patterns = buckets.get("pattern", []) + buckets.get("adr", [])
                 docs = buckets.get("doc", [])
                 behavioral = buckets.get("behavioral", [])
 
-                if is_review and patterns:
-                    ctx.global_patterns = patterns
-                if docs:
-                    ctx.global_patterns.extend(docs)
-                if patterns or docs:
+                # Deduplicate across categories by title
+                all_docs: list = []
+                _seen_titles: set[str] = set()
+                for item in patterns + docs:
+                    t = getattr(item, "title", "")
+                    if t and t in _seen_titles:
+                        continue
+                    if t:
+                        _seen_titles.add(t)
+                    all_docs.append(item)
+
+                if all_docs:
+                    ctx.global_patterns = all_docs
                     ctx.sources_used.append("global_kb")
+                    logger.debug(
+                        "[KB] Global docs injected: %s",
+                        [r.title for r in all_docs],
+                    )
                 if behavioral:
                     ctx.behavioral_instructions = behavioral
+                    logger.debug(
+                        "[KB] Behavioral instructions injected: %s",
+                        [r.title for r in behavioral],
+                    )
             except Exception as exc:
                 logger.debug("[KB] Batched global KB search failed: %s", exc)
+
+        # 6. Merge pre-loaded docs from planning pre-analysis.
+        # The planner's title-relevance filter already identified the most
+        # task-relevant KB docs.  Merge them so every step has access,
+        # regardless of whether this step's search query matches them.
+        # Skip for CMD steps — install commands don't need the full
+        # planning doc set and it wastes tokens.
+        preloaded = getattr(self, '_preloaded_docs', None)
+        if preloaded and step_type != "CMD":
+            existing_titles = {
+                getattr(r, "title", "") for r in ctx.global_patterns
+            }
+            merged = 0
+            for doc in preloaded:
+                t = getattr(doc, "title", "")
+                if t and t not in existing_titles:
+                    ctx.global_patterns.append(doc)
+                    existing_titles.add(t)
+                    merged += 1
+            if merged:
+                if "global_kb" not in ctx.sources_used:
+                    ctx.sources_used.append("global_kb")
+                logger.debug(
+                    "[KB] Merged %d pre-loaded doc(s) from planning",
+                    merged,
+                )
 
         # 7. Token budget management
         ctx = self._apply_token_budget(ctx, max_tokens)

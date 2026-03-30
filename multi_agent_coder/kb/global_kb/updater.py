@@ -192,7 +192,11 @@ def get_manifest_info() -> dict:
     return _load_local_manifest()
 
 
-def check_for_updates(owner: str, repo: str) -> UpdateStatus:
+def check_for_updates(
+    owner: str,
+    repo: str,
+    version: Optional[str] = None,
+) -> UpdateStatus:
     """
     Check whether a newer version is available on GitHub releases.
 
@@ -202,6 +206,9 @@ def check_for_updates(owner: str, repo: str) -> UpdateStatus:
         GitHub repository owner / organisation.
     repo:
         GitHub repository name.
+    version:
+        Specific version to check (e.g. ``"1.2.3"``).  When omitted the
+        latest release is used.
 
     Returns
     -------
@@ -211,7 +218,10 @@ def check_for_updates(owner: str, repo: str) -> UpdateStatus:
     local_manifest = _load_local_manifest()
     current_version = local_manifest.get("version", "0.0.0")
 
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    if version:
+        url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/v{version}"
+    else:
+        url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
     try:
         data = json.loads(_http_get(url, _github_headers()))
     except ConnectionError as exc:

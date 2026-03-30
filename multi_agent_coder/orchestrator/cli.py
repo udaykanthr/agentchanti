@@ -10,6 +10,7 @@ from ..config import Config
 from ..llm.ollama import OllamaClient
 from ..llm.lm_studio import LMStudioClient
 from ..llm.base import LLMError
+from ..llm import build_embed_client
 from ..agents.planner import PlannerAgent
 from ..agents.coder import CoderAgent
 from ..agents.reviewer import ReviewerAgent
@@ -34,7 +35,7 @@ from ..plugins.registry import PluginRegistry
 from .memory import FileMemory
 from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
 from .plan_step import build_waves as _build_plan_waves
-from ..agents.analyser import build_project_context, AnalyseAgent
+from ..agents.analyser import build_project_context, AnalyseAgent, parse_briefing_packages
 
 
 def _rematch_plan_steps(new_steps, old_plan_steps, dependencies):
@@ -270,20 +271,28 @@ def main():
         source_files=source_files)
 
     # ── 4. Init embedding store (SQLite-backed for persistence) ──
+    # Build a dedicated embed client (respects embedding_provider config).
+    # Kept as a top-level var so KB components can reuse it instead of llm_client.
+    embed_client = None if args.no_embeddings else build_embed_client(cfg)
     embed_store = None
-    if not args.no_embeddings:
+    if args.no_embeddings:
+        log.info("Embeddings disabled")
+    elif embed_client is None:
+        log.info(
+            "Embeddings disabled: Anthropic has no embedding API. "
+            "Set 'embedding_provider' in .agentchanti.yaml (ollama/openai/gemini)."
+        )
+    else:
         try:
             from ..embedding_store_sqlite import SQLiteEmbeddingStore
             import os
             db_path = os.path.join(cfg.EMBEDDING_CACHE_DIR, "embeddings.db")
             embed_store = SQLiteEmbeddingStore(
-                llm_client, embed_model=embed_model, db_path=db_path)
+                embed_client, embed_model=embed_model, db_path=db_path)
             log.info(f"Embeddings enabled with SQLite cache (model: {embed_model})")
         except Exception as e:
             log.warning(f"SQLite embedding store failed ({e}), falling back to in-memory")
-            embed_store = EmbeddingStore(llm_client, embed_model=embed_model)
-    else:
-        log.info("Embeddings disabled")
+            embed_store = EmbeddingStore(embed_client, embed_model=embed_model)
 
     # ── 4b. Init step cache ──
     step_cache = None
@@ -339,14 +348,17 @@ def main():
             from ..kb.context_builder import ContextBuilder
             from ..kb.runtime_watcher import RuntimeWatcher
 
-            # Smart startup check — handles global KB, local KB
-            KBStartupManager().run(project_root=_os.getcwd(), api_client=llm_client)
+            # Use embed_client for KB vector ops; fall back to llm_client if unavailable
+            kb_api_client = embed_client or llm_client
 
-            kb_context_builder = ContextBuilder(project_root=_os.getcwd(), api_client=llm_client)
+            # Smart startup check — handles global KB, local KB
+            KBStartupManager().run(project_root=_os.getcwd(), api_client=kb_api_client)
+
+            kb_context_builder = ContextBuilder(project_root=_os.getcwd(), api_client=kb_api_client)
             kb_runtime_watcher = RuntimeWatcher(
                 debounce_seconds=cfg.KB_WATCHER_DEBOUNCE_SECONDS,
             )
-            kb_runtime_watcher.start(project_root=_os.getcwd(), api_client=llm_client)
+            kb_runtime_watcher.start(project_root=_os.getcwd(), api_client=kb_api_client)
             log.info("[KB] Context builder and runtime watcher initialised")
         except Exception as kb_exc:
             log.warning(f"[KB] Initialisation failed (non-fatal): {kb_exc}")
@@ -440,8 +452,9 @@ def main():
                 resuming = True
                 log.info("Auto-resuming from checkpoint" if args.auto else "Resuming (--resume)")
             else:
-                display.stop_spinner()
+                display.pause()
                 resuming = CLIDisplay.prompt_resume(checkpoint_state)
+                display.resume()
 
     # ── 8. Restore state or create git checkpoint ──
     checkpoint_branch: str | None = None
@@ -450,6 +463,8 @@ def main():
     if resuming and checkpoint_state:
         log.info("Resuming from checkpoint...")
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        if kb_runtime_watcher is not None:
+            memory.watcher_created_files = kb_runtime_watcher.created_files
         memory.update(checkpoint_state.get("file_memory", {}))
         steps = checkpoint_state["steps"]
         step_results = checkpoint_state.get("step_results", {})
@@ -558,6 +573,7 @@ def main():
                 log.warning("[Planning] Baseline test analysis failed: %s", _test_exc)
 
         # Pre-analysis: map relevant files, classify intent, enrich context
+        _pre_mem_local = locals().get('_pre_memory')
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -565,10 +581,26 @@ def main():
             knowledge_base=knowledge_base,
             test_analysis=test_analysis,
             language=language,
+            baseline_passing_files=getattr(
+                _pre_mem_local, '_tester_baseline_passing_files', None),
+            baseline_failing_files=getattr(
+                _pre_mem_local, '_tester_baseline_failing_files', None),
+            search_agent=search_agent,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
             log.info("[Planning] Pre-analysis context injected")
+
+        # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
+        _llm_detected = getattr(planner, '_detected_language', None)
+        if _llm_detected and _llm_detected != language:
+            log.info(
+                "Language corrected by LLM during pre-analysis: %s → %s (%s)",
+                language, _llm_detected, get_language_name(_llm_detected),
+            )
+            language = _llm_detected
+            # Re-describe coder agent role with the corrected language
+            coder.role = f"Write clean {get_language_name(language)} code for a single step."
 
         MAX_PLAN_RETRIES = 3
         plan = None
@@ -581,12 +613,29 @@ def main():
             plan = planner.process(args.task, context=planner_context)
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
+            # ── Planner no-op signal ──
+            # If the planner determined the task is already satisfied it
+            # emits ==DONE== instead of steps.  Honour that and exit cleanly.
+            if "==DONE==" in plan:
+                _done_reason = ""
+                for _line in plan.splitlines():
+                    if _line.startswith("reason:"):
+                        _done_reason = _line[len("reason:"):].strip()
+                        break
+                _done_msg = _done_reason or "Task already satisfied — no changes needed."
+                log.info("[Plan] Planner signalled ==DONE==: %s", _done_msg)
+                display.show_status(_done_msg)
+                display.finish()
+                print(f"\n  ✓ {_done_msg}\n")
+                return
+
             # ── 10. Parse steps + dependencies ──
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
+                reclassify_manifest_steps,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -675,11 +724,17 @@ def main():
         if len(steps) < pre_opt_count:
             log.info(f"[Planning] Optimized: {pre_opt_count} → {len(steps)} steps")
 
+        # Reclassify CODE steps targeting only protected dependency manifests
+        # (package.json, requirements.txt, etc.) as CMD install steps.
+        plan_steps_parsed = reclassify_manifest_steps(plan_steps_parsed)
+        steps = steps_as_text_list(plan_steps_parsed)
+        dependencies = steps_dependencies_dict(plan_steps_parsed)
+
         # ── 11. Plan approval loop ──
         if args.auto:
             log.info(f"Auto-approved {len(steps)} steps (--auto mode)")
         while not args.auto:
-            display.stop_spinner()
+            display.pause()  # stop Rich Live so print()/input() are visible
             # Reattach dependency markers so they are visible and editable in TUI
             display_steps = []
             for i, step in enumerate(steps):
@@ -695,6 +750,7 @@ def main():
             if action == "approve":
                 break
             elif action == "replan":
+                display.resume()  # restart Live for spinner during replan
                 display.show_status("Re-planning...")
                 plan = planner.process(args.task, context=planner_context)
                 log.info(f"Re-plan:\n{plan}")
@@ -767,11 +823,18 @@ def main():
                     else:
                         plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
+        display.resume()  # restart Live after approval loop exits
         display.set_steps(steps)
         display.render()
         log.info(f"Approved {len(steps)} steps.")
 
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        if kb_runtime_watcher is not None:
+            memory.watcher_created_files = kb_runtime_watcher.created_files
+        # Propagate task briefing to memory so all downstream agents can use it
+        _briefing_text = getattr(planner, '_task_briefing', '')
+        if _briefing_text:
+            memory._task_briefing = _briefing_text
 
         # Pre-load existing source files into memory so the coder
         # can see and modify them instead of creating new files
@@ -836,6 +899,14 @@ def main():
                             analyse_exc)
         else:
             log.info("[Analysis] LLM enrichment skipped (analyser_enabled: false)")
+
+    # Inject packages from the task briefing's "New packages:" line so that
+    # _ensure_packages_installed installs them before the first CODE step —
+    # even when the plan has no explicit CMD install step.
+    for _pkg in parse_briefing_packages(getattr(memory, '_task_briefing', '')):
+        if _pkg not in project_context.required_packages:
+            project_context.required_packages.append(_pkg)
+            log.info("[PreAnalysis] Briefing package injected: %s", _pkg)
 
     # ── 12. Build execution waves ──
     # Use phase-aware wave builder when structured plan steps are available.
@@ -1030,12 +1101,14 @@ def main():
             if not pipeline_success:
                 break
 
-    # ── 13.5. Final cross-step test verification ──
-    # Re-run all session test files together to catch regressions where a
-    # source fix in step N broke tests that already passed in step M.
+    # ── 13.5. Bulk test execution + per-file fix ──
+    # All TEST steps with inline code deferred their runs until now so that:
+    #   • parallel wave steps don't race to run the full suite simultaneously
+    #   • source fixes for one test can't break another before it's verified
+    # Run all test files once; fix failing ones one at a time; final run-all.
     if pipeline_success:
-        from .pipeline import run_final_test_verification
-        verif_ok, verif_err = run_final_test_verification(
+        from .pipeline import run_bulk_test_execution_and_fix
+        verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
             coder=coder,
@@ -1048,7 +1121,7 @@ def main():
         )
         if not verif_ok:
             pipeline_success = False
-            log.warning(f"[FinalVerify] Pipeline marked failed: {verif_err[:200]}")
+            log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

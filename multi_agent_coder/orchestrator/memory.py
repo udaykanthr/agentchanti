@@ -175,6 +175,7 @@ class FileMemory:
     def __init__(self, embedding_store: EmbeddingStore | None = None,
                  top_k: int = 5):
         self._files: dict[str, str] = {}   # filepath -> contents
+        self._skeleton_cache: dict[str, str] = {}  # filepath -> cached skeleton
         self._store = embedding_store
         self._top_k = top_k
         self._lock = threading.Lock()
@@ -200,6 +201,8 @@ class FileMemory:
                     continue
 
                 self._files[fpath] = content
+                # Invalidate skeleton cache for updated file
+                self._skeleton_cache.pop(fpath, None)
                 if self._store:
                     to_embed.append((fpath, content))
 
@@ -219,6 +222,28 @@ class FileMemory:
     def get(self, filepath: str) -> str | None:
         with self._lock:
             return self._files.get(filepath)
+
+    def delete(self, filepath: str) -> None:
+        """Remove a tracked file from memory (e.g., after path correction)."""
+        with self._lock:
+            self._files.pop(filepath, None)
+            self._skeleton_cache.pop(filepath, None)
+
+    def get_skeleton(self, fpath: str, content: str | None = None) -> str:
+        """Return cached skeleton for *fpath*, computing it on first access.
+
+        The cache is invalidated automatically when :meth:`update` writes
+        a new version of the file, so callers always get a fresh skeleton
+        after a code-step modifies the file.
+        """
+        with self._lock:
+            if fpath in self._skeleton_cache:
+                return self._skeleton_cache[fpath]
+            if content is None:
+                content = self._files.get(fpath, "")
+            skeleton = _extract_file_skeleton(content, fpath)
+            self._skeleton_cache[fpath] = skeleton
+            return skeleton
 
     def all_files(self) -> dict[str, str]:
         with self._lock:
@@ -245,7 +270,8 @@ class FileMemory:
         """Build context with file skeletons instead of full contents.
 
         For each relevant file, includes only imports and function/class
-        signatures with line ranges.
+        signatures with line ranges. Skeletons are cached so repeated calls
+        (e.g. across retries) don't re-run the regex extraction.
         """
         with self._lock:
             scored = self._score_files(step_text)
@@ -253,7 +279,11 @@ class FileMemory:
             budget = max_tokens or float("inf")
             used = 0
             for _score, fpath, content in scored:
-                skeleton = _extract_file_skeleton(content, fpath)
+                if fpath in self._skeleton_cache:
+                    skeleton = self._skeleton_cache[fpath]
+                else:
+                    skeleton = _extract_file_skeleton(content, fpath)
+                    self._skeleton_cache[fpath] = skeleton
                 entry_tokens = _estimate_tokens(skeleton)
                 if used + entry_tokens > budget:
                     break

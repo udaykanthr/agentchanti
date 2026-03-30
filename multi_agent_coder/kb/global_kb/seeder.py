@@ -62,6 +62,15 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="import,module,package,python",
     ),
     ErrorFix(
+        error_type="ModuleNotFoundError",
+        language="python",
+        pattern=r"No module named '(\w+)\.(\w+)'",
+        cause="During Django test setup, the agent mistakenly referenced an app with the project's name prefix (e.g. 'myproject.core') instead of its actual folder name ('core').",
+        fix_template="DO NOT write __init__.py files to the project root to fix this! Instead, EDIT settings.py and urls.py to REMOVE the project prefix ('myproject.') from INSTALLED_APPS and URL imports. Always use the simple app label ('core') when importing apps located at the project root.",
+        severity="error",
+        tags="django,module,import,prefix,python",
+    ),
+    ErrorFix(
         error_type="TypeError",
         language="python",
         pattern=r"TypeError:\s*(unsupported operand|.+takes\s+\d+\s+positional|.+not\s+(callable|subscriptable|iterable))",
@@ -1135,6 +1144,260 @@ _ERROR_SEEDS: list[ErrorFix] = [
         severity="error",
         tags="element,type,invalid,undefined,import,export,default,named,mixed,react,component,testing,javascript,typescript",
     ),
+    # ── Django test client — ALLOWED_HOSTS missing 'testserver' ──────────
+    # ── Production code importing from test modules ───────────────────────
+    ErrorFix(
+        error_type="DjangoProductionImportsTests",
+        language="python",
+        pattern=r"ImportError: cannot import name '(\w+)' from '[\w\.]*\.tests'",
+        cause="A production file (views.py, models.py, urls.py, etc.) contains an import "
+              "from a test module (e.g. 'from .tests import ItemAPITest'). "
+              "Test classes must never be imported into production code. "
+              "This is a code generation hallucination — the LLM invented the import "
+              "to 'avoid an orphaned export', which is not a real Django requirement.",
+        fix_template="CRITICAL — THIS IS A BUG IN THE PRODUCTION FILE, NOT IN THE TEST FILE.\n\n"
+                     "FIX: Remove the test import from the production file entirely.\n\n"
+                     "STEPS:\n"
+                     "1. Open the production file named in the traceback "
+                     "(e.g. views.py, urls.py, models.py).\n"
+                     "2. Delete every line that imports from a test module:\n"
+                     "   REMOVE: from .tests import ItemAPITest\n"
+                     "   REMOVE: from myapp.tests import ...\n"
+                     "   REMOVE: import tests\n"
+                     "3. Do NOT modify the test file or tests/__init__.py to fix this.\n"
+                     "4. Do NOT add re-exports to tests/__init__.py.\n"
+                     "5. Production files (views, models, urls, admin, serializers) "
+                     "must NEVER import test classes or test utilities.\n\n"
+                     "RULE: If the import path contains '.tests' or ends in 'tests', "
+                     "it belongs only in test files. Remove it from production code.",
+        severity="error",
+        tags="django,import,tests,views,production,ImportError,circular,hallucination,python",
+    ),
+    # ── Django manage.py stripped of imports / entry point ───────────────
+    ErrorFix(
+        error_type="DjangoManagePySilentExit",
+        language="python",
+        pattern=r"",  # detected by symptom, not error text
+        cause="manage.py was overwritten by the agent with only the main() function body, "
+              "losing `import os`, `import sys`, and the `if __name__ == '__main__': main()` "
+              "entry point. Python imports the file, defines the function, and exits silently — "
+              "no output, no error, exit code 0. Every manage.py command appears to do nothing.",
+        fix_template="FIX: Restore the missing scaffolding in manage.py.\n\n"
+                     "The file must have this structure:\n\n"
+                     "#!/usr/bin/env python\n"
+                     "\"\"\"Django's command-line utility for administrative tasks.\"\"\"\n"
+                     "import os\n"
+                     "import sys\n\n\n"
+                     "def main():\n"
+                     "    \"\"\"Run administrative tasks.\"\"\"\n"
+                     "    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<config>.settings')\n"
+                     "    try:\n"
+                     "        from django.core.management import execute_from_command_line\n"
+                     "    except ImportError as exc:\n"
+                     "        raise ImportError(\n"
+                     "            \"Couldn't import Django...\"\n"
+                     "        ) from exc\n"
+                     "    execute_from_command_line(sys.argv)\n\n\n"
+                     "if __name__ == '__main__':\n"
+                     "    main()\n\n"
+                     "RULE: NEVER overwrite manage.py. It is a Django framework entry point. "
+                     "If you need to customise argument handling, do it inside main() only — "
+                     "never remove the imports or the if __name__ guard.",
+        severity="critical",
+        tags="django,manage.py,silent,exit,import,os,sys,__main__,entrypoint,python",
+    ),
+    # ── Django tests/ directory vs tests.py stub conflict ────────────────
+    ErrorFix(
+        error_type="DjangoTestsModuleIncorrectlyImported",
+        language="python",
+        pattern=r"'tests' module incorrectly imported from '.*'",
+        cause="Django's `startapp` command creates a stub `tests.py` file. "
+              "If the agent also created a `tests/` subdirectory (e.g. `tests/test_views.py`), "
+              "both `tests.py` and `tests/` exist in the same app directory. "
+              "Python's import system raises 'incorrectly imported' because `tests/` "
+              "is treated as a namespace package (no __init__.py) OR because `tests.py` "
+              "conflicts with the `tests/` package. "
+              "This is always caused by the startapp stub not being removed.",
+        fix_template="FIX: Remove the conflicting stub and ensure __init__.py exists.\n\n"
+                     "STEP 1 — Delete the stub file created by startapp:\n"
+                     "  rm <appname>/tests.py\n"
+                     "(e.g. rm myapp/tests.py)\n\n"
+                     "STEP 2 — Ensure the tests directory has __init__.py:\n"
+                     "  touch <appname>/tests/__init__.py\n"
+                     "(e.g. touch myapp/tests/__init__.py)\n\n"
+                     "STEP 3 — Re-run the test suite:\n"
+                     "  python manage.py test\n\n"
+                     "NOTE: Do NOT move or rename test files — just create __init__.py "
+                     "and remove the conflicting stub.",
+        severity="error",
+        tags="django,tests,import,tests.py,startapp,__init__,namespace,package,python,ImportError",
+    ),
+    # ── Django test runner given a file path instead of dotted module ────
+    ErrorFix(
+        error_type="DjangoTestLabelIsFilePath",
+        language="python",
+        pattern=r"One of the test labels is a path to a file:.*which is not supported",
+        cause="Django's test runner (manage.py test) does not accept filesystem paths "
+              "as test labels. It requires dotted module names (e.g. 'tests.test_views') "
+              "or app labels (e.g. 'myapp'). Passing 'tests/test_views.py' triggers "
+              "RuntimeError. This is an agent runner issue — do NOT modify manage.py.",
+        fix_template="FIX: Convert the file path to a dotted module name before passing it "
+                     "to manage.py test.\n\n"
+                     "WRONG:\n"
+                     "  python manage.py test tests/test_items_api.py\n\n"
+                     "CORRECT:\n"
+                     "  python manage.py test tests.test_items_api\n\n"
+                     "Rule: strip .py extension, replace / with ., strip leading ./\n"
+                     "  tests/test_foo.py       → tests.test_foo\n"
+                     "  ./service/tests/test_views.py → service.tests.test_views\n\n"
+                     "To run the whole test suite without scoping:\n"
+                     "  python manage.py test\n\n"
+                     "NEVER modify manage.py to work around this — fix the test label instead.",
+        severity="error",
+        tags="django,manage.py,test,label,file,path,dotted,module,RuntimeError,python",
+    ),
+    # ── Django TemplateDoesNotExist / app not in INSTALLED_APPS ─────────
+    ErrorFix(
+        error_type="DjangoTemplateDoesNotExistWrongSettings",
+        language="python",
+        pattern=r"TemplateDoesNotExist",
+        cause="Two common causes: (1) The app is missing from INSTALLED_APPS in the settings "
+              "file that Django actually loads. Django projects created with 'django-admin "
+              "startproject' have TWO settings files: a root-level stub (e.g. settings.py at "
+              "the project root) that is NOT used, and the real settings inside the project "
+              "package (e.g. <project>/<project>/settings.py) which DJANGO_SETTINGS_MODULE "
+              "in manage.py points to. Editing the wrong settings file has no effect. "
+              "(2) The template directory structure is wrong — APP_DIRS=True requires templates "
+              "to be at <app>/templates/<app>/<template>.html.",
+        fix_template="STEP 1 — Find the REAL settings file:\n"
+                     "  grep -n 'DJANGO_SETTINGS_MODULE' manage.py\n"
+                     "  # e.g. → 'bootstrap_homepage.settings'\n"
+                     "  # Real file: bootstrap_homepage/bootstrap_homepage/settings.py\n"
+                     "  # NOT:       bootstrap_homepage/settings.py (root stub)\n\n"
+                     "STEP 2 — Add the app to INSTALLED_APPS in the REAL settings file:\n"
+                     "  INSTALLED_APPS = [\n"
+                     "      ...\n"
+                     "      'home',   # the missing app\n"
+                     "  ]\n\n"
+                     "STEP 3 — Verify template path structure:\n"
+                     "  With APP_DIRS=True the template must be at:\n"
+                     "    <app>/templates/<app>/<name>.html\n"
+                     "  e.g. home/templates/home/index.html (loaded as 'home/index.html')\n\n"
+                     "RULE: ALWAYS check manage.py for DJANGO_SETTINGS_MODULE before editing "
+                     "any settings.py. There may be two settings files — only one is real.",
+        severity="error",
+        tags="django,TemplateDoesNotExist,INSTALLED_APPS,settings,manage.py,"
+             "DJANGO_SETTINGS_MODULE,two-settings,APP_DIRS,template,python",
+    ),
+    # ── Django makemigrations: No installed app with label 'X' ──────────
+    ErrorFix(
+        error_type="DjangoNoInstalledAppWithLabel",
+        language="python",
+        pattern=r"No installed app with label '(\w+)'",
+        cause="The app label passed to makemigrations is not in INSTALLED_APPS, OR the agent "
+              "edited the WRONG settings.py. Django nested-layout projects have TWO settings files: "
+              "a root-level one (ignored by Django) and an inner config-package one "
+              "(<project>/<project>/settings.py) which DJANGO_SETTINGS_MODULE actually points to. "
+              "The agent almost always edits the root-level file and leaves the real one unchanged. "
+              "Additionally, apps.py `name` must match the importable module path — for a flat layout "
+              "where manage.py is in the project root and `api/` is a sibling, `name = 'api'` is "
+              "correct; `name = 'django_service.api'` is WRONG for that layout.",
+        fix_template="FIX: Find the REAL settings file before editing anything.\n\n"
+                     "STEP 1 — Identify which settings file Django actually loads:\n"
+                     "  grep -r 'DJANGO_SETTINGS_MODULE' manage.py\n"
+                     "  # e.g. output: django_service.settings\n"
+                     "  # → real settings file is: <project_root>/django_service/settings.py\n"
+                     "  # NOT the root-level settings.py\n\n"
+                     "STEP 2 — Open THAT file and add the app to INSTALLED_APPS:\n"
+                     "  INSTALLED_APPS = [\n"
+                     "      ...\n"
+                     "      'api',   # use the simple app label, NOT 'django_service.api'\n"
+                     "  ]\n\n"
+                     "STEP 3 — Check apps.py name matches the importable path:\n"
+                     "  If manage.py is at <project_root>/manage.py and api/ is at "
+                     "<project_root>/api/, then:\n"
+                     "    name = 'api'        ← CORRECT\n"
+                     "    name = 'django_service.api'  ← WRONG (double-prefix)\n\n"
+                     "STEP 4 — Re-run:\n"
+                     "  python manage.py makemigrations <app_label>\n"
+                     "  python manage.py migrate\n\n"
+                     "RULE: NEVER edit a settings.py without first confirming it is the file "
+                     "DJANGO_SETTINGS_MODULE points to. There may be two settings files.",
+        severity="error",
+        tags="django,makemigrations,migrate,INSTALLED_APPS,app,label,settings,nested,layout,python",
+    ),
+    # ── Django STATICFILES_DIRS pointing to non-existent directory ──────
+    ErrorFix(
+        error_type="DjangoStaticfilesDirsNotExist",
+        language="python",
+        pattern=r"(?:STATICFILES_DIRS.*does not exist|ValueError.*STATICFILES_DIRS|"
+                r"TemplateDoesNotExist|django\.core\.exceptions\.ImproperlyConfigured.*static)",
+        cause="settings.py sets STATICFILES_DIRS to a directory that does not exist on disk "
+              "(e.g. BASE_DIR / 'static'). Django's staticfiles finder raises an error during "
+              "request handling in DEBUG mode, which can manifest as TemplateDoesNotExist or "
+              "a 500 error on the first request.",
+        fix_template="FIX: Guard STATICFILES_DIRS so it only includes directories that exist:\n\n"
+                     "import os\n"
+                     "_extra_static = BASE_DIR / 'static'\n"
+                     "STATICFILES_DIRS = [_extra_static] if os.path.isdir(_extra_static) else []\n\n"
+                     "OR create the missing directory:\n"
+                     "  mkdir -p <project_root>/static\n\n"
+                     "RULE: Never set STATICFILES_DIRS to a path that the project does not "
+                     "actually create. Always guard with an existence check or create the dir "
+                     "in the setup steps.",
+        severity="error",
+        tags="django,static,STATICFILES_DIRS,TemplateDoesNotExist,ImproperlyConfigured,settings,python",
+    ),
+    # ── Django admin list_display field does not exist on model ─────────
+    ErrorFix(
+        error_type="DjangoAdminListDisplayInvalidField",
+        language="python",
+        pattern=r"admin\.E108.*list_display\[\d+\].*refers to '(\w+)'.*not a callable or attribute",
+        cause="The admin class has a field name in `list_display` that does not exist on the "
+              "linked model. This is a hallucination — the LLM assumed a field (e.g. `created_at`, "
+              "`updated_at`, `status`) would be on the model, but it was never defined there. "
+              "Django's system check raises admin.E108 and refuses to start the test runner.",
+        fix_template="FIX: Reconcile list_display with the actual model fields.\n\n"
+                     "STEP 1 — Read the model definition to see which fields actually exist:\n"
+                     "  Open <appname>/models.py and list all field names on the relevant model.\n\n"
+                     "STEP 2 — Choose ONE of the following options:\n\n"
+                     "  Option A (preferred when the field is genuinely needed):\n"
+                     "    Add the missing field to the model:\n"
+                     "      created_at = models.DateTimeField(auto_now_add=True)\n"
+                     "    Then run: python manage.py makemigrations && python manage.py migrate\n\n"
+                     "  Option B (preferred when it was a hallucination):\n"
+                     "    Remove the non-existent field name from list_display in admin.py.\n"
+                     "    Only keep field names that are confirmed to exist on the model.\n\n"
+                     "RULE: NEVER add a field to list_display that is not already defined in "
+                     "models.py. Read models.py first, then write admin.py.",
+        severity="error",
+        tags="django,admin,E108,list_display,field,model,hallucination,SystemCheckError,python",
+    ),
+    # ── Django test client — ALLOWED_HOSTS missing 'testserver' ──────────
+    ErrorFix(
+        error_type="DjangoDisallowedHostTestServer",
+        language="python",
+        pattern=r"DisallowedHost: Invalid HTTP_HOST header: 'testserver'",
+        cause="Django's test client sends requests with HTTP_HOST: 'testserver' by default. "
+              "If 'testserver' is not listed in ALLOWED_HOSTS, Django rejects the request "
+              "with a 400 response instead of routing it normally. "
+              "This is the most common Django test client setup mistake.",
+        fix_template="Add 'testserver' to ALLOWED_HOSTS in the project settings file.\n\n"
+                     "STEP 1 — Find the correct settings file before editing.\n"
+                     "Django projects often use a non-standard layout. Check which path exists:\n"
+                     "  - <project_root>/config/settings.py   ← common with 'config' project name\n"
+                     "  - <project_root>/settings.py\n"
+                     "  - <project_root>/<appname>/settings.py\n"
+                     "NEVER create a new settings.py. Edit the one that already contains INSTALLED_APPS.\n\n"
+                     "STEP 2 — Update ALLOWED_HOSTS in the settings file you found:\n"
+                     "  ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1']\n\n"
+                     "STEP 3 — Verify DJANGO_SETTINGS_MODULE in your test setup points to the same file.\n"
+                     "Example: if settings is at config/settings.py and tests run from the directory\n"
+                     "containing config/, set:\n"
+                     "  os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'",
+        severity="error",
+        tags="django,allowed_hosts,testserver,DisallowedHost,test,client,400,python",
+    ),
     ErrorFix(
         error_type="ThreeJsWebGLContextError",
         language="javascript",
@@ -1824,9 +2087,106 @@ HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
 
 ## Verification
 
-After applying one of these fixes, your Three.js components should render without 
-throwing the WebGL context error, allowing you to test other aspects of the component 
+After applying one of these fixes, your Three.js components should render without
+throwing the WebGL context error, allowing you to test other aspects of the component
 (props, headings, UI elements).
+""",
+    },
+    "django-page-creation-pattern.md": {
+        "title": "Django Page Creation Pattern",
+        "tags": "django, view, url, template, page, routing, INSTALLED_APPS, python",
+        "content": """## Overview
+
+Creating a new page in a Django project requires three coordinated changes.
+Missing any one of them results in a 404 or TemplateDoesNotExist error.
+
+## Required Steps (all three are mandatory)
+
+### 1. View function — `<app>/views.py`
+
+```python
+from django.shortcuts import render
+
+def login(request):
+    return render(request, "myapp/login.html")
+
+def signup(request):
+    return render(request, "myapp/signup.html")
+```
+
+**Never** wrap `render()` in a bare `try/except Exception` — it silently hides
+template errors and serves a broken fallback instead of a visible error page.
+
+### 2. URL pattern — project `urls.py` or app `urls.py`
+
+Add a `path()` entry for every new view:
+
+```python
+# project urls.py
+from django.urls import path, include
+from myapp import views
+
+urlpatterns = [
+    path("login/", views.login, name="login"),
+    path("signup/", views.signup, name="signup"),
+]
+```
+
+Or use `include()` to delegate to the app's own `urls.py`:
+
+```python
+# myapp/urls.py
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path("login/", views.login, name="login"),
+    path("signup/", views.signup, name="signup"),
+]
+```
+
+### 3. Template file — `<app>/templates/<app>/<page>.html`
+
+Django's `APP_DIRS=True` setting only searches templates inside **installed**
+apps.  The correct path is:
+
+```
+myapp/templates/myapp/login.html
+myapp/templates/myapp/signup.html
+```
+
+## INSTALLED_APPS — mandatory for new apps
+
+If the app is new (not yet in `settings.py`), add it to `INSTALLED_APPS` **in
+the same plan**:
+
+```python
+INSTALLED_APPS = [
+    ...
+    "myapp",   # ← required or templates/models/static files are invisible
+]
+```
+
+Forgetting this causes `TemplateDoesNotExist` even when the template file
+exists on disk.
+
+## Anti-Patterns
+
+| Anti-pattern | Problem |
+|---|---|
+| Create template only, no view | 404 — no route to render it |
+| Create view only, no URL pattern | 404 — URL resolver never reaches the view |
+| View + URL but no `INSTALLED_APPS` entry | `TemplateDoesNotExist` |
+| `try: render(...) except Exception: return HttpResponse(...)` | Silently hides real errors |
+
+## Checklist
+
+When adding any new Django page, verify **all** of the following:
+
+- [ ] View function added to `views.py`
+- [ ] `path()` entry added to `urls.py`
+- [ ] Template file created at `<app>/templates/<app>/<name>.html`
+- [ ] App listed in `INSTALLED_APPS` (if app is new)
 """,
     },
 }
@@ -2375,6 +2735,205 @@ Named export → named import: `import { Dashboard } from './Dashboard'`
 ## Rule 6: Avoid mixed default and named exports for the same component
 
 Use `export default` for the main component. Named exports for helpers/constants only.
+""",
+    },
+    "django-test-generation-instructions.md": {
+        "title": "Django Test Generation Instructions",
+        "tags": "django, testing, pytest, test-generation, behavioral, instructions, python, allowed_hosts, template, settings",
+        "content": """## Overview
+
+When generating or fixing tests for Django projects, follow these rules to avoid
+the most common failure patterns. These apply to both pytest-django and unittest-style tests.
+
+## Rule 1: READ the template before asserting its text content
+
+NEVER assume what a Django template renders. Before writing any assertion on
+response content or template text (e.g. `assert b"Welcome" in resp.content`),
+read the actual template file to find the exact text.
+
+WRONG — assumes text that may not be in the template:
+```python
+assert b"Welcome to My Django Homepage" in resp.content
+```
+
+CORRECT — read the template first, then assert what is actually there:
+```python
+# First, read myapp/templates/myapp/home.html to see exact <h1> text
+assert b"Welcome to My Django App" in resp.content  # ← from actual template
+```
+
+## Rule 2: File path assertions must be relative to the test cwd
+
+Tests run from the directory that contains `manage.py` (the sub-project root).
+When asserting a file's existence with `Path("...")`, use a path relative to
+that directory — do NOT prefix it with the sub-project directory name.
+
+WRONG — double-prefix when cwd is already `my_django_project/`:
+```python
+template_path = Path("my_django_project/myapp/templates/myapp/home.html")
+assert template_path.exists()  # fails — resolves to my_django_project/my_django_project/...
+```
+
+CORRECT — relative to cwd (`my_django_project/`):
+```python
+template_path = Path("myapp/templates/myapp/home.html")
+assert template_path.exists()
+```
+
+## Rule 3: ALLOWED_HOSTS must include 'testserver'
+
+Django's test client sends requests with `HTTP_HOST: testserver`. If `testserver`
+is not in `ALLOWED_HOSTS`, the response is 400 — not 200 or 404.
+
+ALWAYS include `'testserver'` when writing or modifying `ALLOWED_HOSTS`:
+```python
+ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1']
+```
+
+If a test returns 400 unexpectedly, check `ALLOWED_HOSTS` before debugging views or URLs.
+
+## Rule 4: Locate the correct settings file before editing
+
+Django projects often use a non-standard layout. The settings file is NOT always
+`settings.py` at the project root. Common locations:
+
+| Layout | Settings path |
+|--------|---------------|
+| `django-admin startproject config .` | `config/settings.py` |
+| `django-admin startproject myapp .` | `myapp/settings.py` |
+| Flat layout | `settings.py` |
+
+**Before editing settings**, grep for `INSTALLED_APPS` to find the real file:
+```bash
+grep -r "INSTALLED_APPS" . --include="*.py" -l
+```
+
+NEVER create a new `settings.py`. NEVER edit a settings file that has fewer than
+~20 lines — it is likely not the real settings file.
+
+## Rule 5: DJANGO_SETTINGS_MODULE must match the real module path
+
+The module path is determined by where `manage.py` is relative to the Python path.
+If `manage.py` is at `my_django_project/manage.py` and settings is at
+`my_django_project/config/settings.py`, then tests running from `my_django_project/`
+should set:
+```python
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+```
+
+NOT `my_django_project.config.settings` — that double-prefixes the package.
+
+## Rule 6: Use Django's TestCase or pytest-django for database tests
+
+If your test accesses the database, use `django.test.TestCase` (which wraps each
+test in a transaction and rolls back) or `@pytest.mark.django_db` with pytest-django.
+Plain `pytest` functions do NOT have database access by default.
+
+```python
+from django.test import TestCase
+
+class MyModelTest(TestCase):
+    def test_create(self):
+        obj = MyModel.objects.create(name="test")
+        self.assertEqual(obj.name, "test")
+```
+
+## Rule 8: NEVER import test classes into production files
+
+Production files (`views.py`, `models.py`, `urls.py`, `admin.py`, `serializers.py`)
+must NEVER import from test modules. This is always a code generation error.
+
+WRONG — remove this from any production file immediately:
+```python
+# views.py
+from .tests import ItemAPITest          # ← WRONG
+from myapp.tests import SomeTestClass   # ← WRONG
+```
+
+If you see `ImportError: cannot import name '...' from '...tests'` originating
+from a production file, delete the offending import line. Do NOT fix the test
+module or add re-exports — the import should not exist at all.
+
+## Rule 9: admin.py list_display must only reference fields that exist on the model
+
+NEVER add a field name to `list_display` in `admin.py` unless that field is
+explicitly defined in the corresponding model in `models.py`.
+
+Common hallucinated fields that trigger `admin.E108`:
+- `created_at` / `updated_at` — only present if explicitly added with `DateTimeField`
+- `status` — only present if explicitly added with `CharField` or `IntegerField`
+- `is_active`, `slug`, `description` — same rule applies
+
+WRONG — assumes the model has `created_at`:
+```python
+class ItemAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'created_at']  # admin.E108 if model lacks created_at
+```
+
+CORRECT — only list fields confirmed in models.py:
+```python
+# models.py has: id, name, price — nothing else
+class ItemAdmin(admin.ModelAdmin):
+    list_display = ['id', 'name', 'price']
+```
+
+If `created_at` tracking is genuinely needed, add it to the model first:
+```python
+# models.py
+created_at = models.DateTimeField(auto_now_add=True)
+```
+Then run `makemigrations` + `migrate` before referencing it in admin.
+
+## Rule 7: When tests fail with SOURCE_BUG triage — diagnose before fixing
+
+If a test failure is triaged as SOURCE_BUG, verify before modifying source files:
+1. Is the assertion text correct? (Rule 1 — read the template)
+2. Is the path correct? (Rule 2 — relative to cwd)
+3. Is ALLOWED_HOSTS correct? (Rule 3)
+4. Are you editing the right settings file? (Rule 4)
+
+A mismatch between what the test asserts and what the source renders is often a
+TEST_BUG, not a SOURCE_BUG — the test was generated with assumed content.
+
+## Rule 10: Use the simple app label in imports and INSTALLED_APPS
+
+When `manage.py startapp home` is run inside a project called `bootstrap_homepage`,
+the app lives at `bootstrap_homepage/home/` but is importable as just `home`
+(because manage.py adds `bootstrap_homepage/` to sys.path).
+
+**INSTALLED_APPS** — use the simple label, not the project-prefixed path:
+```python
+# CORRECT
+INSTALLED_APPS = [..., "home"]
+
+# WRONG — Django cannot find this module; causes AppRegistryNotReady / LookupError
+INSTALLED_APPS = [..., "bootstrap_homepage.home"]
+```
+
+**Test imports** — import from the app directly:
+```python
+# CORRECT
+from home import views
+from home.views import index
+
+# WRONG — raises ModuleNotFoundError
+from bootstrap_homepage.home import views
+```
+
+**unittest.mock patch paths** — patch where the name is looked up (in the
+module that uses it), using the simple label:
+```python
+# CORRECT — patches render in the home.views namespace
+with patch("home.views.render") as mock_render:
+    ...
+
+# WRONG — patches a module path that does not exist
+with patch("bootstrap_homepage.home.views.render") as mock_render:
+    ...
+```
+
+**Rule**: always check the app directory name on disk and use that as-is.
+If `home/` is a sibling of `manage.py`, the import is `from home import ...`.
 """,
     },
 }

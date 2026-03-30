@@ -45,6 +45,7 @@ class KBFileHandler:
         debounce_seconds: float = 0.5,
         vector_store=None,
         api_client=None,
+        created_files: set[str] | None = None,
     ) -> None:
         self._indexer = indexer
         self._project_root = os.path.abspath(project_root)
@@ -53,6 +54,9 @@ class KBFileHandler:
         self._lock = threading.Lock()
         self._vector_store = vector_store
         self._api_client = api_client
+        # Shared mutable set — when provided by RuntimeWatcher, callers who
+        # captured a reference before the handler started will still see updates.
+        self.created_files: set[str] = created_files if created_files is not None else set()
 
     # ------------------------------------------------------------------
     # Watchdog event dispatch
@@ -66,6 +70,9 @@ class KBFileHandler:
     def on_created(self, event) -> None:  # type: ignore[override]
         """Handle a file creation event."""
         if not event.is_directory:
+            rel = self._rel_path(event.src_path)
+            if rel and not self._should_ignore(event.src_path):
+                self.created_files.add(rel.replace("\\", "/"))
             self._handle_change(event.src_path)
 
     def on_deleted(self, event) -> None:  # type: ignore[override]
@@ -224,11 +231,15 @@ class KBWatcher:
         each incremental graph update (Phase 2 integration).
     """
 
-    def __init__(self, indexer, project_root: str, vector_store=None, api_client=None) -> None:
+    def __init__(self, indexer, project_root: str, vector_store=None, api_client=None,
+                 created_files: set[str] | None = None) -> None:
         self._indexer = indexer
         self._project_root = os.path.abspath(project_root)
         self._observer: Optional[object] = None
-        self._handler = KBFileHandler(indexer, project_root, vector_store=vector_store, api_client=api_client)
+        self._handler = KBFileHandler(
+            indexer, project_root, vector_store=vector_store, api_client=api_client,
+            created_files=created_files,
+        )
 
     def start(self) -> None:
         """

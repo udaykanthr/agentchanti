@@ -24,7 +24,7 @@ class GeminiClient(LLMClient):
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Gemini] Sending ~{est_tokens} est. tokens")
         token_tracker.set_context(est_tokens)
-        log.debug(f"[Gemini] Prompt:\n{prompt}")
+        # log.debug(f"[Gemini] Prompt:\n{prompt}")
 
         payload = {
             "contents": [
@@ -101,7 +101,7 @@ class GeminiClient(LLMClient):
                     break
                 try:
                     chunk = json.loads(data_str)
-                    log.debug(f"[Gemini] Chunk: {chunk}")
+                    # log.debug(f"[Gemini] Chunk: {chunk}")
                     # usageMetadata is present in the final chunk with real counts
                     usage = chunk.get("usageMetadata", {})
                     if usage:

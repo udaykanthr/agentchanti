@@ -38,6 +38,7 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                 error_output=error_info,
                 max_tokens=2000,
                 language=language,
+                step_type=step_type,
             )
             if kb_ctx.error_fixes or kb_ctx.behavioral_instructions:
                 kb_error_context = kb_context_builder.format_context_for_prompt(kb_ctx)
@@ -99,9 +100,19 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     # Detect sub-project root to inform the LLM
     subproject = _detect_subproject_root(memory)
 
+    # Inject task briefing so diagnosis never removes features to bypass failures.
+    _diag_briefing = getattr(memory, '_task_briefing', '')
+    _briefing_block = (
+        "TASK BRIEFING (the overall goal — respect Preserve and Key constraint):\n"
+        f"{_diag_briefing}\n\n"
+    ) if _diag_briefing else ""
+
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
         "Analyze the failure and provide a concrete fix.\n\n"
+        f"{_briefing_block}"
+        "CRITICAL: Do NOT remove, comment out, or skip the feature/component that is failing. "
+        "Fix the root cause instead.\n\n"
         f"Step {step_idx+1}: {step_text}\n"
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
@@ -137,6 +148,64 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += f"{prior_context}\n"
     if context_files:
         prompt += f"Relevant project files:\n{context_files}\n\n"
+
+    # ── Django TemplateDoesNotExist → INSTALLED_APPS hint ─────────────────
+    # When Django raises TemplateDoesNotExist the most common root cause is a
+    # new app that was never added to INSTALLED_APPS (APP_DIRS=True only scans
+    # installed apps).  Detect this and inject both the error app name and the
+    # current settings.py so the LLM can produce a targeted fix.
+    _tpl_dne_m = re.search(
+        r'TemplateDoesNotExist[^\n]*?([\w/.-]+/[\w.-]+\.html)',
+        error_info or "",
+    )
+    if _tpl_dne_m:
+        _missing_tpl = _tpl_dne_m.group(1)          # e.g. "homepage/index.html"
+        _app_name = _missing_tpl.split("/")[0]       # e.g. "homepage"
+        # Locate settings.py — look in memory first, then disk
+        _settings_content: str | None = None
+        _settings_path: str | None = None
+        for _fpath, _fcontent in memory.all_files().items():
+            if _fpath.endswith("settings.py") and "INSTALLED_APPS" in _fcontent:
+                _settings_content = _fcontent
+                _settings_path = _fpath
+                break
+        if _settings_content is None:
+            _search_root = subproject or "."
+            for _dirpath, _dirnames, _filenames in os.walk(_search_root):
+                _dirnames[:] = [d for d in _dirnames
+                                if d not in ("venv", ".venv", "node_modules",
+                                             "__pycache__", ".git")]
+                if "settings.py" in _filenames:
+                    _candidate = os.path.join(_dirpath, "settings.py")
+                    try:
+                        with open(_candidate, encoding="utf-8") as _sf:
+                            _sc = _sf.read()
+                        if "INSTALLED_APPS" in _sc:
+                            _settings_content = _sc
+                            _settings_path = _candidate
+                            break
+                    except OSError:
+                        pass
+        if _settings_content and _settings_path:
+            _app_in_settings = (
+                f"'{_app_name}'" in _settings_content
+                or f'"{_app_name}"' in _settings_content
+            )
+            if not _app_in_settings:
+                prompt += (
+                    f"\nDJANGO INSTALLED_APPS WARNING:\n"
+                    f"The error is `TemplateDoesNotExist: {_missing_tpl}`. "
+                    f"The app '{_app_name}' is NOT listed in INSTALLED_APPS in "
+                    f"`{_settings_path}`. With APP_DIRS=True Django only searches "
+                    f"templates inside installed apps — add '{_app_name}' to "
+                    f"INSTALLED_APPS to fix the template lookup.\n\n"
+                    f"#### [FILE]: {_settings_path}\n"
+                    f"```python\n{_settings_content}\n```\n\n"
+                )
+                log.info(
+                    "Step %d: Injected INSTALLED_APPS hint for missing app '%s'",
+                    step_idx + 1, _app_name,
+                )
 
     # ── CSS conflict injection ──────────────────────────────────────────────
     # If the step involves a styling/colour change, inject any global CSS files
@@ -237,22 +306,20 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         prompt += (
             "Respond with:\n"
             "1. ROOT CAUSE: one-line explanation of what went wrong\n"
-            "2. FIX: provide the COMPLETE corrected file(s). Do NOT use diffs or patches.\n"
-            "   Write the ENTIRE file content, not just the changed parts.\n\n"
-            "CRITICAL FORMAT — the #### [FILE]: marker must be OUTSIDE and BEFORE the code block:\n\n"
-            "#### [FILE]: path/to/file.py\n"
-            "```python\n"
-            "# entire file contents here\n"
-            "```\n\n"
-            "WRONG (do NOT do this):\n"
-            "```python\n"
-            "#### [FILE]: path/to/file.py   <-- WRONG! marker inside code block\n"
-            "```\n\n"
-            "WRONG (do NOT do this):\n"
-            "```diff\n"
-            "-old line   <-- WRONG! do not use diff format\n"
-            "+new line\n"
-            "```\n"
+            "2. FIX: PREFER chunk format to avoid unintended changes to unrelated code.\n\n"
+            "   PREFERRED — chunk format (surgical, only the broken section):\n"
+            "   #### [EDIT]: path/to/file.py:function_or_class_name (lines start-end)\n"
+            "   ```python\n"
+            "   # complete replacement for this chunk only\n"
+            "   ```\n\n"
+            "   FALLBACK — full file (only when the entire file must be rewritten):\n"
+            "   #### [FILE]: path/to/file.py\n"
+            "   ```python\n"
+            "   # entire file contents here\n"
+            "   ```\n\n"
+            "CRITICAL: Do NOT use diff/patch format. "
+            "Use [EDIT]: for targeted fixes, [FILE]: only when truly needed.\n"
+            "The [EDIT]: marker MUST be OUTSIDE and BEFORE the code block.\n"
         )
 
     sent_before, recv_before = token_tracker.snapshot()
@@ -347,8 +414,39 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
 
     display.step_info(step_idx, "Applying diagnosis fix...")
 
-    # Extract code file fixes regardless of step type, allowing CMD steps to fix code bugs
-    files = executor.parse_code_blocks(diagnosis)
+    # ── Preferred: parse [EDIT]: chunk markers (surgical, avoids unintended changes) ──
+    files: dict[str, str] = {}
+    try:
+        from ..editing.chunk_editor import ChunkEditor as _CE
+        _ce = _CE()
+        _chunk_edits = _ce.parse_chunk_response(diagnosis)
+        if _chunk_edits:
+            for _edit in _chunk_edits:
+                _fpath = _edit.file_path
+                _existing = memory.get(_fpath)
+                if _existing is None:
+                    try:
+                        with open(_fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            _existing = _f.read()
+                    except OSError:
+                        pass
+                if _existing is not None:
+                    try:
+                        files[_fpath] = _ce.apply_chunk_edits(
+                            _existing, [_edit])
+                    except Exception as _exc:
+                        log.warning(
+                            "Step %d: ChunkEdit apply failed for %s: %s",
+                            step_idx + 1, _fpath, _exc)
+            if files:
+                log.info("Step %d: Diagnosis applied %d chunk edit(s): %s",
+                         step_idx + 1, len(files), list(files.keys()))
+    except ImportError:
+        pass
+
+    # ── Fallback: full-file [FILE]: markers ──
+    if not files:
+        files = executor.parse_code_blocks(diagnosis)
 
     # Fallback: try fuzzy parsing (handles diff blocks, inline file
     # comments, and other common LLM diagnosis formats)
@@ -492,7 +590,25 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         cwd_note = f" (in {fix_cwd}/)" if fix_cwd else ""
         display.step_info(step_idx, f"Running fix: {cmd}{cwd_note}")
         log.info(f"Step {step_idx+1}: Running fix command: {cmd}{cwd_note}")
-        success, output = executor.run_command(cmd, cwd=fix_cwd)
+
+        # Detect long-running server commands so they are started as background
+        # processes rather than blocking until the 120 s timeout expires.
+        _BACKGROUND_PATTERNS = (
+            r'\bmanage\.py\s+runserver\b',
+            r'\bnpm\s+(start|run\s+dev|run\s+start)\b',
+            r'\byarn\s+(start|dev)\b',
+            r'\bpnpm\s+(start|dev)\b',
+            r'\bnpx\s+.*dev\b',
+            r'\bgunicorn\b',
+            r'\buvicorn\b',
+            r'\bflask\s+run\b',
+            r'\bfastapi\s+run\b',
+        )
+        _run_as_bg = any(
+            _re_fix.search(p, cmd, _re_fix.IGNORECASE)
+            for p in _BACKGROUND_PATTERNS
+        )
+        success, output = executor.run_command(cmd, cwd=fix_cwd, background=_run_as_bg)
         if output:
             truncated = output[:4000] if len(output) > 4000 else output
             memory.update({

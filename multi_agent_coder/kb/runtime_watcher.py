@@ -38,6 +38,7 @@ class RuntimeWatcher:
         self._project_root: Optional[str] = None
         self._running = False
         self._stop_event = threading.Event()
+        self._created_files: set[str] = set()  # shared set — survives thread start race
 
     def start(self, project_root: str, api_client=None) -> None:
         """
@@ -86,6 +87,16 @@ class RuntimeWatcher:
         """Return True if the watcher is active."""
         return self._running
 
+    @property
+    def created_files(self) -> set[str]:
+        """Relative paths of files created (not just modified) this session.
+
+        Returns the same mutable set that the KBFileHandler writes to,
+        so callers always see up-to-date entries regardless of when they
+        captured the reference.
+        """
+        return self._created_files
+
     # ------------------------------------------------------------------
     # Internal: check index existence
     # ------------------------------------------------------------------
@@ -114,10 +125,11 @@ class RuntimeWatcher:
                 indexer = Indexer(self._project_root)
                 vector_store = create_vector_store(self._project_root)
                 watcher = KBWatcher(
-                    indexer, 
-                    self._project_root, 
+                    indexer,
+                    self._project_root,
                     vector_store=vector_store,
                     api_client=self._api_client,
+                    created_files=self._created_files,
                 )
                 self._observer = watcher._observer  # will be set after start
                 self._running = True
