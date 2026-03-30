@@ -1128,8 +1128,10 @@ def _prefix_subproject_paths(files: dict[str, str],
             corrected[fpath] = content
             continue
 
-        # Already has the sub-project prefix
-        if fpath.startswith(prefix):
+        # Already has the sub-project prefix (normalise backslashes so
+        # Windows paths like 'my-app\src\foo.js' match 'my-app/')
+        norm_fpath = fpath.replace("\\", "/")
+        if norm_fpath.startswith(prefix):
             corrected[fpath] = content
             continue
 

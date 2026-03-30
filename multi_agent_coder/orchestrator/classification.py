@@ -34,9 +34,12 @@ _TEST_CMD_RE = re.compile(
 # and should be classified by the LLM, not fast-tracked as TEST.
 _TEST_CONFIG_RE = re.compile(
     r'('
+    # Command line config mutations
+    r'npm\s+set-script\b'
+    r'|npm\s+pkg\s+set\s+scripts\.'
     # Script/package.json edits
-    r'add\s+.*scripts?\s+to\b'
-    r'|update\s+.*scripts?\s+in\b'
+    r'|add\s+.*scripts?\b'
+    r'|update\s+.*scripts?\b'
     r'|modify\s+.*package\.json'
     r'|add\s+.*to\s+.*package\.json'
     r'|edit\s+.*package\.json'

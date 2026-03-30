@@ -410,6 +410,10 @@ def main():
                            "Create a step-by-step plan for the coding task and related testcases.",
                            _make_llm_for_agent("planner"),
                            prompt_suffix=planner_suffix)
+    from ..agents.intent import IntentAgent
+    intent_agent = IntentAgent("IntentAnalyzer", "Requirements Analyst",
+                               "Analyze the prompt and search the web if intent is ambiguous to produce a formal REQUIREMENTS_SPEC.",
+                               _make_llm_for_agent("intent"))
     coder = CoderAgent("Coder", "Senior Software Developer",
                        f"Write clean {get_language_name(language)} code for a single step.",
                        _make_llm_for_agent("coder"),
@@ -586,10 +590,15 @@ def main():
             baseline_failing_files=getattr(
                 _pre_mem_local, '_tester_baseline_failing_files', None),
             search_agent=search_agent,
+            intent_agent=intent_agent,
+            cli_display=display,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
-            log.info("[Planning] Pre-analysis context injected")
+
+        # Update task if IntentAgent enriched it during pre_analyze
+        args.task = getattr(planner, '_enriched_task', args.task)
+        log.info("[Planning] Pre-analysis context injected")
 
         # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
         _llm_detected = getattr(planner, '_detected_language', None)

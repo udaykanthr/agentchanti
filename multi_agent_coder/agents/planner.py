@@ -199,7 +199,9 @@ class PlannerAgent(Agent):
                     language: str | None = None,
                     baseline_passing_files: list[str] | None = None,
                     baseline_failing_files: list[str] | None = None,
-                    search_agent=None) -> str:
+                    search_agent=None,
+                    intent_agent=None,
+                    cli_display=None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -260,7 +262,72 @@ class PlannerAgent(Agent):
                 elif intent == "feature":
                     parts.append(f"  ^ This file may need modification for the new feature")
 
-        # 2b. LLM-based task briefing using ONLY the pre-filtered relevant files.
+        # 2b. Intent Analysis — runs BEFORE task briefing so the enriched
+        # task is available for the briefing LLM call.  Placed outside the
+        # `if relevant` guard so it fires even for blank/new projects.
+        _raw_task = task  # preserve original for clean KB search queries
+        if intent_agent is not None:
+            if cli_display:
+                cli_display.show_status("Analyzing intent and gathering requirements...")
+
+            _logger.info("[PreAnalysis] Compiling semantic context for IntentAgent...")
+            _semantic_kb = []
+
+            # Local knowledge base entries (tech stack, patterns, etc.)
+            if knowledge_base and knowledge_base.size > 0:
+                _semantic_kb.append(knowledge_base.format_for_planner() or "")
+
+            # Global KB docs (framework guides, installation docs, etc.)
+            # These are the high-value docs like "React TailwindCSS Responsive
+            # Header", "Vite React Setup Guide", etc.
+            if kb_context_builder is not None:
+                try:
+                    kb_context_builder._ensure_global()
+                    _gs = kb_context_builder._global_store
+                    if _gs is not None:
+                        _intent_docs = _gs.search(
+                            query=task,
+                            categories=["doc", "pattern"],
+                            top_k=10,
+                            api_client=kb_context_builder._api_client,
+                        )
+                        if _intent_docs:
+                            _doc_sections = []
+                            for _d in _intent_docs:
+                                _doc_sections.append(
+                                    f"### {_d.title}\n{_d.content or ''}"
+                                )
+                            _semantic_kb.append(
+                                "Global KB Documentation:\n"
+                                + "\n\n".join(_doc_sections)
+                            )
+                            _logger.info(
+                                "[PreAnalysis] Injected %d global KB doc(s) "
+                                "into IntentAgent context",
+                                len(_intent_docs),
+                            )
+                except Exception as _gkb_exc:
+                    _logger.debug(
+                        "[PreAnalysis] Global KB query for IntentAgent failed: %s",
+                        _gkb_exc,
+                    )
+
+            # Relevant source file skeletons (for existing projects)
+            if relevant:
+                _semantic_kb.append("Relevant Files Current State:\n" + "\n".join(
+                    f"[{fpath}] {skeleton}" for fpath, _, skeleton in relevant
+                ))
+
+            _full_semantic_context = "\n\n".join(_semantic_kb)
+
+            task = intent_agent.analyze_intent(
+                task, search_agent=search_agent,
+                kb_context_builder=kb_context_builder,
+                kb_context=_full_semantic_context)
+            self._enriched_task = task
+            _logger.info("[PreAnalysis] Task intent enriched.")
+
+        # 2c. LLM-based task briefing using ONLY the pre-filtered relevant files.
         # We deliberately pass only the files from step 2 (not the whole project)
         # so the LLM gets focused context without being flooded.  The result is
         # a concrete TASK BRIEFING block injected as the highest-priority context.
@@ -358,6 +425,7 @@ class PlannerAgent(Agent):
                         "[PreAnalysis] Pre-fetched %d KB doc(s) for briefing",
                         len(_pre_pkg_docs),
                     )
+
 
                 _briefing = analyze_task_for_planner(
                     task=task,
@@ -562,10 +630,10 @@ class PlannerAgent(Agent):
                 kb_context_builder._ensure_global()
                 if kb_context_builder._global_store is not None:
                     _logger.info(
-                        "[PreAnalysis] Querying global KB for task: %s", task
+                        "[PreAnalysis] Querying global KB for task: %s", _raw_task
                     )
                     docs = kb_context_builder._global_store.search(
-                        query=task,
+                        query=_raw_task,
                         categories=["doc", "pattern"],
                         top_k=20,
                         api_client=kb_context_builder._api_client,

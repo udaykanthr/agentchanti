@@ -184,6 +184,10 @@ def _run_task_impl(
     planner = PlannerAgent("Planner", "Senior Software Architect",
                            "Create a step-by-step plan for the coding task.",
                            _make_llm("planner"))
+    from .agents.intent import IntentAgent
+    intent_agent = IntentAgent("IntentAnalyzer", "Requirements Analyst",
+                               "Analyze the prompt and search the web if intent is ambiguous to produce a formal REQUIREMENTS_SPEC.",
+                               _make_llm("intent"))
     coder = CoderAgent("Coder", "Senior Software Developer",
                        f"Write clean {get_language_name(language)} code for a single step.",
                        _make_llm("coder"))
@@ -320,9 +324,14 @@ def _run_task_impl(
         knowledge_base=knowledge_base,
         test_analysis=test_analysis,
         language=language,
+        intent_agent=intent_agent,
+        search_agent=search_agent,
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
+
+    # Update task if IntentAgent enriched it during pre_analyze
+    task = getattr(planner, '_enriched_task', task)
 
     # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
     _llm_detected = getattr(planner, '_detected_language', None)

@@ -2192,6 +2192,37 @@ When adding any new Django page, verify **all** of the following:
 }
 
 _BEHAVIORAL_DOCS = {
+    "npm-scripts-instructions.md": {
+        "title": "NPM Scripts Instructions",
+        "tags": "npm, scripts, package.json, set-script, commands, behavioral, instructions, javascript, typescript",
+        "content": """## CRITICAL: NPM Scripts Rules
+
+When generating terminal commands to add or modify scripts in a `package.json` file, you MUST follow these rules.
+
+## Rule 1: NEVER use `npm set-script`
+
+The `npm set-script` command was deprecated and completely removed in npm v7+. It will cause an "Unknown command" error and fail the pipeline.
+NEVER generate commands like `npm set-script test "vitest"`.
+
+## Rule 2: ALWAYS use `npm pkg set` to modify scripts
+
+To add or modify a script via the command line, you MUST use the `npm pkg set` command:
+
+WRONG (fails in modern npm):
+`npm set-script start "vite"`
+`npm run set-script test "jest"`
+
+CORRECT (works in modern npm):
+`npm pkg set scripts.start="vite"`
+`npm pkg set scripts.build="vite build"`
+`npm pkg set scripts.test="vitest run"`
+
+## Rule 3: Multiple scripts
+
+You can set multiple scripts in a single command if needed:
+`npm pkg set scripts.dev="vite" scripts.build="vite build"`
+""",
+    },
     "code-review-instructions.md": {
         "title": "Code Review Instructions",
         "tags": "code-review, instructions, behavioral, quality",
