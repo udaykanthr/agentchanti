@@ -32,7 +32,7 @@ from .agents.planner import PlannerAgent
 from .agents.coder import CoderAgent
 from .agents.reviewer import ReviewerAgent
 from .agents.tester import TesterAgent
-from .agents.analyser import AnalyseAgent, ProjectContext, build_project_context
+from .agents.analyser import AnalyseAgent, ProjectContext, build_project_context, parse_briefing_packages
 from .executor import Executor
 from .embedding_store import EmbeddingStore
 from .cli_display import CLIDisplay, token_tracker, log
@@ -349,6 +349,7 @@ def _run_task_impl(
         fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, parse_heuristic_plan, PlanStep,
+        reclassify_manifest_steps,
     )
     plan_steps: list[PlanStep] | None = None
 
@@ -419,6 +420,14 @@ def _run_task_impl(
             language=language)
         plan_steps = from_legacy_steps(steps, dependencies)
 
+    # Reclassify CODE steps targeting only protected dependency manifests
+    # (package.json, requirements.txt, etc.) as CMD install steps so the
+    # package manager does the safe, atomic update instead of the LLM write
+    # being silently blocked by the protected-file guard.
+    plan_steps = reclassify_manifest_steps(plan_steps)
+    steps = steps_as_text_list(plan_steps)
+    dependencies = steps_dependencies_dict(plan_steps)
+
     # ── Project analysis phase ──────────────────────────────────
     # Build structured ProjectContext from static analysis (zero LLM cost).
     # Optionally enrich with LLM for deeper success criteria and test hints.
@@ -428,6 +437,14 @@ def _run_task_impl(
         language=language,
         project_profile=project_profile,
     )
+
+    # Inject packages from the task briefing's "New packages:" line so that
+    # _ensure_packages_installed runs the actual install before the first CODE
+    # step — even when the plan has no explicit CMD install step.
+    for _pkg in parse_briefing_packages(_briefing_text):
+        if _pkg not in project_context_obj.required_packages:
+            project_context_obj.required_packages.append(_pkg)
+            _logger.info("[PreAnalysis] Briefing package injected: %s", _pkg)
 
     # LLM enrichment — adds deeper success criteria, assertion hints,
     # and testable unit identification.  Uses 1 LLM call.
