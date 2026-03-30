@@ -3092,8 +3092,22 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         _targets_hint = " ".join(plan_step.target_files)
         _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
 
-    # --- Tier 1: Diff-aware editing (requires KB graph + high confidence) ---
+    # Detect primary target file to see if we should force DiffEdit for non-AST
+    target_for_route = _detect_target_file(_edit_step_text, memory)
+    is_non_ast = False
+    if target_for_route:
+        ext = os.path.splitext(target_for_route)[1].lower()
+        if ext in {".html", ".css", ".scss", ".json", ".yaml", ".yml", ".md", ".txt"}:
+            is_non_ast = True
+
+    # --- Tier 1: Diff-aware editing ---
+    try_diff = False
     if cfg and getattr(cfg, "EDITING_DIFF_MODE", False) and code_graph is not None:
+        try_diff = True
+    if is_non_ast:
+        try_diff = True
+
+    if try_diff:
         diff_result = _try_diff_edit(
             step_text=_edit_step_text, coder=coder, task=task,
             memory=memory, display=display, step_idx=step_idx,
@@ -3104,7 +3118,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             return diff_result
 
     # --- Tier 2: Chunk edit (regex-based, no KB graph needed) ---
-    if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True):
+    if cfg and getattr(cfg, "EDITING_CHUNK_MODE", True) and not is_non_ast:
         chunk_result = _try_chunk_edit(
             step_text=_edit_step_text, coder=coder, reviewer=reviewer,
             executor=executor, task=task, memory=memory,
@@ -4924,25 +4938,58 @@ def _try_diff_edit(
     resolver = ScopeResolver(code_graph)
     scope = resolver.resolve(step_text, target_file, code_graph)
 
-    min_conf = getattr(cfg, "EDITING_MIN_CONFIDENCE", 0.60)
-    if scope.confidence < min_conf:
-        log.warning(
-            "[DiffEdit] Confidence %.2f < %.2f for %s, falling back",
-            scope.confidence, min_conf, target_file,
-        )
-        _log_fallback_metric(cfg, target_file, step_text, scope, "low_confidence")
-        return None
+    # Bypass slicing and confidence check for non-AST files
+    non_ast_exts = {".html", ".css", ".scss", ".json", ".yaml", ".yml", ".md", ".txt"}
+    ext = os.path.splitext(target_file)[1].lower()
+    is_non_ast = ext in non_ast_exts
 
-    # 2. Slice files
-    ctx_lines = getattr(cfg, "EDITING_CONTEXT_LINES", 5)
-    slicer = ContextSlicer()
+    if is_non_ast:
+        scope.confidence = 1.0
+        try:
+            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            content = memory.get(target_file, "")
 
-    scopes_map: dict = {}
-    for af in scope.affected_files:
-        scopes_map[af] = scope
+        line_count = len(content.splitlines())
+        formatted = f"=== FILE: {target_file} ({line_count} lines total) ===\n"
+        formatted += f"Language: {ext.lstrip('.')}\n\n"
+        formatted += content
+        if not content.endswith("\n") and content:
+            formatted += "\n"
+        formatted += f"=== END FILE ===\n"
+        
+        full_file_lines = line_count
+        sliced_lines = line_count
+    else:
+        min_conf = getattr(cfg, "EDITING_MIN_CONFIDENCE", 0.60)
+        if scope.confidence < min_conf:
+            log.warning(
+                "[DiffEdit] Confidence %.2f < %.2f for %s, falling back",
+                scope.confidence, min_conf, target_file,
+            )
+            _log_fallback_metric(cfg, target_file, step_text, scope, "low_confidence")
+            return None
 
-    slices = slicer.slice_files(scopes_map)
-    formatted = slicer.format_for_prompt(slices)
+        # 2. Slice files
+        ctx_lines = getattr(cfg, "EDITING_CONTEXT_LINES", 5)
+        slicer = ContextSlicer()
+
+        scopes_map: dict = {}
+        for af in scope.affected_files:
+            scopes_map[af] = scope
+
+        slices = slicer.slice_files(scopes_map)
+        formatted = slicer.format_for_prompt(slices)
+
+        # Compute token stats
+        full_file_lines = 0
+        sliced_lines = 0
+        for fslice in slices.values():
+            full_file_lines += fslice.total_lines
+            sliced_lines += sum(b.line_end - b.line_start + 1 for b in fslice.slices)
+            if fslice.imports_block:
+                sliced_lines += fslice.imports_block.count("\n") + 1
 
     # Prepend project orientation + knowledge context to sliced context
     prefix_parts = []
@@ -4962,15 +5009,6 @@ def _try_diff_edit(
         )
     if prefix_parts:
         formatted = "\n\n".join(prefix_parts) + "\n\n" + formatted
-
-    # Compute token stats
-    full_file_lines = 0
-    sliced_lines = 0
-    for fslice in slices.values():
-        full_file_lines += fslice.total_lines
-        sliced_lines += sum(b.line_end - b.line_start + 1 for b in fslice.slices)
-        if fslice.imports_block:
-            sliced_lines += fslice.imports_block.count("\n") + 1
 
     display.step_info(step_idx, f"[DiffEdit] Sending {sliced_lines}/{full_file_lines} lines to LLM...")
 
@@ -5267,6 +5305,7 @@ Rules:
    Do NOT stop outputting after the function/class closing brace if the original chunk continues
    beyond it (e.g. `Foo.propTypes = ...`, `Foo.defaultProps = ...`, `export default Foo`).
    If those lines appear in the original chunk, reproduce them verbatim in your replacement.
+9. NEVER abbreviate code inside your chunk with comments like `// existing code` or `/* unchanged */`. Write out every line.
 """
 
 

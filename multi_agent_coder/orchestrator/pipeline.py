@@ -1926,6 +1926,7 @@ def run_final_test_verification(
             + kb_instructions
             + "\n\nFix the source file(s) so ALL tests pass."
             + "\n\nIMPORTANT: Preserve ALL existing public symbols (classes, functions, constants) — only add or modify, never remove."
+            + "\n\nCRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!"
             + "\n\nPrefer CHUNK FORMAT for surgical fixes:\n"
             + "#### [EDIT]: path/to/file.py:function_name (lines start-end)\n```\n// replacement chunk\n```\n"
             + "Use full-file [FILE]: format only when the whole file must be rewritten."
@@ -2492,6 +2493,7 @@ def run_bulk_test_execution_and_fix(
                 "2. Copy that exact string (correct case, spacing, punctuation) into "
                 "   the template or source file.\n"
                 "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
+                "CRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!\n\n"
                 "Prefer CHUNK FORMAT for surgical fixes:\n"
                 f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
                 f"```{lang_tag}\n// replacement chunk\n```\n"
@@ -2692,6 +2694,7 @@ def run_bulk_test_execution_and_fix(
                     "2. Copy that exact string (correct case, spacing, punctuation) into "
                     "   the template or source file.\n"
                     "3. Do NOT paraphrase, guess, or change the casing of the expected string.\n\n"
+                    "CRITICAL: NEVER abbreviate or summarize existing code with comments like `// existing code` or `/* unchanged */`. If you are editing a chunk or a file, you MUST write out the ENTIRE content of that chunk or file. Abbreviating code will cause it to be permanently deleted!\n\n"
                     "Prefer CHUNK FORMAT for surgical fixes:\n"
                     f"#### [EDIT]: path/to/file:{lang_tag}:function_name (lines start-end)\n"
                     f"```{lang_tag}\n// replacement chunk\n```\n"

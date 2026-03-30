@@ -62,6 +62,15 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="import,module,package,python",
     ),
     ErrorFix(
+        error_type="ModuleNotFoundError",
+        language="python",
+        pattern=r"No module named '(\w+)\.(\w+)'",
+        cause="During Django test setup, the agent mistakenly referenced an app with the project's name prefix (e.g. 'myproject.core') instead of its actual folder name ('core').",
+        fix_template="DO NOT write __init__.py files to the project root to fix this! Instead, EDIT settings.py and urls.py to REMOVE the project prefix ('myproject.') from INSTALLED_APPS and URL imports. Always use the simple app label ('core') when importing apps located at the project root.",
+        severity="error",
+        tags="django,module,import,prefix,python",
+    ),
+    ErrorFix(
         error_type="TypeError",
         language="python",
         pattern=r"TypeError:\s*(unsupported operand|.+takes\s+\d+\s+positional|.+not\s+(callable|subscriptable|iterable))",
