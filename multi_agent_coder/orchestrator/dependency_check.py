@@ -88,6 +88,18 @@ _TEST_FILE_SUFFIXES = (
     "_test.go", "_test.py",
 )
 
+# Config files consumed by tools by convention — never imported by other
+# project files.  Flagging them as "orphaned exports" is always a false
+# positive and can cause DepCheck to regenerate them without KB context,
+# silently downgrading version-specific syntax (e.g. Tailwind v4 → v3).
+_TOOL_CONFIG_STEMS = frozenset({
+    "postcss.config", "tailwind.config", "vite.config", "vitest.config",
+    "jest.config", "babel.config", "webpack.config", "rollup.config",
+    "eslint.config", ".eslintrc", "prettier.config", ".prettierrc",
+    "stylelint.config", "svelte.config", "next.config", "nuxt.config",
+    "astro.config", "remix.config", "wrangler.config",
+})
+
 
 def _is_test_file(file_path: str) -> bool:
     """Return ``True`` if *file_path* looks like a test file."""
@@ -98,6 +110,22 @@ def _is_test_file(file_path: str) -> bool:
         if basename.endswith(suffix):
             return True
     return False
+
+
+def _is_tool_config_file(file_path: str) -> bool:
+    """Return True if *file_path* is a tool-convention config file.
+
+    These files are read by build tools (PostCSS, Vite, Tailwind, …) via
+    filesystem convention, never imported by other source files.  They must
+    NOT be flagged as orphaned exports.
+    """
+    name = os.path.basename(file_path).lower()
+    # Strip known JS/TS/JSON/CJS/MJS extensions to get the stem
+    for ext in (".js", ".ts", ".cjs", ".mjs", ".json", ".yaml", ".yml"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name in _TOOL_CONFIG_STEMS
 
 
 # ── Data structures ──────────────────────────────────────────────
@@ -877,6 +905,8 @@ def find_gaps(
     for nf in new_files:
         if _is_test_file(nf):
             continue
+        if _is_tool_config_file(nf):
+            continue  # config files are read by tools, never imported
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
             continue
@@ -1078,7 +1108,7 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 
 ## Step Context
 {step_text}
-
+{kb_context_section}
 ## Integration Gaps Found
 {gaps_formatted}
 
@@ -1111,6 +1141,7 @@ def build_fix_prompt(
     memory_files: dict[str, str],
     step_text: str,
     language: str | None,
+    kb_context: str = "",
 ) -> str:
     """Build a single LLM prompt to fix all integration gaps."""
     gap_lines: list[str] = []
@@ -1147,8 +1178,15 @@ def build_fix_prompt(
     elif language == "go":
         module_system_note = "Go project. Use standard import syntax."
 
+    kb_context_section = (
+        f"\n## Project Knowledge Base\n{kb_context.strip()}\n"
+        if kb_context and kb_context.strip()
+        else ""
+    )
+
     return _FIX_PROMPT_TEMPLATE.format(
         step_text=step_text,
+        kb_context_section=kb_context_section,
         gaps_formatted=gaps_formatted,
         files_formatted=files_formatted,
         module_system_note=module_system_note,
@@ -1170,6 +1208,7 @@ def run_dependency_check(
     language: str | None,
     cfg=None,
     all_plan_steps=None,
+    kb_context: str = "",
 ) -> dict[str, str]:
     """Run post-step dependency validation and return fixes.
 
@@ -1246,7 +1285,7 @@ def run_dependency_check(
 
     # Single LLM call
     try:
-        prompt = build_fix_prompt(gaps, memory_files, step_text, language)
+        prompt = build_fix_prompt(gaps, memory_files, step_text, language, kb_context=kb_context)
         display.step_info(step_idx, "[DepCheck] Fixing dependency gaps (LLM)...")
         response = llm_client.generate_response(prompt)
     except Exception as exc:

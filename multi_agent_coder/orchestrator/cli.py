@@ -111,6 +111,51 @@ def _blank_project_scaffold_hint(language: str | None) -> str:
     return "e.g. project init command, package install, framework setup"
 
 
+def _parse_kb_topics(task: str, re_mod) -> list[str]:
+    """
+    Extract KB topics from a REQUIREMENTS_SPEC embedded in *task*.
+
+    Handles both formats the LLM may output:
+
+    Comma-separated (preferred):
+      KB topics: Tailwind CSS, React hooks, Vitest
+
+    Bullet list (common LLM habit):
+      KB topics:
+      - Tailwind CSS
+      - React hooks
+      - Vitest
+
+    Returns a list of clean topic strings, empty if 'none' or not found.
+    """
+    m = re_mod.search(
+        r'KB topics[^:\n]*:\s*(.*?)(?=\n[A-Z][^\n]*:|$)',
+        task,
+        re_mod.IGNORECASE | re_mod.DOTALL,
+    )
+    if not m:
+        return []
+
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ('none', 'n/a'):
+        return []
+
+    # Detect bullet list: any line starting with "- "
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.startswith('- ') for l in lines):
+        topics = [
+            l.lstrip('- ').strip().rstrip('.')
+            for l in lines
+            if l.startswith('- ')
+        ]
+    else:
+        # Comma-separated — may span multiple lines
+        flat = ' '.join(lines)
+        topics = [t.strip().rstrip('.') for t in flat.split(',')]
+
+    return [t for t in topics if t and t.lower() not in ('none', 'n/a')]
+
+
 def main():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -594,6 +639,18 @@ def main():
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
 
+        # ── QUESTION short-circuit ────────────────────────────────────────────
+        # If IntentAgent classified the task as QUESTION, the answer is already
+        # in the REQUIREMENTS_SPEC.  Skip briefing, global KB, and the planner.
+        if getattr(planner, '_is_question_task', False):
+            _answer = getattr(planner, '_question_answer', '')
+            if _answer:
+                print(f"\n{'─' * 60}")
+                print(_answer)
+                print(f"{'─' * 60}\n")
+            display.finish()
+            return
+
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
 
@@ -605,13 +662,7 @@ def main():
         if knowledge_base and knowledge_base.size > 0:
             import re as _re_kb
             _kb_topics: list[str] = []
-            _spec_topics_match = _re_kb.search(
-                r'KB topics:\s*(.+)', args.task, _re_kb.IGNORECASE,
-            )
-            if _spec_topics_match:
-                _raw_topics = _spec_topics_match.group(1).strip()
-                if _raw_topics.lower() not in ('none', 'n/a', ''):
-                    _kb_topics = [t.strip() for t in _raw_topics.split(',') if t.strip()]
+            _kb_topics = _parse_kb_topics(args.task, _re_kb)
 
             if _kb_topics:
                 # Targeted injection: only entries whose text overlaps with the

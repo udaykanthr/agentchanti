@@ -172,6 +172,44 @@ def _find_relevant_files(task: str, source_files: dict[str, str] | None,
     return results
 
 
+def _extract_question_answer(enriched_task: str) -> str:
+    """
+    Pull the Answer + Evidence block out of a QUESTION REQUIREMENTS_SPEC.
+
+    The enriched task looks like:
+      <raw task>
+
+      === INTENT CLARIFICATION ===
+      REQUIREMENTS_SPEC:
+      Task type: QUESTION
+      Goal: ...
+      Answer: ...
+      Evidence: ...
+      KB topics: none
+
+    Returns everything from 'Answer:' to the end of the spec, stripped.
+    Falls back to the full spec block when the Answer field is not found.
+    """
+    # Find the spec block
+    spec_m = re.search(
+        r'REQUIREMENTS_SPEC:(.+)',
+        enriched_task,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not spec_m:
+        return enriched_task.strip()
+    spec = spec_m.group(1).strip()
+
+    # Extract from Answer: onward (drop Task type / Goal header noise)
+    answer_m = re.search(r'(?:^|\n)(Answer:\s*.+)', spec, re.IGNORECASE | re.DOTALL)
+    if answer_m:
+        # Strip trailing KB topics line — it's internal metadata, not for users
+        answer_text = answer_m.group(1).strip()
+        answer_text = re.sub(r'\nKB topics:.*$', '', answer_text, flags=re.IGNORECASE | re.DOTALL).strip()
+        return answer_text
+    return spec
+
+
 class PlannerAgent(Agent):
 
     def _build_prompt(self, task: str, context: str, language: str | None = None) -> str:
@@ -263,10 +301,11 @@ class PlannerAgent(Agent):
                     parts.append(f"  ^ This file may need modification for the new feature")
 
         # 2b. Intent Analysis — runs BEFORE task briefing so the enriched
-        # task is available for the briefing LLM call.  Placed outside the
-        # `if relevant` guard so it fires even for blank/new projects.
+        # task is available for the briefing LLM call.  Skipped for empty
+        # folders: there is nothing for the agent to investigate, and every
+        # tool call would return empty results, wasting LLM budget.
         _raw_task = task  # preserve original for clean KB search queries
-        if intent_agent is not None:
+        if intent_agent is not None and source_files:
             if cli_display:
                 cli_display.show_status("Analyzing intent and gathering requirements...")
 
@@ -299,14 +338,30 @@ class PlannerAgent(Agent):
             task = intent_agent.analyze_intent(
                 task, search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
-                kb_context=_full_semantic_context)
+                kb_context=_full_semantic_context,
+                cli_display=cli_display)
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")
+
+            # Short-circuit for QUESTION tasks — the IntentAgent already
+            # produced a complete answer.  Skip briefing, global KB search,
+            # and the planner entirely; callers inspect _is_question_task.
+            if re.search(r'Task type:\s*QUESTION', task, re.IGNORECASE):
+                self._is_question_task = True
+                self._question_answer = _extract_question_answer(task)
+                _logger.info(
+                    "[PreAnalysis] Task type is QUESTION — skipping briefing and planner.",
+                )
+                return "\n".join(parts)
 
         # 2c. LLM-based task briefing using ONLY the pre-filtered relevant files.
         # We deliberately pass only the files from step 2 (not the whole project)
         # so the LLM gets focused context without being flooded.  The result is
         # a concrete TASK BRIEFING block injected as the highest-priority context.
+        # Clear the investigation trail now — the user has had time to read the
+        # spec detail rows while we prepared contracts below.
+        if cli_display:
+            cli_display.clear_intent_events()
         if relevant or test_analysis:
             try:
                 from ..orchestrator.test_analyzer import analyze_task_for_planner
@@ -605,13 +660,29 @@ class PlannerAgent(Agent):
             try:
                 kb_context_builder._ensure_global()
                 if kb_context_builder._global_store is not None:
+                    # If the IntentAgent produced KB topics, use them as the
+                    # search query — they are a precise, curated list of what
+                    # the planner actually needs.  This avoids the raw task
+                    # pulling in unrelated docs (e.g. Anime.js for a bug fix).
+                    # Fall back to raw task when no topics were specified.
+                    from ..orchestrator.cli import _parse_kb_topics
+                    _parsed_topics = _parse_kb_topics(task, re)
+                    _use_topics = bool(_parsed_topics)
+                    # For the semantic search query, join topics into one string
+                    _kb_topics_raw = ', '.join(_parsed_topics)
+                    _search_query = _kb_topics_raw if _use_topics else _raw_task
+                    # Fewer results when using curated topics — the list is
+                    # already scoped; with raw task we cast wider to compensate.
+                    _top_k = 10 if _use_topics else 20
                     _logger.info(
-                        "[PreAnalysis] Querying global KB for task: %s", _raw_task
+                        "[PreAnalysis] Querying global KB %s: %s",
+                        "via KB topics" if _use_topics else "for task",
+                        _search_query,
                     )
                     docs = kb_context_builder._global_store.search(
-                        query=_raw_task,
+                        query=_search_query,
                         categories=["doc", "pattern"],
-                        top_k=20,
+                        top_k=_top_k,
                         api_client=kb_context_builder._api_client,
                     )
                     _logger.info(
@@ -619,8 +690,17 @@ class PlannerAgent(Agent):
                         len(docs) if docs else 0,
                     )
                     if docs:
+                        # Pre-compute topic keyword set for allowlist check
+                        # (Filter 0).  Only active when KB topics were provided.
+                        _topic_kws: set[str] = set()
+                        if _use_topics:
+                            for _t in _parsed_topics:
+                                _topic_kws.update(
+                                    w.lower() for w in re.findall(r'[a-zA-Z]{3,}', _t)
+                                )
+
                         # Filter docs to only include relevant ones.
-                        # Four filters applied in order:
+                        # Five filters applied in order:
                         # 1. Framework conflict: reject docs about a
                         #    conflicting framework (e.g. Angular for React)
                         # 2. Tech mismatch: skip docs whose tech keywords
@@ -665,6 +745,25 @@ class PlannerAgent(Agent):
                             doc_techs = normalize_tech_keywords(set(
                                 w.lower() for w in _TK.findall(doc_text)
                             ))
+
+                            # Filter 0: KB-topics allowlist
+                            # When the IntentAgent specified explicit topics,
+                            # only admit docs whose title contains at least one
+                            # topic keyword.  This prevents semantic drift where
+                            # the vector search returns loosely related docs
+                            # (e.g. Anime.js when topics are Tailwind + Vitest).
+                            if _topic_kws:
+                                title_kws = set(
+                                    re.findall(r'[a-zA-Z]{3,}',
+                                               (doc.title or "").lower())
+                                )
+                                if not (title_kws & _topic_kws):
+                                    _logger.debug(
+                                        "[PreAnalysis] Skipping '%s' — "
+                                        "not in KB topics allowlist",
+                                        doc.title,
+                                    )
+                                    continue
 
                             # Filter 1: framework conflict
                             if task_techs and has_framework_conflict(task_techs, doc_techs):

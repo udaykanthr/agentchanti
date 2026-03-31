@@ -57,6 +57,7 @@ class TaskResult:
     token_usage: dict = field(default_factory=dict)
     log_file: str = ""
     error: str = ""
+    answer: str = ""  # populated for QUESTION tasks that produce no code changes
 
 
 def run_task(
@@ -328,18 +329,20 @@ def _run_task_impl(
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
 
+    # ── QUESTION short-circuit ────────────────────────────────────────────────
+    # The IntentAgent already produced the answer — no planner call needed.
+    if getattr(planner, '_is_question_task', False):
+        _answer = getattr(planner, '_question_answer', '')
+        return TaskResult(success=True, answer=_answer)
+
     # Update task if IntentAgent enriched it during pre_analyze
     task = getattr(planner, '_enriched_task', task)
 
     # ── Filtered KB injection ─────────────────────────────────────────────────
     if knowledge_base and knowledge_base.size > 0:
         import re as _re_kb
-        _kb_topics: list[str] = []
-        _m = _re_kb.search(r'KB topics:\s*(.+)', task, _re_kb.IGNORECASE)
-        if _m:
-            _raw = _m.group(1).strip()
-            if _raw.lower() not in ('none', 'n/a', ''):
-                _kb_topics = [t.strip() for t in _raw.split(',') if t.strip()]
+        from .orchestrator.cli import _parse_kb_topics
+        _kb_topics: list[str] = _parse_kb_topics(task, _re_kb)
         kb_ctx = (
             knowledge_base.format_for_task(_kb_topics)
             if _kb_topics

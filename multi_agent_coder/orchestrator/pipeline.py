@@ -1425,6 +1425,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         dep_before, dep_after,
                         memory, llm_client, executor, display, language, cfg,
                         all_plan_steps=all_plan_steps,
+                        kb_context=getattr(memory, "_kb_context", "") or "",
                     )
                     if integration_fixes:
                         executor.write_files(integration_fixes)

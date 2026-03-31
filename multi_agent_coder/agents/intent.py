@@ -1,9 +1,39 @@
 import logging
 import os
 import re
+import shlex
+import subprocess
 from .base import Agent
 
 _logger = logging.getLogger(__name__)
+
+# ── Safe-command allowlist for RUN_CMD ───────────────────────────────────────
+# Only patterns listed here are ever executed.  The list is intentionally
+# narrow: read-only git operations, directory listing, file search, and test
+# runners.  Nothing that writes, installs, or deletes is permitted.
+_SAFE_CMD_PATTERNS: list[re.Pattern] = [
+    re.compile(r'^git\s+(diff|log|status|blame|show)\b'),   # read-only git
+    re.compile(r'^(ls|dir)\b'),                              # directory listing
+    re.compile(r'^(grep|findstr)\b'),                        # text search
+    re.compile(r'^npx\s+(vitest|jest)\s+(run|--run)\b'),     # test runner (no install)
+    re.compile(r'^python\s+-m\s+pytest\b'),                  # pytest read-only run
+]
+
+# Shell tokens that are never allowed anywhere in the command string, regardless
+# of the matched allowlist pattern.  These prevent injection via arguments.
+_FORBIDDEN_TOKENS: frozenset[str] = frozenset({
+    "rm", "del", "rmdir", "rd", "mv", "move", "cp", "copy",
+    "chmod", "chown", "sudo", "su", "eval", "exec",
+    "npm", "pip", "yarn", "pnpm",           # no installs
+    ">", ">>", "2>", "&>", "|",             # no output redirection or pipes
+    "`", "$(", "${",                         # no command substitution
+    ";", "&&", "||",                         # no command chaining
+})
+
+# Output caps for RUN_CMD results injected into LLM context
+_CMD_MAX_LINES = 80
+_CMD_MAX_CHARS = 4000
+_CMD_TIMEOUT_SECS = 15
 
 # Stop-words filtered out when extracting a search query from the raw task
 _STOP_WORDS = {
@@ -16,6 +46,160 @@ _STOP_WORDS = {
     "want", "should", "will", "would", "could", "there", "here", "has",
     "have", "been", "does", "did", "then", "than", "so", "about", "which",
 }
+
+
+def _extract_reasoning(response: str) -> str:
+    """
+    Return the reasoning text that precedes a tool command in *response*.
+
+    The LLM typically writes a sentence or two explaining its gap before
+    emitting the tool command.  We show this so the user can follow the
+    investigation chain without reading raw logs.
+
+    Returns up to 2 sentences / 140 chars, or empty string if the response
+    starts immediately with a tool command or REQUIREMENTS_SPEC.
+    """
+    tool_line = re.compile(
+        r'^\s*(KB_SEARCH|SEARCH|RUN_CMD|FIND_USAGES|REQUIREMENTS_SPEC):',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = tool_line.search(response)
+    reasoning = response[:m.start()].strip() if m else response.strip()
+    if not reasoning:
+        return ""
+    # Collapse to first 2 non-empty lines
+    lines = [l.strip() for l in reasoning.splitlines() if l.strip()]
+    text = " ".join(lines[:2])
+    if len(text) > 140:
+        text = text[:137] + "…"
+    return text
+
+
+def _show_spec_details(cli_display, spec: str) -> None:
+    """
+    Add 2-3 condensed detail rows to the investigation panel after the
+    REQUIREMENTS_SPEC row, so the user can see the key fields without
+    reading the full spec text.
+
+    Extracts Goal, Change scope / Create, and KB topics.
+    Each is shown as a dim indented row using kind='detail'.
+    """
+    def _first_line(text: str, max_chars: int = 70) -> str:
+        line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        return line[:max_chars] + ("…" if len(line) > max_chars else "")
+
+    # Goal
+    goal_m = re.search(r'Goal:\s*(.+?)(?=\n\S|\Z)', spec, re.IGNORECASE | re.DOTALL)
+    if goal_m:
+        cli_display.show_intent_event("detail", f"Goal: {_first_line(goal_m.group(1))}")
+
+    # Change scope / Create / Modify (whatever is present)
+    for field in ("Change scope", "Create", "Modify", "Fix scope"):
+        m = re.search(rf'{field}:\s*(.+?)(?=\n\S|\Z)', spec, re.IGNORECASE | re.DOTALL)
+        if m:
+            cli_display.show_intent_event("detail",
+                                          f"{field}: {_first_line(m.group(1))}")
+            break
+
+    # KB topics
+    topics_m = re.search(r'KB topics[^:\n]*:\s*(.+)', spec, re.IGNORECASE)
+    if topics_m:
+        topics = topics_m.group(1).strip()
+        if topics.lower() not in ("none", "n/a", ""):
+            cli_display.show_intent_event("detail", f"KB topics: {topics[:60]}")
+
+
+def _is_safe_cmd(cmd: str) -> tuple[bool, str]:
+    """
+    Validate *cmd* against the allowlist and forbidden-token set.
+
+    Returns (True, "") when safe, or (False, reason) when rejected.
+    The check is intentionally strict: the command must match at least one
+    allowlist pattern AND must not contain any forbidden token.
+    """
+    stripped = cmd.strip()
+    if not stripped:
+        return False, "empty command"
+
+    # Check forbidden tokens first — these override any allowlist match
+    try:
+        tokens = set(shlex.split(stripped, posix=True))
+    except ValueError:
+        tokens = set(stripped.split())
+    # Also check raw string for shell metacharacters that shlex may not split
+    for ft in _FORBIDDEN_TOKENS:
+        if ft in tokens or ft in stripped:
+            return False, f"forbidden token '{ft}'"
+
+    # Must match at least one allowlist pattern
+    for pat in _SAFE_CMD_PATTERNS:
+        if pat.match(stripped):
+            return True, ""
+
+    return False, "command not in allowlist"
+
+
+def _translate_cmd_for_os(cmd: str) -> str:
+    """
+    Translate a Unix-style command to the host OS equivalent.
+
+    Only maps the small set of commands used by IntentAgent's RUN_CMD;
+    git commands are universal and need no translation.
+    """
+    if os.name != "nt":
+        return cmd  # Unix: no translation needed
+
+    stripped = cmd.strip()
+
+    # ls [flags] [path...] → dir [path...]
+    # Strip all Unix flags (e.g. -la, -a) — they are meaningless to cmd.exe.
+    # Keep any non-flag path arguments so "ls src/" → "dir src/".
+    if re.match(r'^ls\b', stripped):
+        parts = stripped.split()
+        paths = [p for p in parts[1:] if not p.startswith('-')]
+        return ("dir " + " ".join(paths)).rstrip() if paths else "dir"
+
+    # grep → findstr, preserve all arguments
+    if re.match(r'^grep\b', stripped):
+        return re.sub(r'^grep\b', 'findstr', stripped, count=1)
+
+    return stripped
+
+
+def _run_cmd(cmd: str, cwd: str | None = None) -> str:
+    """
+    Execute *cmd* in a subprocess and return its output (stdout + stderr),
+    capped at _CMD_MAX_LINES lines / _CMD_MAX_CHARS characters.
+
+    Caller MUST validate with _is_safe_cmd before calling this.
+    """
+    translated = _translate_cmd_for_os(cmd)
+    try:
+        result = subprocess.run(
+            translated,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=_CMD_TIMEOUT_SECS,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output = result.stdout
+        if result.stderr:
+            output += ("\n--- stderr ---\n" + result.stderr) if output else result.stderr
+        if not output.strip():
+            return "(no output)"
+        lines = output.splitlines()
+        if len(lines) > _CMD_MAX_LINES:
+            output = "\n".join(lines[:_CMD_MAX_LINES]) + f"\n... ({len(lines) - _CMD_MAX_LINES} more lines)"
+        if len(output) > _CMD_MAX_CHARS:
+            output = output[:_CMD_MAX_CHARS] + "\n... (truncated)"
+        return output
+    except subprocess.TimeoutExpired:
+        return f"(command timed out after {_CMD_TIMEOUT_SECS}s)"
+    except Exception as exc:
+        return f"(command failed: {exc})"
 
 
 class IntentAgent(Agent):
@@ -37,6 +221,8 @@ class IntentAgent(Agent):
     Supported commands the LLM can emit:
       SEARCH: <query>      — delegates to SearchAgent (web search)
       KB_SEARCH: <query>   — queries local source + global KB docs
+      RUN_CMD: <command>   — runs a safe read-only shell command and returns output
+      FIND_USAGES: <name>  — finds callers of a component/function
     """
 
     def process(self, task: str, context: str = "") -> str:
@@ -50,6 +236,7 @@ class IntentAgent(Agent):
         kb_context_builder=None,
         kb_context: str = "",
         max_iterations: int = 5,
+        cli_display=None,
     ) -> str:
         """
         Investigate the task and produce a grounded REQUIREMENTS_SPEC.
@@ -73,6 +260,8 @@ class IntentAgent(Agent):
         if kb_context_builder is not None:
             pre_query = self._extract_search_query(raw_task)
             _logger.info("[IntentAnalysis] Pre-seeding context with KB_SEARCH '%s'", pre_query)
+            if cli_display:
+                cli_display.show_intent_event("preseed", f"Pre-seed: {pre_query}")
             pre_result = self._query_kb(kb_context_builder, pre_query)
             if pre_result:
                 accumulated_context += (
@@ -80,8 +269,12 @@ class IntentAgent(Agent):
                     f"{pre_result}\n\n"
                 )
                 _logger.info("[IntentAnalysis] Pre-seed successful.")
+                if cli_display:
+                    cli_display.update_last_intent_event(f"{len(pre_result):,} chars")
             else:
                 _logger.info("[IntentAnalysis] Pre-seed returned no results.")
+                if cli_display:
+                    cli_display.update_last_intent_event("no results")
 
         # ── Iterative investigation loop ──────────────────────────────────────
         last_response = ""
@@ -95,10 +288,23 @@ class IntentAgent(Agent):
         for iteration in range(1, max_iterations + 1):
             is_last = iteration == max_iterations or force_conclude
             prompt = self._build_prompt(raw_task, accumulated_context, conclude=is_last)
+            if cli_display:
+                cli_display.show_intent_event(
+                    "think", f"Querying LLM (iteration {iteration}/{max_iterations})",
+                    iteration=iteration, max_iterations=max_iterations,
+                )
 
             try:
                 response = self.llm_client.generate_response(prompt)
                 last_response = response
+                if cli_display:
+                    cli_display.update_last_intent_event(
+                        f"~{len(response.split()):,} words"
+                    )
+                    cli_display.set_intent_response(response)
+                    reasoning = _extract_reasoning(response)
+                    if reasoning:
+                        cli_display.show_intent_event("reason", reasoning)
 
                 # ── KB_SEARCH command ─────────────────────────────────────────
                 # Use \b instead of ^ so prefixes like "COMMAND: KB_SEARCH:"
@@ -125,6 +331,10 @@ class IntentAgent(Agent):
                     _logger.info(
                         "[IntentAnalysis] Iteration %d: KB_SEARCH '%s'", iteration, query,
                     )
+                    if cli_display:
+                        cli_display.show_intent_event("kb", f"KB_SEARCH: {query}",
+                                                       iteration=iteration,
+                                                       max_iterations=max_iterations)
                     # LLMs often pack multiple file names into one query
                     # (e.g. "Food.jsx; SnakeSegment.jsx"). Split on common
                     # separators and run each sub-query so every file is found.
@@ -143,6 +353,8 @@ class IntentAgent(Agent):
                         accumulated_context += (
                             f"KB Search Results for '{query}':\n{kb_result}\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event(f"{len(kb_result):,} chars")
                     else:
                         _logger.warning(
                             "[IntentAnalysis] KB search returned no results for: %s", query,
@@ -150,6 +362,8 @@ class IntentAgent(Agent):
                         accumulated_context += (
                             f"KB Search for '{query}': no results found.\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event("no results")
                     continue
 
                 # ── SEARCH command ────────────────────────────────────────────
@@ -178,6 +392,10 @@ class IntentAgent(Agent):
                     _logger.info(
                         "[IntentAnalysis] Iteration %d: SEARCH '%s'", iteration, query,
                     )
+                    if cli_display:
+                        cli_display.show_intent_event("web", f"SEARCH: {query}",
+                                                       iteration=iteration,
+                                                       max_iterations=max_iterations)
                     search_result = search_agent.search_for_task(
                         query, kb_context=kb_context,
                     )
@@ -185,6 +403,8 @@ class IntentAgent(Agent):
                         accumulated_context += (
                             f"Web Search Results for '{query}':\n{search_result}\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event(f"{len(search_result):,} chars")
                     else:
                         _logger.warning(
                             "[IntentAnalysis] Web search returned no results for: %s", query,
@@ -192,6 +412,72 @@ class IntentAgent(Agent):
                         accumulated_context += (
                             f"Web Search for '{query}': no results found.\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event("no results")
+                    continue
+
+                # ── RUN_CMD command ───────────────────────────────────────────
+                # Executes a shell command and returns its output so the LLM
+                # can use live project state (git diff, test results, file list)
+                # as investigation evidence.
+                # Safety: validated against _SAFE_CMD_PATTERNS + _FORBIDDEN_TOKENS
+                # before any subprocess is spawned.  Rejected commands are
+                # reported back to the LLM so it can reformulate.
+                cmd_match = re.search(
+                    r'\bRUN_CMD:\s*(.+)$', response,
+                    re.MULTILINE | re.IGNORECASE,
+                )
+                if cmd_match:
+                    raw_cmd = cmd_match.group(1).strip()
+                    cmd_key = f"RUN_CMD:{raw_cmd.lower()}"
+                    if cmd_key in executed_commands:
+                        _logger.info(
+                            "[IntentAnalysis] Iteration %d: RUN_CMD '%s' already executed — forcing conclude.",
+                            iteration, raw_cmd,
+                        )
+                        accumulated_context += (
+                            f"[RUN_CMD '{raw_cmd}' already ran — output is above. "
+                            f"You have enough context. Write REQUIREMENTS_SPEC now.]\n\n"
+                        )
+                        force_conclude = True
+                        continue
+                    executed_commands.add(cmd_key)
+                    safe, reason = _is_safe_cmd(raw_cmd)
+                    if not safe:
+                        _logger.warning(
+                            "[IntentAnalysis] Iteration %d: RUN_CMD '%s' rejected — %s",
+                            iteration, raw_cmd, reason,
+                        )
+                        if cli_display:
+                            cli_display.show_intent_event("reject",
+                                                           f"RUN_CMD rejected: {reason}",
+                                                           iteration=iteration,
+                                                           max_iterations=max_iterations)
+                        accumulated_context += (
+                            f"[RUN_CMD '{raw_cmd}' was rejected: {reason}. "
+                            f"Only read-only git/grep/ls/test-runner commands are allowed. "
+                            f"Rephrase or use KB_SEARCH instead.]\n\n"
+                        )
+                        continue
+                    _logger.info(
+                        "[IntentAnalysis] Iteration %d: RUN_CMD '%s'", iteration, raw_cmd,
+                    )
+                    if cli_display:
+                        cli_display.show_intent_event("cmd", f"RUN_CMD: {raw_cmd}",
+                                                       iteration=iteration,
+                                                       max_iterations=max_iterations)
+                    project_root = (
+                        getattr(kb_context_builder, "_project_root", None)
+                        if kb_context_builder is not None else None
+                    )
+                    cmd_output = _run_cmd(raw_cmd, cwd=project_root)
+                    accumulated_context += (
+                        f"RUN_CMD output for `{raw_cmd}`:\n"
+                        f"```\n{cmd_output}\n```\n\n"
+                    )
+                    if cli_display:
+                        lines = cmd_output.count("\n") + 1
+                        cli_display.update_last_intent_event(f"{lines} lines")
                     continue
 
                 # ── FIND_USAGES command ───────────────────────────────────────
@@ -220,15 +506,23 @@ class IntentAgent(Agent):
                     _logger.info(
                         "[IntentAnalysis] Iteration %d: FIND_USAGES '%s'", iteration, name,
                     )
+                    if cli_display:
+                        cli_display.show_intent_event("usage", f"FIND_USAGES: {name}",
+                                                       iteration=iteration,
+                                                       max_iterations=max_iterations)
                     usage_result = self._find_usages(kb_context_builder, name)
                     if usage_result:
                         accumulated_context += (
                             f"Usages of '{name}':\n{usage_result}\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event(f"{len(usage_result):,} chars")
                     else:
                         accumulated_context += (
                             f"FIND_USAGES '{name}': no call sites found.\n\n"
                         )
+                        if cli_display:
+                            cli_display.update_last_intent_event("no usages found")
                     continue
 
                 # ── REQUIREMENTS_SPEC ─────────────────────────────────────────
@@ -238,6 +532,10 @@ class IntentAgent(Agent):
                 )
                 if spec_match:
                     spec = spec_match.group(1).strip()
+                    # Normalise KB topics: LLMs sometimes output a bullet list
+                    # instead of a comma-separated line.  Convert to one line so
+                    # downstream parsers (cli.py / api.py) can split on ',' reliably.
+                    spec = self._normalize_kb_topics(spec)
 
                     # ── BUG_FIX gate: enforce at least one tool call ──────────
                     # A BUG_FIX Root cause cited from training-data patterns
@@ -265,6 +563,16 @@ class IntentAgent(Agent):
                         continue
 
                     _logger.info("[IntentAnalysis] Successfully generated REQUIREMENTS_SPEC.")
+                    task_type_m = re.search(r'Task type:\s*(\w+)', spec, re.IGNORECASE)
+                    task_type_label = task_type_m.group(1) if task_type_m else "UNKNOWN"
+                    if cli_display:
+                        cli_display.show_intent_event("spec",
+                                                       f"REQUIREMENTS_SPEC: {task_type_label}",
+                                                       iteration=iteration,
+                                                       max_iterations=max_iterations)
+                        _show_spec_details(cli_display, spec)
+                        # Events stay visible — cleared by pre_analyze when
+                        # the briefing/planning phase begins.
                     return (
                         f"{raw_task}\n\n"
                         f"=== INTENT CLARIFICATION (from requirements analyst) ===\n"
@@ -276,6 +584,11 @@ class IntentAgent(Agent):
                 _logger.info(
                     "[IntentAnalysis] No exact marker found — treating response as spec.",
                 )
+                if cli_display:
+                    cli_display.show_intent_event("spec", "REQUIREMENTS_SPEC: (inferred)",
+                                                   iteration=iteration,
+                                                   max_iterations=max_iterations)
+                    _show_spec_details(cli_display, response)
                 return (
                     f"{raw_task}\n\n"
                     f"=== INTENT CLARIFICATION (from requirements analyst) ===\n"
@@ -320,9 +633,9 @@ class IntentAgent(Agent):
         "Interface analysis: <declared props vs what callers pass — mismatches that "
         "cause the bug; 'none' if root cause is not an interface issue>\n"
         "Constraints: <ambiguities resolved from actual code>\n"
-        "KB topics: <comma-separated framework/library topics the planner will need "
-        "docs for — e.g. 'Tailwind z-index, React refs'; write 'none' if the fix "
-        "is pure logic/config with no external library involved>\n"
+        "KB topics: <2-5 short keywords the planner needs docs for — library or "
+        "framework names only, e.g. 'Tailwind, React refs, Vitest'; "
+        "write 'none' if the fix is pure logic with no external library>\n"
     )
     _SPEC_FEATURE = (
         "REQUIREMENTS_SPEC:\n"
@@ -333,8 +646,8 @@ class IntentAgent(Agent):
         "Reuse: <existing patterns, components, or utilities already in the codebase>\n"
         "Constraints: <API contracts to preserve, tests that cover adjacent code>\n"
         "Packages/versions: <new dependencies needed, or 'none'>\n"
-        "KB topics: <comma-separated topics the planner needs docs for — e.g. "
-        "'Anime.js install, React hooks'; write 'none' if no external docs needed>\n"
+        "KB topics: <2-5 short keywords — library/framework names only, "
+        "e.g. 'Anime.js, React hooks'; write 'none' if no new packages needed>\n"
     )
     _SPEC_MODIFY = (
         "REQUIREMENTS_SPEC:\n"
@@ -345,15 +658,18 @@ class IntentAgent(Agent):
         "Change scope: <minimal list of files/functions to edit>\n"
         "Preserve: <behavior, API surface, or tests that must not break>\n"
         "Constraints: <from actual code>\n"
-        "KB topics: <comma-separated topics the planner needs docs for; 'none' if "
-        "this is a pure internal refactor>\n"
+        "KB topics: <2-5 short keywords — library/framework names only; "
+        "'none' if this is a pure internal refactor>\n"
     )
     _SPEC_QUESTION = (
         "REQUIREMENTS_SPEC:\n"
         "Task type: QUESTION\n"
-        "Goal: <what the user wants to understand>\n"
-        "Answer: <direct answer grounded in the code evidence>\n"
-        "Evidence: <file names, function signatures, prop names that support the answer>\n"
+        "Goal: <what the user wants to understand — one sentence>\n"
+        "Answer: <direct answer grounded in evidence; for git questions cite commit\n"
+        "        hashes, changed files, and the actual diff lines as proof>\n"
+        "Git evidence: <paste the key lines from git log / git diff that support\n"
+        "              your answer; write 'n/a' if the question is not git-related>\n"
+        "Evidence: <file names, function names, or source lines that support the answer>\n"
         "KB topics: none\n"
     )
 
@@ -383,9 +699,12 @@ class IntentAgent(Agent):
             prompt += (
                 "You have enough evidence. Classify the task and write the matching "
                 "REQUIREMENTS_SPEC now — no tool calls.\n\n"
-                "Classification reminder: if the user reports something broken,\n"
-                "not visible, or not working — even if phrased as a question —\n"
-                "that is BUG_FIX, not QUESTION.\n\n"
+                "Classification reminder:\n"
+                "  - If the user reports something broken, not visible, or not working\n"
+                "    — even if phrased as a question — that is BUG_FIX, not QUESTION.\n"
+                "  - If the user says 'understand', 'explain', 'what changed', 'what did\n"
+                "    these commits do', 'summarise recent changes' — that is QUESTION,\n"
+                "    NOT MODIFY. The user wants an explanation, not code edits.\n\n"
                 + self._spec_all_formats()
             )
             return prompt
@@ -400,10 +719,18 @@ class IntentAgent(Agent):
             "             BUG_FIX — not QUESTION. The question is about the cause of\n"
             "             a bug, not a request for general code explanation.\n\n"
             "  FEATURE  — add new functionality, build something that does not exist.\n\n"
-            "  MODIFY   — change existing behaviour, refactor, update, rename.\n\n"
-            "  QUESTION — ONLY use this when the user wants to understand how working\n"
-            "             code functions (e.g. 'explain how auth works', 'what does\n"
-            "             this function do'). NOT for broken/invisible/crashing things.\n\n"
+            "  MODIFY   — change existing behaviour, refactor, update, rename.\n"
+            "             IMPORTANT: MODIFY means the user wants you to MAKE changes.\n"
+            "             If the user only wants to UNDERSTAND or EXPLAIN changes that\n"
+            "             were already made, that is QUESTION — not MODIFY.\n\n"
+            "  QUESTION — the user wants to understand, explain, or summarise something.\n"
+            "             Use this when:\n"
+            "               • 'explain how X works' / 'what does this function do'\n"
+            "               • 'understand the recent changes' / 'explain the last N commits'\n"
+            "               • 'what changed in git' / 'summarise the recent commits'\n"
+            "               • any 'understand/explain/summarise' phrasing where no code\n"
+            "                 edit is being requested — only an explanation.\n"
+            "             NOT for broken/invisible/crashing things (those are BUG_FIX).\n\n"
 
             "── STEP 2: Investigation rules per type ───────────────────────────\n"
             "BUG_FIX (mandatory tracing — you MUST read actual code before concluding):\n"
@@ -431,9 +758,17 @@ class IntentAgent(Agent):
             "  Locate the current implementation — read it before suggesting changes.\n"
             "  Identify what must be preserved (tests, public API, callers).\n"
             "  Define the minimal diff, not a rewrite.\n\n"
-            "QUESTION (only for genuine code understanding requests):\n"
-            "  Read actual code evidence. Do NOT use training-data patterns or\n"
-            "  general best-practices as evidence — cite actual file content.\n\n"
+            "QUESTION:\n"
+            "  Your job is to produce an explanation grounded in real evidence.\n"
+            "  If the task mentions 'git commits', 'recent changes', 'last N commits',\n"
+            "  'what changed', 'git log' — you MUST use git tools first:\n"
+            "    Step A: RUN_CMD: git log --oneline -<N>   (see what was committed)\n"
+            "    Step B: RUN_CMD: git diff HEAD~<N> HEAD   (see exact line changes)\n"
+            "    Step C: Use the diff output as your primary evidence for the Answer.\n"
+            "  Do NOT infer 'what was changed' from the current file state alone —\n"
+            "  the current state tells you what the code looks like NOW, not what\n"
+            "  was CHANGED. Only git diff/log shows what actually changed.\n"
+            "  For non-git questions: use KB_SEARCH to read actual source code.\n\n"
 
             "── STEP 3: Conclude or investigate ───────────────────────────────\n"
             "Can you fill every required field of the REQUIREMENTS_SPEC with specific\n"
@@ -448,6 +783,15 @@ class IntentAgent(Agent):
             "        FIND_USAGES: <ComponentName or functionName>\n"
             "          When: you need to see both sides of an interface — what a\n"
             "          component DECLARES vs what its CALLER PASSES.\n\n"
+            "        RUN_CMD: <command>\n"
+            "          When: you need live project state that KB_SEARCH cannot provide.\n"
+            "          Allowed: git diff, git log, git status, git blame, git show,\n"
+            "                   ls/dir, grep/findstr, npx vitest run, python -m pytest\n"
+            "          Examples:\n"
+            "            RUN_CMD: git diff HEAD -- src/components/Header.jsx\n"
+            "            RUN_CMD: git log --oneline -10 src/components/Header.jsx\n"
+            "            RUN_CMD: grep -r 'useHeader' src/\n"
+            "          NOT allowed: npm install, rm, pipes (|), redirects (>)\n\n"
             "        SEARCH: <query>\n"
             "          When: you need external docs or package versions.\n\n"
             "        Example:\n"
@@ -457,6 +801,53 @@ class IntentAgent(Agent):
             + self._spec_all_formats()
         )
         return prompt
+
+    @staticmethod
+    def _normalize_kb_topics(spec: str) -> str:
+        """
+        Ensure 'KB topics:' is a single comma-separated line.
+
+        LLMs sometimes output a markdown bullet list:
+          KB topics:
+          - Tailwind CSS
+          - React hooks
+
+        This converts it to:
+          KB topics: Tailwind CSS, React hooks
+
+        Also strips trailing punctuation and collapses whitespace.
+        """
+        def _replace_block(m: re.Match) -> str:
+            block = m.group(0)
+            # Collect lines after "KB topics:" that start with "- "
+            lines = block.splitlines()
+            header = lines[0]  # "KB topics:" or "KB topics: something"
+            after_colon = header.split(":", 1)[1].strip().rstrip(".")
+            bullet_items: list[str] = []
+            for line in lines[1:]:
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    bullet_items.append(stripped[2:].strip().rstrip("."))
+                elif stripped:
+                    # Non-bullet continuation — treat as additional item
+                    bullet_items.append(stripped.rstrip("."))
+                else:
+                    break  # blank line ends the block
+            if bullet_items:
+                items = ", ".join(bullet_items)
+                return f"KB topics: {items}"
+            # No bullets — just clean up the header value
+            return f"KB topics: {after_colon}" if after_colon else header
+
+        # Match "KB topics" (with any optional text before the colon, e.g.
+        # "KB topics (for developer/tester reference):") followed by optional
+        # inline text and optional bullet-list lines on subsequent lines.
+        return re.sub(
+            r'KB topics[^:\n]*:[^\n]*(?:\n[ \t]*-[^\n]+)*',
+            _replace_block,
+            spec,
+            flags=re.IGNORECASE,
+        )
 
     def _spec_all_formats(self) -> str:
         """Return all four REQUIREMENTS_SPEC format templates as a single block."""
