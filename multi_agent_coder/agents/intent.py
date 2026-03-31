@@ -326,6 +326,17 @@ class IntentAgent(Agent):
 
             try:
                 response = self.llm_client.generate_response(prompt)
+                # ── Duplicate response guard ──────────────────────────────────
+                # If the LLM produces the same response twice in a row it is
+                # stuck and retrying will not help.  Force conclude immediately
+                # so the loop exits rather than burning more iterations/tokens.
+                if response.strip() == last_response.strip() and last_response:
+                    _logger.warning(
+                        "[IntentAnalysis] Iteration %d: identical response to previous "
+                        "— forcing conclude to avoid infinite loop.",
+                        iteration,
+                    )
+                    force_conclude = True
                 last_response = response
                 if cli_display:
                     cli_display.update_last_intent_event(
@@ -566,32 +577,6 @@ class IntentAgent(Agent):
                     # instead of a comma-separated line.  Convert to one line so
                     # downstream parsers (cli.py / api.py) can split on ',' reliably.
                     spec = self._normalize_kb_topics(spec)
-
-                    # ── BUG_FIX gate: enforce at least one tool call ──────────
-                    # A BUG_FIX Root cause cited from training-data patterns
-                    # rather than actual source is unreliable.  If the spec
-                    # declares BUG_FIX but no tool has been called yet (no real
-                    # code was read this session beyond the pre-seed), push back
-                    # once and demand a FIND_USAGES or KB_SEARCH first.
-                    is_bug_fix = bool(re.search(
-                        r'Task type:\s*BUG_FIX', spec, re.IGNORECASE,
-                    ))
-                    if is_bug_fix and not executed_commands and not is_last:
-                        _logger.info(
-                            "[IntentAnalysis] BUG_FIX spec without any tool calls "
-                            "— requiring code trace before accepting.",
-                        )
-                        accumulated_context += (
-                            f"[Your REQUIREMENTS_SPEC was rejected: task is BUG_FIX "
-                            f"but you have not read any actual component source yet. "
-                            f"Root cause must be grounded in real code, not patterns.\n"
-                            f"Use FIND_USAGES on the component that fails to render, "
-                            f"or KB_SEARCH for its source file, then write the spec.]\n\n"
-                        )
-                        # Store the draft so we can fall back to it if needed
-                        last_response = response
-                        continue
-
                     _logger.info("[IntentAnalysis] Successfully generated REQUIREMENTS_SPEC.")
                     task_type_m = re.search(r'Task type:\s*(\w+)', spec, re.IGNORECASE)
                     task_type_label = task_type_m.group(1) if task_type_m else "UNKNOWN"
