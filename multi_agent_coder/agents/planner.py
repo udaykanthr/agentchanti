@@ -316,16 +316,33 @@ class PlannerAgent(Agent):
             if knowledge_base and knowledge_base.size > 0:
                 _semantic_kb.append(knowledge_base.format_for_planner() or "")
 
-            # Global KB docs (framework guides, installation docs, etc.)
-            # These are the high-value docs like "React TailwindCSS Responsive
-            # Header", "Vite React Setup Guide", etc.
-            # Global KB docs (framework guides, patterns) are intentionally
-            # NOT injected into IntentAgent context — the intent agent
-            # needs to understand what existing code does, not how to
-            # build new code.  Global docs inflate token counts with
-            # irrelevant content (e.g. Anime.js guide for a snake bug)
-            # and are already available to the planner through its own
-            # channel.
+            # Global KB doc titles — pass only titles (no content) so the
+            # IntentAgent can pick the relevant ones and emit them as
+            # `KB docs:` in its spec.  The planner will then load those docs
+            # directly via get_by_titles() — no re-embedding needed.
+            _available_kb_titles: list[str] = []
+            if kb_context_builder is not None:
+                try:
+                    kb_context_builder._ensure_global()
+                    _gs = kb_context_builder._global_store
+                    if _gs is not None:
+                        _title_hits = _gs.search(
+                            query=_raw_task,
+                            categories=["doc", "pattern"],
+                            top_k=12,
+                            api_client=kb_context_builder._api_client,
+                        )
+                        _available_kb_titles = [
+                            r.title for r in (_title_hits or []) if r.title
+                        ]
+                        if _available_kb_titles:
+                            _logger.info(
+                                "[PreAnalysis] %d global KB titles surfaced "
+                                "for IntentAgent",
+                                len(_available_kb_titles),
+                            )
+                except Exception:
+                    pass
 
             # Relevant source file skeletons (for existing projects)
             if relevant:
@@ -339,7 +356,9 @@ class PlannerAgent(Agent):
                 task, search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
                 kb_context=_full_semantic_context,
-                cli_display=cli_display)
+                cli_display=cli_display,
+                available_kb_docs=_available_kb_titles or None,
+            )
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")
 
@@ -407,31 +426,39 @@ class PlannerAgent(Agent):
                     _contracts[_fpath] = _entry
 
                 # ── Pre-fetch KB package docs BEFORE generating the briefing ──
-                # Scan the task text for likely package names and pull their
-                # KB docs so the briefing's "Agent directive" uses the correct
-                # current API rather than LLM training-data guesses.
-                # (The search-agent step below is a fallback for packages the
-                # KB doesn't yet have, and it runs after briefing generation.)
+                # If the IntentAgent already named specific KB docs, load them
+                # directly (no keyword search needed — avoids 5 redundant
+                # embedding calls and ensures the briefing uses exactly the
+                # same docs the IntentAgent selected).
+                # Fallback: keyword-token scan for tasks without KB docs.
                 _pre_pkg_docs: list[str] = []
                 if kb_context_builder is not None:
                     try:
-                        import re as _re_pkg
-                        # Heuristic: words in the task that look like npm/pip
-                        # package names (lowercase, may contain hyphens/dots,
-                        # not common English words)
-                        _COMMON_WORDS = frozenset({
-                            "the", "and", "for", "with", "this", "that",
-                            "using", "use", "add", "implement", "enhance",
-                            "game", "visuals", "visual", "animation",
-                        })
-                        _task_tokens = [
-                            w.lower() for w in _re_pkg.findall(
-                                r'[a-zA-Z][a-zA-Z0-9._-]{2,}', task)
-                            if w.lower() not in _COMMON_WORDS
-                        ]
+                        from ..orchestrator.cli import _parse_kb_doc_titles as _pkdt
+                        _briefing_doc_titles = _pkdt(task)
                         kb_context_builder._ensure_global()
                         _gs_pre = kb_context_builder._global_store
-                        if _gs_pre is not None and _task_tokens:
+                        if _gs_pre is not None and _briefing_doc_titles:
+                            # Fast path: use IntentAgent's picks directly
+                            _briefing_hits = _gs_pre.get_by_titles(_briefing_doc_titles)
+                            for _h in (_briefing_hits or []):
+                                if _h.content or _h.title:
+                                    _pre_pkg_docs.append(
+                                        f"### {_h.title}\n{_h.content or ''}"
+                                    )
+                        elif _gs_pre is not None:
+                            # Fallback: keyword-token search
+                            import re as _re_pkg
+                            _COMMON_WORDS = frozenset({
+                                "the", "and", "for", "with", "this", "that",
+                                "using", "use", "add", "implement", "enhance",
+                                "game", "visuals", "visual", "animation",
+                            })
+                            _task_tokens = [
+                                w.lower() for w in _re_pkg.findall(
+                                    r'[a-zA-Z][a-zA-Z0-9._-]{2,}', task)
+                                if w.lower() not in _COMMON_WORDS
+                            ]
                             for _tok in _task_tokens[:5]:
                                 _hits = _gs_pre.search(
                                     query=_tok,
@@ -660,44 +687,106 @@ class PlannerAgent(Agent):
             try:
                 kb_context_builder._ensure_global()
                 if kb_context_builder._global_store is not None:
-                    # If the IntentAgent produced KB topics, use them as the
-                    # search query — they are a precise, curated list of what
-                    # the planner actually needs.  This avoids the raw task
-                    # pulling in unrelated docs (e.g. Anime.js for a bug fix).
-                    # Fall back to raw task when no topics were specified.
-                    from ..orchestrator.cli import _parse_kb_topics
-                    _parsed_topics = _parse_kb_topics(task, re)
-                    _use_topics = bool(_parsed_topics)
-                    # For the semantic search query, join topics into one string
-                    _kb_topics_raw = ', '.join(_parsed_topics)
-                    _search_query = _kb_topics_raw if _use_topics else _raw_task
-                    # Fewer results when using curated topics — the list is
-                    # already scoped; with raw task we cast wider to compensate.
-                    _top_k = 10 if _use_topics else 20
-                    _logger.info(
-                        "[PreAnalysis] Querying global KB %s: %s",
-                        "via KB topics" if _use_topics else "for task",
-                        _search_query,
-                    )
-                    docs = kb_context_builder._global_store.search(
-                        query=_search_query,
-                        categories=["doc", "pattern"],
-                        top_k=_top_k,
-                        api_client=kb_context_builder._api_client,
-                    )
-                    _logger.info(
-                        "[PreAnalysis] Global KB search returned %d docs",
-                        len(docs) if docs else 0,
-                    )
+                    from ..orchestrator.cli import _parse_kb_topics, _parse_kb_doc_titles
+
+                    # Resolve docs via fast-path (title lookup) or fallback
+                    # (vector search + topic filters).
+                    _kb_doc_titles = _parse_kb_doc_titles(task)
+                    _parsed_topics: list[str] = []
+                    _use_topics = False
+                    docs = None
+
+                    if _kb_doc_titles:
+                        # Fast path: IntentAgent named specific docs.
+                        # get_by_titles() is a pure filesystem scan — no embedding.
+                        _logger.info(
+                            "[PreAnalysis] IntentAgent named %d KB doc(s) — "
+                            "loading by title (skipping vector search)",
+                            len(_kb_doc_titles),
+                        )
+                        docs = kb_context_builder._global_store.get_by_titles(
+                            _kb_doc_titles
+                        ) or []
+                        if docs:
+                            _preloaded_fp = list(docs)
+                            # Also parse KB topics so context_builder can use
+                            # them to filter per-step batch_search results even
+                            # when the fast-path handles planner doc loading.
+                            _fp_topics = _parse_kb_topics(task, re)
+                            _fp_per_topic_kws: list[set[str]] = [
+                                {w.lower() for w in re.findall(r'[a-zA-Z]{3,}', t)}
+                                for t in _fp_topics if t
+                            ]
+                            if kb_context_builder is not None:
+                                kb_context_builder._preloaded_docs = _preloaded_fp
+                                kb_context_builder._intent_topics = _fp_per_topic_kws or []
+                            _fp_hints = [
+                                f"### {d.title}\n{d.content or d.title}"
+                                for d in _preloaded_fp
+                                if (d.content or d.title)
+                            ]
+                            if _fp_hints:
+                                parts.append("\n[Framework/Library Documentation]")
+                                parts.append(
+                                    "CRITICAL: These KB docs are curated and up-to-date. "
+                                    "You MUST follow them exactly:\n"
+                                    "- Use the EXACT install commands from these docs "
+                                    "(including all peer dependencies like postcss, jsdom, etc.)\n"
+                                    "- If a doc says a command is deprecated/removed, "
+                                    "do NOT use that command\n"
+                                    "- Prefer patterns shown in these docs over your training data"
+                                )
+                                parts.extend(_fp_hints)
+                                _logger.info(
+                                    "[PreAnalysis] %d doc(s) injected (KB docs fast-path)",
+                                    len(_fp_hints),
+                                )
+                        docs = None  # fully handled above; skip fallback filter loop
+                    else:
+                        # Fallback: vector search + Filter 0–4.
+                        _parsed_topics = _parse_kb_topics(task, re)
+                        _use_topics = bool(_parsed_topics)
+                        _kb_topics_raw = ', '.join(_parsed_topics)
+                        _search_query = _kb_topics_raw if _use_topics else _raw_task
+                        _top_k = 10 if _use_topics else 20
+                        _logger.info(
+                            "[PreAnalysis] Querying global KB %s: %s",
+                            "via KB topics" if _use_topics else "for task",
+                            _search_query,
+                        )
+                        docs = kb_context_builder._global_store.search(
+                            query=_search_query,
+                            categories=["doc", "pattern"],
+                            top_k=_top_k,
+                            api_client=kb_context_builder._api_client,
+                        )
+                        _logger.info(
+                            "[PreAnalysis] Global KB search returned %d docs",
+                            len(docs) if docs else 0,
+                        )
+
                     if docs:
-                        # Pre-compute topic keyword set for allowlist check
-                        # (Filter 0).  Only active when KB topics were provided.
+                        # Fallback-path filter loop.
+                        # Pre-compute per-topic keyword sets for Filter 0.
                         _topic_kws: set[str] = set()
+                        _per_topic_kws: list[set[str]] = []
                         if _use_topics:
                             for _t in _parsed_topics:
-                                _topic_kws.update(
-                                    w.lower() for w in re.findall(r'[a-zA-Z]{3,}', _t)
-                                )
+                                kws = {
+                                    w.lower()
+                                    for w in re.findall(r'[a-zA-Z]{3,}', _t)
+                                }
+                                if kws:
+                                    _per_topic_kws.append(kws)
+                                    _topic_kws.update(kws)
+
+                        def _topic_stem_match(a: str, b: str) -> bool:
+                            """True when a and b share a common stem prefix."""
+                            n = min(len(a), len(b))
+                            if n < 3:
+                                return False
+                            pfx = min(n, 5)
+                            return a[:pfx] == b[:pfx]
 
                         # Filter docs to only include relevant ones.
                         # Five filters applied in order:
@@ -746,18 +835,33 @@ class PlannerAgent(Agent):
                                 w.lower() for w in _TK.findall(doc_text)
                             ))
 
-                            # Filter 0: KB-topics allowlist
+                            # Filter 0: KB-topics allowlist (per-topic)
                             # When the IntentAgent specified explicit topics,
-                            # only admit docs whose title contains at least one
-                            # topic keyword.  This prevents semantic drift where
-                            # the vector search returns loosely related docs
-                            # (e.g. Anime.js when topics are Tailwind + Vitest).
-                            if _topic_kws:
+                            # a doc must stem-match ≥ min(2, topic_size)
+                            # keywords from at least ONE complete topic.
+                            # Single-word matching against the merged pool
+                            # was too loose: "react" from topic "React
+                            # (functional components)" admitted every React
+                            # doc regardless of relevance.
+                            if _per_topic_kws:
                                 title_kws = set(
                                     re.findall(r'[a-zA-Z]{3,}',
                                                (doc.title or "").lower())
                                 )
-                                if not (title_kws & _topic_kws):
+                                _passed_f0 = False
+                                for _tkws in _per_topic_kws:
+                                    _threshold = max(1, min(2, len(_tkws)))
+                                    _matches = sum(
+                                        1 for tw in title_kws
+                                        if any(
+                                            _topic_stem_match(tw, tk)
+                                            for tk in _tkws
+                                        )
+                                    )
+                                    if _matches >= _threshold:
+                                        _passed_f0 = True
+                                        break
+                                if not _passed_f0:
                                     _logger.debug(
                                         "[PreAnalysis] Skipping '%s' — "
                                         "not in KB topics allowlist",
@@ -874,6 +978,10 @@ class PlannerAgent(Agent):
                         # them into every step's KB context automatically.
                         if _preloaded and kb_context_builder is not None:
                             kb_context_builder._preloaded_docs = _preloaded
+                        # Also propagate topic filter so batch_search in
+                        # context_builder can reuse the same allowlist.
+                        if _per_topic_kws and kb_context_builder is not None:
+                            kb_context_builder._intent_topics = _per_topic_kws
                         if doc_hints:
                             parts.append("\n[Framework/Library Documentation]")
                             parts.append(

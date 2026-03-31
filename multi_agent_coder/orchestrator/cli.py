@@ -156,6 +156,44 @@ def _parse_kb_topics(task: str, re_mod) -> list[str]:
     return [t for t in topics if t and t.lower() not in ('none', 'n/a')]
 
 
+def _parse_kb_doc_titles(task: str) -> list[str]:
+    """
+    Extract explicit KB doc titles from a REQUIREMENTS_SPEC embedded in *task*.
+
+    Parses the `KB docs:` line that IntentAgent emits when it was given a list
+    of available global KB doc titles and selected the relevant ones.
+
+    Handles both formats:
+      KB docs: Tailwind CSS v4 Setup Guide, React Component Patterns
+      KB docs:
+      - Tailwind CSS v4 Setup Guide
+      - React Component Patterns
+
+    Returns exact title strings ready for GlobalKBStore.get_by_titles().
+    """
+    import re as _re
+    m = _re.search(
+        r'KB docs[^:\n]*:\s*(.*?)(?=\n[A-Z][^\n]*:|$)',
+        task,
+        _re.IGNORECASE | _re.DOTALL,
+    )
+    if not m:
+        return []
+
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ('none', 'n/a'):
+        return []
+
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.startswith('- ') for l in lines):
+        titles = [l.lstrip('- ').strip().rstrip('.') for l in lines if l.startswith('- ')]
+    else:
+        flat = ' '.join(lines)
+        titles = [t.strip().rstrip('.') for t in flat.split(',')]
+
+    return [t for t in titles if t and t.lower() not in ('none', 'n/a')]
+
+
 def main():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.

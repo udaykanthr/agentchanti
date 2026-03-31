@@ -237,6 +237,7 @@ class IntentAgent(Agent):
         kb_context: str = "",
         max_iterations: int = 5,
         cli_display=None,
+        available_kb_docs: list[str] | None = None,
     ) -> str:
         """
         Investigate the task and produce a grounded REQUIREMENTS_SPEC.
@@ -251,6 +252,19 @@ class IntentAgent(Agent):
         accumulated_context = ""
         if kb_context:
             accumulated_context += f"Project Stack / Knowledge Base Context:\n{kb_context}\n\n"
+
+        # ── Available global KB docs ──────────────────────────────────────────
+        # When the planner pre-fetched global KB titles, surface them so the
+        # LLM can pick the most relevant ones and emit them as `KB docs:` in
+        # the REQUIREMENTS_SPEC.  The planner will then load those docs directly
+        # via get_by_titles() — no re-embedding needed.
+        if available_kb_docs:
+            _titles_block = "\n".join(f"  - {t}" for t in available_kb_docs)
+            accumulated_context += (
+                "Available Reference Docs (global KB — pick the most relevant "
+                "for this task and list them under 'KB docs:' in your spec):\n"
+                f"{_titles_block}\n\n"
+            )
 
         # ── Pre-seed: give the LLM a starting point, not a conclusion ─────────
         # Run one automatic KB search before the loop so the LLM can see what
@@ -636,6 +650,8 @@ class IntentAgent(Agent):
         "KB topics: <2-5 short keywords the planner needs docs for — library or "
         "framework names only, e.g. 'Tailwind, React refs, Vitest'; "
         "write 'none' if the fix is pure logic with no external library>\n"
+        "KB docs: <exact titles from Available Reference Docs that are directly "
+        "relevant; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_FEATURE = (
         "REQUIREMENTS_SPEC:\n"
@@ -648,6 +664,8 @@ class IntentAgent(Agent):
         "Packages/versions: <new dependencies needed, or 'none'>\n"
         "KB topics: <2-5 short keywords — library/framework names only, "
         "e.g. 'Anime.js, React hooks'; write 'none' if no new packages needed>\n"
+        "KB docs: <exact titles from Available Reference Docs that are directly "
+        "relevant; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_MODIFY = (
         "REQUIREMENTS_SPEC:\n"
@@ -660,6 +678,8 @@ class IntentAgent(Agent):
         "Constraints: <from actual code>\n"
         "KB topics: <2-5 short keywords — library/framework names only; "
         "'none' if this is a pure internal refactor>\n"
+        "KB docs: <exact titles from Available Reference Docs that are directly "
+        "relevant; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_QUESTION = (
         "REQUIREMENTS_SPEC:\n"
