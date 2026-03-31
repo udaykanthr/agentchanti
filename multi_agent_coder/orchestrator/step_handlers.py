@@ -3052,26 +3052,30 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             subproject_cwd=subproject_cwd, language=language,
         )
 
-    # Pre-fetch KB docs for code generation — scoped to behavioral +
-    # doc categories only (no patterns/ADRs) and filtered by relevance
-    # to the specific step description so that unrelated docs (e.g. test
-    # generation instructions for a CSS step) are excluded.
+    # Pre-fetch KB docs for code generation — use planner-declared titles
+    # (plan_step.kb_docs) when available for an exact lookup so that only
+    # the docs the planner actually referenced are injected.  Fall back to
+    # a broad semantic search only when the planner declared no titles.
     _code_behavioral_ctx = ""
     if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _step_query = (
-                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
-                    or step_text.split("\n")[0].strip()
-                )
-                _beh_results = _gstore.search(
-                    query=_step_query,
-                    categories=["behavioral", "doc"],
-                    top_k=4,
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                    language=language,
-                )
+                _declared_kb = getattr(plan_step, 'kb_docs', None) if plan_step else None
+                if _declared_kb:
+                    _beh_results = _gstore.get_by_titles(_declared_kb)
+                else:
+                    _step_query = (
+                        (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                        or step_text.split("\n")[0].strip()
+                    )
+                    _beh_results = _gstore.search(
+                        query=_step_query,
+                        categories=["behavioral", "doc"],
+                        top_k=4,
+                        api_client=getattr(kb_context_builder, '_api_client', None),
+                        language=language,
+                    )
                 if _beh_results:
                     _beh_parts = []
                     for item in _beh_results:
@@ -3827,13 +3831,20 @@ def _cleanup_ghost_test_files(
 
 # ── Enhancement #6: Import-trace context injection ──────────────
 def _extract_imported_sources(test_files: dict[str, str],
-                              memory: FileMemory) -> dict[str, str]:
+                              memory: FileMemory,
+                              resolve_from_disk: bool = False) -> dict[str, str]:
     """Parse import statements in test files to identify tested source files.
 
     Returns a dict of {filepath: content} for source files that are
     directly imported by the test files.
+
+    When *resolve_from_disk* is True, imports that are not found in memory
+    are resolved relative to the test file's directory on disk and read
+    directly.  This covers checkpoint-resume runs where source files written
+    in a previous session are no longer tracked in FileMemory.
     """
     import re as _re
+    import os as _os
 
     # Python: from src.snake_game import ... / import snake_game
     _PY_IMPORT_RE = _re.compile(
@@ -3842,20 +3853,26 @@ def _extract_imported_sources(test_files: dict[str, str],
     _JS_IMPORT_RE = _re.compile(
         r'''(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))''')
 
+    _JS_EXTS = ('.jsx', '.js', '.tsx', '.ts', '.mjs', '.cjs')
+    _PY_EXTS = ('.py',)
+
     all_files = memory.all_files()
     imported_sources: dict[str, str] = {}
 
     for _tpath, tcontent in test_files.items():
         # Collect candidate module paths from imports
         candidates: set[str] = set()
+        # Also keep the raw relative paths for disk resolution
+        raw_rel_imports: list[str] = []
+
         for m in _PY_IMPORT_RE.finditer(tcontent):
             mod = m.group(1) or m.group(2)
             if mod:
                 candidates.add(mod.replace('.', '/'))
         for m in _JS_IMPORT_RE.finditer(tcontent):
             rel = m.group(1) or m.group(2)
-            if rel:
-                # Strip leading ./ or ../
+            if rel and not rel.startswith(('@', 'react', 'vitest', 'jest', 'node:')):
+                raw_rel_imports.append(rel)
                 clean = _re.sub(r'^\.\.?/', '', rel)
                 candidates.add(clean)
 
@@ -3870,6 +3887,34 @@ def _extract_imported_sources(test_files: dict[str, str],
                 if cand in fpath or fpath.endswith(cand) or fpath.endswith(cand + '.py'):
                     imported_sources[fpath] = content
                     break
+
+        # Disk fallback: resolve relative imports from the test file's directory
+        if resolve_from_disk and raw_rel_imports:
+            test_dir = _os.path.dirname(_tpath)
+            for rel in raw_rel_imports:
+                # Only resolve relative paths (start with . or ..)
+                if not rel.startswith('.'):
+                    continue
+                resolved_base = _os.path.normpath(
+                    _os.path.join(test_dir, rel)).replace('\\', '/')
+                # Skip if already found via memory
+                if any(resolved_base in fp or fp.startswith(resolved_base)
+                       for fp in imported_sources):
+                    continue
+                # Try common source extensions
+                exts = _JS_EXTS if _tpath.endswith(
+                    ('.jsx', '.js', '.tsx', '.ts', '.mjs')) else _PY_EXTS
+                for ext in ('', *exts):
+                    candidate_path = resolved_base + ext
+                    if candidate_path in imported_sources:
+                        break
+                    try:
+                        with open(candidate_path, 'r', encoding='utf-8',
+                                  errors='replace') as _f:
+                            imported_sources[candidate_path] = _f.read()
+                        break
+                    except OSError:
+                        continue
 
     return imported_sources
 
@@ -4250,25 +4295,30 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     prev_gen_error = None  # Track errors across gen attempts for early exit
     prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
-    # Pre-fetch KB docs for test generation — scoped to behavioral +
-    # doc categories and filtered by relevance to the specific step
-    # description so unrelated docs are excluded.
+    # Pre-fetch KB docs for test generation — use planner-declared titles
+    # (plan_step.kb_docs) when available for an exact lookup so that only
+    # the docs the planner actually referenced are injected.  Fall back to
+    # a broad semantic search only when the planner declared no titles.
     _behavioral_ctx = ""
     if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _step_query = (
-                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
-                    or step_text.split("\n")[0].strip()
-                )
-                _beh_results = _gstore.search(
-                    query=_step_query,
-                    categories=["behavioral", "doc"],
-                    top_k=4,
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                    language=language,
-                )
+                _declared_kb = getattr(plan_step, 'kb_docs', None) if plan_step else None
+                if _declared_kb:
+                    _beh_results = _gstore.get_by_titles(_declared_kb)
+                else:
+                    _step_query = (
+                        (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                        or step_text.split("\n")[0].strip()
+                    )
+                    _beh_results = _gstore.search(
+                        query=_step_query,
+                        categories=["behavioral", "doc"],
+                        top_k=4,
+                        api_client=getattr(kb_context_builder, '_api_client', None),
+                        language=language,
+                    )
                 if _beh_results:
                     _beh_parts = []
                     for item in _beh_results:

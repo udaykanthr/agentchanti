@@ -545,12 +545,10 @@ def main():
             if project_context:
                 planner_context += f"\nCurrent directory contents:\n{project_context}"
 
-        # Inject knowledge base context
-        if knowledge_base and knowledge_base.size > 0:
-            kb_context = knowledge_base.format_for_planner()
-            if kb_context:
-                planner_context += f"\n\n{kb_context}"
-                log.info(f"Injected {knowledge_base.size} knowledge entries into planner")
+        # KB injection is deferred to after pre_analyze so the IntentAgent's
+        # REQUIREMENTS_SPEC (which includes a "KB topics:" field) can be used
+        # to filter down to only the relevant entries.  Placeholder comment
+        # here — actual injection happens below after pre_analyze completes.
 
         # Baseline test analysis before planning — run existing tests to
         # identify which files pass/fail so the planner only touches broken ones.
@@ -598,6 +596,39 @@ def main():
 
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
+
+        # ── Filtered KB injection ─────────────────────────────────────────────
+        # Parse "KB topics:" from the REQUIREMENTS_SPEC the IntentAgent just
+        # produced.  Use those topics to filter knowledge_base entries so the
+        # planner only sees docs relevant to this specific task — not the full
+        # 83-entry dump which includes irrelevant framework docs and old fixes.
+        if knowledge_base and knowledge_base.size > 0:
+            import re as _re_kb
+            _kb_topics: list[str] = []
+            _spec_topics_match = _re_kb.search(
+                r'KB topics:\s*(.+)', args.task, _re_kb.IGNORECASE,
+            )
+            if _spec_topics_match:
+                _raw_topics = _spec_topics_match.group(1).strip()
+                if _raw_topics.lower() not in ('none', 'n/a', ''):
+                    _kb_topics = [t.strip() for t in _raw_topics.split(',') if t.strip()]
+
+            if _kb_topics:
+                # Targeted injection: only entries whose text overlaps with the
+                # stated topics.  Always include the stack summary (1 entry).
+                kb_context = knowledge_base.format_for_task(_kb_topics)
+                log.info(
+                    "Filtered KB injection: topics=%s", _kb_topics,
+                )
+            else:
+                # "none" or no KB topics field → inject only stack + packages
+                # (no patterns/fixes which tend to be task-specific noise).
+                kb_context = knowledge_base.format_stack_only()
+                log.info("KB topics: none — injecting stack summary only")
+
+            if kb_context:
+                planner_context += f"\n\n{kb_context}"
+
         log.info("[Planning] Pre-analysis context injected")
 
         # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
@@ -1127,6 +1158,7 @@ def main():
             cfg=cfg,
             project_context=project_context,
             kb_context_builder=kb_context_builder,
+            all_plan_steps=plan_steps_parsed,
         )
         if not verif_ok:
             pipeline_success = False

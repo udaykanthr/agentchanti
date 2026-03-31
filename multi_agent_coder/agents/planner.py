@@ -280,37 +280,13 @@ class PlannerAgent(Agent):
             # Global KB docs (framework guides, installation docs, etc.)
             # These are the high-value docs like "React TailwindCSS Responsive
             # Header", "Vite React Setup Guide", etc.
-            if kb_context_builder is not None:
-                try:
-                    kb_context_builder._ensure_global()
-                    _gs = kb_context_builder._global_store
-                    if _gs is not None:
-                        _intent_docs = _gs.search(
-                            query=task,
-                            categories=["doc", "pattern"],
-                            top_k=10,
-                            api_client=kb_context_builder._api_client,
-                        )
-                        if _intent_docs:
-                            _doc_sections = []
-                            for _d in _intent_docs:
-                                _doc_sections.append(
-                                    f"### {_d.title}\n{_d.content or ''}"
-                                )
-                            _semantic_kb.append(
-                                "Global KB Documentation:\n"
-                                + "\n\n".join(_doc_sections)
-                            )
-                            _logger.info(
-                                "[PreAnalysis] Injected %d global KB doc(s) "
-                                "into IntentAgent context",
-                                len(_intent_docs),
-                            )
-                except Exception as _gkb_exc:
-                    _logger.debug(
-                        "[PreAnalysis] Global KB query for IntentAgent failed: %s",
-                        _gkb_exc,
-                    )
+            # Global KB docs (framework guides, patterns) are intentionally
+            # NOT injected into IntentAgent context — the intent agent
+            # needs to understand what existing code does, not how to
+            # build new code.  Global docs inflate token counts with
+            # irrelevant content (e.g. Anime.js guide for a snake bug)
+            # and are already available to the planner through its own
+            # channel.
 
             # Relevant source file skeletons (for existing projects)
             if relevant:

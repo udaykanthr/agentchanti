@@ -396,6 +396,107 @@ class KnowledgeBase:
 
         return "=== PROJECT KNOWLEDGE ===\n" + "\n".join(parts) + "\n=== END KNOWLEDGE ==="
 
+    def format_stack_only(self) -> str:
+        """Minimal injection: stack summary + installed packages only.
+
+        Used when the IntentAgent reports 'KB topics: none' — the planner
+        still needs to know the tech stack and available packages, but does
+        not need patterns or fixes that are irrelevant to the current task.
+        """
+        k = self._knowledge
+        parts: list[str] = []
+
+        if k.project_summary:
+            parts.append(f"Project: {k.project_summary}")
+
+        ts = k.tech_stack
+        stack_parts = []
+        if ts.language:
+            stack_parts.append(ts.language)
+        if ts.framework:
+            stack_parts.append(ts.framework)
+        if ts.test_framework:
+            stack_parts.append(f"tests: {ts.test_framework}")
+        if ts.package_manager:
+            stack_parts.append(f"pkg: {ts.package_manager}")
+        if stack_parts:
+            parts.append(f"Stack: {', '.join(stack_parts)}")
+
+        if k.installed_packages:
+            parts.append(f"Installed: {', '.join(k.installed_packages[-30:])}")
+
+        if not parts:
+            return ""
+        return "=== PROJECT KNOWLEDGE ===\n" + "\n".join(parts) + "\n=== END KNOWLEDGE ==="
+
+    def format_for_task(self, topics: list[str]) -> str:
+        """Topic-filtered injection driven by the IntentAgent's REQUIREMENTS_SPEC.
+
+        Only includes patterns, fixes, and file_purposes whose text overlaps
+        with at least one of the stated *topics*.  Stack + packages are always
+        included (they are cheap and always relevant).
+
+        Parameters
+        ----------
+        topics:
+            List of topic strings from the 'KB topics:' field of the
+            REQUIREMENTS_SPEC (e.g. ['Tailwind z-index', 'React hooks']).
+        """
+        k = self._knowledge
+        parts: list[str] = []
+
+        if k.project_summary:
+            parts.append(f"Project: {k.project_summary}")
+
+        ts = k.tech_stack
+        stack_parts = []
+        if ts.language:
+            stack_parts.append(ts.language)
+        if ts.framework:
+            stack_parts.append(ts.framework)
+        if ts.test_framework:
+            stack_parts.append(f"tests: {ts.test_framework}")
+        if ts.package_manager:
+            stack_parts.append(f"pkg: {ts.package_manager}")
+        if stack_parts:
+            parts.append(f"Stack: {', '.join(stack_parts)}")
+
+        if k.installed_packages:
+            parts.append(f"Installed: {', '.join(k.installed_packages[-30:])}")
+
+        # Keyword overlap check — case-insensitive, any topic word matches
+        topic_words = {
+            w.lower()
+            for t in topics
+            for w in t.replace(',', ' ').split()
+            if len(w) > 2
+        }
+
+        def _matches(text: str) -> bool:
+            tl = text.lower()
+            return any(w in tl for w in topic_words)
+
+        if k.file_purposes:
+            matched_fp = [
+                f"  {p}: {desc}"
+                for p, desc in k.file_purposes.items()
+                if _matches(p) or _matches(desc)
+            ]
+            if matched_fp:
+                parts.append("Key files:\n" + "\n".join(matched_fp[:10]))
+
+        matched_patterns = [p for p in k.patterns if _matches(p)]
+        for p in matched_patterns[-5:]:
+            parts.append(f"  [pattern] {p}")
+
+        matched_fixes = [f for f in k.fixes if _matches(f)]
+        for f in matched_fixes[-5:]:
+            parts.append(f"  [fix] {f}")
+
+        if not parts:
+            return ""
+        return "=== PROJECT KNOWLEDGE ===\n" + "\n".join(parts) + "\n=== END KNOWLEDGE ==="
+
     def format_for_agents(self) -> str:
         """Compact format for all agent prompts (~200 tokens max)."""
         k = self._knowledge

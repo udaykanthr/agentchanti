@@ -533,7 +533,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                         _kb_query = f"{_kb_query} {' '.join(_tech_extras)}"
             except Exception:
                 pass
-        if kb_context_builder is not None:
+        # Skip KB context (and its embedding API call) for inline-code steps —
+        # the coder is never invoked for inline steps so the context is wasted.
+        _has_inline = (
+            plan_step is not None
+            and getattr(plan_step, "inline_code", None)
+            and len(plan_step.inline_code) > 0
+        )
+        if kb_context_builder is not None and not _has_inline:
             try:
                 from ..kb.context_builder import ContextBuilder
                 kb_ctx = kb_context_builder.build_context(
@@ -2284,6 +2291,7 @@ def run_bulk_test_execution_and_fix(
     cfg=None,
     project_context=None,
     kb_context_builder=None,
+    all_plan_steps=None,
 ) -> tuple[bool, str]:
     """Run all session test files in a single bulk execution, then fix failures
     one test file at a time.
@@ -2312,6 +2320,18 @@ def run_bulk_test_execution_and_fix(
         _ANSI_RE,
         _parse_test_counts,
     )
+
+    # Build test-file → kb_docs mapping from planner-declared step metadata.
+    # Used in the fix loop to skip broad KB search when the plan already
+    # specifies exactly which docs apply to each test file.
+    _step_kb_docs: dict[str, list[str]] = {}
+    if all_plan_steps:
+        for _ps in all_plan_steps:
+            _declared = getattr(_ps, 'kb_docs', None)
+            if not _declared:
+                continue
+            for _tf in getattr(_ps, 'target_files', []):
+                _step_kb_docs[_tf] = _declared
 
     all_files = memory.all_files()
     test_files = {
@@ -2439,7 +2459,8 @@ def run_bulk_test_execution_and_fix(
                 except OSError:
                     pass
             imported_sources = _extract_imported_sources(
-                {test_path: current_content}, memory)
+                {test_path: current_content}, memory,
+                resolve_from_disk=True)
 
             source_ctx = (
                 f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
@@ -2453,21 +2474,39 @@ def run_bulk_test_execution_and_fix(
             # the LLM can see the correct file to edit instead of guessing.
             source_ctx += _django_settings_context(subproject_cwd)
 
-            # Optionally inject KB guidance
+            # Inject KB guidance — use planner-declared docs when available
+            # (exact title lookup, no semantic search) to avoid injecting
+            # irrelevant docs (e.g. Django instructions for a React test).
+            # Fall back to build_context() only when the plan has no kb_docs.
             kb_instructions = ""
             if kb_context_builder is not None:
                 try:
-                    from ..kb.context_builder import ContextBuilder
-                    kb_ctx = kb_context_builder.build_context(
-                        task_description=task,
-                        current_file=test_path,
-                        max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
-                        language=lang,
-                        step_type="TEST",
-                    )
-                    kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
-                    if kb_text:
-                        kb_instructions = f"\n\nKnowledge base guidance:\n{kb_text}"
+                    _declared_titles = _step_kb_docs.get(test_path)
+                    if _declared_titles:
+                        _gstore = getattr(kb_context_builder, '_global_store', None)
+                        if _gstore is not None:
+                            _kb_results = _gstore.get_by_titles(_declared_titles)
+                            if _kb_results:
+                                _kb_parts = [
+                                    getattr(r, 'content', '') or getattr(r, 'title', '')
+                                    for r in _kb_results
+                                ]
+                                kb_instructions = (
+                                    "\n\nKnowledge base guidance:\n"
+                                    + "\n".join(p for p in _kb_parts if p)
+                                )
+                    else:
+                        from ..kb.context_builder import ContextBuilder
+                        kb_ctx = kb_context_builder.build_context(
+                            task_description=task,
+                            current_file=test_path,
+                            max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 2000) if cfg else 2000,
+                            language=lang,
+                            step_type="TEST",
+                        )
+                        kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
+                        if kb_text:
+                            kb_instructions = f"\n\nKnowledge base guidance:\n{kb_text}"
                 except Exception:
                     pass
 
@@ -2530,6 +2569,10 @@ def run_bulk_test_execution_and_fix(
                 if not fix_files:
                     fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
+                    if subproject_cwd:
+                        from .step_handlers import _prefix_subproject_paths
+                        fix_files = _prefix_subproject_paths(
+                            fix_files, subproject_cwd, memory)
                     executor.write_files(fix_files)
                     memory.update(fix_files)
                     _logger.info(
@@ -2663,7 +2706,8 @@ def run_bulk_test_execution_and_fix(
                     except OSError:
                         pass
                 imported_sources = _extract_imported_sources(
-                    {test_path: current_content}, memory)
+                    {test_path: current_content}, memory,
+                    resolve_from_disk=True)
                 source_ctx = (
                     f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
                 )
@@ -2732,6 +2776,10 @@ def run_bulk_test_execution_and_fix(
                     if not fix_files:
                         fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                     if fix_files:
+                        if subproject_cwd:
+                            from .step_handlers import _prefix_subproject_paths
+                            fix_files = _prefix_subproject_paths(
+                                fix_files, subproject_cwd, memory)
                         executor.write_files(fix_files)
                         memory.update(fix_files)
                         _logger.info(

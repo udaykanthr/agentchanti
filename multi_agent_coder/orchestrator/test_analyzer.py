@@ -520,12 +520,52 @@ def analyze_task_for_planner(
         f"{package_docs}\n"
     ) if package_docs else ""
 
+    # Check if the task already contains a typed REQUIREMENTS_SPEC from the
+    # IntentAgent — if so, surface its key fields for the briefing LLM so it
+    # treats them as authoritative ground truth rather than re-deriving them.
+    import re as _re_spec
+    _spec_hint = ""
+    _spec_block = _re_spec.search(
+        r'=== INTENT CLARIFICATION.*?===\n(.*)',
+        task, _re_spec.DOTALL | _re_spec.IGNORECASE,
+    )
+    if _spec_block:
+        _spec_text = _spec_block.group(1)
+        _task_type = (_re_spec.search(r'Task type:\s*(\S+)', _spec_text) or object())
+        _task_type = getattr(_task_type, 'group', lambda _: None)(1)
+        if _task_type:
+            _type_directive = {
+                "BUG_FIX": (
+                    "This task was classified as BUG_FIX by a prior code investigator.\n"
+                    "The Root cause, Fix scope, and Do not touch fields below are "
+                    "AUTHORITATIVE — derive your Modify, Do not touch, and Agent "
+                    "directive answers directly from them. Do not expand the fix scope."
+                ),
+                "FEATURE": (
+                    "This task was classified as FEATURE by a prior code investigator.\n"
+                    "Use the Create, Integrate with, and Reuse fields below to derive "
+                    "your Modify/Create/Agent directive answers."
+                ),
+                "MODIFY": (
+                    "This task was classified as MODIFY by a prior code investigator.\n"
+                    "Use the Change scope and Preserve fields to derive your "
+                    "Modify and Preserve answers. Stay within the stated change scope."
+                ),
+            }.get(_task_type, "")
+            if _type_directive:
+                _spec_hint = (
+                    f"\n{'='*60}\n"
+                    f"PRIOR REQUIREMENTS ANALYSIS (authoritative — follow it):\n"
+                    f"{_type_directive}\n"
+                    f"{'='*60}\n"
+                )
+
     prompt = f"""\
 You are a software project analyst preparing a briefing for an AI coding agent.
 The agent will plan and execute code changes to accomplish the user's task.
 Your job is to determine — based on the ACTUAL current project state below —
 exactly what needs to change, what must be preserved, and what must not be touched.
-
+{_spec_hint}
 USER TASK:
 {task}
 
@@ -534,15 +574,16 @@ USER TASK:
 Answer these questions concisely and precisely:
 1. What is the real goal of this task (one sentence)?
 2. Which existing files need to be modified?  Name them specifically.
-   IMPORTANT: Prefer the innermost component that directly owns/renders the
-   visual element mentioned in the task (e.g. if the task says "snake game
-   background", look inside the SnakeGame component — NOT the routing wrapper
-   that mounts it).  A wrapping div's background is NOT the same as the game
-   board/canvas background drawn inside the component itself.
+   IMPORTANT: If the task contains a REQUIREMENTS_SPEC with a "Fix scope:" or
+   "Change scope:" field, use EXACTLY those files — do not expand the list.
+   Otherwise prefer the innermost component that directly owns/renders the
+   visual element mentioned in the task.
 3. Which new files (if any) need to be created?
+   If the REQUIREMENTS_SPEC has a "Create:" field, use it directly.
 4. Which files must NOT be touched?  Give a compact summary (e.g. "all test
    files — N currently passing" or a glob pattern) rather than listing every
    individual path.  The exact file list is already in the baseline analysis.
+   If the REQUIREMENTS_SPEC has a "Do not touch:" field, include those files.
 5. What does a successful result look like?  (observable outcome, not process steps)
 6. What is the single most important constraint the coding agent must respect?
 7. Looking at the source implementation and test assertions for the files being
@@ -550,19 +591,19 @@ Answer these questions concisely and precisely:
    handlers are NOT part of this task and must be kept exactly as they are?
    Be specific — list concrete things (e.g. "snake renders as filled rectangles",
    "ArrowKey events still work alongside WASD", "GRID_SIZE constant is exported").
+   If the REQUIREMENTS_SPEC has a "Preserve:" field, include those behaviors.
 8. Which NEW packages must be installed for this task that are NOT already present
    in the project's dependencies (check package.json / requirements.txt in the
    source files above)?  List bare package names only (e.g. "animejs", "lodash"),
    comma-separated.  Write NONE if every dependency is already installed.
 9. What is the MINIMAL surgical change required?  Be as specific as possible:
    name the exact attribute, property, CSS class string, or value to add/change.
+   If the REQUIREMENTS_SPEC has a "Root cause:" field (BUG_FIX) use it to
+   derive the exact fix — do not invent additional changes beyond the root cause.
    Do NOT describe general restructuring approaches — point to the exact edit
    (e.g. "add 'mx-auto max-w-7xl' to the className of the <div> wrapping <Routes>
    in App.jsx" rather than "potentially adjust the flex container").
    The coder must make ONLY this change and nothing else.
-   IMPORTANT: If the task refers to a visual element rendered INSIDE a component
-   (e.g. "game area", "canvas", "board"), the directive must target that component's
-   own file — not a wrapper or routing file that merely mounts the component.
 
 Respond in this EXACT format — no extra text, no markdown outside the block:
 TASK BRIEFING:

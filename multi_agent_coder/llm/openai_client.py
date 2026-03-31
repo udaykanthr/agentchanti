@@ -165,7 +165,7 @@ class OpenAIClient(LLMClient):
         if dimensions:
             payload["dimensions"] = dimensions
         try:
-            response = requests.post(url, headers=self._headers(), json=payload, timeout=120)
+            response = requests.post(url, headers=self._headers(), json=payload, timeout=60)
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])

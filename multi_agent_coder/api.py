@@ -298,10 +298,8 @@ def _run_task_impl(
         if project_context:
             planner_context += f"\nCurrent directory contents:\n{project_context}"
 
-    if knowledge_base and knowledge_base.size > 0:
-        kb_ctx = knowledge_base.format_for_planner()
-        if kb_ctx:
-            planner_context += f"\n\n{kb_ctx}"
+    # KB injection deferred — done after pre_analyze so the IntentAgent's
+    # "KB topics:" field can filter it down to relevant entries only.
 
     # Baseline test analysis before planning
     from .agents.planner import _classify_task_intent
@@ -332,6 +330,23 @@ def _run_task_impl(
 
     # Update task if IntentAgent enriched it during pre_analyze
     task = getattr(planner, '_enriched_task', task)
+
+    # ── Filtered KB injection ─────────────────────────────────────────────────
+    if knowledge_base and knowledge_base.size > 0:
+        import re as _re_kb
+        _kb_topics: list[str] = []
+        _m = _re_kb.search(r'KB topics:\s*(.+)', task, _re_kb.IGNORECASE)
+        if _m:
+            _raw = _m.group(1).strip()
+            if _raw.lower() not in ('none', 'n/a', ''):
+                _kb_topics = [t.strip() for t in _raw.split(',') if t.strip()]
+        kb_ctx = (
+            knowledge_base.format_for_task(_kb_topics)
+            if _kb_topics
+            else knowledge_base.format_stack_only()
+        )
+        if kb_ctx:
+            planner_context += f"\n\n{kb_ctx}"
 
     # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
     _llm_detected = getattr(planner, '_detected_language', None)
@@ -577,6 +592,7 @@ def _run_task_impl(
             cfg=cfg,
             project_context=project_context_obj,
             kb_context_builder=kb_context_builder,
+            all_plan_steps=plan_steps,
         )
         if not verif_ok:
             pipeline_success = False
