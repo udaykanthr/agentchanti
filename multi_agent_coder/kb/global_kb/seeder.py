@@ -2768,6 +2768,95 @@ Named export → named import: `import { Dashboard } from './Dashboard'`
 Use `export default` for the main component. Named exports for helpers/constants only.
 """,
     },
+    "react-router-setup-instructions.md": {
+        "title": "React Router Setup Instructions",
+        "tags": "react, react-router, BrowserRouter, HashRouter, MemoryRouter, main.jsx, App.jsx, entry-point, singleton, nested, router, behavioral, instructions, javascript, typescript",
+        "content": """## CRITICAL: React Router Setup Rules
+
+When generating or modifying React apps that use React Router, follow these rules to
+prevent the "You cannot render a <Router> inside another <Router>" runtime error.
+
+## Rule 1: Only ONE BrowserRouter in the entire app — always in main.jsx/index.jsx
+
+The BrowserRouter (or HashRouter) MUST be placed only at the app entry point:
+```jsx
+// main.jsx or index.jsx — CORRECT placement
+import { BrowserRouter } from 'react-router-dom';
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+);
+```
+
+NEVER place BrowserRouter inside App.jsx or any child component — it causes a
+"You cannot render a <Router> inside another <Router>" runtime error:
+```jsx
+// App.jsx — WRONG: causes nested Router runtime error
+export default function App() {
+  return (
+    <BrowserRouter>   {/* Remove this */}
+      <div>...</div>
+    </BrowserRouter>
+  );
+}
+```
+
+## Rule 2: When removing a BrowserRouter wrapper, return the inner element directly
+
+Return the inner element as a single JSX root — do NOT leave JSX comments floating
+before the root element:
+
+```jsx
+// BEFORE (broken — BrowserRouter wraps a comment + div):
+return (
+  <BrowserRouter>
+    {/* some comment */}
+    <div className="min-h-screen">...</div>
+  </BrowserRouter>
+);
+
+// CORRECT — move comment INSIDE the div, return div directly:
+return (
+  <div className="min-h-screen">
+    {/* some comment */}
+    ...
+  </div>
+);
+```
+
+## Rule 3: NEVER leave a JSX comment before the root JSX element in a return
+
+`{/* comment */}` MUST be inside an open JSX element. Placing it before the
+opening tag of the root element causes a syntax error:
+
+```jsx
+// WRONG — syntax error: {/* */} floats before root element
+return (
+  {/* this causes a parse error */}
+  <div>...</div>
+);
+
+// CORRECT — comment is inside the root element
+return (
+  <div>
+    {/* this is valid */}
+    ...
+  </div>
+);
+```
+
+## Rule 4: Use MemoryRouter in tests — never BrowserRouter
+
+Tests that render components should always use MemoryRouter:
+```jsx
+import { MemoryRouter } from 'react-router-dom';
+render(<MemoryRouter><ComponentUnderTest /></MemoryRouter>);
+```
+""",
+    },
     "django-test-generation-instructions.md": {
         "title": "Django Test Generation Instructions",
         "tags": "django, testing, pytest, test-generation, behavioral, instructions, python, allowed_hosts, template, settings",

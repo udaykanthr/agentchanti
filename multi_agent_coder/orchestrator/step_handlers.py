@@ -3040,7 +3040,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       plan_step=None,
                       all_plan_steps=None,
                       kb_context_builder=None,
-                      partial_inline_code: dict[str, str] | None = None) -> tuple[bool, str]:
+                      partial_inline_code: dict[str, str] | None = None,
+                      initial_error: str = "") -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -3098,6 +3099,11 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         _targets_hint = " ".join(plan_step.target_files)
         _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
 
+    # When falling back from inline static-check failure, prepend the specific
+    # errors so all edit tiers (chunk, diff, full-file) know what to fix.
+    if initial_error:
+        _edit_step_text = f"{_edit_step_text}\n\n[ERRORS TO FIX]\n{initial_error}"
+
     # Detect primary target file to see if we should force DiffEdit for non-AST
     target_for_route = _detect_target_file(_edit_step_text, memory)
     is_non_ast = False
@@ -3139,7 +3145,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             return chunk_result
 
     # --- Tier 3: Full-file flow (fallback) ---
-    feedback = ""
+    feedback = initial_error  # Pre-seed with inline static errors when falling back
     context_window = cfg.CONTEXT_WINDOW if cfg else 8192
     ctx_budget = int(context_window * 0.8)
     prev_files: dict[str, str] = {}  # Track files from previous attempt

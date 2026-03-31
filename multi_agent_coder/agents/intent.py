@@ -229,13 +229,20 @@ class IntentAgent(Agent):
         """Implementation of base Agent process. Fallback if called directly."""
         return self.analyze_intent(task)
 
+    # Hard cap — pure runaway guard, never meant to be hit in normal operation.
+    # The loop exits naturally when the LLM writes REQUIREMENTS_SPEC, or when
+    # the duplicate-command guard sets force_conclude.
+    _SAFETY_CAP = 20
+    # If accumulated context grows beyond this, force the LLM to conclude so
+    # we don't overflow its context window or burn cloud tokens indefinitely.
+    _MAX_CONTEXT_CHARS = 60_000
+
     def analyze_intent(
         self,
         raw_task: str,
         search_agent=None,
         kb_context_builder=None,
         kb_context: str = "",
-        max_iterations: int = 5,
         cli_display=None,
         available_kb_docs: list[str] | None = None,
     ) -> str:
@@ -299,13 +306,22 @@ class IntentAgent(Agent):
         # next iteration so the LLM doesn't burn more rounds ignoring the note.
         force_conclude = False
 
-        for iteration in range(1, max_iterations + 1):
-            is_last = iteration == max_iterations or force_conclude
+        iteration = 0
+        while True:
+            iteration += 1
+            context_overflow = len(accumulated_context) > self._MAX_CONTEXT_CHARS
+            is_last = force_conclude or context_overflow
+            if iteration > self._SAFETY_CAP:
+                _logger.warning(
+                    "[IntentAnalysis] Safety cap (%d iterations) reached — breaking.",
+                    self._SAFETY_CAP,
+                )
+                break
             prompt = self._build_prompt(raw_task, accumulated_context, conclude=is_last)
             if cli_display:
                 cli_display.show_intent_event(
-                    "think", f"Querying LLM (iteration {iteration}/{max_iterations})",
-                    iteration=iteration, max_iterations=max_iterations,
+                    "think", f"Querying LLM (iteration {iteration})",
+                    iteration=iteration, max_iterations=0,
                 )
 
             try:
@@ -348,7 +364,7 @@ class IntentAgent(Agent):
                     if cli_display:
                         cli_display.show_intent_event("kb", f"KB_SEARCH: {query}",
                                                        iteration=iteration,
-                                                       max_iterations=max_iterations)
+                                                       max_iterations=0)
                     # LLMs often pack multiple file names into one query
                     # (e.g. "Food.jsx; SnakeSegment.jsx"). Split on common
                     # separators and run each sub-query so every file is found.
@@ -409,7 +425,7 @@ class IntentAgent(Agent):
                     if cli_display:
                         cli_display.show_intent_event("web", f"SEARCH: {query}",
                                                        iteration=iteration,
-                                                       max_iterations=max_iterations)
+                                                       max_iterations=0)
                     search_result = search_agent.search_for_task(
                         query, kb_context=kb_context,
                     )
@@ -466,7 +482,7 @@ class IntentAgent(Agent):
                             cli_display.show_intent_event("reject",
                                                            f"RUN_CMD rejected: {reason}",
                                                            iteration=iteration,
-                                                           max_iterations=max_iterations)
+                                                           max_iterations=0)
                         accumulated_context += (
                             f"[RUN_CMD '{raw_cmd}' was rejected: {reason}. "
                             f"Only read-only git/grep/ls/test-runner commands are allowed. "
@@ -479,7 +495,7 @@ class IntentAgent(Agent):
                     if cli_display:
                         cli_display.show_intent_event("cmd", f"RUN_CMD: {raw_cmd}",
                                                        iteration=iteration,
-                                                       max_iterations=max_iterations)
+                                                       max_iterations=0)
                     project_root = (
                         getattr(kb_context_builder, "_project_root", None)
                         if kb_context_builder is not None else None
@@ -523,7 +539,7 @@ class IntentAgent(Agent):
                     if cli_display:
                         cli_display.show_intent_event("usage", f"FIND_USAGES: {name}",
                                                        iteration=iteration,
-                                                       max_iterations=max_iterations)
+                                                       max_iterations=0)
                     usage_result = self._find_usages(kb_context_builder, name)
                     if usage_result:
                         accumulated_context += (
@@ -583,7 +599,7 @@ class IntentAgent(Agent):
                         cli_display.show_intent_event("spec",
                                                        f"REQUIREMENTS_SPEC: {task_type_label}",
                                                        iteration=iteration,
-                                                       max_iterations=max_iterations)
+                                                       max_iterations=0)
                         _show_spec_details(cli_display, spec)
                         # Events stay visible — cleared by pre_analyze when
                         # the briefing/planning phase begins.
@@ -601,7 +617,7 @@ class IntentAgent(Agent):
                 if cli_display:
                     cli_display.show_intent_event("spec", "REQUIREMENTS_SPEC: (inferred)",
                                                    iteration=iteration,
-                                                   max_iterations=max_iterations)
+                                                   max_iterations=0)
                     _show_spec_details(cli_display, response)
                 return (
                     f"{raw_task}\n\n"
@@ -620,8 +636,8 @@ class IntentAgent(Agent):
         # complete but the LLM never got a final call to produce the spec.
         if last_response:
             _logger.warning(
-                "[IntentAnalysis] Max iterations (%d) reached — using last response as spec.",
-                max_iterations,
+                "[IntentAnalysis] Safety cap reached after %d iterations — using last response as spec.",
+                iteration,
             )
             return (
                 f"{raw_task}\n\n"

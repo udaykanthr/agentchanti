@@ -886,8 +886,8 @@ class CLIDisplay:
         title = Text()
         title.append("◈ ", style="dim cyan")
         title.append("INVESTIGATING", style="bold cyan")
-        if max_iter:
-            title.append(f"  iteration {iteration}/{max_iter}", style="dim")
+        if iteration:
+            title.append(f"  iteration {iteration}", style="dim")
         title.append(f"  {spin}", style=_CLR["active"])
 
         return Panel(

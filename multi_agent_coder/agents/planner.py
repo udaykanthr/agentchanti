@@ -682,6 +682,68 @@ class PlannerAgent(Agent):
         # into the planner context. Adding it again here would duplicate
         # installed packages, tech stack, and patterns.
 
+        # 3b. Task-only intent pass for blank projects.
+        # When there are no source files the IntentAgent was skipped (step 2b)
+        # because it has nothing to investigate.  Instead of falling back to
+        # pure vector search (which matches by embedding similarity and
+        # over-fetches), we make ONE lightweight LLM call:
+        #   task description + available KB doc titles → LLM picks exact subset
+        # The output is appended to `task` as a "KB docs:" line so the
+        # fast-path in step 4 loads them via get_by_titles() — no re-embedding.
+        if not source_files and intent_agent is not None and kb_context_builder is not None:
+            try:
+                kb_context_builder._ensure_global()
+                _gs = kb_context_builder._global_store
+                if _gs is not None:
+                    _blank_hits = _gs.search(
+                        query=task,
+                        categories=["doc", "pattern"],
+                        top_k=15,
+                        api_client=kb_context_builder._api_client,
+                    ) or []
+                    _blank_titles = [r.title for r in _blank_hits if r.title]
+                    if _blank_titles:
+                        _numbered = "\n".join(
+                            f"{i + 1}. {t}" for i, t in enumerate(_blank_titles)
+                        )
+                        _select_prompt = (
+                            "You are selecting documentation for a coding task in a "
+                            "brand-new empty project (no existing source files).\n\n"
+                            f"Task: {task}\n\n"
+                            "Available documentation titles:\n"
+                            f"{_numbered}\n\n"
+                            "Select ONLY the titles directly needed to complete this task.\n"
+                            "Output EXACTLY one line in this format:\n"
+                            "KB docs: <comma-separated exact titles from the list above>\n\n"
+                            "Rules:\n"
+                            "- Use exact title strings as shown above\n"
+                            "- Maximum 6 titles\n"
+                            "- Exclude titles about unrelated frameworks or languages\n"
+                            "- If none are relevant write: KB docs: none"
+                        )
+                        _kb_select_resp = intent_agent.llm_client.generate_response(
+                            _select_prompt
+                        )
+                        _kbm = re.search(
+                            r'KB docs[^:\n]*:\s*(.+)', _kb_select_resp, re.IGNORECASE
+                        )
+                        if _kbm:
+                            _selected = _kbm.group(1).strip()
+                            if _selected.lower() not in ('none', 'n/a', ''):
+                                task = task + f"\n\nKB docs: {_selected}"
+                                _logger.info(
+                                    "[PreAnalysis] Task-only KB select (blank project): %s",
+                                    _selected,
+                                )
+                                if cli_display:
+                                    cli_display.show_status(
+                                        f"KB docs selected: {_selected[:70]}"
+                                    )
+            except Exception as _toi_exc:
+                _logger.debug(
+                    "[PreAnalysis] Task-only intent pass failed: %s", _toi_exc
+                )
+
         # 4. Global KB documentation (framework guides, installation docs)
         if kb_context_builder is not None:
             try:

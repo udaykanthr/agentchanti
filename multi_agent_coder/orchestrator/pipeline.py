@@ -867,13 +867,68 @@ def _execute_step(step_idx: int, step_text: str, *,
                                         )
                                         break
                             if not _fuzzy_hit:
-                                _logger.warning(
-                                    "[InlineEdit] find string not found in %s — "
-                                    "falling through to coder",
-                                    _resolved,
+                                # ── Minimal-diff fallback ──────────────────────
+                                # When the full FIND block fails (e.g. planner
+                                # assumed stale scaffold content), extract only
+                                # the lines that actually change between FIND and
+                                # REPLACE and try to apply each change individually.
+                                # Only succeeds when every changed line appears
+                                # exactly once in the file (no ambiguity).
+                                import difflib as _difflib
+                                _find_all_lns = _find_str.splitlines()
+                                _repl_all_lns = _repl_str.splitlines()
+                                _sm = _difflib.SequenceMatcher(
+                                    None, _find_all_lns, _repl_all_lns, autojunk=False
                                 )
-                                _edit_all_ok = False
-                                break
+                                _delta: list = []  # [(old_line, new_line | None)]
+                                for _tag, _i1, _i2, _j1, _j2 in _sm.get_opcodes():
+                                    if _tag == "replace":
+                                        for _k in range(max(_i2 - _i1, _j2 - _j1)):
+                                            _o = _find_all_lns[_i1 + _k] if _i1 + _k < _i2 else None
+                                            _n = _repl_all_lns[_j1 + _k] if _j1 + _k < _j2 else None
+                                            if _o is not None:
+                                                _delta.append((_o, _n))
+                                    elif _tag == "delete":
+                                        for _k in range(_i1, _i2):
+                                            _delta.append((_find_all_lns[_k], None))
+                                    # 'insert' has no anchor line — skip
+                                if _delta:
+                                    _work_lns = _patched.splitlines(keepends=True)
+                                    _work_s = [l.strip() for l in _work_lns]
+                                    _min_ok = True
+                                    for _old_ln, _new_ln in _delta:
+                                        _old_s = _old_ln.strip()
+                                        _idxs = [i for i, s in enumerate(_work_s) if s == _old_s]
+                                        if len(_idxs) != 1:
+                                            _min_ok = False
+                                            break
+                                        _idx = _idxs[0]
+                                        if _new_ln is not None:
+                                            _bi = len(_work_lns[_idx]) - len(_work_lns[_idx].lstrip())
+                                            _work_lns[_idx] = (
+                                                " " * _bi + _new_ln.lstrip()
+                                                + ("\n" if _work_lns[_idx].endswith("\n") else "")
+                                            )
+                                            _work_s[_idx] = _new_ln.strip()
+                                        else:
+                                            _work_lns[_idx] = ""
+                                            _work_s[_idx] = ""
+                                    if _min_ok:
+                                        _patched = "".join(_work_lns)
+                                        _fuzzy_hit = True
+                                        _logger.info(
+                                            "[InlineEdit] Minimal-diff fallback applied in %s "
+                                            "(%d change(s))",
+                                            _resolved, len(_delta),
+                                        )
+                                if not _fuzzy_hit:
+                                    _logger.warning(
+                                        "[InlineEdit] find string not found in %s — "
+                                        "falling through to coder",
+                                        _resolved,
+                                    )
+                                    _edit_all_ok = False
+                                    break
 
                     if not _edit_all_ok:
                         break
@@ -1108,6 +1163,10 @@ def _execute_step(step_idx: int, step_text: str, *,
                             plan_step=plan_step,
                             all_plan_steps=all_plan_steps,
                             kb_context_builder=kb_context_builder,
+                            initial_error=(
+                                f"Syntax/lint errors in the inline-edited file "
+                                f"— fix these:\n{_inline_static_errs}"
+                            ),
                         )
                     else:
                         # Tier C: Existing-file rewrite — run Reviewer when in

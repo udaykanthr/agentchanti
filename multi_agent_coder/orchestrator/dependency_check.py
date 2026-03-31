@@ -1335,6 +1335,16 @@ def run_dependency_check(
         for gap in gaps
     )
 
+    # Build set of files protected by pending inline_edits in future plan steps.
+    # DepCheck must not overwrite a file that a later planned step will edit
+    # surgically — doing so corrupts the FIND anchor the planner relies on.
+    _pending_inline_targets: set[str] = set()
+    if all_plan_steps:
+        for _ps in all_plan_steps:
+            if _ps.status in ("pending", "in_progress"):
+                for _ef in (_ps.inline_edits or {}).keys():
+                    _pending_inline_targets.add(_ef.replace("\\", "/"))
+
     validated: dict[str, str] = {}
     for fpath, content in fix_files.items():
         matched = fpath
@@ -1345,6 +1355,19 @@ def run_dependency_check(
                     matched = known
                     norm_matched = matched.replace("\\", "/")
                     break
+        # Skip files that a future plan step will edit via inline_edits — let
+        # the planned step handle the content rather than clobbering it here.
+        if _pending_inline_targets and (
+            norm_matched in _pending_inline_targets
+            or any(
+                pit.endswith("/" + norm_matched) or norm_matched.endswith("/" + pit)
+                for pit in _pending_inline_targets
+            )
+        ):
+            _logger.debug(
+                "[DepCheck] Skipping fix for '%s' — protected by pending inline_edit", fpath
+            )
+            continue
         # Tier 1: gap source/target
         if matched in relevant_files:
             validated[matched] = content
