@@ -717,7 +717,9 @@ class PlannerAgent(Agent):
                             "KB docs: <comma-separated exact titles from the list above>\n\n"
                             "Rules:\n"
                             "- Use exact title strings as shown above\n"
-                            "- Maximum 6 titles\n"
+                            "- Maximum 16 titles\n"
+                            "- Prioritize setup/install guides for every framework or tool "
+                            "explicitly named in the task — these are essential for a new project\n"
                             "- Exclude titles about unrelated frameworks or languages\n"
                             "- If none are relevant write: KB docs: none"
                         )

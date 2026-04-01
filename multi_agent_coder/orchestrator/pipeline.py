@@ -833,7 +833,26 @@ def _execute_step(step_idx: int, step_text: str, *,
                             )
                             continue
                         if _find_str in _patched:
-                            _patched = _patched.replace(_find_str, _repl_str, 1)
+                            _find_pos = _patched.index(_find_str)
+                            _after_find = _patched[_find_pos + len(_find_str):]
+                            # Guard: if REPLACE starts with FIND text and the
+                            # original file has content after the match, a plain
+                            # str.replace would append that tail after the
+                            # replacement block, duplicating it.  This happens
+                            # when the LLM anchors on a single import/line but
+                            # puts the entire new file in REPLACE.  Fix: treat
+                            # FIND as a positional anchor and replace from its
+                            # position to EOF with REPLACE.
+                            if (_repl_str.lstrip('\n').startswith(_find_str.lstrip('\n'))
+                                    and _after_find.strip()):
+                                _patched = _patched[:_find_pos] + _repl_str
+                                _logger.debug(
+                                    "[InlineEdit] Anchor-to-EOF applied in %s "
+                                    "(REPLACE starts with FIND — tail dedup)",
+                                    _resolved,
+                                )
+                            else:
+                                _patched = _patched.replace(_find_str, _repl_str, 1)
                             _logger.debug("[InlineEdit] Exact match applied in %s", _resolved)
                         else:
                             # Fuzzy fallback: normalize whitespace per-line and
@@ -1193,6 +1212,24 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 if p in _inline_files
                             )
                             _kb_ctx_inline = getattr(memory, "_kb_context", "")
+                            # Also load step-specific global KB docs (plan_step.kb_docs)
+                            # so the reviewer has framework docs like "Tailwind CSS v4
+                            # Setup Guide" and doesn't reject valid code based on older
+                            # training data.
+                            _gstore_inline = getattr(kb_context_builder, '_global_store', None) if kb_context_builder else None
+                            _declared_kb_inline = getattr(plan_step, 'kb_docs', None) if plan_step else None
+                            if _gstore_inline and _declared_kb_inline:
+                                try:
+                                    _step_docs_inline = _gstore_inline.get_by_titles(_declared_kb_inline)
+                                    if _step_docs_inline:
+                                        _step_doc_text = "\n".join(
+                                            getattr(d, "content", "") or getattr(d, "title", "")
+                                            for d in _step_docs_inline
+                                            if getattr(d, "content", "") or getattr(d, "title", "")
+                                        )
+                                        _kb_ctx_inline = (_kb_ctx_inline + "\n\n" + _step_doc_text).strip()
+                                except Exception:
+                                    pass
                             _reviewer_kb_inline = (
                                 f"\n\n[KB Documentation — trust this over your "
                                 f"training data]\n{_kb_ctx_inline}\n"
@@ -2473,6 +2510,105 @@ def run_bulk_test_execution_and_fix(
     if "manage.py" in base_cmd:
         output = _fix_django_startup_crashes(output, subproject_cwd, executor)
 
+    # ── Step 2a: Fix shared root causes before per-file loop ─────────────────
+    # When all (or most) test files fail with the same error pointing at a
+    # shared config file (vitest.config.js, jest.config.js, vite.config.js,
+    # setup files, etc.), fix that one file first rather than burning
+    # per-file fix budgets on the same root cause 3× per test.
+    failed_files = _parse_failed_test_files(output, list(test_files.keys()), subproject_cwd)
+    if len(failed_files) > 1:
+        _shared_fix_applied = False
+        # Extract the first error line that references a non-test config file
+        _CONFIG_FILE_RE = re.compile(
+            r'[\w./\\-]*(vitest\.config|vite\.config|jest\.config|'
+            r'webpack\.config|babel\.config|setup\w*)[\w./\\-]*',
+            re.IGNORECASE,
+        )
+        _error_lines = output.splitlines()
+        _shared_config: str | None = None
+        for _el in _error_lines[:60]:  # scan first 60 lines of test output
+            _cm = _CONFIG_FILE_RE.search(_el)
+            if _cm:
+                _shared_config = _cm.group(0).strip().replace("\\", "/")
+                break
+
+        if _shared_config:
+            # Count how many failing test files mention this config in the output
+            _mentioning = sum(
+                1 for _tf in failed_files
+                if _shared_config in output or _shared_config.split("/")[-1] in output
+            )
+            if _mentioning >= len(failed_files):
+                _logger.info(
+                    "[BulkTest] Shared root cause detected — %s referenced in all "
+                    "%d failing test outputs. Fixing shared config first.",
+                    _shared_config, len(failed_files),
+                )
+                print(f"  [BulkTest] Shared config error in {_shared_config} — fixing once...")
+                # Read the current config file content
+                _cfg_candidates = [
+                    _shared_config,
+                    os.path.join(subproject_cwd or "", _shared_config.split("/")[-1]),
+                    os.path.join(subproject_cwd or "", _shared_config),
+                ]
+                _cfg_content = ""
+                _cfg_path = ""
+                for _cp in _cfg_candidates:
+                    try:
+                        with open(_cp, "r", encoding="utf-8", errors="replace") as _cf:
+                            _cfg_content = _cf.read()
+                            _cfg_path = _cp
+                            break
+                    except OSError:
+                        pass
+                if _cfg_content:
+                    _shared_fix_prompt = (
+                        f"Task: {task}\n\n"
+                        f"All test files are failing due to an error in the shared "
+                        f"config file `{_cfg_path}`.\n\n"
+                        f"Error output:\n{output[:2000]}\n\n"
+                        f"Current content of `{_cfg_path}`:\n"
+                        f"```\n{_cfg_content}\n```\n\n"
+                        f"Fix ONLY `{_cfg_path}` so tests can run. "
+                        f"Do NOT touch any test files or component files.\n\n"
+                        f"IMPORTANT: Output only code — no prose, no markdown headers.\n"
+                        f"Use full-file format:\n"
+                        f"#### [FILE]: {_cfg_path}\n"
+                        f"```\n// fixed content\n```"
+                    )
+                    try:
+                        _shared_fix_resp = coder.llm_client.generate_response(_shared_fix_prompt)
+                        _shared_fix_files = executor.parse_code_blocks(_shared_fix_resp)
+                        if not _shared_fix_files:
+                            _shared_fix_files = executor.parse_code_blocks_fuzzy(_shared_fix_resp)
+                        if _shared_fix_files:
+                            if subproject_cwd:
+                                from .step_handlers import _prefix_subproject_paths
+                                _shared_fix_files = _prefix_subproject_paths(
+                                    _shared_fix_files, subproject_cwd, memory)
+                            executor.write_files(_shared_fix_files)
+                            memory.update(_shared_fix_files)
+                            _logger.info(
+                                "[BulkTest] Shared config fix applied: %s",
+                                list(_shared_fix_files.keys()),
+                            )
+                            # Re-run all tests to see if the shared fix resolved things
+                            _ok_shared, output = executor.run_command(base_cmd, cwd=subproject_cwd)
+                            if _ok_shared:
+                                _logger.info("[BulkTest] Shared config fix resolved all failures.")
+                                print("  [BulkTest] All tests pass after shared config fix.")
+                                return True
+                            # Update failed_files with whatever remains
+                            failed_files = _parse_failed_test_files(
+                                output, list(test_files.keys()), subproject_cwd)
+                            _shared_fix_applied = True
+                            _logger.info(
+                                "[BulkTest] After shared fix, %d file(s) still failing: %s",
+                                len(failed_files), failed_files,
+                            )
+                    except Exception as _sfe:
+                        _logger.warning("[BulkTest] Shared config fix failed: %s", _sfe)
+
     # ── Step 2: Fix one failing test file at a time ──
     failed_files = _parse_failed_test_files(output, list(test_files.keys()), subproject_cwd)
     _logger.info("[BulkTest] Failed test files: %s", failed_files)
@@ -2488,6 +2624,12 @@ def run_bulk_test_execution_and_fix(
             display.record_test_result(fpath, passed=1, total=1, failures=[])
 
     lang_tag = lang or "python"
+
+    # Track fix content hashes per test file to prevent the loop from
+    # re-applying an identical (failed) fix across attempts.
+    # Keys are test file paths; values are sets of hex content digests.
+    import hashlib as _hashlib
+    _applied_fix_signatures: dict[str, set[str]] = {}
 
     # Use an index-based loop so we can append newly-impacted test files
     # to failed_files mid-iteration without losing them.
@@ -2522,10 +2664,30 @@ def run_bulk_test_execution_and_fix(
                 {test_path: current_content}, memory,
                 resolve_from_disk=True)
 
+            # Also resolve 2nd-level imports (files imported by the direct
+            # imports) so the LLM can see all relevant source components.
+            # Capped at 4 extra files to avoid bloating the prompt.
+            _second_level: dict[str, str] = {}
+            if imported_sources:
+                _second_level = _extract_imported_sources(
+                    imported_sources, memory, resolve_from_disk=True)
+                # Remove anything already in imported_sources or the test file
+                for _k in list(_second_level.keys()):
+                    if _k in imported_sources or _k == test_path:
+                        del _second_level[_k]
+                # Keep at most 4 extra files (shortest paths first = most local)
+                _second_level = dict(
+                    sorted(_second_level.items(), key=lambda kv: len(kv[0]))[:4]
+                )
+
             source_ctx = (
                 f"#### [FILE]: {test_path}\n```{lang_tag}\n{current_content}\n```\n\n"
             )
             for fp, cnt in imported_sources.items():
+                source_ctx += (
+                    f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
+                )
+            for fp, cnt in _second_level.items():
                 source_ctx += (
                     f"#### [FILE]: {fp}\n```{lang_tag}\n{cnt}\n```\n\n"
                 )
@@ -2617,7 +2779,63 @@ def run_bulk_test_execution_and_fix(
                                         _bt_existing = _f.read()
                                 except OSError:
                                     pass
+                            # If the LLM used a subproject-relative path (e.g.
+                            # "src/components/Foo.jsx" instead of
+                            # "react-responsive-page/src/components/Foo.jsx"),
+                            # try resolving it via the subproject prefix so the
+                            # existing file content can be found and the edit
+                            # doesn't silently fall through.
+                            if _bt_existing is None and subproject_cwd:
+                                _bt_fp_prefixed = f"{subproject_cwd}/{_bt_fp}"
+                                _bt_existing = memory.get(_bt_fp_prefixed)
+                                if _bt_existing is None:
+                                    try:
+                                        with open(_bt_fp_prefixed, "r", encoding="utf-8", errors="replace") as _f:
+                                            _bt_existing = _f.read()
+                                    except OSError:
+                                        pass
+                                if _bt_existing is not None:
+                                    _bt_fp = _bt_fp_prefixed
+                                    _bt_edit = type(_bt_edit)(
+                                        file_path=_bt_fp,
+                                        chunk_id=_bt_edit.chunk_id,
+                                        line_start=_bt_edit.line_start,
+                                        line_end=_bt_edit.line_end,
+                                        new_content=_bt_edit.new_content,
+                                        is_new=_bt_edit.is_new,
+                                        insert_after=_bt_edit.insert_after,
+                                    )
                             if _bt_existing:
+                                # Guard: reject full-file replacements that are
+                                # suspiciously small compared to the existing file
+                                # and lack any function/class definitions — these
+                                # are almost always a lone stub like
+                                # `export default Foo;` that would destroy the file.
+                                _is_full_replace = (
+                                    _bt_edit.line_start == 1
+                                    and _bt_edit.line_end >= 99999
+                                )
+                                if _is_full_replace and _bt_existing:
+                                    _new_lines = _bt_edit.new_content.splitlines()
+                                    _old_lines = _bt_existing.splitlines()
+                                    _too_small = len(_new_lines) < max(5, len(_old_lines) * 0.15)
+                                    _has_def = any(
+                                        kw in _bt_edit.new_content
+                                        for kw in (
+                                            'function ', 'const ', 'class ',
+                                            'def ', 'export default function',
+                                            '=>', 'return (', 'return <',
+                                        )
+                                    )
+                                    if _too_small and not _has_def:
+                                        _logger.warning(
+                                            "[BulkTest] Rejected suspiciously tiny "
+                                            "full-file replacement for %s "
+                                            "(%d lines → %d lines, no definitions) "
+                                            "— skipping to avoid destroying the file.",
+                                            _bt_fp, len(_old_lines), len(_new_lines),
+                                        )
+                                        continue
                                 try:
                                     fix_files[_bt_fp] = _bt_ce.apply_chunk_edits(_bt_existing, [_bt_edit])
                                 except Exception:
@@ -2633,6 +2851,24 @@ def run_bulk_test_execution_and_fix(
                         from .step_handlers import _prefix_subproject_paths
                         fix_files = _prefix_subproject_paths(
                             fix_files, subproject_cwd, memory)
+
+                    # Dedup: compute a signature of the proposed file contents
+                    # and skip if this exact fix was already applied for this
+                    # test file — prevents the loop from burning retries on an
+                    # identical broken fix.
+                    _fix_sig = _hashlib.md5(
+                        "".join(sorted(fix_files.values())).encode("utf-8", errors="replace")
+                    ).hexdigest()
+                    _sigs_for_test = _applied_fix_signatures.setdefault(test_path, set())
+                    if _fix_sig in _sigs_for_test:
+                        _logger.warning(
+                            "[BulkTest] Skipping duplicate fix for %s "
+                            "(same content already applied, attempt %d/%d).",
+                            basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+                        )
+                        break
+                    _sigs_for_test.add(_fix_sig)
+
                     executor.write_files(fix_files)
                     memory.update(fix_files)
                     _logger.info(

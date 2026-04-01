@@ -268,8 +268,9 @@ class IntentAgent(Agent):
         if available_kb_docs:
             _titles_block = "\n".join(f"  - {t}" for t in available_kb_docs)
             accumulated_context += (
-                "Available Reference Docs (global KB — pick the most relevant "
-                "for this task and list them under 'KB docs:' in your spec):\n"
+                "Available Reference Docs (global KB — list all relevant ones "
+                "under 'KB docs:' in your spec, including setup/install guides "
+                "when creating a new project):\n"
                 f"{_titles_block}\n\n"
             )
 
@@ -617,17 +618,31 @@ class IntentAgent(Agent):
                 break
 
         # Loop exhausted — use the last LLM response rather than discarding the
-        # investigation.  This prevents the silent fallback where all KB searches
-        # complete but the LLM never got a final call to produce the spec.
-        if last_response:
+        # investigation, but ONLY if it looks like a final answer.  If the last
+        # response still contains a tool command the loop was interrupted while
+        # mid-research (e.g. iteration N+1 returned empty after iteration N
+        # emitted KB_SEARCH).  Using a mid-research question as the spec causes
+        # downstream Task Briefing to generate wrong goals like "state the file
+        # name" instead of "fix the bug", so fall through to the raw-task
+        # fallback instead.
+        _mid_research = re.search(
+            r'^\s*(KB_SEARCH|SEARCH|RUN_CMD|FIND_USAGES):', last_response,
+            re.IGNORECASE | re.MULTILINE,
+        ) if last_response else None
+        if last_response and not _mid_research:
             _logger.warning(
-                "[IntentAnalysis] Safety cap reached after %d iterations — using last response as spec.",
+                "[IntentAnalysis] Loop exited after %d iterations — using last response as spec.",
                 iteration,
             )
             return (
                 f"{raw_task}\n\n"
                 f"=== INTENT CLARIFICATION (from requirements analyst) ===\n"
                 f"{last_response.strip()}"
+            )
+        if _mid_research:
+            _logger.warning(
+                "[IntentAnalysis] Last response is mid-research (contains tool call) "
+                "— discarding, falling back to raw task.",
             )
         _logger.warning("[IntentAnalysis] Returning original raw task as fallback.")
         return raw_task
@@ -651,8 +666,8 @@ class IntentAgent(Agent):
         "KB topics: <2-5 short keywords the planner needs docs for — library or "
         "framework names only, e.g. 'Tailwind, React refs, Vitest'; "
         "write 'none' if the fix is pure logic with no external library>\n"
-        "KB docs: <exact titles from Available Reference Docs that are directly "
-        "relevant; omit this line (or write 'none') if none apply>\n"
+        "KB docs: <exact titles from Available Reference Docs that are relevant "
+        "to this task; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_FEATURE = (
         "REQUIREMENTS_SPEC:\n"
@@ -665,8 +680,8 @@ class IntentAgent(Agent):
         "Packages/versions: <new dependencies needed, or 'none'>\n"
         "KB topics: <2-5 short keywords — library/framework names only, "
         "e.g. 'Anime.js, React hooks'; write 'none' if no new packages needed>\n"
-        "KB docs: <exact titles from Available Reference Docs that are directly "
-        "relevant; omit this line (or write 'none') if none apply>\n"
+        "KB docs: <exact titles from Available Reference Docs that are relevant "
+        "to this task; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_MODIFY = (
         "REQUIREMENTS_SPEC:\n"
@@ -679,8 +694,8 @@ class IntentAgent(Agent):
         "Constraints: <from actual code>\n"
         "KB topics: <2-5 short keywords — library/framework names only; "
         "'none' if this is a pure internal refactor>\n"
-        "KB docs: <exact titles from Available Reference Docs that are directly "
-        "relevant; omit this line (or write 'none') if none apply>\n"
+        "KB docs: <exact titles from Available Reference Docs that are relevant "
+        "to this task; omit this line (or write 'none') if none apply>\n"
     )
     _SPEC_QUESTION = (
         "REQUIREMENTS_SPEC:\n"

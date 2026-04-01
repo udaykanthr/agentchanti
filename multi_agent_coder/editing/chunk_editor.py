@@ -855,6 +855,53 @@ class ChunkEditor:
         return result
 
     @staticmethod
+    def _strip_diff_markers(code: str) -> str:
+        """If *code* looks like a unified diff, apply it and return clean code.
+
+        Detects unified-diff format by checking whether the majority of
+        non-blank lines start with '+', '-', or ' ' (space context prefix).
+        When detected:
+          - Lines starting with '+' (but not '+++') → keep, strip leading '+'
+          - Lines starting with '-' (but not '---') → discard
+          - Lines starting with ' ' (context)        → keep, strip leading ' '
+          - '---'/'+++ ' headers and '\\ No newline' → skip
+
+        If the content does NOT look like a diff it is returned unchanged.
+        """
+        lines = code.splitlines()
+        non_blank = [l for l in lines if l.strip()]
+        if not non_blank:
+            return code
+
+        diff_lines = sum(
+            1 for l in non_blank
+            if l.startswith(("+", "-", " "))
+            and not l.startswith(("---", "+++"))
+        )
+        # Require >60% diff-style lines to avoid false positives on code that
+        # legitimately starts with '-' or '+' (e.g. shell scripts, CSS).
+        if diff_lines / len(non_blank) < 0.6:
+            return code
+
+        result: list[str] = []
+        for line in lines:
+            if line.startswith("+++") or line.startswith("---"):
+                continue  # diff header
+            if line.startswith("\\ "):
+                continue  # "\ No newline at end of file"
+            if line.startswith("+"):
+                result.append(line[1:])
+            elif line.startswith("-"):
+                pass  # removed line — discard
+            else:
+                # Context line: strip exactly one leading space if present
+                result.append(line[1:] if line.startswith(" ") else line)
+
+        cleaned = "\n".join(result)
+        logger.debug("[ChunkEditor] Stripped unified diff markers from code block")
+        return cleaned
+
+    @staticmethod
     def _extract_code_block(
         lines: list[str],
         start_idx: int,
@@ -877,11 +924,13 @@ class ChunkEditor:
         i += 1  # skip opening fence
         while i < len(lines):
             if lines[i].strip() == "```":
-                return "\n".join(code_lines), i + 1
+                code = "\n".join(code_lines)
+                return ChunkEditor._strip_diff_markers(code), i + 1
             code_lines.append(lines[i])
             i += 1
 
         # No closing fence found — include what we have
         if code_lines:
-            return "\n".join(code_lines), i
+            code = "\n".join(code_lines)
+            return ChunkEditor._strip_diff_markers(code), i
         return None, start_idx
