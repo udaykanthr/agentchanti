@@ -1654,7 +1654,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             _orig_cmd = _orig_cmd_match.group(1) if _orig_cmd_match else None
 
             _task_goal = getattr(project_context, 'goal_summary', '') if project_context else ''
-            fix_applied, cmds_succeeded, has_fix_commands = _apply_fix(
+            fix_applied, cmds_succeeded, has_fix_commands, _fix_cmds_run = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type,
                 original_error_cmd=_orig_cmd,
@@ -1689,6 +1689,33 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                     f"(code fixes + replacement commands succeeded). "
                     f"Skipping re-run of deprecated original command.")
                 return True
+
+            # For CMD steps: if the fix command is a corrected replacement of
+            # the original (same core operation, different path/syntax), skip
+            # re-running the original — it would just fail again.
+            # Detection: strip leading "cd X &&" prefixes and compare the
+            # first two words (e.g. "npm install"). If they match, the fix
+            # *is* the corrected command, not a prerequisite.
+            if (step_type == "CMD"
+                    and has_fix_commands and cmds_succeeded and fix_applied
+                    and _fix_cmds_run and _orig_cmd):
+                import re as _re_repl
+                _CD_STRIP = _re_repl.compile(r'(?:cd\s+\S+\s*&&\s*)+')
+
+                def _cmd_key(c: str) -> str:
+                    parts = _CD_STRIP.sub('', c).strip().split()
+                    return ' '.join(parts[:2]).lower() if len(parts) >= 2 else ''
+
+                _orig_key = _cmd_key(_orig_cmd)
+                if _orig_key and any(_cmd_key(fc) == _orig_key for fc in _fix_cmds_run):
+                    display.step_info(
+                        step_idx,
+                        "Fix command replaced original — step resolved.")
+                    log.info(
+                        f"Task {step_idx+1}: CMD step resolved via corrected replacement "
+                        f"command (same operation, fix succeeded). "
+                        f"Skipping re-run of original command.")
+                    return True
 
             # Always re-run the original step after applying fixes.
             # Fix commands may be prerequisites (e.g. `npm install` for a

@@ -413,6 +413,7 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     applied = False
     cmds_succeeded = True
     has_fix_commands = False
+    executed_cmds: list[str] = []
 
     display.step_info(step_idx, "Applying diagnosis fix...")
 
@@ -623,5 +624,6 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
             cmds_succeeded = False
         applied = True
         has_fix_commands = True
+        executed_cmds.append(cmd)
 
-    return applied, cmds_succeeded, has_fix_commands
+    return applied, cmds_succeeded, has_fix_commands, executed_cmds

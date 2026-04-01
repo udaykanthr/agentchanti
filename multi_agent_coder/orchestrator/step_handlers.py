@@ -3700,6 +3700,43 @@ def _remap_test_to_existing(test_files: dict[str, str],
     return remapped
 
 
+def _fix_subproject_test_paths(test_files: dict[str, str],
+                                subproject: str | None) -> dict[str, str]:
+    """Remap test paths that the LLM placed outside the subproject directory.
+
+    When source files live at ``{subproject}/src/...``, LLMs often mirror
+    the full workspace-relative path under ``__tests__/``, producing paths
+    like ``__tests__/{subproject}/src/Foo.test.jsx``.  These files land
+    outside the subproject and are invisible to the test runner that
+    executes inside ``{subproject}/``.
+
+    This function rewrites such paths to
+    ``{subproject}/__tests__/src/Foo.test.jsx`` so the test runner can
+    find and execute them.
+    """
+    if not subproject:
+        return test_files
+
+    sub_norm = subproject.replace("\\", "/").rstrip("/")
+    prefix = f"__tests__/{sub_norm}/"
+
+    remapped: dict[str, str] = {}
+    for fpath, content in test_files.items():
+        norm = fpath.replace("\\", "/")
+        if norm.startswith(prefix):
+            rest = norm[len(prefix):]
+            new_path = f"{sub_norm}/__tests__/{rest}"
+            log.warning(
+                f"[SubprojectTestPath] '{norm}' -> '{new_path}' "
+                f"(moved inside subproject dir)"
+            )
+            remapped[new_path] = content
+        else:
+            remapped[fpath] = content
+
+    return remapped
+
+
 def _filter_test_only_files(fix_files: dict[str, str],
                             test_files: dict[str, str],
                             memory: FileMemory) -> dict[str, str]:
@@ -4465,6 +4502,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             test_files, memory,
             base_dir=getattr(memory, 'base_dir', "."))
 
+        # Fix paths the LLM placed outside the subproject.
+        # e.g. __tests__/{subproject}/src/Foo.test.jsx
+        #   -> {subproject}/__tests__/src/Foo.test.jsx
+        test_files = _fix_subproject_test_paths(test_files, subproject_cwd)
+
         # Filter: only allow test files (block any source/config files)
         test_files = _filter_test_only_files(test_files, test_files, memory)
         if not test_files:
@@ -4813,6 +4855,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     fix_files = _remap_test_to_existing(
                         fix_files, memory,
                         base_dir=getattr(memory, 'base_dir', "."))
+                    fix_files = _fix_subproject_test_paths(fix_files, subproject_cwd)
                     if not is_source_bug:
                         fix_files = _filter_test_only_files(
                             fix_files, test_files, memory)
