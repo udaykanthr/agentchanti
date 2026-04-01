@@ -14,7 +14,7 @@ from .step_handlers import (
     _shell_instructions, _strip_protected_files, _apply_content_fixes,
     _detect_subproject_root, _find_css_conflicts, _detect_target_files,
 )
-from .classification import _extract_commands_from_text, _looks_like_command
+from .classification import _extract_commands_from_text, _looks_like_command, resolve_cmd_placeholders
 
 
 def _diagnose_failure(step_text: str, step_type: str, error_info: str,
@@ -392,7 +392,9 @@ def _extract_echo_chain_file_writes(text: str) -> dict[str, str]:
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                display: CLIDisplay, step_idx: int,
                step_type: str = "CODE",
-               original_error_cmd: str | None = None) -> tuple[bool, bool, bool]:
+               original_error_cmd: str | None = None,
+               step_text: str = '',
+               task: str = '') -> tuple[bool, bool, bool]:
     """Apply fixes from a diagnosis response.
 
     Returns ``(applied, cmds_succeeded, has_fix_commands)`` where *applied* is True if any
@@ -573,6 +575,9 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     )
 
     for cmd in fix_commands:
+        # Resolve any <placeholder> tokens the LLM left in the fix command
+        cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=task)
+
         # Determine if this command should run in the sub-project directory
         fix_cwd = None
         if subproject:

@@ -284,7 +284,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     _upper = text.upper()
     _last_plan = _upper.rfind("==PLAN==")
     if _last_plan >= 0:
-        _end_after = _upper.find("==END==", _last_plan)
+        # Use rfind so that small LLMs that emit ==END== after EVERY step
+        # (instead of only once at the end) don't cause premature truncation.
+        _end_after = _upper.rfind("==END==", _last_plan)
         if _end_after > _last_plan:
             text = text[_last_plan + len("==PLAN=="):_end_after]
         else:

@@ -814,7 +814,11 @@ def main():
                 print("\n  [ERROR] Could not parse any steps. Check the log file.\n")
                 return
 
-            # Validate plan quality
+            # Validate plan quality — skip for structured plans, which are
+            # already validated by validate_plan() above and whose step
+            # descriptions don't populate the legacy text list reliably.
+            if plan_steps_parsed is not None:
+                break
             is_valid, reason = Executor.validate_plan_quality(raw_steps)
             if is_valid:
                 break

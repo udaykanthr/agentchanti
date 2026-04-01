@@ -24,7 +24,7 @@ from .test_analyzer import perform_baseline_test_analysis, _count_test_failures,
 from .memory import FileMemory
 from .classification import (
     _extract_command_from_step, _extract_commands_from_text,
-    _looks_like_command, _cleanup_shell_command
+    _looks_like_command, _cleanup_shell_command, resolve_cmd_placeholders,
 )
 
 from ..diff_display import show_diffs, prompt_diff_approval, _detect_hazards
@@ -1453,6 +1453,11 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # Clean up bash-style line continuations and dangling operators
     cmd = _cleanup_shell_command(cmd)
 
+    # ── Resolve LLM placeholders ──
+    # Dumb/small LLMs sometimes output <project-name> instead of the real name.
+    _task_desc = getattr(project_context, 'goal_summary', '') if project_context else ''
+    cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=_task_desc)
+
     # ── Idempotency check ──
     # Detect the subproject root early so idempotency checks resolve
     # paths relative to the correct directory.
@@ -1558,29 +1563,48 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         # Mark scaffold files: when a project-creation command succeeds, record
         # the subproject so that _auto_fix_hazards can skip hazard checks for
         # npm/framework-generated template files on their first modification.
-        if not getattr(memory, '_scaffolded_subproject', None):
-            _SCAFFOLD_PATTERNS = [
-                re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
-                re.compile(r'create-react-app\s+(\S+)'),
-                re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
-                re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
-                re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),
-                re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),
-                re.compile(r'vue\s+create\s+(\S+)'),
-                re.compile(r'ng\s+new\s+(\S+)'),
-                re.compile(r'rails\s+new\s+(\S+)'),
-                re.compile(r'cargo\s+new\s+(\S+)'),
-                re.compile(r'django-admin\s+startproject\s+(\S+)'),
-            ]
-            for _pat in _SCAFFOLD_PATTERNS:
-                _m = _pat.search(cmd)
-                if _m:
-                    _candidate = _m.group(1).strip().rstrip('/')
+        # Also verify the expected sentinel file exists — some scaffold CLIs
+        # (e.g. `npx create vite@latest`) exit 0 but produce nothing.
+        _SCAFFOLD_PATTERNS = [
+            (re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),        'package.json'),
+            (re.compile(r'create-react-app\s+(\S+)'),                 'package.json'),
+            (re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),            'package.json'),
+            (re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),    'package.json'),
+            (re.compile(r'npx\s+create-vite(?:@\S+)?\s+(\S+)'),      'package.json'),
+            (re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),             'package.json'),
+            (re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),     'package.json'),
+            (re.compile(r'vue\s+create\s+(\S+)'),                     'package.json'),
+            (re.compile(r'ng\s+new\s+(\S+)'),                         'package.json'),
+            (re.compile(r'rails\s+new\s+(\S+)'),                      'Gemfile'),
+            (re.compile(r'cargo\s+new\s+(\S+)'),                      'Cargo.toml'),
+            (re.compile(r'django-admin\s+startproject\s+(\S+)'),      'manage.py'),
+        ]
+        for _pat, _sentinel in _SCAFFOLD_PATTERNS:
+            _m = _pat.search(cmd)
+            if _m:
+                _candidate = _m.group(1).strip().rstrip('/')
+                # Resolve sentinel path: for `.` target use cwd, else subdir
+                _base = subproject_cwd or '.'
+                if _candidate in ('.', './', ''):
+                    _sentinel_path = os.path.join(_base, _sentinel)
+                else:
+                    _sentinel_path = os.path.join(_base, _candidate, _sentinel)
+                if not os.path.exists(_sentinel_path):
+                    log.warning(
+                        f"[Scaffold] Exit code 0 but sentinel '{_sentinel}' not found "
+                        f"at '{_sentinel_path}' — scaffold did not produce expected output. "
+                        f"Treating as failure."
+                    )
+                    success = False
+                elif not getattr(memory, '_scaffolded_subproject', None):
                     if _candidate not in ('.', './', '') and not _candidate.startswith('./'):
                         memory._scaffolded_subproject = _candidate
                         log.info(f"[Scaffold] Marked '{_candidate}' as freshly "
                                  f"scaffolded — hazard check skipped on first write")
-                    break
+                break
+
+    if success:
+        display.step_info(step_idx, "Command succeeded.")
         return True, ""
     else:
         display.step_info(step_idx, "Command failed. See log.")
@@ -3125,6 +3149,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             memory=memory, display=display, step_idx=step_idx,
             language=language, cfg=cfg, code_graph=code_graph,
             project_profile=project_profile,
+            kb_context_builder=kb_context_builder,
         )
         if diff_result is not None:
             return diff_result
@@ -4962,6 +4987,7 @@ def _try_diff_edit(
     cfg: Config,
     code_graph,
     project_profile=None,
+    kb_context_builder=None,
 ) -> tuple[bool, str] | None:
     """Attempt a diff-aware edit.  Returns ``(success, error_info)`` on
     success, or ``None`` to signal the caller should fall back to the
@@ -4979,8 +5005,9 @@ def _try_diff_edit(
         log.debug("[DiffEdit] editing module not available: %s", exc)
         return None
 
-    # Identify target file from step text or memory
-    target_file = _detect_target_file(step_text, memory)
+    # Identify target file from step text or memory (KB fallback if needed)
+    target_file = _detect_target_file(step_text, memory,
+                                      kb_context_builder=kb_context_builder)
     if not target_file:
         log.debug("[DiffEdit] No target file identified from step text")
         return None
@@ -5160,7 +5187,53 @@ def _try_diff_edit(
     return True, ""
 
 
-def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
+def _resolve_from_kb(step_text: str, memory: FileMemory, kb_context_builder) -> list[str]:
+    """Use KB semantic search to find project files not yet tracked in memory.
+
+    Extracts filename hints from *step_text*, asks the KB for the most
+    relevant project files, cross-references by basename, reads matching
+    files from disk, and loads them into *memory* so subsequent context
+    builders can include them.
+
+    Returns the list of file paths that were resolved and loaded.
+    """
+    import re as _re
+
+    # Extract bare filenames mentioned in the step text (e.g. "main.jsx")
+    filename_hints: set[str] = set()
+    for m in _re.finditer(r'[\w/\\]+\.\w{1,5}', step_text):
+        filename_hints.add(os.path.basename(m.group().replace("\\", "/")))
+
+    if not filename_hints:
+        return []
+
+    try:
+        kb_files = kb_context_builder.get_relevant_files(step_text, max_files=10)
+    except Exception as exc:
+        log.debug("[TargetResolve] KB get_relevant_files failed: %s", exc)
+        return []
+
+    to_load: dict[str, str] = {}
+    existing = memory.all_files()
+    for fpath in kb_files:
+        if os.path.basename(fpath) in filename_hints and fpath not in existing:
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                        to_load[fpath] = _f.read()
+                except Exception:
+                    pass
+
+    if to_load:
+        memory.update(to_load)
+        log.debug("[TargetResolve] KB resolved %d file(s) into memory: %s",
+                  len(to_load), list(to_load.keys()))
+
+    return list(to_load.keys())
+
+
+def _detect_target_file(step_text: str, memory: FileMemory,
+                        kb_context_builder=None) -> str | None:
     """Try to identify the target file for editing from the step text."""
     import re as _re
 
@@ -5189,6 +5262,12 @@ def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
     # If only one file in memory, use it
     if len(known_files) == 1:
         return known_files[0]
+
+    # Fallback: ask KB to find the file on disk and load it into memory
+    if kb_context_builder is not None:
+        resolved = _resolve_from_kb(step_text, memory, kb_context_builder)
+        if resolved:
+            return resolved[0]
 
     return None
 
@@ -5279,7 +5358,8 @@ def _find_css_conflicts(
 
 
 def _detect_target_files(step_text: str, memory: FileMemory,
-                         max_files: int = 3) -> list[str]:
+                         max_files: int = 3,
+                         kb_context_builder=None) -> list[str]:
     """Identify ALL target files for editing from the step text."""
     import re as _re
 
@@ -5311,6 +5391,11 @@ def _detect_target_files(step_text: str, memory: FileMemory,
 
     if not found and len(known_files) == 1:
         _add(known_files[0])
+
+    # Fallback: ask KB to find files on disk and load them into memory
+    if not found and kb_context_builder is not None:
+        for fpath in _resolve_from_kb(step_text, memory, kb_context_builder):
+            _add(fpath)
 
     return found
 
@@ -5465,7 +5550,8 @@ def _try_chunk_edit(
         return None
 
     max_files = getattr(cfg, "EDITING_MAX_CHUNK_FILES", 3)
-    target_files = _detect_target_files(step_text, memory, max_files=max_files)
+    target_files = _detect_target_files(step_text, memory, max_files=max_files,
+                                        kb_context_builder=kb_context_builder)
     if not target_files:
         log.debug("[ChunkEdit] No target files identified")
         return None

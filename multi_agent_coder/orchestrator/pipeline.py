@@ -1653,10 +1653,13 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 r"Command `(.+?)` failed\.", error_info or "")
             _orig_cmd = _orig_cmd_match.group(1) if _orig_cmd_match else None
 
+            _task_goal = getattr(project_context, 'goal_summary', '') if project_context else ''
             fix_applied, cmds_succeeded, has_fix_commands = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type,
-                original_error_cmd=_orig_cmd)
+                original_error_cmd=_orig_cmd,
+                step_text=step_text,
+                task=_task_goal)
 
             if not fix_applied:
                 last_diagnosis_content = diagnosis
