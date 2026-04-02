@@ -21,6 +21,7 @@ from .step_handlers import (
     MAX_STEP_RETRIES,
 )
 from .diagnosis import _diagnose_failure, _apply_fix
+from .error_router import classify_error
 
 _logger = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ def _find_tests_impacted_by_sources(
 
         src_stems: set[str] = set()
         for src in modified_sources:
-            stem = src.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+            stem = src.replace("\\", "/").rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
             src_stems.add(stem)
 
         for tpath, tcontent in all_test_files.items():
@@ -140,7 +141,7 @@ def _find_tests_impacted_by_sources(
                 if mod:
                     imports.add(mod.replace('.', '/'))
             for imp in imports:
-                imp_stem = imp.rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
+                imp_stem = imp.replace("\\", "/").rsplit('/', 1)[-1].rsplit('.', 1)[0].lower()
                 if imp_stem in src_stems:
                     candidates.add(tpath)
                     break
@@ -256,8 +257,9 @@ def _infer_test_file_path(src_path: str, language: str | None) -> str:
         src/utils/math.ts          ->  src/utils/__tests__/math.test.ts
         api/views.py               ->  api/tests/test_views.py
     """
-    src_dir = src_path.rsplit("/", 1)[0] if "/" in src_path else "."
-    basename = src_path.rsplit("/", 1)[-1]
+    src_path_norm = src_path.replace("\\", "/")
+    src_dir = src_path_norm.rsplit("/", 1)[0] if "/" in src_path_norm else "."
+    basename = src_path_norm.rsplit("/", 1)[-1]
     stem, _, ext = basename.rpartition(".")
 
     _ext_map: dict[str, str] = {
@@ -281,7 +283,8 @@ def _source_covered_by_test_step(
     Checks plan-declared imports and inline test-file content so that
     both plan-parsed and LLM-inlined test specs are handled.
     """
-    src_basename = src_path.rsplit("/", 1)[-1]
+    src_path_norm = src_path.replace("\\", "/")
+    src_basename = src_path_norm.rsplit("/", 1)[-1]
     src_stem = src_basename.rsplit(".", 1)[0]
 
     # Plan-declared imports (e.g. imports: src/components/Footer.jsx:default)
@@ -333,7 +336,8 @@ def _generate_test_coverage_for_inline_changes(
         if not new_content:
             continue
 
-        src_basename = src_path.rsplit("/", 1)[-1]
+        src_path_norm = src_path.replace("\\", "/")
+        src_basename = src_path_norm.rsplit("/", 1)[-1]
         src_stem = src_basename.rsplit(".", 1)[0]
 
         # ── Find best existing test file ──
@@ -348,13 +352,14 @@ def _generate_test_coverage_for_inline_changes(
                 break
 
         target_test_path = existing_test_path or _infer_test_file_path(src_path, language)
+        target_test_basename = target_test_path.replace("\\", "/").rsplit("/", 1)[-1]
         action = "update" if existing_test_path else "create"
 
         display.step_info(
             step_idx,
             f"[Inline] No test coverage for {src_basename} — "
             f"{'updating' if action == 'update' else 'generating'} "
-            f"{target_test_path.rsplit('/', 1)[-1]}...",
+            f"{target_test_basename}...",
         )
         _logger.info(
             "[Inline] Generating test coverage for uncovered source %s -> %s",
@@ -1630,6 +1635,24 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
 
     last_diagnosis_content = None
 
+    # Classify the error once — result is reused across all retry attempts.
+    # Uses regex (0 tokens) for common cases; falls back to a tiny single-shot
+    # LLM call only for ambiguous errors.
+    _step_type_for_route = display.steps[step_idx].get("type", "CODE")
+    _kb_matched = False  # refined inside _diagnose_failure after KB lookup
+    error_route = classify_error(
+        error_info=error_info,
+        step_type=_step_type_for_route,
+        project_context=project_context,
+        kb_matched=_kb_matched,
+        llm_client=llm_client if search_agent is not None else None,
+    )
+    log.info(
+        "Step %d: ErrorRouter → source=%s skip_web=%s confidence=%s reason=%s",
+        step_idx + 1, error_route.source_type, error_route.skip_web,
+        error_route.confidence, error_route.reason,
+    )
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
             display.step_info(
@@ -1643,7 +1666,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 memory, llm_client, display, step_idx,
                 search_agent=search_agent, language=language,
                 previous_diagnosis=last_diagnosis_content,
-                kb_context_builder=kb_context_builder)
+                kb_context_builder=kb_context_builder,
+                error_route=error_route)
 
             # Extract the original failing command from error_info so
             # _apply_fix can filter it out (prevents re-running the same
@@ -1700,14 +1724,22 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                     and has_fix_commands and cmds_succeeded and fix_applied
                     and _fix_cmds_run and _orig_cmd):
                 import re as _re_repl
-                _CD_STRIP = _re_repl.compile(r'(?:cd\s+\S+\s*&&\s*)+')
 
-                def _cmd_key(c: str) -> str:
-                    parts = _CD_STRIP.sub('', c).strip().split()
-                    return ' '.join(parts[:2]).lower() if len(parts) >= 2 else ''
+                def _cmd_keys(c: str) -> set[str]:
+                    segments = [s.strip() for s in _re_repl.split(r'&&|;', c)]
+                    keys = set()
+                    for seg in segments:
+                        parts = seg.split()
+                        if not parts: continue
+                        cmd = parts[0].lower()
+                        if cmd in ('cd', 'mkdir', 'echo', 'set', 'export'):
+                            continue
+                        keys.add(' '.join(parts[:2]).lower() if len(parts) >= 2 else cmd)
+                    return keys
 
-                _orig_key = _cmd_key(_orig_cmd)
-                if _orig_key and any(_cmd_key(fc) == _orig_key for fc in _fix_cmds_run):
+                _orig_keys = _cmd_keys(_orig_cmd)
+                if _orig_keys and any(
+                        _orig_keys.intersection(_cmd_keys(fc)) for fc in _fix_cmds_run):
                     display.step_info(
                         step_idx,
                         "Fix command replaced original — step resolved.")
@@ -2419,6 +2451,7 @@ def run_bulk_test_execution_and_fix(
     project_context=None,
     kb_context_builder=None,
     all_plan_steps=None,
+    search_agent=None,
 ) -> tuple[bool, str]:
     """Run all session test files in a single bulk execution, then fix failures
     one test file at a time.
@@ -2559,8 +2592,16 @@ def run_bulk_test_execution_and_fix(
         for _el in _error_lines[:60]:  # scan first 60 lines of test output
             _cm = _CONFIG_FILE_RE.search(_el)
             if _cm:
-                _shared_config = _cm.group(0).strip().replace("\\", "/")
-                break
+                _candidate = _cm.group(0).strip().replace("\\", "/")
+                # Must look like an actual file path (contains a dot/extension),
+                # not a bare keyword like "setup" from test description prose.
+                # Also exclude test files themselves (e.g. vitest.setup.test.js).
+                if (
+                    "." in _candidate
+                    and not re.search(r'\.(test|spec)\.[a-z]+$', _candidate, re.IGNORECASE)
+                ):
+                    _shared_config = _candidate
+                    break
 
         if _shared_config:
             # Count how many failing test files mention this config in the output
@@ -2627,7 +2668,7 @@ def run_bulk_test_execution_and_fix(
                             if _ok_shared:
                                 _logger.info("[BulkTest] Shared config fix resolved all failures.")
                                 print("  [BulkTest] All tests pass after shared config fix.")
-                                return True
+                                return True, ""
                             # Update failed_files with whatever remains
                             failed_files = _parse_failed_test_files(
                                 output, list(test_files.keys()), subproject_cwd)
@@ -2671,6 +2712,44 @@ def run_bulk_test_execution_and_fix(
         print(f"  [BulkTest] Fixing {basename}...")
 
         current_output = output  # use full output for first attempt
+        _no_code_last_attempt = False   # True when LLM returned prose but no code
+        _test_rewrite_done = False      # True after a test-rewrite pivot was attempted
+
+        # ── ErrorRouter: classify this test failure once per file ────────────
+        # Determines whether web search is worth calling before fixing.
+        # Computed from the initial error output (before any fix is applied).
+        _initial_error = _extract_file_specific_errors(output, test_path, max_chars=2000)
+        if not _initial_error:
+            _initial_error = output[-2000:]
+        _route = None
+        _bulk_search_context = ""
+        try:
+            from .error_router import classify_error as _classify_error
+            _route = _classify_error(
+                error_info=_initial_error,
+                step_type="TEST",
+                project_context=project_context,
+                kb_matched=False,
+                llm_client=coder.llm_client if search_agent is not None else None,
+            )
+            log.info(
+                "[BulkTest] ErrorRouter %s → source=%s skip_web=%s (%s)",
+                basename, _route.source_type, _route.skip_web, _route.reason,
+            )
+            if search_agent is not None and not _route.skip_web:
+                _lang = language or (
+                    getattr(project_context, "language", None) if project_context else None)
+                _kb_ctx = getattr(memory, "_kb_context", "")
+                _bulk_search_context = search_agent.search_for_error(
+                    _initial_error, test_path,
+                    language=_lang,
+                    kb_context=_kb_ctx,
+                    query_override=_route.query_hint or None,
+                )
+                if _bulk_search_context:
+                    log.info("[BulkTest] Search context injected for %s", basename)
+        except Exception as _re_exc:
+            log.debug("[BulkTest] ErrorRouter failed for %s: %s", basename, _re_exc)
 
         for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
             # Extract error relevant to this file
@@ -2790,6 +2869,17 @@ def run_bulk_test_execution_and_fix(
                 f"```{lang_tag}\n// replacement chunk\n```\n"
                 "Use full-file [FILE]: format only when the whole file must be rewritten."
             )
+            if _bulk_search_context:
+                fix_prompt += (
+                    f"\n\nWeb search context (use to inform your fix):\n"
+                    f"{_bulk_search_context}\n"
+                )
+            if _no_code_last_attempt:
+                fix_prompt += (
+                    "\n\nCRITICAL: Your previous response contained only explanation text "
+                    "with no code changes. You MUST output actual file content using "
+                    "#### [FILE]: or #### [EDIT]: markers — no prose-only replies."
+                )
 
             try:
                 fix_response = coder.llm_client.generate_response(fix_prompt)
@@ -2876,35 +2966,109 @@ def run_bulk_test_execution_and_fix(
                     fix_files = executor.parse_code_blocks(fix_response)
                 if not fix_files:
                     fix_files = executor.parse_code_blocks_fuzzy(fix_response)
-                if fix_files:
-                    if subproject_cwd:
-                        from .step_handlers import _prefix_subproject_paths
-                        fix_files = _prefix_subproject_paths(
-                            fix_files, subproject_cwd, memory)
 
-                    # Dedup: compute a signature of the proposed file contents
-                    # and skip if this exact fix was already applied for this
-                    # test file — prevents the loop from burning retries on an
-                    # identical broken fix.
-                    _fix_sig = _hashlib.md5(
-                        "".join(sorted(fix_files.values())).encode("utf-8", errors="replace")
-                    ).hexdigest()
-                    _sigs_for_test = _applied_fix_signatures.setdefault(test_path, set())
-                    if _fix_sig in _sigs_for_test:
-                        _logger.warning(
-                            "[BulkTest] Skipping duplicate fix for %s "
-                            "(same content already applied, attempt %d/%d).",
-                            basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
-                        )
-                        break
-                    _sigs_for_test.add(_fix_sig)
-
-                    executor.write_files(fix_files)
-                    memory.update(fix_files)
-                    _logger.info(
-                        "[BulkTest] Applied fixes for %s: %s",
-                        basename, list(fix_files.keys()),
+                # ── No code in response — don't re-run unchanged test ──────────
+                if not fix_files:
+                    _logger.warning(
+                        "[BulkTest] No code extracted from LLM response for %s "
+                        "(attempt %d/%d) — skipping re-run, retrying with stronger prompt.",
+                        basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
                     )
+                    _no_code_last_attempt = True
+                    continue
+
+                _no_code_last_attempt = False
+
+                if subproject_cwd:
+                    from .step_handlers import _prefix_subproject_paths
+                    fix_files = _prefix_subproject_paths(
+                        fix_files, subproject_cwd, memory)
+
+                # Dedup: compute a signature of the proposed file contents
+                # and skip if this exact fix was already applied for this
+                # test file — prevents the loop from burning retries on an
+                # identical broken fix.
+                _fix_sig = _hashlib.md5(
+                    "".join(sorted(fix_files.values())).encode("utf-8", errors="replace")
+                ).hexdigest()
+                _sigs_for_test = _applied_fix_signatures.setdefault(test_path, set())
+                if _fix_sig in _sigs_for_test:
+                    _logger.warning(
+                        "[BulkTest] Duplicate source fix for %s (attempt %d/%d) "
+                        "— pivoting to test rewrite.",
+                        basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
+                    )
+                    # ── Pivot: rewrite the TEST to match actual implementation ──
+                    # The source is likely correct; the test expectation is wrong.
+                    if not _test_rewrite_done:
+                        _test_rewrite_done = True
+                        _rw_content = memory.all_files().get(test_path, "")
+                        if not _rw_content:
+                            try:
+                                with open(test_path, "r", encoding="utf-8",
+                                          errors="replace") as _rf:
+                                    _rw_content = _rf.read()
+                            except OSError:
+                                pass
+                        _rw_prompt = (
+                            f"The source fix for `{test_path}` was already applied "
+                            f"but the test still fails.\n\n"
+                            f"Rewrite the TEST FILE ITSELF so it matches what the "
+                            f"implementation actually does. Do NOT remove any tests — "
+                            f"update expected values, selectors, or text to match "
+                            f"reality.\n\n"
+                            f"Current test file:\n"
+                            f"#### [FILE]: {test_path}\n"
+                            f"```{lang_tag}\n{_rw_content}\n```\n\n"
+                            f"Error output:\n{file_error}\n\n"
+                            f"Relevant source:\n{source_ctx}\n\n"
+                            "Output the COMPLETE rewritten test file using:\n"
+                            f"#### [FILE]: {test_path}\n"
+                            f"```{lang_tag}\n// full file\n```"
+                        )
+                        try:
+                            _rw_response = coder.llm_client.generate_response(_rw_prompt)
+                            _rw_files = executor.parse_code_blocks(_rw_response)
+                            if not _rw_files:
+                                _rw_files = executor.parse_code_blocks_fuzzy(_rw_response)
+                            if _rw_files:
+                                if subproject_cwd:
+                                    _rw_files = _prefix_subproject_paths(
+                                        _rw_files, subproject_cwd, memory)
+                                executor.write_files(_rw_files)
+                                memory.update(_rw_files)
+                                _logger.info(
+                                    "[BulkTest] Test rewrite applied for %s: %s",
+                                    basename, list(_rw_files.keys()),
+                                )
+                                _single_rw = _build_scoped_test_cmd(
+                                    base_cmd, {test_path: ""}, subproject_cwd)
+                                _ok_rw, current_output = executor.run_command(
+                                    _single_rw, cwd=subproject_cwd)
+                                if _ok_rw:
+                                    _logger.info(
+                                        "[BulkTest] %s passes after test rewrite.", basename)
+                                    print(f"  [BulkTest] {basename} fixed via test rewrite")
+                                    _p, _t, _ = _parse_test_counts(current_output)
+                                    display.record_test_result(
+                                        test_path, passed=_p, total=_t, failures=[])
+                                    break
+                                _logger.warning(
+                                    "[BulkTest] Test rewrite for %s still failing.",
+                                    basename)
+                        except Exception as _rw_exc:
+                            _logger.warning(
+                                "[BulkTest] Test rewrite failed for %s: %s",
+                                basename, _rw_exc)
+                    break
+
+                _sigs_for_test.add(_fix_sig)
+                executor.write_files(fix_files)
+                memory.update(fix_files)
+                _logger.info(
+                    "[BulkTest] Applied fixes for %s: %s",
+                    basename, list(fix_files.keys()),
+                )
             except Exception as exc:
                 _logger.warning("[BulkTest] Fix generation failed for %s: %s", basename, exc)
                 break

@@ -23,7 +23,8 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       search_agent=None,
                       language: str | None = None,
                       previous_diagnosis: str | None = None,
-                      kb_context_builder=None) -> str:
+                      kb_context_builder=None,
+                      error_route=None) -> str:
     display.step_info(step_idx, "Analyzing failure root cause...")
 
     # ── KB error-fix lookup using actual error output ────
@@ -80,16 +81,23 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         _installed_note = f"Installed: {', '.join(dict.fromkeys(_installed_pkgs))}"
 
     # ── Optional: search the web for error documentation ────
+    # Gated by error_route: skip entirely for code-logic or KB-matched errors.
     search_context = ""
-    if search_agent is not None:
+    _skip_web = error_route is not None and error_route.skip_web
+    if _skip_web:
+        log.info(f"Step {step_idx+1}: ErrorRouter skip_web=True "
+                 f"({error_route.source_type}, {error_route.reason}) — skipping web search")
+    if search_agent is not None and not _skip_web:
         display.step_info(step_idx, "Searching web for error documentation...")
         try:
             _search_kb = getattr(memory, '_kb_context', '')
             if _installed_note:
                 _search_kb = f"{_installed_note}\n{_search_kb}" if _search_kb else _installed_note
+            _query_override = error_route.query_hint if error_route else None
             search_context = search_agent.search_for_error(
                 error_info, step_text, language=language,
-                kb_context=_search_kb)
+                kb_context=_search_kb,
+                query_override=_query_override)
             if search_context:
                 log.info(f"Step {step_idx+1}: Search agent found documentation")
         except Exception as exc:
@@ -117,6 +125,14 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
     )
+    if error_route and error_route.source_type in ("code", "kb"):
+        _hint_map = {
+            "code": "a code/logic bug in the existing files — focus on the written code, not package installation",
+            "kb":   "a known pattern covered by KB docs — apply the KB fix below",
+        }
+        prompt += (
+            f"DIAGNOSIS HINT: This is likely {_hint_map[error_route.source_type]}.\n\n"
+        )
     if kb_error_context:
         prompt += (
             "The following error-fix patterns from the knowledge base match "
@@ -625,5 +641,15 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         applied = True
         has_fix_commands = True
         executed_cmds.append(cmd)
+
+        # For CMD steps the LLM often emits multiple alternative commands
+        # (e.g. "try this; if that fails, try this other form").  Stop after
+        # the first one that succeeds so a later alternative that's now
+        # irrelevant (e.g. mkdir when the dir already exists) can't flip
+        # cmds_succeeded to False and suppress the replacement-command check.
+        if step_type == "CMD" and success:
+            log.info(f"Step {step_idx+1}: CMD fix command succeeded — "
+                     f"stopping fix command loop (alternatives not needed).")
+            break
 
     return applied, cmds_succeeded, has_fix_commands, executed_cmds

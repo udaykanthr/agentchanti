@@ -1252,6 +1252,7 @@ def main():
             project_context=project_context,
             kb_context_builder=kb_context_builder,
             all_plan_steps=plan_steps_parsed,
+            search_agent=search_agent,
         )
         if not verif_ok:
             pipeline_success = False

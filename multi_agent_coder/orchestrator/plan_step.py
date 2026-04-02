@@ -394,6 +394,10 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             else:
                 # Strip markdown fences (```js, ```) that wrap inline code
                 if line.startswith("```"):
+                    if in_markdown_fence:
+                        # Closing fence — mark boundary so multi-target steps
+                        # can split blocks even without // filename.ext headers.
+                        code_lines.append(_FENCE_BOUNDARY)
                     in_markdown_fence = not in_markdown_fence
                     continue
                 # Strip "> " prefix from code lines — the LLM sometimes
@@ -796,48 +800,78 @@ _FILE_COMMENT_RE = re.compile(
     r"^//\s*([\w./-]+\.\w{1,5})\s*$"
 )
 
+# Sentinel inserted into code_lines at each closing ``` fence boundary
+# so _assign_inline_code can split multiple files without // header comments.
+_FENCE_BOUNDARY = "\x00FENCE_BOUNDARY\x00"
+
 
 def _assign_inline_code(step: PlanStep, code_lines: list[str]) -> None:
     """Assign captured inline code to a step's ``inline_code`` dict.
 
     For single-target steps, all code goes to that target file.
-    For multi-target steps, the parser splits on ``// FileName.ext``
-    comment headers to map code to each file.
+    For multi-target steps the parser tries three strategies in order:
+
+    1. ``// FileName.ext`` comment headers between blocks.
+    2. Fence boundaries (``_FENCE_BOUNDARY`` sentinels inserted at each
+       closing `` ``` `` fence) — if the number of non-empty fence blocks
+       matches the number of targets, assign block N to target N.
+    3. Fallback: everything goes to ``targets[0]``.
     """
-    full_code = "\n".join(code_lines).strip()
+    targets = step.target_files
+
+    # ── Strategy 1: // filename.ext comment headers ──
+    if len(targets) > 1:
+        current_file: Optional[str] = None
+        file_lines: dict[str, list[str]] = {}
+        for line in code_lines:
+            if line == _FENCE_BOUNDARY:
+                continue
+            m = _FILE_COMMENT_RE.match(line.strip())
+            if m:
+                fname = m.group(1)
+                matched = _match_target(fname, targets)
+                current_file = matched or fname
+                file_lines.setdefault(current_file, [])
+                continue
+            if current_file is not None:
+                file_lines[current_file] = file_lines.get(current_file, [])
+                file_lines[current_file].append(line)
+        if file_lines:
+            for fpath, lines in file_lines.items():
+                content = "\n".join(lines).strip()
+                if content:
+                    step.inline_code[fpath] = content
+            return
+
+    # ── Strategy 2: fence boundary splitting (no // headers) ──
+    if len(targets) > 1:
+        fence_blocks: list[list[str]] = []
+        current_block: list[str] = []
+        for line in code_lines:
+            if line == _FENCE_BOUNDARY:
+                if current_block:
+                    fence_blocks.append(current_block)
+                current_block = []
+            else:
+                current_block.append(line)
+        if current_block:
+            fence_blocks.append(current_block)
+
+        non_empty = [b for b in fence_blocks if any(ln.strip() for ln in b)]
+        if len(non_empty) == len(targets):
+            for target, block_lines in zip(targets, non_empty):
+                content = "\n".join(block_lines).strip()
+                if content:
+                    step.inline_code[target] = content
+            return
+
+    # ── Strategy 3: fallback — all code to first target ──
+    clean_lines = [ln for ln in code_lines if ln != _FENCE_BOUNDARY]
+    full_code = "\n".join(clean_lines).strip()
     if not full_code:
         return
 
-    targets = step.target_files
-
-    if len(targets) == 1:
-        step.inline_code[targets[0]] = full_code
-        return
-
-    # Multi-target: try splitting on // filename.ext comment headers
-    current_file: Optional[str] = None
-    file_lines: dict[str, list[str]] = {}
-
-    for line in code_lines:
-        m = _FILE_COMMENT_RE.match(line.strip())
-        if m:
-            fname = m.group(1)
-            # Match against known targets or use as-is
-            matched = _match_target(fname, targets)
-            current_file = matched or fname
-            file_lines.setdefault(current_file, [])
-            continue
-        if current_file is not None:
-            file_lines[current_file] = file_lines.get(current_file, [])
-            file_lines[current_file].append(line)
-
-    if file_lines:
-        for fpath, lines in file_lines.items():
-            content = "\n".join(lines).strip()
-            if content:
-                step.inline_code[fpath] = content
-    elif len(targets) > 0:
-        # No file headers found — assign all code to first target
+    if len(targets) >= 1:
         step.inline_code[targets[0]] = full_code
 
 

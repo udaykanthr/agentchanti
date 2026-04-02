@@ -510,6 +510,44 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="npm,script,missing,package-json,test,vitest,jest",
     ),
     ErrorFix(
+        error_type="ViteScaffoldDirectoryMissing",
+        language="javascript",
+        pattern=r"(The system cannot find the path specified|no such file or directory|ENOENT).*npm create vite",
+        cause="The scaffold command used `cd <name> && npm create vite@latest .` but the "
+              "target directory does not exist yet. The `cd` fails before npm runs, so no "
+              "files are created.",
+        fix_template="NEVER use `cd <folder> && npm create vite@latest .` when the folder "
+                     "doesn't exist yet.\n\n"
+                     "CORRECT form — creates the folder automatically:\n"
+                     "  npm create vite@latest <project-name> -- --template react --no-interactive\n\n"
+                     "If you need the in-directory form, create the folder first:\n"
+                     "  mkdir <project-name> && cd <project-name> && npm create vite@latest . -- --template react\n\n"
+                     "The KB doc `Vite React Setup Guide` shows the correct single-command form. "
+                     "Always prefer `npm create vite@latest <name>` over the `cd && .` pattern.",
+        severity="error",
+        tags="vite,scaffold,mkdir,directory,not,found,npm,create,cd,enoent,javascript",
+    ),
+    ErrorFix(
+        error_type="PostcssConfigCreatedEmpty",
+        language="javascript",
+        pattern=r"(type nul\s*>.*postcss\.config|touch.*postcss\.config|echo\s*>.*postcss\.config)",
+        cause="A CMD step used `type nul >`, `touch`, or `echo >` to create postcss.config.mjs "
+              "as an empty file. This produces a zero-byte config with no plugin entry, so "
+              "Tailwind CSS generates no styles and no error is thrown — the breakage is silent.",
+        fix_template="DELETE the empty postcss.config.mjs and recreate it as a CODE step "
+                     "with the correct content. NEVER use shell commands to create config files "
+                     "that need content.\n\n"
+                     "CORRECT postcss.config.mjs content:\n"
+                     "  export default {\n"
+                     "    plugins: {\n"
+                     "      '@tailwindcss/postcss': {},\n"
+                     "    },\n"
+                     "  }\n\n"
+                     "The plan step must be [CODE] type with a content: block, not [CMD].",
+        severity="error",
+        tags="postcss,tailwindcss,empty,config,touch,type-nul,cmd,code,step,javascript",
+    ),
+    ErrorFix(
         error_type="TailwindCSSDeprecatedDirectives",
         language="all",
         pattern=r"@tailwind\s+(base|components|utilities)",
@@ -918,6 +956,87 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "vitest.config.ts or a setup file referenced by setupFiles.",
         severity="error",
         tags="vitest,jest,test,suite,empty,setup,scaffold,no,found,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="ViteAutoTestUsedNodeTestRunner",
+        language="javascript",
+        pattern=r"(import\s+\{[^}]*\}\s+from\s+'node:test'|require\('node:test'\)|import\s+\w+\s+from\s+'node:assert')",
+        cause="An auto-generated test file imported Node's built-in `node:test` / `node:assert` "
+              "instead of Vitest. These are incompatible test runners — `node:test` blocks are "
+              "invisible to `npx vitest run`, causing the baseline test run to fail with "
+              "'No test suite found' or simply producing no output for those files.",
+        fix_template="NEVER import from 'node:test' or 'node:assert' in a Vitest project.\n\n"
+                     "Replace with Vitest imports:\n"
+                     "  // WRONG\n"
+                     "  import { describe, it } from 'node:test'\n"
+                     "  import assert from 'node:assert/strict'\n\n"
+                     "  // CORRECT\n"
+                     "  import { describe, it, expect } from 'vitest'\n\n"
+                     "Replace assert calls with expect():\n"
+                     "  assert.equal(x, y)        →  expect(x).toBe(y)\n"
+                     "  assert.ok(x)              →  expect(x).toBeTruthy()\n"
+                     "  assert.deepEqual(a, b)    →  expect(a).toEqual(b)\n"
+                     "  assert.strictEqual(a, b)  →  expect(a).toBe(b)\n\n"
+                     "This error is most common in auto-generated tests for config files "
+                     "(postcss.config.mjs, vitest.config.js). The best fix is to DELETE those "
+                     "tests entirely — config files are scaffolding, not application logic.",
+        severity="error",
+        tags="vitest,node:test,assert,test-runner,wrong-framework,auto-test,javascript",
+    ),
+    ErrorFix(
+        error_type="ViteEsmRequireInTest",
+        language="javascript",
+        pattern=r"require\(\s*['\"][^'\"]*(?:vitest\.config|vite\.config|postcss\.config)[^'\"]*['\"]\s*\)",
+        cause="A test is calling require() on an ESM config file (vitest.config.js, vite.config.js, "
+              "postcss.config.mjs). These files use `export default` (ESM syntax) and cannot be "
+              "loaded with require(). The test was likely auto-generated for a config file that "
+              "has no business logic worth testing.",
+        fix_template="Config files that use `export default` (ESM) cannot be require()'d.\n\n"
+                     "Option 1 — DELETE the test (recommended):\n"
+                     "  vitest.config.js, postcss.config.mjs, and vite.config.js are framework "
+                     "scaffolding. They do not contain application logic and should NOT have unit "
+                     "tests. Delete the test file.\n\n"
+                     "Option 2 — Replace require() with dynamic import():\n"
+                     "  // WRONG\n"
+                     "  const config = require('../vitest.config.js')\n\n"
+                     "  // CORRECT\n"
+                     "  it('...', async () => {\n"
+                     "    const { default: config } = await import('../vitest.config.js')\n"
+                     "    expect(config.test.environment).toBe('jsdom')\n"
+                     "  })",
+        severity="error",
+        tags="vitest,esm,require,import,config,postcss,vite,module,javascript",
+    ),
+    ErrorFix(
+        error_type="VitestMainJsxModuleCaching",
+        language="javascript",
+        pattern=r"expected.*vi\.fn\(\).*to not be called.*but actually been called.*\d+ time",
+        cause="main.jsx (or index.js) is executed once and cached by the ESM module system. "
+              "vi.resetModules() in afterEach does NOT cause a subsequent `await import('../main.jsx')` "
+              "to re-execute the module — it returns the cached version without running createRoot() again. "
+              "The first test's renderMock call count bleeds into the second test because mockClear/resetMocks "
+              "was not called.",
+        fix_template="Use vi.clearAllMocks() (clears call counts) instead of vi.resetModules() "
+                     "(which doesn't work for already-resolved dynamic imports in the same file).\n\n"
+                     "CORRECT pattern for main.jsx tests:\n"
+                     "  afterEach(() => {\n"
+                     "    vi.clearAllMocks()          // resets mock call counts\n"
+                     "    document.body.innerHTML = '' // resets DOM\n"
+                     "  })\n\n"
+                     "  it('renders the App into the root element', async () => {\n"
+                     "    document.body.innerHTML = '<div id=\"root\"></div>'\n"
+                     "    await import('../main.jsx')  // executes once, then cached\n"
+                     "    expect(renderMock).toHaveBeenCalledTimes(1)\n"
+                     "  })\n\n"
+                     "  it('second test — module cached, createRoot not called again', async () => {\n"
+                     "    document.body.innerHTML = ''\n"
+                     "    await import('../main.jsx')  // returns cached, does NOT re-run\n"
+                     "    expect(renderMock).not.toHaveBeenCalled()  // cleared by afterEach\n"
+                     "  })\n\n"
+                     "KEY INSIGHT: vi.clearAllMocks() resets call counts so the second test starts "
+                     "fresh. The module not re-executing is the EXPECTED behavior, not a bug.",
+        severity="error",
+        tags="vitest,main,jsx,module,cache,resetModules,clearAllMocks,esm,createRoot,javascript",
     ),
     # ── Vitest + @testing-library/jest-dom ──────────────────────────────
     ErrorFix(
@@ -2855,6 +2974,41 @@ Tests that render components should always use MemoryRouter:
 import { MemoryRouter } from 'react-router-dom';
 render(<MemoryRouter><ComponentUnderTest /></MemoryRouter>);
 ```
+
+## Rule 5: When writing main.jsx inline code in a plan — ALWAYS include BrowserRouter
+
+This is the most commonly missed rule with concise LLMs.
+
+If ANY component in the plan uses `<Link>`, `<NavLink>`, `<Route>`, `<Routes>`,
+`useNavigate()`, `useLocation()`, or `useParams()` from `react-router-dom`, the
+`main.jsx` inline code MUST wrap `<App />` in `<BrowserRouter>`.
+
+Omitting this causes this runtime crash:
+```
+TypeError: Cannot destructure property 'basename' of useContext(...) as it is null
+```
+
+CORRECT main.jsx when react-router-dom is installed:
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+```
+
+CHECKLIST before writing main.jsx inline code:
+- [ ] Is `react-router-dom` in the npm install step? → add BrowserRouter to main.jsx
+- [ ] Does any component step use `<Link>` or `<NavLink>`? → add BrowserRouter to main.jsx
+- [ ] BrowserRouter goes in main.jsx ONLY — never in App.jsx or children
 """,
     },
     "django-test-generation-instructions.md": {
