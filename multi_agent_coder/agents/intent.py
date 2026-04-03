@@ -274,6 +274,16 @@ class IntentAgent(Agent):
                 f"{_titles_block}\n\n"
             )
 
+        # ── Detect visual/layout bug early ──────────────────────────────────
+        _task_lower = raw_task.lower()
+        _is_visual_bug = any(kw in _task_lower for kw in (
+            "not visible", "nothing happens", "doesn't appear", "doesn't show",
+            "does not appear", "does not show", "hidden", "invisible",
+            "not rendering", "not displayed", "not showing", "can't see",
+            "menu", "modal", "dropdown", "popup", "overlay", "sidebar",
+            "z-index", "behind", "underneath",
+        ))
+
         # ── Pre-seed: give the LLM a starting point, not a conclusion ─────────
         # Run one automatic KB search before the loop so the LLM can see what
         # exists in the project and decide what it still needs to investigate.
@@ -297,6 +307,47 @@ class IntentAgent(Agent):
                 _logger.info("[IntentAnalysis] Pre-seed returned no results.")
                 if cli_display:
                     cli_display.update_last_intent_event("no results")
+
+            # ── BUG_FIX enhancement: fetch full file content for target ───────
+            # Semantic snippets (30 lines) are insufficient for tracing render
+            # logic and CSS layering.  For bug-related tasks, identify the
+            # likely target file(s) from the pre-seed and inject their full
+            # source so the LLM has the complete picture before it concludes.
+            if pre_result:
+                _target_files = self._extract_target_files_from_preseed(pre_result)
+                for tf in _target_files[:2]:  # cap at 2 files
+                    full_src = self._read_full_file(kb_context_builder, tf)
+                    if full_src:
+                        accumulated_context += (
+                            f"Full Source (auto-loaded for investigation): {tf}\n"
+                            f"{full_src}\n\n"
+                        )
+                        _logger.info(
+                            "[IntentAnalysis] Auto-loaded full source: %s (%d chars)",
+                            tf, len(full_src),
+                        )
+                        if cli_display:
+                            cli_display.show_intent_event(
+                                "preseed", f"Full source: {tf}"
+                            )
+
+            # ── Visual bug enhancement: auto-fetch CSS/style files ────────────
+            # For visual/layout bugs, the root cause is often in CSS (z-index,
+            # display, overflow, pointer-events) rather than JS logic.  Auto-
+            # fetch CSS files that could affect the target component.
+            if _is_visual_bug and pre_result:
+                _logger.info("[IntentAnalysis] Visual bug detected — auto-searching CSS/style files.")
+                css_results = self._search_related_css(kb_context_builder, raw_task, pre_result)
+                if css_results:
+                    accumulated_context += (
+                        f"CSS/Style Context (auto-retrieved for visual bug investigation):\n"
+                        f"{css_results}\n\n"
+                    )
+                    _logger.info(
+                        "[IntentAnalysis] Auto-loaded CSS context: %d chars", len(css_results),
+                    )
+                    if cli_display:
+                        cli_display.show_intent_event("preseed", "CSS/style files loaded")
 
         # ── Iterative investigation loop ──────────────────────────────────────
         last_response = ""
@@ -574,13 +625,84 @@ class IntentAgent(Agent):
                 )
                 if spec_match:
                     spec = spec_match.group(1).strip()
+                    task_type_m = re.search(r'Task type:\s*(\w+)', spec, re.IGNORECASE)
+                    task_type_label = task_type_m.group(1) if task_type_m else "UNKNOWN"
+
+                    # ── BUG_FIX guard: reject premature spec ─────────────────
+                    # For BUG_FIX tasks, the LLM MUST have used at least one
+                    # investigation tool (KB_SEARCH / FIND_USAGES / RUN_CMD)
+                    # beyond the auto-preseed.  Pre-seed snippets alone are not
+                    # enough to correctly identify root cause — the LLM tends
+                    # to guess from partial context and get it wrong (e.g.
+                    # "button lacks onClick" when onClick exists but z-index
+                    # is missing).  Force it to actually investigate.
+                    if (
+                        task_type_label.upper() == "BUG_FIX"
+                        and not executed_commands
+                        and not force_conclude
+                    ):
+                        _logger.info(
+                            "[IntentAnalysis] BUG_FIX spec rejected on iteration %d "
+                            "— no investigation tools used yet. Forcing deeper analysis.",
+                            iteration,
+                        )
+                        accumulated_context += (
+                            "[Your REQUIREMENTS_SPEC was rejected because you have not "
+                            "investigated the actual code yet. For BUG_FIX tasks you MUST:\n"
+                            "  1. Use KB_SEARCH to read the FULL source of the target file\n"
+                            "  2. For visual bugs (not visible / hidden / menu): also read "
+                            "CSS files and check z-index, display, overflow, pointer-events\n"
+                            "  3. Use FIND_USAGES to verify the component interface\n"
+                            "  4. Verify your hypothesis against the actual code — do NOT "
+                            "claim 'lacks X' without confirming X is truly absent\n"
+                            "After investigation, write REQUIREMENTS_SPEC with evidence.]\n\n"
+                        )
+                        if cli_display:
+                            cli_display.show_intent_event(
+                                "reject",
+                                "BUG_FIX spec rejected — no investigation yet",
+                                iteration=iteration, max_iterations=0,
+                            )
+                        continue
+
+                    # ── Root-cause cross-validation for BUG_FIX ──────────────
+                    # Check if the spec claims something is "missing" or "lacks"
+                    # but the evidence already shows it exists.  This catches
+                    # the common LLM error of guessing without reading.
+                    if task_type_label.upper() == "BUG_FIX" and not force_conclude:
+                        contradiction = self._check_root_cause_contradiction(
+                            spec, accumulated_context,
+                        )
+                        if contradiction:
+                            _logger.warning(
+                                "[IntentAnalysis] Root-cause contradiction detected: %s",
+                                contradiction,
+                            )
+                            accumulated_context += (
+                                f"[ROOT CAUSE CONTRADICTION: {contradiction}\n"
+                                "Re-examine the code evidence above. Your claimed root "
+                                "cause does not match the actual code. Look for OTHER "
+                                "possible causes:\n"
+                                "  - CSS issues: z-index layering, display:none, "
+                                "overflow:hidden, pointer-events:none\n"
+                                "  - Conditional rendering: state that never becomes true\n"
+                                "  - Event handler that sets state but UI doesn't react "
+                                "(wrong CSS, element behind another, opacity:0)\n"
+                                "Write a corrected REQUIREMENTS_SPEC.]\n\n"
+                            )
+                            if cli_display:
+                                cli_display.show_intent_event(
+                                    "reject",
+                                    f"Root-cause contradiction: {contradiction[:60]}",
+                                    iteration=iteration, max_iterations=0,
+                                )
+                            continue
+
                     # Normalise KB topics: LLMs sometimes output a bullet list
                     # instead of a comma-separated line.  Convert to one line so
                     # downstream parsers (cli.py / api.py) can split on ',' reliably.
                     spec = self._normalize_kb_topics(spec)
                     _logger.info("[IntentAnalysis] Successfully generated REQUIREMENTS_SPEC.")
-                    task_type_m = re.search(r'Task type:\s*(\w+)', spec, re.IGNORECASE)
-                    task_type_label = task_type_m.group(1) if task_type_m else "UNKNOWN"
                     if cli_display:
                         cli_display.show_intent_event("spec",
                                                        f"REQUIREMENTS_SPEC: {task_type_label}",
@@ -769,20 +891,28 @@ class IntentAgent(Agent):
             "             NOT for broken/invisible/crashing things (those are BUG_FIX).\n\n"
 
             "── STEP 2: Investigation rules per type ───────────────────────────\n"
-            "BUG_FIX (mandatory tracing — you MUST read actual code before concluding):\n"
+            "BUG_FIX (mandatory tracing — you MUST use at least one tool before concluding):\n"
             "  1. Identify the component that should render the failing element.\n"
-            "  2. Use FIND_USAGES to compare what that component DECLARES (props,\n"
+            "  2. Use KB_SEARCH to read the FULL source of the target component.\n"
+            "     DO NOT rely only on pre-seed snippets — they may be incomplete.\n"
+            "  3. Use FIND_USAGES to compare what that component DECLARES (props,\n"
             "     params, data shape) vs what its CALLER actually PASSES.\n"
-            "     This catches prop-name mismatches, wrong data formats, missing props\n"
-            "     — the most common cause of 'renders nothing' bugs.\n"
-            "  3. If the interface matches, use KB_SEARCH to read the component body\n"
-            "     and trace the rendering logic (conditional returns, null checks,\n"
-            "     CSS that hides the element).\n"
-            "  4. For visual / layout bugs (invisible, wrong color, wrong position):\n"
-            "     also check CSS/SCSS files. Use KB_SEARCH: <filename>.css to read\n"
-            "     global or component-scoped stylesheets. FIND_USAGES also searches\n"
-            "     CSS files for class-name references (.SnakeBoard, .snake-board).\n"
-            "  5. Root cause MUST cite: specific file + specific prop/line/condition\n"
+            "     This catches prop-name mismatches, wrong data formats, missing props.\n"
+            "  4. For 'nothing happens' / 'not visible' / menu / modal / overlay bugs:\n"
+            "     The root cause is OFTEN CSS, not JavaScript. You MUST check:\n"
+            "     a) z-index layering: does the element have a z-index high enough\n"
+            "        to appear above siblings? (e.g. header z-40 vs menu with no z-index)\n"
+            "     b) display/visibility: is the element display:none or visibility:hidden?\n"
+            "     c) overflow:hidden on a parent that clips the element\n"
+            "     d) pointer-events:none preventing click interaction\n"
+            "     e) position: does the element need fixed/absolute positioning to overlay?\n"
+            "     f) width/height: is the element 0-sized?\n"
+            "     Use KB_SEARCH: <filename>.css to read stylesheets.\n"
+            "     Also read Tailwind classes in the JSX — they ARE the CSS.\n"
+            "  5. VERIFY before claiming: if you think something is 'missing' or 'lacks',\n"
+            "     search the evidence to CONFIRM it is truly absent. Do NOT claim\n"
+            "     'button lacks onClick' when onClick is present with a different value.\n"
+            "  6. Root cause MUST cite: specific file + specific prop/line/condition\n"
             "     or CSS rule that is wrong. Generic hypotheses are NOT acceptable.\n"
             "  You CANNOT write Root cause from patterns or training knowledge alone.\n"
             "  If you have not read the actual component/CSS code, use a tool first.\n\n"
@@ -894,6 +1024,169 @@ class IntentAgent(Agent):
             + self._SPEC_MODIFY + "\n"
             + self._SPEC_QUESTION
         )
+
+    # ── New helpers for enhanced BUG_FIX investigation ─────────────────────
+
+    @staticmethod
+    def _extract_target_files_from_preseed(pre_result: str) -> list[str]:
+        """
+        Extract file paths mentioned in pre-seed results.
+
+        Looks for common patterns:
+          ### Header.jsx (full source) — src/components/Header.jsx
+          ### Header (function) — src/components/Header.jsx lines 1-112
+        Returns a list of unique file basenames suitable for full-file lookup.
+        """
+        # Match filenames with extensions in ### headers
+        header_files = re.findall(
+            r'###\s+\S+.*?—\s*(\S+\.(?:jsx?|tsx?|vue|svelte|py|css|scss))',
+            pre_result,
+        )
+        # Also match bare filenames in the content (e.g. "Header.jsx")
+        inline_files = re.findall(
+            r'\b(\w+\.(?:jsx?|tsx?|vue|svelte|py|css|scss))\b',
+            pre_result,
+        )
+        seen = set()
+        result = []
+        for f in header_files + inline_files:
+            basename = f.split("/")[-1].split("\\")[-1]
+            if basename.lower() not in seen:
+                seen.add(basename.lower())
+                result.append(basename)
+        return result
+
+    @staticmethod
+    def _read_full_file(kb_context_builder, filename: str) -> str:
+        """
+        Read the full source of *filename* from the project.
+
+        Walks the project tree to find the file, returns its content capped at
+        300 lines.  Returns empty string if not found.
+        """
+        project_root = getattr(kb_context_builder, '_project_root', None)
+        if not project_root:
+            return ""
+        skip_dirs = {"node_modules", ".git", "dist", "build", ".next", "__pycache__"}
+        target_lower = filename.lower()
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for fname in filenames:
+                if fname.lower() == target_lower:
+                    abs_path = os.path.join(dirpath, fname)
+                    rel_path = os.path.relpath(abs_path, project_root).replace("\\", "/")
+                    try:
+                        with open(abs_path, encoding="utf-8", errors="ignore") as fh:
+                            all_lines = fh.readlines()
+                        cap = 300
+                        content = "".join(all_lines[:cap])
+                        if len(all_lines) > cap:
+                            content += f"\n  ... ({len(all_lines) - cap} more lines)"
+                        return f"### {fname} (full source) — {rel_path}\n{content}"
+                    except OSError:
+                        pass
+        return ""
+
+    @staticmethod
+    def _search_related_css(kb_context_builder, raw_task: str, pre_result: str) -> str:
+        """
+        Find and return CSS/style files that could affect the target component.
+
+        Strategy:
+          1. Extract component names from pre-seed results
+          2. Search for matching .css/.scss files by component name
+          3. Also search for global stylesheets (index.css, App.css, globals.css)
+          4. Return the content of z-index, display, overflow, position, and
+             pointer-events rules found in those files
+        """
+        project_root = getattr(kb_context_builder, '_project_root', None)
+        if not project_root:
+            return ""
+
+        # Extract component names from pre-seed
+        components = re.findall(r'###\s+(\w+)', pre_result)
+        # Add common global CSS file stems
+        css_targets = {"index", "app", "global", "globals", "main", "style", "styles"}
+        for comp in components:
+            css_targets.add(comp.lower())
+
+        skip_dirs = {"node_modules", ".git", "dist", "build", ".next", "__pycache__"}
+        css_exts = {".css", ".scss", ".sass", ".less"}
+        sections: list[str] = []
+
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in css_exts:
+                    continue
+                stem = os.path.splitext(fname)[0].lower()
+                if stem not in css_targets:
+                    continue
+                abs_path = os.path.join(dirpath, fname)
+                rel_path = os.path.relpath(abs_path, project_root).replace("\\", "/")
+                try:
+                    with open(abs_path, encoding="utf-8", errors="ignore") as fh:
+                        content = fh.read()
+                    if not content.strip():
+                        continue
+                    # Cap at 200 lines
+                    lines = content.splitlines()
+                    if len(lines) > 200:
+                        content = "\n".join(lines[:200]) + f"\n  ... ({len(lines) - 200} more lines)"
+                    sections.append(f"### {fname} — {rel_path}\n{content}")
+                except OSError:
+                    continue
+
+        return "\n\n".join(sections[:4])  # cap at 4 CSS files
+
+    @staticmethod
+    def _check_root_cause_contradiction(spec: str, evidence: str) -> str:
+        """
+        Cross-check BUG_FIX root cause against accumulated evidence.
+
+        Returns a contradiction description if found, empty string if consistent.
+
+        Checks for the common LLM error pattern: spec claims something is
+        "missing" or "lacks" but the evidence shows it actually exists.
+        """
+        root_m = re.search(
+            r'Root cause:\s*(.+?)(?=\n\w|\Z)',
+            spec,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not root_m:
+            return ""
+        root_cause = root_m.group(1).strip()
+
+        # Pattern: "lacks an onClick" / "missing onClick" / "no onClick handler"
+        # Check if the evidence actually shows this element exists
+        missing_patterns = re.findall(
+            r'(?:lacks?|missing|no|absent|without|does not have)\s+(?:an?\s+)?'
+            r'[`\'"]?(\w+(?:\s*\([^)]*\))?)[`\'"]?(?:\s+handler|\s+prop|\s+attribute)?',
+            root_cause,
+            re.IGNORECASE,
+        )
+        for claimed_missing in missing_patterns:
+            # Clean up: "onClick" from "onClick handler"
+            token = claimed_missing.strip().split("(")[0].strip()
+            if not token or len(token) < 3:
+                continue
+            # Search evidence for the token actually existing in code context
+            # Look for it in code blocks (``` ... ```) within evidence
+            code_blocks = re.findall(r'```[\s\S]*?```', evidence)
+            full_source_blocks = re.findall(
+                r'### .+?\(full source\).*?\n([\s\S]*?)(?=\n###|\Z)', evidence,
+            )
+            searchable = " ".join(code_blocks + full_source_blocks)
+            if token in searchable:
+                return (
+                    f"Spec claims '{token}' is missing/lacking, but the evidence "
+                    f"shows '{token}' already exists in the code. The root cause "
+                    f"is likely something else (CSS z-index, display, conditional "
+                    f"rendering, or event propagation)."
+                )
+        return ""
 
     @staticmethod
     def _extract_search_query(raw_task: str) -> str:

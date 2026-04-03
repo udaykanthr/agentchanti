@@ -732,6 +732,36 @@ class PlannerAgent(Agent):
                         if _kbm:
                             _selected = _kbm.group(1).strip()
                             if _selected.lower() not in ('none', 'n/a', ''):
+                                # ── Force-include setup guides for task-mentioned tech ──
+                                # Smaller LLMs sometimes omit setup/install guides even
+                                # when the technology is explicitly named in the task.
+                                # For blank projects every named framework needs its
+                                # setup doc, so we patch the selection with a keyword
+                                # safety net — zero LLM cost.
+                                _task_kw = {
+                                    w.lower() for w in re.findall(r'[A-Za-z][\w.-]*', task)
+                                } - {
+                                    "a", "an", "the", "is", "it", "in", "on", "at",
+                                    "to", "for", "of", "and", "or", "with", "using",
+                                    "have", "has", "be", "by", "as", "all", "app",
+                                    "implement", "create", "build", "add", "make",
+                                    "use", "integrated", "components", "component",
+                                    "web", "page", "responsive", "testcases",
+                                }
+                                _selected_lower = _selected.lower()
+                                _forced: list[str] = []
+                                for _t in _blank_titles:
+                                    _tl = _t.lower()
+                                    if ("setup" in _tl or "install" in _tl) and \
+                                            _t not in _selected:
+                                        if any(kw in _tl for kw in _task_kw):
+                                            _forced.append(_t)
+                                if _forced:
+                                    _selected = _selected + ", " + ", ".join(_forced)
+                                    _logger.info(
+                                        "[PreAnalysis] Force-included setup guides: %s",
+                                        ", ".join(_forced),
+                                    )
                                 task = task + f"\n\nKB docs: {_selected}"
                                 _logger.info(
                                     "[PreAnalysis] Task-only KB select (blank project): %s",
