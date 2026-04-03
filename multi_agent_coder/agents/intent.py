@@ -1199,3 +1199,80 @@ class IntentAgent(Agent):
                 break
 
         return "\n---\n".join(chunks)
+
+
+# ── IntentSpec ─────────────────────────────────────────────────────────────────
+# Structured representation of the REQUIREMENTS_SPEC the IntentAgent produces.
+# Parsed zero-cost from the enriched task string — no extra LLM call.
+
+from dataclasses import dataclass, field as _dc_field
+
+
+@dataclass
+class IntentSpec:
+    """Structured fields extracted from the IntentAgent's REQUIREMENTS_SPEC."""
+    task_type: str = ""
+    do_not_touch: list[str] = _dc_field(default_factory=list)   # BUG_FIX
+    fix_scope: list[str] = _dc_field(default_factory=list)      # BUG_FIX
+    preserve: list[str] = _dc_field(default_factory=list)       # MODIFY
+    change_scope: list[str] = _dc_field(default_factory=list)   # MODIFY
+    constraints: list[str] = _dc_field(default_factory=list)    # all types
+    packages: list[str] = _dc_field(default_factory=list)       # FEATURE
+    integrate_with: list[str] = _dc_field(default_factory=list) # FEATURE
+
+
+def _extract_spec_field(spec_text: str, field_name: str) -> str:
+    """Return the value for *field_name* from REQUIREMENTS_SPEC text (single line)."""
+    m = re.search(
+        rf'^{re.escape(field_name)}:\s*(.+)',
+        spec_text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _split_spec_values(text: str) -> list[str]:
+    """Split a comma/semicolon-separated spec field into individual items."""
+    if not text or text.lower().strip() in ('none', 'n/a', '-'):
+        return []
+    items = re.split(r'[,;]', text)
+    return [
+        item.strip().strip('"\'`<>')
+        for item in items
+        if item.strip() and item.strip().lower() not in ('none', 'n/a')
+    ]
+
+
+def parse_intent_spec(enriched_task: str) -> "IntentSpec | None":
+    """Parse IntentSpec from the enriched task string produced by IntentAgent.
+
+    Returns ``None`` when no REQUIREMENTS_SPEC block is present (blank projects,
+    fallback paths, QUESTION tasks) so callers can skip intent-aware logic.
+    """
+    if not enriched_task:
+        return None
+
+    # Locate the REQUIREMENTS_SPEC block (ends at next '===' header or EOF)
+    m = re.search(
+        r'REQUIREMENTS_SPEC:\s*\n(.*?)(?=\n===|\Z)',
+        enriched_task,
+        re.DOTALL,
+    )
+    if not m:
+        return None
+
+    spec = m.group(1)
+
+    task_type_m = re.search(r'^Task type:\s*(\S+)', spec, re.IGNORECASE | re.MULTILINE)
+    task_type = task_type_m.group(1).strip() if task_type_m else ""
+
+    return IntentSpec(
+        task_type=task_type,
+        do_not_touch=_split_spec_values(_extract_spec_field(spec, "Do not touch")),
+        fix_scope=_split_spec_values(_extract_spec_field(spec, "Fix scope")),
+        preserve=_split_spec_values(_extract_spec_field(spec, "Preserve")),
+        change_scope=_split_spec_values(_extract_spec_field(spec, "Change scope")),
+        constraints=_split_spec_values(_extract_spec_field(spec, "Constraints")),
+        packages=_split_spec_values(_extract_spec_field(spec, "Packages/versions")),
+        integrate_with=_split_spec_values(_extract_spec_field(spec, "Integrate with")),
+    )

@@ -471,7 +471,125 @@ def _apply_content_fixes(
     return result
 
 
-def _strip_protected_files(files: dict[str, str]) -> dict[str, str]:
+def _inject_browser_router_if_needed(
+    files: dict[str, str],
+    memory: "FileMemory",
+) -> dict[str, str]:
+    """Wrap <App /> in <BrowserRouter> when Link/NavLink is used but BrowserRouter is absent.
+
+    When the planner's inline code for main.jsx/index.jsx includes ``createRoot``
+    but omits ``BrowserRouter``, any component that uses ``<Link>`` or ``<NavLink>``
+    from ``react-router-dom`` will crash at runtime with:
+
+        useHref() may only be used within a <Router> context.
+
+    This helper scans the entry-point file written in *files*, detects the omission,
+    then patches the file by:
+      1. Adding ``import { BrowserRouter } from 'react-router-dom'``
+      2. Wrapping the ``<App />`` JSX element with ``<BrowserRouter>``.
+
+    Only runs when memory contains at least one file that imports from
+    ``react-router-dom`` and references ``Link`` or ``NavLink``.
+    """
+    result = dict(files)
+
+    for filepath, content in list(result.items()):
+        basename = filepath.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if basename not in ("main.jsx", "main.tsx", "index.jsx", "index.tsx"):
+            continue
+
+        # Already has a Router — nothing to do
+        if "BrowserRouter" in content or "HashRouter" in content:
+            continue
+
+        # Only applies to React 18 createRoot entry points
+        if "createRoot" not in content:
+            continue
+
+        # Check if any memory file uses Link / NavLink from react-router-dom
+        all_memory_files = memory.all_files()
+        uses_router_link = any(
+            "react-router-dom" in c and bool(
+                re.search(r'\b(?:Link|NavLink)\b', c)
+            )
+            for c in all_memory_files.values()
+        )
+        if not uses_router_link:
+            continue
+
+        # Check if any OTHER memory file already wraps with BrowserRouter
+        # (e.g. Root.jsx or App.jsx).  If so, skip injection — the router
+        # is already provided deeper in the component tree.
+        child_has_router = any(
+            ("BrowserRouter" in c or "HashRouter" in c)
+            and fpath_key != filepath
+            for fpath_key, c in all_memory_files.items()
+        )
+        if child_has_router:
+            log.debug(
+                "BrowserRouter injection skipped for %s — "
+                "a child component already provides BrowserRouter",
+                filepath,
+            )
+            continue
+
+        patched = content
+
+        # ── 1. Add BrowserRouter import ──
+        rrd_import_re = re.compile(
+            r"(import\s+\{)([^}]+?)(\}\s+from\s+['\"]react-router-dom['\"])"
+        )
+        rrd_match = rrd_import_re.search(patched)
+        if rrd_match and "BrowserRouter" not in rrd_match.group(2):
+            patched = rrd_import_re.sub(
+                lambda m: m.group(1) + m.group(2).rstrip() + ", BrowserRouter" + m.group(3),
+                patched,
+                count=1,
+            )
+        elif not rrd_match:
+            # Insert after last React-related import line
+            react_imports = list(re.finditer(
+                r"^import .+['\"]react(?:-dom)?['\"].*$", patched, re.MULTILINE
+            ))
+            if react_imports:
+                insert_pos = react_imports[-1].end()
+                patched = (
+                    patched[:insert_pos]
+                    + "\nimport { BrowserRouter } from 'react-router-dom'"
+                    + patched[insert_pos:]
+                )
+            else:
+                patched = "import { BrowserRouter } from 'react-router-dom'\n" + patched
+
+        # ── 2. Wrap the root component with <BrowserRouter> ──
+        # Detect the root component rendered inside createRoot().render()
+        # It could be <App />, <Root />, or any PascalCase component.
+        _root_comp_re = re.compile(
+            r'(<(?:App|Root|[A-Z]\w*)\s*/>)'
+        )
+        patched = _root_comp_re.sub(
+            r'<BrowserRouter>\n      \1\n    </BrowserRouter>',
+            patched,
+            count=1,
+        )
+
+        if patched != content:
+            result[filepath] = patched
+            log.info(
+                "BrowserRouter injection: patched %s "
+                "(Link/NavLink detected in project memory)",
+                filepath,
+            )
+
+    return result
+
+
+def _looks_like_file_path(s: str) -> bool:
+    """Return True if *s* looks like a file path (has extension or path separator)."""
+    return bool(re.search(r'\.\w{2,6}$', s) or '/' in s or os.sep in s)
+
+
+def _strip_protected_files(files: dict[str, str], intent_spec=None) -> dict[str, str]:
     """Handle protected manifest files from parsed LLM output.
 
     For lock files (package-lock.json, yarn.lock, etc.) — fully blocked.
@@ -517,7 +635,7 @@ def _strip_protected_files(files: dict[str, str]) -> dict[str, str]:
     for fpath, content in files.items():
         basename = os.path.basename(fpath)
 
-        # Not a protected file — pass through
+        # Not a core protected file — pass through
         if basename not in Executor._PROTECTED_FILENAMES:
             filtered[fpath] = content
             continue
@@ -1171,6 +1289,22 @@ def _prefix_subproject_paths(files: dict[str, str],
                 corrected[candidate] = content
                 continue
 
+        # Bare filename (no directory component): the fuzzy parser may
+        # extract just "Header.jsx" from LLM prose like "Here is Header.jsx:".
+        # Before blindly prefixing to "subproject/Header.jsx", check memory
+        # for a file whose basename matches — if exactly one exists, use it.
+        norm_basename = os.path.basename(norm)
+        if norm_basename == norm:  # no directory component
+            basename_matches = [
+                kp for kp in known_paths
+                if os.path.basename(kp.replace("\\", "/")) == norm_basename
+            ]
+            if len(basename_matches) == 1:
+                resolved = basename_matches[0]
+                log.info(f"[SubProject] Resolved bare filename '{fpath}' → '{resolved}'")
+                corrected[resolved] = content
+                continue
+
         # Prefix with sub-project root
         new_path = prefix + fpath
         log.info(f"[SubProject] Prefixed '{fpath}' → '{new_path}'")
@@ -1379,7 +1513,8 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                      display: CLIDisplay, step_idx: int,
                      language: str | None = None,
                      project_context=None,
-                     plan_step=None) -> tuple[bool, str]:
+                     plan_step=None,
+                     intent_spec=None) -> tuple[bool, str]:
     # Prefer the structured plan's explicit command field
     cmd = (plan_step.command if plan_step is not None and plan_step.command
            else _extract_command_from_step(step_text))
@@ -1457,6 +1592,19 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # Dumb/small LLMs sometimes output <project-name> instead of the real name.
     _task_desc = getattr(project_context, 'goal_summary', '') if project_context else ''
     cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=_task_desc)
+
+    # ── Strip dead `cd <dir> &&` before scaffold commands ──
+    # LLMs often generate `cd <name> && npm create vite@latest <name>` but the
+    # directory doesn't exist yet — `npm create vite@latest` is what creates it.
+    # Strip the leading `cd` so the scaffold command can run correctly.
+    _SCAFFOLD_CD_RE = re.compile(
+        r'^cd\s+\S+\s*&&\s*(npm\s+create\s+(?:vite|react-app|next-app|expo)\b)',
+        re.IGNORECASE,
+    )
+    _m = _SCAFFOLD_CD_RE.match(cmd)
+    if _m:
+        cmd = cmd[_m.start(1):]
+        log.info(f"Step {step_idx+1}: Stripped dead `cd` prefix from scaffold command")
 
     # ── Idempotency check ──
     # Detect the subproject root early so idempotency checks resolve
@@ -3065,7 +3213,8 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       all_plan_steps=None,
                       kb_context_builder=None,
                       partial_inline_code: dict[str, str] | None = None,
-                      initial_error: str = "") -> tuple[bool, str]:
+                      initial_error: str = "",
+                      intent_spec=None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -3384,7 +3533,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         # Strip protected manifest files (package.json, etc.) to prevent
         # LLM from overwriting them with corrupted versions
-        files = _strip_protected_files(files)
+        files = _strip_protected_files(files, intent_spec=intent_spec)
 
         # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
         content_fixes = getattr(memory, '_content_fixes', None)
@@ -4034,6 +4183,7 @@ _TEST_BUG_PATTERNS = re.compile(
 )
 
 
+
 def _triage_test_failure(error_detail: str, source_summary: str,
                          test_summary: str, llm_client,
                          display: CLIDisplay, step_idx: int) -> str:
@@ -4041,22 +4191,26 @@ def _triage_test_failure(error_detail: str, source_summary: str,
 
     Returns 'TEST_BUG' or 'SOURCE_BUG'.
     """
-    # Fast-path: known patterns that are always test bugs — skip LLM call
+    # Fast-path: known JS/RTL patterns that are unambiguously test bugs
     if _TEST_BUG_PATTERNS.search(error_detail):
         log.info(f"Step {step_idx+1}: Triage result: TEST_BUG (pattern match)")
         return "TEST_BUG"
 
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
-        "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
-        "- TEST_BUG = the test assertion, setup, or import is incorrect (e.g. looking for wrong text/classes)\n"
-        "- SOURCE_BUG = the source code under test has a logic, syntax, "
-        "or implementation error\n\n"
-        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an element "
-        "(text, role, test-id, etc.) or asserts for specific CSS classes/styles that do not "
-        "exist in the provided source code, it is ALMOST ALWAYS a TEST_BUG. The source "
-        "code is the ground truth for content and theme. Do NOT label as SOURCE_BUG just to force "
-        "the source code to match dumb, brittle test assertions or ruin the project aesthetics.\n\n"
+        "Answer with ONLY one word: TEST_BUG, SOURCE_BUG, or CONFIG_BUG\n\n"
+        "- TEST_BUG    = the test assertion, selector, or import is wrong "
+        "(e.g. looking for text/classes that do not match what the source renders)\n"
+        "- SOURCE_BUG  = the source code under test has a logic, syntax, or "
+        "implementation error that the test correctly exposes\n"
+        "- CONFIG_BUG  = the test framework or environment is misconfigured — "
+        "the test cannot even run (e.g. missing jsdom environment so `document` "
+        "is undefined, missing pytest fixture, missing test setup file, wrong "
+        "config key, missing required package for the test runner)\n\n"
+        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an "
+        "element (text, role, test-id, etc.) or asserts specific CSS classes that "
+        "do not exist in the source, it is ALMOST ALWAYS a TEST_BUG — do NOT label "
+        "SOURCE_BUG just to force the source to match brittle assertions.\n\n"
         f"Test output:\n{error_detail[:3000]}\n\n"
     )
     if source_summary:
@@ -4064,7 +4218,7 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     if test_summary:
         triage_prompt += f"Test files:\n{test_summary[:4000]}\n"
 
-    display.step_info(step_idx, "Analyzing failure origin (test vs source)...")
+    display.step_info(step_idx, "Analyzing failure origin (test / source / config)...")
 
     sent_before, recv_before = token_tracker.snapshot()
     response = llm_client.generate_response(triage_prompt).strip().upper()
@@ -4072,6 +4226,9 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     display.step_tokens(step_idx, sent_after - sent_before,
                         recv_after - recv_before)
 
+    if "CONFIG_BUG" in response:
+        log.info(f"Step {step_idx+1}: Triage result: CONFIG_BUG")
+        return "CONFIG_BUG"
     if "SOURCE_BUG" in response:
         log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG")
         return "SOURCE_BUG"
@@ -4089,7 +4246,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       kb_context_builder=None,
                       plan_step=None,
                       all_plan_steps=None,
-                      project_profile=None) -> tuple[bool, str]:
+                      project_profile=None,
+                      intent_spec=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -4483,7 +4641,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             continue
 
         # Strip protected manifest files before they reach memory
-        test_files = _strip_protected_files(test_files)
+        test_files = _strip_protected_files(test_files, intent_spec=intent_spec)
 
         # Apply KB-driven content fixes (e.g. jest-dom → jest-dom/vitest)
         content_fixes = getattr(memory, '_content_fixes', None)
@@ -4728,6 +4886,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     f"{test_path}:\n{current_content[:3000]}\n",
                     coder.llm_client, display, step_idx)
                 is_source_bug = (bug_origin == "SOURCE_BUG")
+                is_config_bug = (bug_origin == "CONFIG_BUG")
 
                 # KB error-fix lookup
                 kb_fix_context = ""
@@ -4753,7 +4912,76 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 if pre_analysis_results:
                     _task_context_header += f"{pre_analysis_results}\n\n"
 
-                if is_source_bug:
+                if is_config_bug:
+                    # ── CONFIG_BUG: fix the test environment config ──────────
+                    # Find the vitest/vite config file in memory or on disk
+                    display.step_info(
+                        step_idx, "Config bug — fixing vitest/vite environment config...")
+                    _cfg_candidates = [
+                        "vitest.config.js", "vitest.config.ts",
+                        "vite.config.js", "vite.config.ts",
+                    ]
+                    subproject = _detect_subproject_root(memory)
+                    _cfg_paths = []
+                    for _cn in _cfg_candidates:
+                        for _pfx in ([f"{subproject}/{_cn}"] if subproject else []) + [_cn]:
+                            _cfg_paths.append(_pfx)
+
+                    _cfg_file = ""
+                    _cfg_path = ""
+                    for _cp in _cfg_paths:
+                        _cfg_file = memory.get(_cp) or ""
+                        if not _cfg_file:
+                            try:
+                                with open(_cp, "r", encoding="utf-8", errors="replace") as _cf:
+                                    _cfg_file = _cf.read()
+                            except OSError:
+                                pass
+                        if _cfg_file:
+                            _cfg_path = _cp
+                            break
+
+                    _cfg_ctx = (
+                        f"#### [FILE]: {_cfg_path}\n```js\n{_cfg_file}\n```\n\n"
+                        if _cfg_file and _cfg_path
+                        else f"(no vitest/vite config found — create one)\n\n"
+                    )
+                    fix_ctx = (
+                        f"{_task_context_header}"
+                        f"ALL tests are failing with:\n{error_detail}\n\n"
+                        f"This is caused by a missing or misconfigured test environment "
+                        f"(jsdom not enabled in vitest/vite config).\n\n"
+                        f"Current config:\n{_cfg_ctx}"
+                        f"Test runner: vitest\n"
+                    )
+                    fix_prompt = (
+                        f"Fix the vitest/vite configuration so tests run in a jsdom "
+                        f"browser-like environment.\n"
+                        f"Required: add `test: {{ environment: 'jsdom', globals: true, "
+                        f"setupFiles: './vitest.setup.js' }}` (or equivalent) to the config.\n"
+                        f"Return the corrected config file using #### [FILE]: format.\n"
+                        f"Do NOT modify test files or source files."
+                    )
+                    sent_before, recv_before = token_tracker.snapshot()
+                    fix_response = coder.process(
+                        fix_prompt, context=fix_ctx, language=language)
+                    sent_after, recv_after = token_tracker.snapshot()
+                    display.step_tokens(step_idx,
+                                        sent_after - sent_before,
+                                        recv_after - recv_before)
+                    fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    if fix_files:
+                        if subproject:
+                            fix_files = _prefix_subproject_paths(fix_files, subproject, memory)
+                        executor.write_files(fix_files)
+                        memory.update(fix_files)
+                        log.info("Step %d: CONFIG_BUG fix applied: %s",
+                                 step_idx + 1, list(fix_files.keys()))
+                    continue  # re-run the test file after config fix
+
+                elif is_source_bug:
                     display.step_info(
                         step_idx,
                         f"Bug in SOURCE for {f_basename}, fixing source...")
@@ -4850,7 +5078,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     if not fix_files:
                         fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
-                    fix_files = _strip_protected_files(fix_files)
+                    fix_files = _strip_protected_files(fix_files, intent_spec=intent_spec)
                     fix_files = _normalize_fix_paths(fix_files, memory)
                     fix_files = _remap_test_to_existing(
                         fix_files, memory,

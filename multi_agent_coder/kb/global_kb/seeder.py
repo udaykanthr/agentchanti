@@ -2822,6 +2822,92 @@ expect(nav).toHaveClass('-translate-x-full')
 expect(nav).toHaveClass('md:flex')
 expect(nav).not.toHaveClass('hidden')
 ```
+
+## Rule 17: NEVER use `document.getElementById` in @testing-library tests
+
+`@testing-library/react`'s `render()` renders into a temporary `<div>` container that
+is NOT `#root`. `document.getElementById('root')` always returns `null` in tests.
+
+**WRONG — always null, test will fail at `toBeTruthy()`:**
+```js
+render(<App />)
+const root = document.getElementById('root')
+expect(root).toBeTruthy()  // FAILS — root is null
+```
+
+**CORRECT — use screen queries or container from render:**
+```js
+const { container } = render(<App />)
+// Option A: assert on visible content
+expect(screen.getByRole('main')).toBeInTheDocument()
+
+// Option B: assert on the render container itself
+expect(container.firstChild).toBeInTheDocument()
+```
+
+## Rule 18: `toHaveClass()` MUST be called with at least one class name argument
+
+Calling `toHaveClass()` with **zero arguments** throws a hard error in
+`@testing-library/jest-dom` v6+:
+
+```
+Error: toHaveClass must be called with at least one argument
+```
+
+This often appears as a meaningless assertion like:
+```js
+expect(document.body).toHaveClass()  // ← WRONG — always throws
+```
+
+**CORRECT — always pass the expected class name:**
+```js
+expect(document.body).toHaveClass('some-class')  // specific assertion
+// OR — if you only want to confirm the element is in the document, use:
+expect(document.body).toBeInTheDocument()
+```
+
+If you were trying to assert that opening a modal does *something* to the body
+(e.g. adds a scroll-lock class), verify which class the component actually adds
+and assert on that. If no class is added, remove the assertion entirely.
+
+## Rule 19: Slide-over panels render in the DOM even when visually hidden
+
+Components that use CSS transforms (e.g. Tailwind's `translate-x-full`) or opacity
+to "hide" panels keep those elements in the DOM at all times. This means:
+
+- `getByText('Brand')` will find BOTH the desktop brand link AND the mobile panel title
+- `getByRole('navigation')` may find BOTH the desktop nav AND the mobile nav panel
+
+**WRONG — fails when desktop and mobile both render the same text:**
+```js
+// Header renders brand in desktop <a> AND mobile <aside> (both inside <header>)
+screen.getByText('ColorWave')  // Error: Found multiple elements with text 'ColorWave'
+
+// ALSO WRONG — within(banner) still finds both when the mobile aside is inside <header>
+const header = screen.getByRole('banner')
+within(header).getByText('ColorWave')  // STILL finds two — aside is inside <header>!
+```
+
+**CORRECT — use role-based query or getAllByText:**
+```js
+// 1. BEST: Use getByRole('link') to target the desktop brand anchor specifically
+//    The mobile panel title is a <span>, not an <a> — roles distinguish them
+screen.getByRole('link', { name: 'ColorWave' })
+
+// 2. Or use getAllByText and assert count when both occurrences are expected
+const allBrand = screen.getAllByText('ColorWave')
+expect(allBrand.length).toBeGreaterThanOrEqual(1)
+
+// 3. For mobile-panel-specific assertions, scope to the mobile panel element directly
+//    (e.g. by its id or data-testid, NOT by getByRole('banner'))
+const mobileMenu = document.querySelector('[data-testid="mobile-menu"]')
+//    or: const mobileMenu = container.querySelector('#mobile-menu')
+expect(within(mobileMenu).getByText('ColorWave')).toBeInTheDocument()
+```
+
+**Key insight:** `within(header)` / `within(banner)` does NOT help when the mobile
+slide-over `<aside>` is rendered inside the `<header>` tag — it will still find all
+occurrences of the text in both desktop and mobile elements.
 """,
     },
     "react-export-default-instructions.md": {

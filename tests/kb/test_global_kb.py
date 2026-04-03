@@ -272,7 +272,7 @@ class TestSeeder(unittest.TestCase):
         summary = seed(embed=False, base_dir=self.tmpdir)
 
         # Check errors.db was populated
-        self.assertEqual(summary["errors_seeded"], 74)
+        self.assertEqual(summary["errors_seeded"], 79)
         self.assertGreaterEqual(summary["content_fixes_seeded"], 1)
         self.assertEqual(summary["docs_seeded"], 18)  # 3+2+5+4
         self.assertEqual(summary["chunks_embedded"], 0)
@@ -283,7 +283,7 @@ class TestSeeder(unittest.TestCase):
         counts = edict.count_by_language()
         expected_per_lang = {
             "python": 16,  # 13 base + 2 django (DjangoTemplateDoesNotExistWrongSettings, DjangoStaticfilesDirsNotExist) + 1 added by user
-            "javascript": 30,  # 5 base + 2 npm + 5 react-testing + 1 waitFor-assumed-content + 1 nested-router + 1 assumed-aria + 1 queryByRole-null + 1 rerender-memoryrouter + 2 vitest + 1 no-suite + 1 vite-resolve + 1 component-type-invalid + 1 suspense-fallback-sync-query + 1 empty-root + 1 css-brittle
+            "javascript": 35,  # 5 base + 2 npm + 5 react-testing + 1 waitFor-assumed-content + 1 nested-router + 1 assumed-aria + 1 queryByRole-null + 1 rerender-memoryrouter + 2 vitest + 1 no-suite + 1 vite-resolve + 1 component-type-invalid + 1 suspense-fallback-sync-query + 1 empty-root + 1 css-brittle + 5 new
             "typescript": 5, "java": 5, "go": 5, "rust": 5, "csharp": 5,
         }
         for lang, expected in expected_per_lang.items():
@@ -583,7 +583,7 @@ class TestUpdaterClean(unittest.TestCase):
 
         clean(base_dir=self.tmpdir)
         summary = seed(embed=False, base_dir=self.tmpdir)
-        self.assertEqual(summary["errors_seeded"], 74)
+        self.assertEqual(summary["errors_seeded"], 79)
         self.assertGreaterEqual(summary["docs_seeded"], 1)
 
 

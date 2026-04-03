@@ -687,6 +687,13 @@ class ChunkEditor:
                         resolved_start = i + 1  # 1-indexed
                         resolved_end = resolved_start + edit_span - 1
                         resolved_end = min(resolved_end, total_lines)
+                        # If the original edit was meant to reach the end of
+                        # the file (line_end >= total_lines - 2) and our
+                        # content-aligned end falls short, extend it to cover
+                        # all remaining lines.  Without this, lines beyond
+                        # resolved_end are left as orphan duplicates.
+                        if edit.line_end >= total_lines - 2:
+                            resolved_end = total_lines
                         logger.info(
                             "[ChunkEditor] Content-aligned edit (no chunk "
                             "match) for %s:%s: %d-%d → %d-%d "

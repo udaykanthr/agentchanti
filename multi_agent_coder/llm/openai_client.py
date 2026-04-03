@@ -58,7 +58,7 @@ class OpenAIClient(LLMClient):
         log.debug(f"[OpenAI] Usage: prompt={prompt_tokens} completion={completion_tokens}")
 
         response_text = data["choices"][0]["message"]["content"]
-        log.debug(f"[OpenAI] Response:\n{response_text}")
+        log.debug(f"[OpenAI] Response:\n{completion_tokens}")
         return response_text
 
     # ── Streaming generation ──
@@ -120,7 +120,7 @@ class OpenAIClient(LLMClient):
             model_name=self.model,
         )
         log.debug(f"[OpenAI] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
-        log.debug(f"[OpenAI] Response:\n{result}")
+        log.debug(f"[OpenAI] Response:\n{completion_tokens}")
 
         if self._stream_callback:
             self._stream_callback(tokens_generated)

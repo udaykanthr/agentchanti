@@ -1335,9 +1335,11 @@ def run_dependency_check(
         for gap in gaps
     )
 
-    # Build set of files protected by pending inline_edits in future plan steps.
-    # DepCheck must not overwrite a file that a later planned step will edit
-    # surgically — doing so corrupts the FIND anchor the planner relies on.
+    # Build set of files protected by pending plan steps.
+    # DepCheck must not overwrite a file that a later planned step will write
+    # (either via inline_edits or as a full-file target) — doing so clobbers
+    # content the planner already decided on, causing race-condition corruption
+    # when multiple CODE steps execute in the same parallel wave.
     _pending_inline_targets: set[str] = set()
     if all_plan_steps:
         for _ps in all_plan_steps:
@@ -1366,6 +1368,14 @@ def run_dependency_check(
         ):
             _logger.debug(
                 "[DepCheck] Skipping fix for '%s' — protected by pending inline_edit", fpath
+            )
+            continue
+        # Never regenerate an existing tool-config file — DepCheck has no KB
+        # context to reproduce version-specific syntax (e.g. Tailwind v4 vs v3,
+        # Vite vs Vitest config). If the LLM erroneously emits one, discard it.
+        if _is_tool_config_file(norm_matched) and matched in memory_files:
+            _logger.debug(
+                "[DepCheck] Skipping fix for existing tool config '%s'", fpath
             )
             continue
         # Tier 1: gap source/target

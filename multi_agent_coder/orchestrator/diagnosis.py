@@ -24,7 +24,8 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       language: str | None = None,
                       previous_diagnosis: str | None = None,
                       kb_context_builder=None,
-                      error_route=None) -> str:
+                      error_route=None,
+                      intent_spec=None) -> str:
     display.step_info(step_idx, "Analyzing failure root cause...")
 
     # ── KB error-fix lookup using actual error output ────
@@ -115,10 +116,19 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"{_diag_briefing}\n\n"
     ) if _diag_briefing else ""
 
+    _intent_block = ""
+    if intent_spec is not None and intent_spec.constraints:
+        _intent_block = (
+            "INTENT CONSTRAINTS (from requirements analysis — respect these when fixing):\n"
+            + "\n".join(f"- {c}" for c in intent_spec.constraints)
+            + "\n\n"
+        )
+
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
         "Analyze the failure and provide a concrete fix.\n\n"
         f"{_briefing_block}"
+        f"{_intent_block}"
         "CRITICAL: Do NOT remove, comment out, or skip the feature/component that is failing. "
         "Fix the root cause instead.\n\n"
         f"Step {step_idx+1}: {step_text}\n"

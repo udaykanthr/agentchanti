@@ -192,7 +192,10 @@ def _extract_project_name_from_text(text: str) -> str | None:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
-            if name.lower() not in ('the', 'a', 'an', 'new', 'project', 'app', 'name'):
+            if name.lower() not in ('the', 'a', 'an', 'new', 'project', 'app', 'name',
+                                    'from', 'for', 'in', 'of', 'at', 'by', 'to',
+                                    'with', 'on', 'is', 'are', 'its', 'this',
+                                    'exact', 'given', 'task', 'my', 'your'):
                 return name.lower().replace('_', '-')
     return None
 

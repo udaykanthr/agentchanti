@@ -33,7 +33,10 @@ from ..report import generate_html_report, StepReport
 from ..plugins.registry import PluginRegistry
 
 from .memory import FileMemory
-from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .pipeline import (
+    build_step_waves, _execute_step, _run_diagnosis_loop,
+    run_wiring_verification,
+)
 from .plan_step import build_waves as _build_plan_waves
 from ..agents.analyser import build_project_context, AnalyseAgent, parse_briefing_packages
 
@@ -493,7 +496,7 @@ def main():
                            "Create a step-by-step plan for the coding task and related testcases.",
                            _make_llm_for_agent("planner"),
                            prompt_suffix=planner_suffix)
-    from ..agents.intent import IntentAgent
+    from ..agents.intent import IntentAgent, parse_intent_spec
     intent_agent = IntentAgent("IntentAnalyzer", "Requirements Analyst",
                                "Analyze the prompt and search the web if intent is ambiguous to produce a formal REQUIREMENTS_SPEC.",
                                _make_llm_for_agent("intent"))
@@ -691,6 +694,7 @@ def main():
 
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
+        intent_spec = parse_intent_spec(args.task)
 
         # ── Filtered KB injection ─────────────────────────────────────────────
         # Parse "KB topics:" from the REQUIREMENTS_SPEC the IntentAgent just
@@ -1090,6 +1094,7 @@ def main():
                 project_context=project_context,
                 plan_step=_ps,
                 all_plan_steps=plan_steps_parsed,
+                intent_spec=intent_spec,
             )
 
             if success:
@@ -1121,6 +1126,7 @@ def main():
                     project_context=project_context,
                     plan_step=_ps,
                     all_plan_steps=plan_steps_parsed,
+                    intent_spec=intent_spec,
                 )
                 if fixed:
                     display.complete_step(idx, "done")
@@ -1168,6 +1174,7 @@ def main():
                         project_context=project_context,
                         plan_step=_ps,
                         all_plan_steps=plan_steps_parsed,
+                        intent_spec=intent_spec,
                     )
                     futures[f] = idx
 
@@ -1211,6 +1218,7 @@ def main():
                     project_context=project_context,
                     plan_step=_ps,
                     all_plan_steps=plan_steps_parsed,
+                    intent_spec=intent_spec,
                 )
                 if fixed:
                     display.complete_step(idx, "done")
@@ -1257,6 +1265,26 @@ def main():
         if not verif_ok:
             pipeline_success = False
             log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
+
+    # ── 13.6. Wiring verification ──
+    # One LLM call that checks all fix-scope files together for cross-file
+    # integration issues (entry-point mounts, import/export mismatches, etc.).
+    # Resolves files not in memory via disk read → glob → KB semantic search.
+    if pipeline_success and cfg.WIRING_VERIFICATION_ENABLED:
+        import os as _os
+        wv_ok, wv_err = run_wiring_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            task=args.task,
+            language=language,
+            cfg=cfg,
+            kb_context_builder=kb_context_builder,
+            project_root=_os.getcwd(),
+        )
+        if not wv_ok:
+            log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

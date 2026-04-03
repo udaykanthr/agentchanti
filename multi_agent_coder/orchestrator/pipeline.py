@@ -81,6 +81,19 @@ _SOURCE_EXTS = frozenset({
     ".go", ".rb", ".java", ".rs", ".cs", ".cpp", ".c", ".php",
 })
 
+# ── Wiring verification: fix scope parsing ────────────────────────────────
+# Matches a "Fix scope:" section in the task description.
+_FIX_SCOPE_SECTION_RE = re.compile(
+    r'fix\s+scope\s*:?\s*(.+?)(?=\nDo not touch:|\nConstraints:|\nInterface|\nKB topics:|\Z)',
+    re.IGNORECASE | re.DOTALL,
+)
+# Matches backtick-quoted strings that look like file paths.
+_BACKTICK_PATH_RE = re.compile(r'`([^`]+\.[a-zA-Z]{1,6}[^`]*)`')
+# Matches bare file names with common source/config extensions.
+_BARE_FILENAME_RE = re.compile(
+    r'\b([\w.\-/]+\.(?:jsx|tsx|js|ts|mjs|cjs|py|css|html|json|go|rb|rs|java|cs|vue|svelte))\b'
+)
+
 def _is_test_file(file_path: str) -> bool:
     """Return True if *file_path* looks like a test file."""
     import os
@@ -382,6 +395,26 @@ def _generate_test_coverage_for_inline_changes(
                 f"```{lang_tag}\n{old_content}\n```\n\n"
             )
 
+        # Detect subproject CWD: if source and test share a common top-level
+        # directory (e.g. responsive-web-page/), the test runner's CWD when
+        # invoked as `cd {subproject} && npm test` is already that directory.
+        # process.cwd() calls inside the test must NOT re-include the prefix.
+        _subproject_note = ""
+        _src_parts = src_path_norm.split("/")
+        if len(_src_parts) > 1:
+            _subproject = _src_parts[0]
+            _target_norm = target_test_path.replace("\\", "/")
+            if _target_norm.startswith(_subproject + "/"):
+                _subproject_note = (
+                    f"\n\nIMPORTANT — Subproject CWD: This test runs inside the "
+                    f"`{_subproject}/` directory (vitest/jest CWD when npm test "
+                    f"is run as `cd {_subproject} && npm test`). "
+                    f"Do NOT prefix file paths with `{_subproject}/` in "
+                    f"`process.cwd()` calls.\n"
+                    f"CORRECT: `resolve(process.cwd(), 'vitest.config.js')`\n"
+                    f"WRONG:   `resolve(process.cwd(), '{_subproject}/vitest.config.js')`\n"
+                )
+
         prompt = (
             f"Source file `{src_path}` was just written/updated and has "
             f"no corresponding test step in the plan.\n\n"
@@ -393,7 +426,8 @@ def _generate_test_coverage_for_inline_changes(
             f"Requirements:\n"
             f"- Target file: `{target_test_path}`\n"
             f"- Do NOT remove existing tests\n"
-            f"- Only test observable behaviour, not implementation details\n\n"
+            f"- Only test observable behaviour, not implementation details\n"
+            f"{_subproject_note}\n"
             f"Output ONLY the complete test file:\n"
             f"#### [FILE]: {target_test_path}\n```{lang_tag}\n...full content...\n```"
         )
@@ -467,6 +501,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                   project_context=None,
                   plan_step: PlanStep | None = None,
                   all_plan_steps: list[PlanStep] | None = None,
+                  intent_spec=None,
                   ) -> tuple[int, bool, str]:
     """Execute a single step. Returns ``(step_idx, success, error_info)``.
 
@@ -758,7 +793,7 @@ def _execute_step(step_idx: int, step_text: str, *,
             success, error_info = _handle_cmd_step(
                 step_text, executor, llm_client, memory, display, step_idx,
                 language=language, project_context=project_context,
-                plan_step=plan_step)
+                plan_step=plan_step, intent_spec=intent_spec)
 
         elif step_type == "CODE":
             # ── Inline edit fast path ──
@@ -995,6 +1030,17 @@ def _execute_step(step_idx: int, step_text: str, *,
                     and len(plan_step.inline_code) > 0):
                 display.step_info(step_idx, "Writing inline code from plan (0 LLM calls)")
                 _inline_files = dict(plan_step.inline_code)
+                # Resolve <project-name> and similar placeholder tokens that the
+                # planner may have left in file path keys (e.g. when a dumb LLM
+                # outputs "target: <project-name>/src/App.jsx").  The same logic
+                # used for CMD placeholders is applied to path strings.
+                from .classification import resolve_cmd_placeholders as _resolve_ph
+                _ph_task = task or ''
+                if any('<' in k for k in _inline_files):
+                    _inline_files = {
+                        _resolve_ph(k, step_text=step_text, task=_ph_task): v
+                        for k, v in _inline_files.items()
+                    }
                 _inline_subproject = _detect_subproject_root(memory)
                 # Fallback: if memory-based detection failed (e.g. no source
                 # files in memory yet, so _detect_subproject_root bails early),
@@ -1090,6 +1136,27 @@ def _execute_step(step_idx: int, step_text: str, *,
                             "[Inline] Content fixes checked — "
                             "no corrections needed"
                         )
+
+                # ── BrowserRouter injection (for inline main.jsx/index.jsx) ──
+                # When the planner bakes inline code for the entry-point file but
+                # omits BrowserRouter while other files use Link/NavLink, the app
+                # crashes at runtime.  Detect and patch deterministically here
+                # (same zero-LLM approach as content fixes).
+                from .step_handlers import _inject_browser_router_if_needed
+                _br_fixed = _inject_browser_router_if_needed(_inline_files, memory)
+                _br_changed = [
+                    p for p in _inline_files
+                    if _br_fixed.get(p) != _inline_files.get(p)
+                ]
+                if _br_changed:
+                    executor.write_files({p: _br_fixed[p] for p in _br_changed})
+                    memory.update({p: _br_fixed[p] for p in _br_changed})
+                    _inline_files = _br_fixed
+                    display.step_info(
+                        step_idx,
+                        f"[Inline] BrowserRouter injected into "
+                        f"{', '.join(p.rsplit('/', 1)[-1] for p in _br_changed)}",
+                    )
 
                 # ── Inline code quality gate (Phase 1) ──
                 # The planner wrote this code WITH full KB context, so it is
@@ -1191,6 +1258,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 f"Syntax/lint errors in the inline-edited file "
                                 f"— fix these:\n{_inline_static_errs}"
                             ),
+                            intent_spec=intent_spec,
                         )
                     else:
                         # Tier C: Existing-file rewrite — run Reviewer when in
@@ -1302,6 +1370,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     plan_step=plan_step,
                                     all_plan_steps=all_plan_steps,
                                     kb_context_builder=kb_context_builder,
+                                    intent_spec=intent_spec,
                                 )
                         else:
                             # Tier D: Static clean, no existing-file rewrite
@@ -1413,6 +1482,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         all_plan_steps=all_plan_steps,
                         kb_context_builder=kb_context_builder,
                         partial_inline_code=_partial,
+                        intent_spec=intent_spec,
                     )
 
         elif step_type == "TEST":
@@ -1487,7 +1557,8 @@ def _execute_step(step_idx: int, step_text: str, *,
                     kb_context_builder=kb_context_builder,
                     plan_step=plan_step,
                     all_plan_steps=all_plan_steps,
-                    project_profile=project_profile)
+                    project_profile=project_profile,
+                    intent_spec=intent_spec)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
@@ -1597,6 +1668,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         project_context=None,
                         plan_step: PlanStep | None = None,
                         all_plan_steps: list[PlanStep] | None = None,
+                        intent_spec=None,
                         ) -> bool:
     """Run diagnose → fix → retry loop. Returns ``True`` if the step was fixed.
 
@@ -1667,7 +1739,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 search_agent=search_agent, language=language,
                 previous_diagnosis=last_diagnosis_content,
                 kb_context_builder=kb_context_builder,
-                error_route=error_route)
+                error_route=error_route,
+                intent_spec=intent_spec)
 
             # Extract the original failing command from error_info so
             # _apply_fix can filter it out (prevents re-running the same
@@ -1769,6 +1842,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 project_context=project_context,
                 plan_step=plan_step,
                 all_plan_steps=all_plan_steps,
+                intent_spec=intent_spec,
             )
 
             if success:
@@ -2395,11 +2469,17 @@ def _parse_failed_test_files(
     from .step_handlers import _ANSI_RE
     clean = _ANSI_RE.sub('', output)
     failed: list[str] = []
-    failed_set: set[str] = set()
+    # Normalize to forward-slashes so mixed-separator duplicates are caught
+    # (e.g. "foo/bar.jsx" and "foo\bar.jsx" refer to the same file on Windows).
+    failed_set: set[str] = set()  # stores normalized paths
+
+    def _norm(p: str) -> str:
+        return p.replace("\\", "/")
 
     for fpath in known_test_files:
         basename = fpath.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
         stem = basename[:-3] if basename.endswith(".py") else basename
+        norm_fpath = _norm(fpath)
 
         # vitest/jest:  " FAIL src/__tests__/Foo.test.jsx"
         # pytest:       "FAILED tests/test_foo.py::test_bar"
@@ -2408,9 +2488,9 @@ def _parse_failed_test_files(
             clean,
             re.MULTILINE | re.IGNORECASE,
         ):
-            if fpath not in failed_set:
+            if norm_fpath not in failed_set:
                 failed.append(fpath)
-                failed_set.add(fpath)
+                failed_set.add(norm_fpath)
             continue
 
         # Django manage.py test:
@@ -2421,16 +2501,16 @@ def _parse_failed_test_files(
             clean,
             re.MULTILINE | re.IGNORECASE,
         ):
-            if fpath not in failed_set:
+            if norm_fpath not in failed_set:
                 failed.append(fpath)
-                failed_set.add(fpath)
+                failed_set.add(norm_fpath)
 
     # Also resolve Django module paths to actual files on disk — catches
     # failures in pre-existing test files not written during this session.
     for extra in _resolve_django_failed_files(output, subproject_cwd):
-        if extra not in failed_set:
+        if _norm(extra) not in failed_set:
             failed.append(extra)
-            failed_set.add(extra)
+            failed_set.add(_norm(extra))
 
     # Fallback: if we couldn't identify specific files but tests failed,
     # treat all known test files as candidates
@@ -2494,11 +2574,17 @@ def run_bulk_test_execution_and_fix(
                 _step_kb_docs[_tf] = _declared
 
     all_files = memory.all_files()
-    test_files = {
-        fpath: content
-        for fpath, content in all_files.items()
-        if _is_test_file(fpath) and not fpath.startswith("_")
-    }
+    # Deduplicate test files by normalized path — mixed separators (foo/bar vs foo\bar)
+    # can produce the same basename twice, causing double-processing of one file.
+    _seen_norm: set[str] = set()
+    test_files: dict[str, str] = {}
+    for fpath, content in all_files.items():
+        if not (_is_test_file(fpath) and not fpath.startswith("_")):
+            continue
+        _np = fpath.replace("\\", "/")
+        if _np not in _seen_norm:
+            _seen_norm.add(_np)
+            test_files[fpath] = content
 
     if not test_files:
         _logger.info("[BulkTest] No test files found — skipping bulk run.")
@@ -3017,6 +3103,16 @@ def run_bulk_test_execution_and_fix(
                             f"implementation actually does. Do NOT remove any tests — "
                             f"update expected values, selectors, or text to match "
                             f"reality.\n\n"
+                            "IMPORTANT GUIDELINES for the rewrite:\n"
+                            "- If a test asserts an exact library-internal string (e.g. a "
+                            "plugin name like `'vite:react-babel'`, an internal key, or an "
+                            "internal version string), use a flexible matcher instead: "
+                            "`includes('react')`, `startsWith('vite:')`, or `toContain()`. "
+                            "Exact internal names change across library versions.\n"
+                            "- For assertions on DOM text or component output, copy the "
+                            "exact string from the source/template into the test.\n"
+                            "- Do NOT change what is being tested — only update the "
+                            "expected values to match what the code actually produces.\n\n"
                             f"Current test file:\n"
                             f"#### [FILE]: {test_path}\n"
                             f"```{lang_tag}\n{_rw_content}\n```\n\n"
@@ -3319,3 +3415,315 @@ def run_bulk_test_execution_and_fix(
     _logger.warning("[BulkTest] Final run-all failed:\n%s", output_final[:600])
     print("  [BulkTest] FAILED — some tests still failing after fixes.")
     return False, error_msg
+
+
+# ---------------------------------------------------------------------------
+# Wiring verification — cross-file integration check after all steps complete
+# ---------------------------------------------------------------------------
+
+def _parse_fix_scope(task: str) -> tuple[list[str], list[str]]:
+    """Parse fix scope file references from the task description.
+
+    Looks for a ``Fix scope:`` section, then extracts:
+    - backtick-quoted paths / filenames  → *exact_paths*
+    - remaining natural-language text    → *nl_queries* (for KB semantic search)
+
+    Returns ``(exact_paths, nl_queries)``.
+    """
+    # Narrow to "Fix scope:" section when present; otherwise scan full task.
+    m = _FIX_SCOPE_SECTION_RE.search(task)
+    scope_text = m.group(1) if m else task
+
+    exact_paths: list[str] = []
+    seen: set[str] = set()
+
+    # 1. Backtick-quoted paths/names
+    for bm in _BACKTICK_PATH_RE.finditer(scope_text):
+        p = bm.group(1).strip()
+        if p and p not in seen:
+            exact_paths.append(p)
+            seen.add(p)
+
+    # 2. Bare file names not already captured
+    for bm in _BARE_FILENAME_RE.finditer(scope_text):
+        p = bm.group(1).strip()
+        if p not in seen:
+            exact_paths.append(p)
+            seen.add(p)
+
+    # 3. Remaining text as NL query (strip captured paths, collapse whitespace)
+    nl_text = _BACKTICK_PATH_RE.sub('', scope_text)
+    nl_text = _BARE_FILENAME_RE.sub('', nl_text)
+    nl_text = re.sub(r'[\s,;()]+', ' ', nl_text).strip()
+    nl_queries = [nl_text] if len(nl_text) > 20 else []
+
+    return exact_paths, nl_queries
+
+
+def _resolve_fix_scope_files(
+    exact_paths: list[str],
+    nl_queries: list[str],
+    memory: FileMemory,
+    kb_context_builder=None,
+    project_root: str = "",
+) -> dict[str, str]:
+    """Resolve fix-scope entries to ``{path: content}``.
+
+    Fallback chain per entry:
+    1. FileMemory exact key match
+    2. FileMemory basename / suffix match
+    3. Disk read  (file exists, was not modified this session)
+    4. Filesystem glob  (``**/<basename>``)
+    5. KB semantic search  (when *kb_context_builder* is available)
+
+    Files from steps 3-5 are included as read-only context — they are NOT
+    added to FileMemory so that the written-files audit trail stays clean.
+    """
+    import glob as _glob
+    import os as _os
+
+    root = project_root or _os.getcwd()
+
+    def _read_disk(path: str) -> str | None:
+        abs_p = path if _os.path.isabs(path) else _os.path.join(root, path)
+        try:
+            if _os.path.isfile(abs_p):
+                with open(abs_p, encoding="utf-8", errors="replace") as fh:
+                    return fh.read()
+        except OSError:
+            pass
+        return None
+
+    def _glob_search(name: str) -> tuple[str, str] | None:
+        basename = _os.path.basename(name)
+        hits = _glob.glob(_os.path.join(root, "**", basename), recursive=True)
+        for hit in hits:
+            content = _read_disk(hit)
+            if content:
+                rel = _os.path.relpath(hit, root).replace("\\", "/")
+                return rel, content
+        return None
+
+    result: dict[str, str] = {}
+
+    for path in exact_paths:
+        basename = _os.path.basename(path)
+
+        # 1. FileMemory exact
+        content = memory.get(path)
+        if content is not None:
+            result[path] = content
+            continue
+
+        # 2. FileMemory basename / suffix match
+        for stored_path, stored_content in memory.all_files().items():
+            sp_norm = stored_path.replace("\\", "/")
+            p_norm = path.replace("\\", "/")
+            if (sp_norm.endswith(p_norm)
+                    or _os.path.basename(stored_path) == basename):
+                result[stored_path] = stored_content
+                break
+        else:
+            # 3. Disk read
+            content = _read_disk(path)
+            if content is not None:
+                result[path] = content
+            else:
+                # 4. Glob
+                found = _glob_search(path)
+                if found:
+                    result[found[0]] = found[1]
+                else:
+                    # 5. KB semantic search
+                    resolved_via_kb = False
+                    if kb_context_builder is not None:
+                        try:
+                            relevant = kb_context_builder.get_relevant_files(
+                                task_description=f"file {path} {basename}",
+                                max_files=1,
+                            )
+                            for r_path in relevant:
+                                r_content = memory.get(r_path) or _read_disk(r_path)
+                                if r_content:
+                                    result[r_path] = r_content
+                                    resolved_via_kb = True
+                                    break
+                        except Exception as kb_exc:
+                            _logger.debug(
+                                "[WiringVerification] KB search failed for %s: %s",
+                                path, kb_exc,
+                            )
+                    if not resolved_via_kb:
+                        _logger.warning(
+                            "[WiringVerification] Could not resolve: %s — skipping", path
+                        )
+
+    # Natural-language queries → KB semantic search (top-3 files each)
+    for nl_query in nl_queries:
+        if kb_context_builder is not None:
+            try:
+                relevant = kb_context_builder.get_relevant_files(
+                    task_description=nl_query,
+                    max_files=3,
+                )
+                for r_path in relevant:
+                    if r_path not in result:
+                        r_content = memory.get(r_path) or _read_disk(r_path)
+                        if r_content:
+                            result[r_path] = r_content
+            except Exception as exc:
+                _logger.debug(
+                    "[WiringVerification] KB NL query failed (%r): %s", nl_query, exc
+                )
+
+    return result
+
+
+def run_wiring_verification(
+    *,
+    memory: FileMemory,
+    executor,
+    coder,
+    display: "CLIDisplay",
+    task: str,
+    language: str | None,
+    cfg=None,
+    kb_context_builder=None,
+    project_root: str = "",
+) -> tuple[bool, str]:
+    """Cross-file wiring check executed once after all pipeline steps complete.
+
+    Algorithm
+    ---------
+    1. Parse ``Fix scope:`` from the task description to get target files.
+    2. Resolve each target via layered fallback:
+       FileMemory → disk read → filesystem glob → KB semantic search.
+       Files not in FileMemory land in a read-only *verification_context*
+       buffer — they are never written back.
+    3. Make a single LLM call asking for cross-file integration issues
+       (missing mounts, import/export mismatches, wrong prop shapes, etc.).
+    4. If the LLM finds issues, parse code blocks and apply fixes via the
+       executor + memory.  Returns ``(True, "")`` on success.
+    5. If no fix scope is declared in the task, falls back to all session
+       files tracked by FileMemory.
+
+    Always non-fatal on LLM errors — returns ``(True, "")`` rather than
+    blocking the pipeline on a transient failure.
+    """
+    import os as _os
+    from .memory import _should_skip_for_context
+
+    _logger.info("[WiringVerification] Starting cross-file wiring check")
+
+    # ── 1. Parse fix scope ────────────────────────────────────────────────
+    exact_paths, nl_queries = _parse_fix_scope(task)
+
+    # ── 2. Resolve files ──────────────────────────────────────────────────
+    if exact_paths or nl_queries:
+        verification_context = _resolve_fix_scope_files(
+            exact_paths, nl_queries, memory,
+            kb_context_builder=kb_context_builder,
+            project_root=project_root or _os.getcwd(),
+        )
+    else:
+        # No explicit scope — use all session files as a broad check.
+        _logger.info(
+            "[WiringVerification] No fix scope in task — checking all session files"
+        )
+        verification_context = {
+            p: c for p, c in memory.all_files().items()
+            if not _should_skip_for_context(p)
+        }
+
+    if not verification_context:
+        _logger.info("[WiringVerification] No files resolved — skipping")
+        return True, ""
+
+    _logger.info(
+        "[WiringVerification] Resolved %d file(s): %s",
+        len(verification_context), list(verification_context.keys()),
+    )
+
+    # ── 3. Build verification prompt ──────────────────────────────────────
+    lang_tag = language or "code"
+    context_block = "\n\n".join(
+        f"#### [FILE]: {path}\n```{lang_tag}\n{content}\n```"
+        for path, content in verification_context.items()
+    )
+
+    prompt = (
+        f"Task: {task}\n\n"
+        "You are performing a final cross-file wiring review. "
+        "Examine ALL files below together and identify any integration "
+        "issue that would cause a blank screen, runtime crash, or silent "
+        "failure at startup. Common issues to check:\n"
+        "  • Missing ReactDOM.createRoot / wrong entry-point mounting\n"
+        "  • Default-export / named-export mismatch between files\n"
+        "  • Import path typo or missing file extension\n"
+        "  • Component receives wrong prop shape (undefined, wrong type)\n"
+        "  • Undefined variable or missing null-check at render time\n"
+        "  • Module not found (package not imported / wrong casing)\n"
+        "  • Any other wiring issue that prevents the UI from rendering\n\n"
+        f"Files in scope:\n{context_block}\n\n"
+        "RESPONSE FORMAT:\n"
+        "  • If NO issues exist, respond with exactly: NO_ISSUES_FOUND\n"
+        "  • If issues exist, output the COMPLETE fixed content of every "
+        "affected file using:\n"
+        "    #### [FILE]: path/to/file\n"
+        f"    ```{lang_tag}\n"
+        "    // complete file content — never abbreviate\n"
+        "    ```\n"
+        "CRITICAL: Never use `// existing code` or `/* unchanged */` — "
+        "write the full file content or your fix will delete existing code."
+    )
+
+    display.show_status("Verifying cross-file wiring...")
+
+    # ── 4. LLM call ───────────────────────────────────────────────────────
+    try:
+        response = coder.llm_client.generate_response(prompt)
+    except Exception as exc:
+        _logger.warning("[WiringVerification] LLM call failed (non-fatal): %s", exc)
+        return True, ""
+
+    if "NO_ISSUES_FOUND" in response:
+        _logger.info("[WiringVerification] No wiring issues found")
+        print("  [WiringVerify] No cross-file wiring issues found.")
+        return True, ""
+
+    # ── 5. Parse and apply fixes ──────────────────────────────────────────
+    fix_files: dict[str, str] = {}
+    try:
+        fix_files = executor.parse_code_blocks(response)
+    except Exception:
+        pass
+    if not fix_files:
+        try:
+            fix_files = executor.parse_code_blocks_fuzzy(response)
+        except Exception:
+            pass
+
+    if not fix_files:
+        # LLM described an issue in prose but produced no code — log and
+        # treat as informational (don't block the pipeline).
+        _logger.warning(
+            "[WiringVerification] LLM reported issues but no code blocks found; "
+            "review manually:\n%s", response[:400],
+        )
+        return True, ""
+
+    _logger.info(
+        "[WiringVerification] Applying fixes for: %s", list(fix_files.keys())
+    )
+    print(
+        f"  [WiringVerify] Wiring issues found — fixing: "
+        f"{', '.join(fix_files.keys())}"
+    )
+    try:
+        executor.write_files(fix_files)
+        memory.update(fix_files)
+    except Exception as exc:
+        _logger.warning("[WiringVerification] Failed to write fixes: %s", exc)
+        return False, f"[WiringVerification] Fix write failed: {exc}"
+
+    return True, ""
