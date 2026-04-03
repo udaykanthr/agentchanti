@@ -75,7 +75,7 @@ def _make_embed_client():
     from ...config import Config
     cfg = Config.load()
     embed_model = cfg.EMBEDDING_MODEL or cfg.DEFAULT_MODEL
-    provider = cfg.PROVIDER
+    provider = cfg.EMBEDDING_PROVIDER or cfg.PROVIDER
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
