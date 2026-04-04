@@ -887,6 +887,7 @@ def find_gaps(
     step_text: str,
     memory_files: dict[str, str],
     plan_imported_by: dict[str, str] | None = None,
+    pending_target_files: set[str] | None = None,
 ) -> list[IntegrationGap]:
     """Compare before/after snapshots to detect integration gaps.
 
@@ -900,6 +901,10 @@ def find_gaps(
     """
     gaps: list[IntegrationGap] = []
     all_known_files = set(memory_files.keys())
+    # Include files that pending plan steps will create — these are not
+    # broken imports, just files that haven't been written yet.
+    if pending_target_files:
+        all_known_files |= pending_target_files
 
     # ── 1. Orphaned exports ──
     for nf in new_files:
@@ -1270,11 +1275,17 @@ def run_dependency_check(
     # Build plan_imported_by map: source_file → consumer_file (first declared wins)
     # Uses PlanStep.imported_by which is auto-derived from imports_from relationships
     # plus any explicit imported_by: lines the planner wrote.
+    # Also collect pending target files so find_gaps() can suppress false
+    # broken_import gaps for files that a future step will create.
     plan_imported_by: dict[str, str] = {}
+    _pending_targets: set[str] = set()
     if all_plan_steps:
         for ps in all_plan_steps:
             for tf in (ps.target_files or []):
-                session_files.add(tf.replace("\\", "/"))
+                _ntf = tf.replace("\\", "/")
+                session_files.add(_ntf)
+                if ps.status in ("pending", "in_progress"):
+                    _pending_targets.add(_ntf)
             for consumer_file in (ps.imported_by or []):
                 for tf in (ps.target_files or []):
                     norm_tf = tf.replace("\\", "/")
@@ -1287,6 +1298,7 @@ def run_dependency_check(
         gaps = find_gaps(
             dep_before, dep_after, new_files, step_text, memory_files,
             plan_imported_by=plan_imported_by or None,
+            pending_target_files=_pending_targets or None,
         )
     except Exception as exc:
         _logger.warning("[DepCheck] Gap detection failed: %s", exc)
@@ -1373,15 +1385,23 @@ def run_dependency_check(
 
     # Build set of files protected by pending plan steps.
     # DepCheck must not overwrite a file that a later planned step will write
-    # (either via inline_edits or as a full-file target) — doing so clobbers
+    # (via inline_edits, inline_code, or as a target_file) — doing so clobbers
     # content the planner already decided on, causing race-condition corruption
     # when multiple CODE steps execute in the same parallel wave.
+    # A common case: main.jsx imports ./index.css which doesn't exist yet, but
+    # step 2.2 will write the correct Tailwind v4 content.  Without this guard
+    # DepCheck's LLM generates old Tailwind v3 directives that overwrite the
+    # planner's correct version.
     _pending_inline_targets: set[str] = set()
     if all_plan_steps:
         for _ps in all_plan_steps:
             if _ps.status in ("pending", "in_progress"):
                 for _ef in (_ps.inline_edits or {}).keys():
                     _pending_inline_targets.add(_ef.replace("\\", "/"))
+                for _tf in (_ps.target_files or []):
+                    _pending_inline_targets.add(_tf.replace("\\", "/"))
+                for _ic in (_ps.inline_code or {}).keys():
+                    _pending_inline_targets.add(_ic.replace("\\", "/"))
 
     validated: dict[str, str] = {}
     for fpath, content in fix_files.items():
@@ -1403,7 +1423,7 @@ def run_dependency_check(
             )
         ):
             _logger.debug(
-                "[DepCheck] Skipping fix for '%s' — protected by pending inline_edit", fpath
+                "[DepCheck] Skipping fix for '%s' — protected by pending plan step", fpath
             )
             continue
         # Never regenerate an existing tool-config file — DepCheck has no KB

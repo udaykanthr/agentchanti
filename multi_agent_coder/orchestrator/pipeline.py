@@ -1643,44 +1643,74 @@ def _execute_step(step_idx: int, step_text: str, *,
                     for path, content in _inline_test_files.items()
                 }
 
-                executor.write_files(_inline_test_files)
-                memory.update(_inline_test_files)
-                display.step_tokens(step_idx, 0, 0)
-                _logger.info(
-                    "[PlanStep] Inline test code: wrote %d file(s) for step %s: %s",
-                    len(_inline_test_files), plan_step.id,
-                    list(_inline_test_files.keys()),
-                )
+                # Gate: syntax validation before writing inline test code.
+                # Mirrors the Tier B lint check on the CODE inline path —
+                # catches truncated files (missing `}`), bad JSX, etc. and
+                # falls back to the Tester LLM to regenerate from scratch.
+                from .step_handlers import _quick_offline_lint
+                _inline_test_lint = _quick_offline_lint(_inline_test_files)
+                if _inline_test_lint:
+                    _logger.warning(
+                        "[Inline/test] Syntax errors in step %s — "
+                        "falling back to Tester LLM: %s",
+                        plan_step.id if plan_step else step_idx,
+                        _inline_test_lint[:300],
+                    )
+                    display.step_info(
+                        step_idx,
+                        "[Inline/test] Syntax errors found — falling back to Tester LLM",
+                    )
+                    # Clear inline code so the else branch runs _handle_test_step
+                    plan_step.inline_code.clear()
+                    success, error_info = _handle_test_step(
+                        step_text, tester, coder, reviewer, executor,
+                        task, memory, display, step_idx, language=language,
+                        auto=auto, search_agent=search_agent,
+                        project_context=project_context,
+                        kb_context_builder=kb_context_builder,
+                        plan_step=plan_step,
+                        all_plan_steps=all_plan_steps,
+                        project_profile=project_profile,
+                        intent_spec=intent_spec)
+                else:
+                    executor.write_files(_inline_test_files)
+                    memory.update(_inline_test_files)
+                    display.step_tokens(step_idx, 0, 0)
+                    _logger.info(
+                        "[PlanStep] Inline test code: wrote %d file(s) for step %s: %s",
+                        len(_inline_test_files), plan_step.id,
+                        list(_inline_test_files.keys()),
+                    )
 
-                # Deterministic KB content-fix gate (e.g. jest-dom → jest-dom/vitest)
-                from .step_handlers import _apply_content_fixes as _acf_test
-                _cf_test = getattr(memory, "_content_fixes", None)
-                if _cf_test:
-                    _fixed_test = _acf_test(_inline_test_files, _cf_test)
-                    _changed_test = [
-                        p for p in _inline_test_files
-                        if _fixed_test.get(p) != _inline_test_files.get(p)
-                    ]
-                    if _changed_test:
-                        executor.write_files(
-                            {p: _fixed_test[p] for p in _changed_test})
-                        memory.update(
-                            {p: _fixed_test[p] for p in _changed_test})
-                        display.step_info(
-                            step_idx,
-                            f"[Inline/test] Content fixes applied to "
-                            f"{len(_changed_test)} file(s)",
-                        )
+                    # Deterministic KB content-fix gate (e.g. jest-dom → jest-dom/vitest)
+                    from .step_handlers import _apply_content_fixes as _acf_test
+                    _cf_test = getattr(memory, "_content_fixes", None)
+                    if _cf_test:
+                        _fixed_test = _acf_test(_inline_test_files, _cf_test)
+                        _changed_test = [
+                            p for p in _inline_test_files
+                            if _fixed_test.get(p) != _inline_test_files.get(p)
+                        ]
+                        if _changed_test:
+                            executor.write_files(
+                                {p: _fixed_test[p] for p in _changed_test})
+                            memory.update(
+                                {p: _fixed_test[p] for p in _changed_test})
+                            display.step_info(
+                                step_idx,
+                                f"[Inline/test] Content fixes applied to "
+                                f"{len(_changed_test)} file(s)",
+                            )
 
-                # Defer test execution — all TEST steps write their files
-                # first; a single bulk run happens after all waves complete.
-                # This avoids redundant parallel runs when multiple TEST steps
-                # are in the same wave and prevents source-fixes for one test
-                # from breaking another test that hasn't run yet.
-                display.step_info(
-                    step_idx,
-                    "[Inline/test] Test files written — execution deferred to bulk run",
-                )
+                    # Defer test execution — all TEST steps write their files
+                    # first; a single bulk run happens after all waves complete.
+                    # This avoids redundant parallel runs when multiple TEST steps
+                    # are in the same wave and prevents source-fixes for one test
+                    # from breaking another test that hasn't run yet.
+                    display.step_info(
+                        step_idx,
+                        "[Inline/test] Test files written — execution deferred to bulk run",
+                    )
             else:
                 success, error_info = _handle_test_step(
                     step_text, tester, coder, reviewer, executor,
@@ -1933,6 +1963,16 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         if any(seg in t for seg in (
                             '.test.', '.spec.', '__tests__', 'test_'))
                     ]
+                    # Fallback: when plan_step has no target_files
+                    # (e.g. CMD step reclassified to TEST), discover
+                    # test files from memory that are failing.
+                    if not _test_paths:
+                        _test_paths = [
+                            fp for fp in memory.all_files()
+                            if any(seg in fp for seg in (
+                                '.test.', '.spec.',
+                                '__tests__', 'test_'))
+                        ]
                     if _test_paths:
                         log.info(
                             "Task %d: Diagnosis had code but nothing "
@@ -1979,6 +2019,23 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                             plan_step.imports_from
                             if plan_step else {}
                         )
+                        # Fallback: when plan_step has no imports_from
+                        # (e.g. CMD step), include non-test source files
+                        # from memory so the LLM knows what the
+                        # components actually render.
+                        if not _dt_imports:
+                            _dt_imports = {
+                                fp: ""
+                                for fp in _all_mem
+                                if not any(seg in fp for seg in (
+                                    '.test.', '.spec.',
+                                    '__tests__', 'test_',
+                                    '_cmd_output/',
+                                    'node_modules/'))
+                                and fp.endswith((
+                                    '.jsx', '.tsx', '.js', '.ts',
+                                    '.py', '.vue'))
+                            }
                         for _imp_path in _dt_imports:
                             _imp_content = _all_mem.get(_imp_path, "")
                             if _imp_content:
@@ -2863,13 +2920,16 @@ def run_bulk_test_execution_and_fix(
     # Used in the fix loop to skip broad KB search when the plan already
     # specifies exactly which docs apply to each test file.
     _step_kb_docs: dict[str, list[str]] = {}
+    _step_descs: dict[str, str] = {}
     if all_plan_steps:
         for _ps in all_plan_steps:
             _declared = getattr(_ps, 'kb_docs', None)
-            if not _declared:
-                continue
+            _desc = getattr(_ps, 'description', None)
             for _tf in getattr(_ps, 'target_files', []):
-                _step_kb_docs[_tf] = _declared
+                if _declared:
+                    _step_kb_docs[_tf] = _declared
+                if _desc:
+                    _step_descs[_tf] = _desc
 
     all_files = memory.all_files()
     # Deduplicate test files by normalized path — mixed separators (foo/bar vs foo\bar)
@@ -3490,9 +3550,10 @@ def run_bulk_test_execution_and_fix(
                             "[BulkTest] All fixes were source files for %s "
                             "— retrying with test-only constraint", basename)
                         _bt_step_desc = ""
-                        if plan_step and plan_step.description:
+                        _ps_desc = _step_descs.get(test_path)
+                        if _ps_desc:
                             _bt_step_desc = (
-                                f"STEP INTENT: {plan_step.description}\n"
+                                f"STEP INTENT: {_ps_desc}\n"
                             )
                         _test_only_prompt = (
                             f"{_bt_briefing_block}"
@@ -3786,8 +3847,14 @@ def run_bulk_test_execution_and_fix(
                             # Retry with test-only constraint (same
                             # logic as Loop 1 — see detailed comments there)
                             try:
+                                _to2_step_desc = ""
+                                _to2_ps = _step_descs.get(test_path)
+                                if _to2_ps:
+                                    _to2_step_desc = (
+                                        f"STEP INTENT: {_to2_ps}\n")
                                 _to2_prompt = (
                                     f"{_bt_briefing_block}"
+                                    f"{_to2_step_desc}"
                                     f"Test file `{test_path}` failed.\n\n"
                                     f"Error:\n{current_output[:3000]}\n\n"
                                     f"Source files (READ-ONLY):\n"
