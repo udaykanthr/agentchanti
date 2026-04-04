@@ -70,7 +70,7 @@ _DEFAULTS = {
     "review_mode": "static",
     "dependency_check_enabled": True,
     "analyser_enabled": False,
-    "wiring_verification_enabled": False,
+    "wiring_verification_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -395,8 +395,8 @@ class Config:
         )
 
         # Wiring verification — cross-file integration check after all steps
-        # (off by default; enable via `wiring_verification: {enabled: true}`
-        # or WIRING_VERIFICATION_ENABLED=true env var)
+        # (on by default; disable via `wiring_verification: {enabled: false}`
+        # or WIRING_VERIFICATION_ENABLED=false env var)
         _wv_section = yd.get("wiring_verification", {})
         if not isinstance(_wv_section, dict):
             _wv_section = {}

@@ -1418,14 +1418,25 @@ def run_dependency_check(
         if matched in relevant_files:
             validated[matched] = content
             continue
-        # Tier 2: planned session file
+        # Tier 2: planned session file — but ONLY if it's not already in
+        # memory with correct content.  If a file was already written by a
+        # completed step (e.g. index.css with Tailwind v4 syntax), the
+        # DepCheck LLM may "fix" it using outdated training data (e.g.
+        # Tailwind v3 directives).  Only allow overwrites for files that
+        # have an actual gap or are not yet written.
         is_session_file = norm_matched in session_files or any(
             sf.endswith("/" + norm_matched) or norm_matched.endswith("/" + sf)
             for sf in session_files
         )
         if is_session_file:
-            validated[matched] = content
-            _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            if matched not in memory_files:
+                validated[matched] = content
+                _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            else:
+                _logger.debug(
+                    "[DepCheck] Skipping fix for '%s' — already in memory "
+                    "with no detected gap (preventing LLM overwrite of "
+                    "correct content)", fpath)
             continue
         # Tier 3: wiring file for watcher-created sources
         in_project = any(norm_matched.startswith(root + "/") for root in project_roots)

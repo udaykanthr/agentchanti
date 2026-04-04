@@ -1986,6 +1986,10 @@ _PKG_JSON_NON_DEP_FIELDS = frozenset({
     'name', 'version', 'description', 'main', 'module', 'browser',
     'type', 'author', 'license', 'homepage', 'repository', 'bugs',
     'private', 'engines', 'os', 'cpu',
+    # Script names and the "scripts" key itself are not packages
+    'scripts', 'dev', 'build', 'start', 'test', 'lint', 'preview',
+    'pretest', 'posttest', 'prebuild', 'postbuild', 'prepare',
+    'prepublishOnly', 'preinstall', 'postinstall',
 })
 
 
@@ -2003,9 +2007,17 @@ def _extract_packages_from_inline_edits(step: 'PlanStep') -> list:
                     continue
                 if basename == 'package.json':
                     # Match: "animejs": "^4.2.0"
-                    m = re.match(r'^"([^"]+)"\s*:\s*"[^"]*"$', stripped)
+                    m = re.match(r'^"([^"]+)"\s*:\s*"([^"]*)"$', stripped)
                     if m and m.group(1) not in _PKG_JSON_NON_DEP_FIELDS:
-                        packages.append(m.group(1))
+                        # Reject entries whose value looks like a script
+                        # command (e.g. "vite build") rather than a semver
+                        # version (e.g. "^4.2.0").  Script values contain
+                        # spaces or don't start with a version-range prefix.
+                        val = m.group(2)
+                        _is_version = bool(re.match(
+                            r'^[\^~>=<*0-9]', val)) and ' ' not in val
+                        if _is_version:
+                            packages.append(m.group(1))
                 elif basename in ('requirements.txt', 'Pipfile', 'pyproject.toml', 'setup.py'):
                     # Match: animejs==4.2.0  or  animejs>=3
                     m = re.match(r'^([A-Za-z0-9_.-]+)', stripped)

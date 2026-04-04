@@ -896,6 +896,73 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
             )
         files = _struct_ok
 
+    if files:
+        # ── Diff-size circuit breaker (all languages) ──
+        # Reject diagnosis edits that change >40% of a source file's lines.
+        # This catches the common failure mode where the LLM rewrites an
+        # entire component (e.g. Header.jsx 120→37 lines) during test
+        # diagnosis instead of making a targeted fix.  Test files are exempt.
+        import difflib as _dl
+        _diff_ok: dict[str, str] = {}
+        for _fp, _new_content in files.items():
+            _is_test = any(seg in _fp for seg in (
+                '__tests__', '/tests/', '/test/', '.test.', '.spec.', 'test_'))
+            if _is_test:
+                _diff_ok[_fp] = _new_content
+                continue
+            _orig = memory.get(_fp)
+            if _orig is None:
+                try:
+                    with open(os.path.join(".", _fp), "r",
+                              encoding="utf-8", errors="replace") as _f:
+                        _orig = _f.read()
+                except OSError:
+                    _orig = None
+            if _orig is None:
+                _diff_ok[_fp] = _new_content
+                continue
+            _orig_lines = _orig.splitlines()
+            _new_lines = _new_content.splitlines()
+            _orig_len = len(_orig_lines)
+            if _orig_len < 5:
+                _diff_ok[_fp] = _new_content
+                continue
+            # Check shared lines — block full-file replacement (<30% shared)
+            _shared = sum(1 for ln in _new_lines if ln in set(_orig_lines))
+            _shared_ratio = _shared / max(_orig_len, 1)
+            if _orig_len >= 10 and _shared_ratio < 0.30:
+                log.warning(
+                    "Step %d: Diff guard blocked full-file replacement of "
+                    "%s during diagnosis (shared %.0f%% of %d lines)",
+                    step_idx + 1, _fp, _shared_ratio * 100, _orig_len)
+                display.step_info(
+                    step_idx,
+                    f"Blocked full rewrite of {os.path.basename(_fp)}")
+                continue
+            # Check change ratio — reject >40% changed
+            _sm = _dl.SequenceMatcher(None, _orig_lines, _new_lines)
+            _changed = sum(
+                max(j2 - j1, i2 - i1)
+                for tag, i1, i2, j1, j2 in _sm.get_opcodes()
+                if tag != 'equal')
+            _change_ratio = _changed / max(_orig_len, 1)
+            if _change_ratio > 0.40:
+                log.warning(
+                    "Step %d: Diff guard rejected diagnosis fix for %s — "
+                    "changes %.0f%% of lines (threshold 40%%)",
+                    step_idx + 1, _fp, _change_ratio * 100)
+                display.step_info(
+                    step_idx,
+                    f"Rejected fix for {os.path.basename(_fp)}: "
+                    f"changes {_change_ratio * 100:.0f}% of lines")
+                continue
+            _diff_ok[_fp] = _new_content
+        if len(_diff_ok) < len(files):
+            log.info(
+                "Step %d: Diff guard rejected %d/%d file(s)",
+                step_idx + 1, len(files) - len(_diff_ok), len(files))
+        files = _diff_ok
+
     if files and step_target_files:
         # ── Scope guard: restrict diagnosis fixes to step-relevant files ──
         # The diagnosis LLM receives context files for reference but should

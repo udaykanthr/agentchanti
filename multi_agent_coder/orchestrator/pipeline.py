@@ -1010,28 +1010,71 @@ def _execute_step(step_idx: int, step_text: str, *,
                     )
 
                 if not _edit_all_ok:
-                    # If some blocks applied before the failure, write the
-                    # partial result to disk so the coder sees the already-
-                    # patched file rather than the original.  This avoids the
-                    # coder regenerating hunks that were already correct, and
-                    # prevents line-number drift that causes its diff to fail.
-                    if _patched is not None and _cur is not None and _patched != _cur:
-                        try:
-                            with open(_resolved, "w", encoding="utf-8") as _wf:
-                                _wf.write(_patched)
-                            memory.update({_resolved: _patched})
-                            _logger.info(
-                                "[InlineEdit] Partial edits written to %s "
-                                "before falling through to coder",
-                                _resolved,
-                            )
-                        except OSError as _we:
-                            _logger.warning(
-                                "[InlineEdit] Could not write partial edits to %s: %s",
-                                _resolved, _we,
-                            )
-                    plan_step.inline_code.clear()
-                    _logger.info("[InlineEdit] Falling through to coder (edit failed)")
+                    # ── REPLACE-as-full-file fallback ──
+                    # When the FIND block doesn't match (e.g. scaffold template
+                    # changed between Vite versions), check if the REPLACE block
+                    # looks like a complete file replacement.  If so, use it
+                    # directly instead of falling through to the coder LLM
+                    # (which lacks KB context and generates garbage).
+                    _used_replace_fallback = False
+                    if plan_step.inline_edits:
+                        for _ie_path, _ie_pairs in plan_step.inline_edits.items():
+                            _ie_resolved = _ie_path
+                            # Find the matching resolved path
+                            for _kf in (plan_step.target_files or []):
+                                if _kf.endswith(_ie_path) or _ie_path.endswith(os.path.basename(_kf)):
+                                    _ie_resolved = _kf
+                                    break
+                            for _, _repl in _ie_pairs:
+                                _repl_stripped = _repl.strip()
+                                # A "complete file" REPLACE block has imports
+                                # or function/class defs — it's not just a
+                                # small patch fragment.
+                                _has_structure = (
+                                    'import ' in _repl_stripped
+                                    or 'export ' in _repl_stripped
+                                    or 'function ' in _repl_stripped
+                                    or 'class ' in _repl_stripped
+                                    or 'def ' in _repl_stripped
+                                    or 'from ' in _repl_stripped
+                                )
+                                _is_substantial = len(_repl_stripped) > 100
+                                if _has_structure and _is_substantial:
+                                    plan_step.inline_code[_ie_resolved] = _repl_stripped
+                                    _logger.info(
+                                        "[InlineEdit] FIND failed but REPLACE "
+                                        "looks like a complete file — promoting "
+                                        "REPLACE content for %s (%d chars)",
+                                        _ie_resolved, len(_repl_stripped),
+                                    )
+                                    _used_replace_fallback = True
+
+                    if _used_replace_fallback:
+                        plan_step.inline_edits = {}
+                        _logger.info(
+                            "[InlineEdit] Using plan REPLACE content as "
+                            "full-file replacement (skipping coder LLM)")
+                    else:
+                        # If some blocks applied before the failure, write the
+                        # partial result to disk so the coder sees the already-
+                        # patched file rather than the original.
+                        if _patched is not None and _cur is not None and _patched != _cur:
+                            try:
+                                with open(_resolved, "w", encoding="utf-8") as _wf:
+                                    _wf.write(_patched)
+                                memory.update({_resolved: _patched})
+                                _logger.info(
+                                    "[InlineEdit] Partial edits written to %s "
+                                    "before falling through to coder",
+                                    _resolved,
+                                )
+                            except OSError as _we:
+                                _logger.warning(
+                                    "[InlineEdit] Could not write partial edits to %s: %s",
+                                    _resolved, _we,
+                                )
+                        plan_step.inline_code.clear()
+                        _logger.info("[InlineEdit] Falling through to coder (edit failed)")
 
             # ── Inline code fast path ──
             # If the planner already provided complete code in the plan,
@@ -1113,6 +1156,36 @@ def _execute_step(step_idx: int, step_text: str, *,
                     list(_inline_files.keys()),
                 )
 
+                # ── Seed scaffold entry-point files into memory ──
+                # When writing into a scaffolded subproject, the entry-point
+                # file (main.jsx, index.jsx, etc.) may not be touched by any
+                # plan step.  If it's not in memory, depcheck can't see it
+                # and reports false "orphaned export" gaps for App.jsx.
+                # Read it into memory so the import graph is complete.
+                _scaff_root = getattr(memory, '_scaffolded_subproject', None)
+                if _scaff_root:
+                    import os as _os_scaff
+                    _entry_names = (
+                        'main.jsx', 'main.tsx', 'index.jsx', 'index.tsx',
+                        'main.py', 'main.go', 'main.rs', 'index.js', 'index.ts',
+                    )
+                    for _ename in _entry_names:
+                        _epath = f"{_scaff_root}/src/{_ename}"
+                        if _epath not in memory.all_files():
+                            _full = _os_scaff.path.join('.', _epath)
+                            if _os_scaff.path.isfile(_full):
+                                try:
+                                    with open(_full, 'r', encoding='utf-8',
+                                              errors='replace') as _ef:
+                                        _econtent = _ef.read()
+                                    memory.update({_epath: _econtent})
+                                    _logger.info(
+                                        "[Scaffold] Seeded entry-point %s "
+                                        "into memory (depcheck visibility)",
+                                        _epath)
+                                except OSError:
+                                    pass
+
                 # Deterministic KB content-fix gate for inline code.
                 #
                 # The planner generates inline code WITH full KB context
@@ -1148,26 +1221,11 @@ def _execute_step(step_idx: int, step_text: str, *,
                             "no corrections needed"
                         )
 
-                # ── BrowserRouter injection (for inline main.jsx/index.jsx) ──
-                # When the planner bakes inline code for the entry-point file but
-                # omits BrowserRouter while other files use Link/NavLink, the app
-                # crashes at runtime.  Detect and patch deterministically here
-                # (same zero-LLM approach as content fixes).
-                from .step_handlers import _inject_browser_router_if_needed
-                _br_fixed = _inject_browser_router_if_needed(_inline_files, memory)
-                _br_changed = [
-                    p for p in _inline_files
-                    if _br_fixed.get(p) != _inline_files.get(p)
-                ]
-                if _br_changed:
-                    executor.write_files({p: _br_fixed[p] for p in _br_changed})
-                    memory.update({p: _br_fixed[p] for p in _br_changed})
-                    _inline_files = _br_fixed
-                    display.step_info(
-                        step_idx,
-                        f"[Inline] BrowserRouter injected into "
-                        f"{', '.join(p.rsplit('/', 1)[-1] for p in _br_changed)}",
-                    )
+                # NOTE: BrowserRouter injection was removed here — duplicate
+                # provider/wrapper issues (Router, ThemeProvider, etc.) are now
+                # caught by the language-agnostic post-completion wiring
+                # verification (run_wiring_verification), which checks all
+                # files together after all CODE steps complete.
 
                 # ── Inline code quality gate (Phase 1) ──
                 # The planner wrote this code WITH full KB context, so it is
@@ -1889,6 +1947,14 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                       f"attempt {diag_attempt}: {exc}")
             display.step_info(step_idx, f"Diagnosis error: {type(exc).__name__}")
             continue
+
+    # Restore files to pre-diagnosis state so that destructive edits
+    # from failed diagnosis attempts (e.g. overwriting package.json
+    # with downgraded versions) don't persist on disk and corrupt
+    # future runs or resume attempts.
+    memory.restore(_diag_snapshot, executor=executor)
+    log.info(f"Task {step_idx+1}: Restored file snapshot after "
+             f"all diagnosis attempts failed.")
 
     display.step_info(
         step_idx, "Step failed after all fix attempts. Halting pipeline.")
@@ -3696,6 +3762,8 @@ def run_wiring_verification(
         "  • Component receives wrong prop shape (undefined, wrong type)\n"
         "  • Undefined variable or missing null-check at render time\n"
         "  • Module not found (package not imported / wrong casing)\n"
+        "  • Duplicate context/provider wrappers (e.g. Router, ThemeProvider, "
+        "Store) in both entry-point AND child — causes nested provider errors\n"
         "  • Any other wiring issue that prevents the UI from rendering\n\n"
         f"Files in scope:\n{context_block}\n\n"
         "RESPONSE FORMAT:\n"

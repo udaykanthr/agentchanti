@@ -475,6 +475,7 @@ def _apply_content_fixes(
 def _inject_browser_router_if_needed(
     files: dict[str, str],
     memory: "FileMemory",
+    all_plan_steps=None,
 ) -> dict[str, str]:
     """Wrap <App /> in <BrowserRouter> when Link/NavLink is used but BrowserRouter is absent.
 
@@ -526,6 +527,22 @@ def _inject_browser_router_if_needed(
             and fpath_key != filepath
             for fpath_key, c in all_memory_files.items()
         )
+
+        # Also check pending plan steps' inline code — App.jsx may not
+        # be in memory yet (written in a later wave) but the plan already
+        # contains its content with BrowserRouter.
+        if not child_has_router and all_plan_steps:
+            for ps in all_plan_steps:
+                for _ps_path, _ps_content in (ps.inline_code or {}).items():
+                    if _ps_path != filepath and (
+                        "BrowserRouter" in _ps_content
+                        or "HashRouter" in _ps_content
+                    ):
+                        child_has_router = True
+                        break
+                if child_has_router:
+                    break
+
         if child_has_router:
             log.debug(
                 "BrowserRouter injection skipped for %s — "
@@ -3905,11 +3922,71 @@ def _remap_test_to_existing(test_files: dict[str, str],
             target = existing[basename]
             log.warning(f"[TestPathRemap] '{norm}' -> '{target}' "
                         f"(matched existing test file)")
+            # Rewrite relative import paths to account for the new
+            # directory location.  Without this, imports like
+            #   import X from '../components/Foo'
+            # that were correct for the OLD path become broken at
+            # the NEW path (e.g. src/__tests__/ → src/components/__tests__/).
+            content = _rewrite_imports_for_remap(content, norm, target)
             remapped[target] = content
         else:
             remapped[fpath] = content
 
     return remapped
+
+
+def _rewrite_imports_for_remap(content: str, old_path: str,
+                               new_path: str) -> str:
+    """Rewrite relative import paths in *content* when a file moves.
+
+    Given that a file was originally at *old_path* but is being written
+    to *new_path*, adjust all relative imports (``./`` or ``../``) so
+    they resolve to the same target from the new location.
+
+    Only processes JS/TS-style imports (``import … from '…'`` and
+    ``require('…')``).  Python relative imports are not handled here
+    because Python test files rarely get remapped.
+    """
+    import posixpath
+
+    old_dir = posixpath.dirname(old_path.replace("\\", "/"))
+    new_dir = posixpath.dirname(new_path.replace("\\", "/"))
+
+    if old_dir == new_dir:
+        return content  # same directory — nothing to rewrite
+
+    # Pattern matches:  from '...'  or  from "..."  or  require('...')
+    _IMPORT_PATH_RE = re.compile(
+        r"""((?:from\s+|require\s*\(\s*)['"])"""   # prefix: from ' or require('
+        r"""(\.\.?/.+?)"""                          # the relative path
+        r"""(['")]\s*\)?)""",                       # closing quote (and optional paren)
+    )
+
+    def _rebase(match: re.Match) -> str:
+        prefix = match.group(1)
+        rel_path = match.group(2)
+        suffix = match.group(3)
+
+        # Resolve the import target as an absolute posix path relative
+        # to the OLD directory, then compute a new relative path from
+        # the NEW directory.
+        abs_target = posixpath.normpath(
+            posixpath.join(old_dir, rel_path))
+        new_rel = posixpath.relpath(abs_target, new_dir)
+
+        # Ensure it starts with ./ or ../ (bare names are treated as
+        # package imports by bundlers).
+        if not new_rel.startswith("."):
+            new_rel = "./" + new_rel
+
+        if new_rel != rel_path:
+            log.debug("[TestPathRemap] Rewrote import: '%s' → '%s' "
+                      "(file moved %s → %s)",
+                      rel_path, new_rel, old_path, new_path)
+
+        return prefix + new_rel + suffix
+
+    return _IMPORT_PATH_RE.sub(_rebase, content)
 
 
 def _fix_subproject_test_paths(test_files: dict[str, str],
@@ -4241,10 +4318,53 @@ _TEST_BUG_PATTERNS = re.compile(
     r"|Unable to find role"
     r"|Expected.*to have class"
     r"|Expected.*to have attribute"
-    r"|Expected.*to be in the document",
+    r"|Expected.*to be in the document"
+    # Import resolution failures in test files — almost always a wrong
+    # relative path in the test, not a missing source file.
+    r"|Failed to resolve import .* from .*\.(?:test|spec)\."
+    r"|Cannot find module .* from .*\.(?:test|spec)\."
+    r"|Module not found:.*\.(?:test|spec)\.",
     re.DOTALL,
 )
 
+
+# ── Error signature extraction for oscillation detection ──────────
+_ERROR_SIG_PATTERNS = re.compile(
+    r"(?:Failed to resolve import .+? from .+)"
+    r"|(?:Cannot find module .+? from .+)"
+    r"|(?:Module not found:.+)"
+    r"|(?:TestingLibraryElementError:.+)"
+    r"|(?:Unable to find (?:an element|role).+)"
+    r"|(?:Error: .+? is not (?:a function|defined|a constructor))"
+    r"|(?:(?:TypeError|ReferenceError|SyntaxError):.+)"
+    r"|(?:Expected .+? (?:to (?:be|have|equal|match)|not to).+)",
+)
+
+
+def _extract_error_signature(output: str) -> str | None:
+    """Extract a short, stable signature from test failure output.
+
+    Returns a normalised string that identifies the *class* of error
+    (e.g. the failing import path, the missing element query, the
+    TypeError message) without being sensitive to line numbers or
+    whitespace differences.  Returns ``None`` if no recognisable
+    error pattern is found.
+    """
+    # Try structured patterns first
+    m = _ERROR_SIG_PATTERNS.search(output)
+    if m:
+        sig = m.group(0).strip()
+        # Normalise whitespace and truncate to keep signatures comparable
+        sig = re.sub(r'\s+', ' ', sig)[:200]
+        return sig
+
+    # Fallback: grab the first FAIL line (Vitest / Jest style)
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FAIL") or "FAILED" in stripped:
+            return re.sub(r'\s+', ' ', stripped)[:200]
+
+    return None
 
 
 def _triage_test_failure(error_detail: str, source_summary: str,
@@ -4945,6 +5065,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             # ── Per-file fix loop ──
             file_fixed = False
             prev_output = output
+            # Track error signatures across attempts for oscillation
+            # detection.  An "error signature" is the first meaningful
+            # error line (import failure, assertion, etc.) — if it
+            # recurs across two non-consecutive attempts, we're stuck.
+            _seen_error_sigs: list[str] = []
             # Snapshot before attempting fixes so we can restore if a
             # bad fix corrupts the source files across attempts.
             _test_fix_snap = memory.snapshot()
@@ -5197,6 +5322,75 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     if not is_source_bug:
                         fix_files = _filter_test_only_files(
                             fix_files, test_files, memory)
+                    else:
+                        # ── Source-file protection during test diagnosis ──
+                        # When triage says SOURCE_BUG, the LLM is allowed to
+                        # edit source files.  But we must guard against two
+                        # failure modes:
+                        #   1) Full-file replacement — the LLM rewrites the
+                        #      entire source instead of a surgical fix.
+                        #   2) Excessive diff — the fix changes >40% of lines,
+                        #      which almost always means the LLM is rewriting
+                        #      the component to match brittle test assertions.
+                        _guarded: dict[str, str] = {}
+                        for _fp, _fc in fix_files.items():
+                            _basename = os.path.basename(_fp)
+                            _is_test = any(p in _fp for p in (
+                                '__tests__', '/tests/', '/test/', '.test.', '.spec.', 'test_'))
+                            if _is_test:
+                                _guarded[_fp] = _fc
+                                continue
+                            # Check 1: block full-file replacement of source files
+                            _orig = memory.get(_fp)
+                            if _orig is None:
+                                try:
+                                    with open(_fp, 'r', encoding='utf-8',
+                                              errors='replace') as _f:
+                                        _orig = _f.read()
+                                except OSError:
+                                    _orig = None
+                            if _orig is not None:
+                                _orig_lines = _orig.splitlines()
+                                _new_lines = _fc.splitlines()
+                                _orig_len = len(_orig_lines)
+                                _new_len = len(_new_lines)
+                                # Full-file replacement: new content shares <30%
+                                # of original lines — reject it.
+                                if _orig_len >= 10:
+                                    _shared = sum(1 for ln in _new_lines
+                                                  if ln in set(_orig_lines))
+                                    _shared_ratio = _shared / max(_orig_len, 1)
+                                    if _shared_ratio < 0.30:
+                                        log.warning(
+                                            "Step %d: Blocked full-file "
+                                            "replacement of source %s during "
+                                            "test diagnosis (shared %.0f%% of "
+                                            "%d lines) — skipping",
+                                            step_idx + 1, _basename,
+                                            _shared_ratio * 100, _orig_len)
+                                        continue
+                                # Check 2: diff-size circuit breaker (>40% changed)
+                                if _orig_len >= 5:
+                                    import difflib as _dl
+                                    _sm = _dl.SequenceMatcher(
+                                        None, _orig_lines, _new_lines)
+                                    _changed = sum(
+                                        max(j2 - j1, i2 - i1)
+                                        for tag, i1, i2, j1, j2
+                                        in _sm.get_opcodes()
+                                        if tag != 'equal')
+                                    _change_ratio = _changed / max(_orig_len, 1)
+                                    if _change_ratio > 0.40:
+                                        log.warning(
+                                            "Step %d: Rejected source fix for "
+                                            "%s — changes %.0f%% of lines "
+                                            "(threshold 40%%) during test "
+                                            "diagnosis",
+                                            step_idx + 1, _basename,
+                                            _change_ratio * 100)
+                                        continue
+                            _guarded[_fp] = _fc
+                        fix_files = _guarded
                     if fix_files:
                         # Syntax guard: reject Python files with syntax errors
                         _syntax_ok: dict[str, str] = {}
@@ -5247,9 +5441,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     file_fixed = True
                     break
 
-                # Stuck detection: same errors after fix — only bail on the
-                # last attempt, so earlier retries still get a chance.
-                if output == prev_output and fix_attempt == MAX_STEP_RETRIES:
+                # ── Stuck / oscillation detection ──
+                # 1) Identical output: bail immediately (no point retrying).
+                if output == prev_output:
                     log.warning(
                         f"Step {step_idx+1}: [{f_basename}] identical "
                         f"output after fix attempt {fix_attempt}, stopping.")
@@ -5257,6 +5451,25 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         step_idx,
                         f"{f_basename}: same error after fix — skipping.")
                     break
+
+                # 2) Error-class oscillation: extract a short signature
+                #    from the error output and check if we've seen it
+                #    before.  Two occurrences of the same signature means
+                #    the fix loop is going in circles.
+                _err_sig = _extract_error_signature(output)
+                if _err_sig and _err_sig in _seen_error_sigs:
+                    log.warning(
+                        f"Step {step_idx+1}: [{f_basename}] error "
+                        f"signature recurred after fix attempt "
+                        f"{fix_attempt}: {_err_sig!r} — stopping.")
+                    display.step_info(
+                        step_idx,
+                        f"{f_basename}: recurring error pattern — "
+                        f"skipping.")
+                    break
+                if _err_sig:
+                    _seen_error_sigs.append(_err_sig)
+
                 prev_output = output
 
             if not file_fixed:
