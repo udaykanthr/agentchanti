@@ -1856,6 +1856,89 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 step_target_files=_step_targets)
 
             if not fix_applied:
+                # ── Test-only retry for TEST steps ──
+                # When the diagnosis produced code (it has [EDIT]: or
+                # [FILE]: markers) but _apply_fix returned False, the
+                # likely cause is the diff guard blocking destructive
+                # source rewrites.  For TEST steps, retry with a
+                # test-only prompt.
+                #
+                # We do NOT retry when:
+                #  - The diagnosis had no code at all (prose-only) — the
+                #    LLM genuinely didn't know the fix
+                #  - step_type != "TEST" — source bugs need source fixes
+                #  - The diagnosis was a CMD fix (has_fix_commands=True)
+                _diag_had_code = (
+                    "#### [EDIT]:" in diagnosis
+                    or "#### [FILE]:" in diagnosis
+                    or "```" in diagnosis
+                )
+                if step_type == "TEST" and _diag_had_code:
+                    _test_targets = (
+                        plan_step.target_files if plan_step else None
+                    ) or []
+                    _test_paths = [
+                        t for t in _test_targets
+                        if any(seg in t for seg in (
+                            '.test.', '.spec.', '__tests__', 'test_'))
+                    ]
+                    if _test_paths:
+                        log.info(
+                            "Task %d: Diagnosis had code but nothing "
+                            "applied (likely diff guard) — retrying "
+                            "with test-only constraint",
+                            step_idx + 1)
+                        _diag_test_prompt = (
+                            f"A test step failed. The previous fix "
+                            f"attempt was rejected because it tried to "
+                            f"rewrite source files too aggressively.\n\n"
+                            f"Error:\n{error_info[:3000]}\n\n"
+                            f"CRITICAL: Fix ONLY the test file(s). "
+                            f"Source files are correct and must NOT be "
+                            f"modified.\n\n"
+                            f"Common test fixes:\n"
+                            f"- Wrap renders in <MemoryRouter> when "
+                            f"components use react-router Link/NavLink\n"
+                            f"- Use getAllByRole/getAllByText when "
+                            f"multiple elements match (desktop + mobile)\n"
+                            f"- Scope queries with within(container)\n\n"
+                            f"Test files to fix: {_test_paths}\n\n"
+                            f"Return the COMPLETE fixed test file(s) "
+                            f"using #### [FILE]: format."
+                        )
+                        try:
+                            _dt_resp = llm_client.generate_response(
+                                _diag_test_prompt)
+                            _dt_files = executor.parse_code_blocks(
+                                _dt_resp)
+                            if not _dt_files:
+                                _dt_files = (
+                                    executor.parse_code_blocks_fuzzy(
+                                        _dt_resp))
+                            if _dt_files:
+                                # Only accept test files
+                                _dt_files = {
+                                    fp: fc
+                                    for fp, fc in _dt_files.items()
+                                    if any(seg in fp for seg in (
+                                        '.test.', '.spec.',
+                                        '__tests__', 'test_'))
+                                }
+                            if _dt_files:
+                                executor.write_files(_dt_files)
+                                memory.update(_dt_files)
+                                fix_applied = True
+                                log.info(
+                                    "Task %d: Diagnosis test-only "
+                                    "retry produced fix for: %s",
+                                    step_idx + 1,
+                                    list(_dt_files.keys()))
+                        except Exception as _dt_exc:
+                            log.warning(
+                                "Task %d: Diagnosis test-only retry "
+                                "failed: %s", step_idx + 1, _dt_exc)
+
+            if not fix_applied:
                 last_diagnosis_content = diagnosis
                 display.step_info(step_idx, "No actionable fix found in diagnosis.")
                 log.warning(f"Task {step_idx+1}: Diagnosis produced no actionable fix.")
