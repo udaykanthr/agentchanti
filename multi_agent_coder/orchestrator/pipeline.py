@@ -945,8 +945,17 @@ def _execute_step(step_idx: int, step_text: str, *,
                             # puts the entire new file in REPLACE.  Fix: treat
                             # FIND as a positional anchor and replace from its
                             # position to EOF with REPLACE.
-                            if (_repl_str.lstrip('\n').startswith(_find_str.lstrip('\n'))
-                                    and _after_find.strip()):
+                            #
+                            # However, if REPLACE is only slightly larger than
+                            # FIND (small insertion like adding one import line),
+                            # this is NOT a full-file rewrite — use normal
+                            # str.replace to preserve the rest of the file.
+                            _repl_is_full_rewrite = (
+                                _repl_str.lstrip('\n').startswith(_find_str.lstrip('\n'))
+                                and _after_find.strip()
+                                and len(_repl_str) > len(_find_str) * 2
+                            )
+                            if _repl_is_full_rewrite:
                                 _patched = _patched[:_find_pos] + _repl_str
                                 _logger.debug(
                                     "[InlineEdit] Anchor-to-EOF applied in %s "
