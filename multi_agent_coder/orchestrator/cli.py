@@ -300,12 +300,18 @@ def main():
         language = detect_language_from_task(args.task) or detect_language()
     log.info(f"Language: {language} ({get_language_name(language)})")
 
+    # Load custom language backends from config
+    if cfg.LANGUAGE_BACKENDS:
+        from ..language_backend import load_custom_backends
+        load_custom_backends(cfg.LANGUAGE_BACKENDS)
+
     # ── 2. Init LLM client ──
     stream_enabled = cfg.STREAM_RESPONSES and not args.no_stream
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=stream_enabled,
+        max_output_tokens=cfg.MAX_OUTPUT_TOKENS,
     )
 
     provider = args.provider or cfg.PROVIDER
@@ -765,6 +771,7 @@ def main():
             # ── 10. Parse steps + dependencies ──
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
+                fix_nested_workspace_collision,
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -784,6 +791,9 @@ def main():
                     errors = validate_plan(plan_steps_parsed)
                     if errors:
                         log.warning(f"[Plan] Validation warnings: {errors}")
+                    ws_fixes = fix_nested_workspace_collision(plan_steps_parsed)
+                    if ws_fixes:
+                        log.info(f"[Plan] Auto-fixed workspace collision: {ws_fixes}")
                     dep_fixes = fix_import_dependencies(plan_steps_parsed)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")

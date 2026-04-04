@@ -146,8 +146,25 @@ def _classify(
                 source_type="code", skip_web=True,
                 reason=f"'{pkg_name}' is installed — likely wrong import path",
             )
-        else:
-            # Genuinely missing package → web search
+        # Check if package is a local project module (directory or .py file)
+        # before triggering web search.  Local project modules like
+        # "snake_game" are not pip-installable — searching the web for
+        # them wastes tokens.
+        import os as _os_er
+        _is_local = (
+            _os_er.path.isdir(pkg_name)
+            or _os_er.path.isfile(f"{pkg_name}.py")
+            or _os_er.path.isfile(f"{pkg_name}/__init__.py")
+        )
+        if _is_local:
+            _logger.info(
+                "[ErrorRouter] %r is a local project module → code (skip web)", pkg_name)
+            return ErrorRoute(
+                source_type="code", skip_web=True,
+                reason=f"'{pkg_name}' is a local project directory/module",
+            )
+        if pkg_name:
+            # Genuinely missing external package → web search
             query = _build_package_query(pkg_name, project_context)
             _logger.info("[ErrorRouter] %r not installed → web (query: %s)", pkg_name, query)
             return ErrorRoute(

@@ -60,12 +60,24 @@ Language: {lang_name}
         else:
             prompt += self._python_import_path_rules()
 
-        # Add language-specific test guidance
+        # Add language-specific test guidance via pluggable backend.
+        # JS/TS retain their detailed methods (vitest/jest/ESM logic);
+        # all other languages use the backend system.
         if language in ("javascript", "typescript"):
             prompt += self._js_test_rules(language, fw, env_info=env_info,
                                           test_runner=test_runner)
-        else:
+        elif language == "python" or language is None:
             prompt += self._python_test_rules()
+        else:
+            from ..language_backend import get_backend
+            _test_backend = get_backend(language)
+            _test_rules = _test_backend.get_test_rules(test_runner=test_runner,
+                                                        env_info=env_info)
+            if _test_rules:
+                prompt += (
+                    f"\n═══════ {_test_backend.display_name.upper()} "
+                    f"TEST RULES ═══════\n{_test_rules}"
+                )
 
         test_suffix = fw.get("suffix", "")
         if test_suffix:

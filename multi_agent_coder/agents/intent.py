@@ -233,6 +233,10 @@ class IntentAgent(Agent):
     # The loop exits naturally when the LLM writes REQUIREMENTS_SPEC, or when
     # the duplicate-command guard sets force_conclude.
     _SAFETY_CAP = 20
+    # Max investigation-only iterations for BUG_FIX before auto-concluding.
+    # After this many iterations without a tool call, we switch to conclude
+    # mode rather than rejecting the spec endlessly.
+    _BUG_FIX_INVESTIGATE_CAP = 3
     # If accumulated context grows beyond this, force the LLM to conclude so
     # we don't overflow its context window or burn cloud tokens indefinitely.
     _MAX_CONTEXT_CHARS = 60_000
@@ -357,6 +361,10 @@ class IntentAgent(Agent):
         # After the first duplicate is detected, force conclude on the very
         # next iteration so the LLM doesn't burn more rounds ignoring the note.
         force_conclude = False
+        # Count consecutive BUG_FIX rejections (spec produced but no tools used).
+        # After _BUG_FIX_INVESTIGATE_CAP, switch to investigation-only prompt
+        # instead of rejecting forever.
+        bug_fix_reject_count = 0
 
         iteration = 0
         while True:
@@ -641,26 +649,91 @@ class IntentAgent(Agent):
                         and not executed_commands
                         and not force_conclude
                     ):
+                        bug_fix_reject_count += 1
+                        if bug_fix_reject_count >= self._BUG_FIX_INVESTIGATE_CAP:
+                            # ── Phase switch: investigation-only prompt ──────
+                            # The LLM keeps producing specs instead of tool
+                            # calls.  Rather than rejecting forever, run ONE
+                            # automatic investigation round: pick the most
+                            # likely target file from the spec and KB_SEARCH
+                            # it.  This gives the LLM real evidence and
+                            # breaks the deadlock.
+                            _logger.warning(
+                                "[IntentAnalysis] BUG_FIX rejected %d times — "
+                                "auto-investigating to break deadlock.",
+                                bug_fix_reject_count,
+                            )
+                            auto_target = self._extract_target_file(spec)
+                            if auto_target and kb_context_builder is not None:
+                                cmd_key = f"KB_SEARCH:{auto_target.lower()}"
+                                if cmd_key not in executed_commands:
+                                    executed_commands.add(cmd_key)
+                                    _logger.info(
+                                        "[IntentAnalysis] Auto-investigating: KB_SEARCH '%s'",
+                                        auto_target,
+                                    )
+                                    if cli_display:
+                                        cli_display.show_intent_event(
+                                            "kb",
+                                            f"Auto KB_SEARCH: {auto_target}",
+                                            iteration=iteration,
+                                            max_iterations=0,
+                                        )
+                                    kb_result = self._query_kb(
+                                        kb_context_builder, auto_target,
+                                    )
+                                    if kb_result:
+                                        accumulated_context += (
+                                            f"[Auto-investigation] KB Search Results "
+                                            f"for '{auto_target}':\n{kb_result}\n\n"
+                                        )
+                                    else:
+                                        accumulated_context += (
+                                            f"[Auto-investigation] KB Search for "
+                                            f"'{auto_target}': no results found.\n\n"
+                                        )
+                            # Now the LLM has evidence.  Let the next iteration
+                            # produce a spec — executed_commands is non-empty
+                            # so the guard won't fire again.
+                            accumulated_context += (
+                                "[Investigation complete. You now have source code "
+                                "evidence above. Write your REQUIREMENTS_SPEC using "
+                                "the evidence — cite specific files and lines.]\n\n"
+                            )
+                            if cli_display:
+                                cli_display.show_intent_event(
+                                    "reject",
+                                    f"BUG_FIX: auto-investigated after {bug_fix_reject_count} rejections",
+                                    iteration=iteration, max_iterations=0,
+                                )
+                            continue
+
                         _logger.info(
                             "[IntentAnalysis] BUG_FIX spec rejected on iteration %d "
-                            "— no investigation tools used yet. Forcing deeper analysis.",
-                            iteration,
+                            "— no investigation tools used yet (%d/%d). "
+                            "Sending investigation-only prompt.",
+                            iteration, bug_fix_reject_count,
+                            self._BUG_FIX_INVESTIGATE_CAP,
                         )
+                        # Instead of repeating the same full prompt with a
+                        # rejection note (which the LLM ignores), inject a
+                        # targeted directive that ONLY asks for a tool call —
+                        # no spec template to latch onto.
                         accumulated_context += (
-                            "[Your REQUIREMENTS_SPEC was rejected because you have not "
-                            "investigated the actual code yet. For BUG_FIX tasks you MUST:\n"
-                            "  1. Use KB_SEARCH to read the FULL source of the target file\n"
-                            "  2. For visual bugs (not visible / hidden / menu): also read "
-                            "CSS files and check z-index, display, overflow, pointer-events\n"
-                            "  3. Use FIND_USAGES to verify the component interface\n"
-                            "  4. Verify your hypothesis against the actual code — do NOT "
-                            "claim 'lacks X' without confirming X is truly absent\n"
-                            "After investigation, write REQUIREMENTS_SPEC with evidence.]\n\n"
+                            "[INVESTIGATION REQUIRED — do NOT write REQUIREMENTS_SPEC yet.]\n"
+                            "You jumped to a conclusion without reading the code. "
+                            "Before you can write a spec, you MUST investigate.\n\n"
+                            "Your ONLY allowed response is ONE of these tool calls:\n"
+                            "  KB_SEARCH: <filename or symbol>\n"
+                            "  FIND_USAGES: <ComponentName or functionName>\n"
+                            "  RUN_CMD: <read-only command>\n\n"
+                            "Pick the file most likely to contain the bug and search for it. "
+                            "Do NOT write any other output.\n\n"
                         )
                         if cli_display:
                             cli_display.show_intent_event(
                                 "reject",
-                                "BUG_FIX spec rejected — no investigation yet",
+                                f"BUG_FIX: requesting investigation ({bug_fix_reject_count}/{self._BUG_FIX_INVESTIGATE_CAP})",
                                 iteration=iteration, max_iterations=0,
                             )
                         continue
@@ -1139,6 +1212,27 @@ class IntentAgent(Agent):
                     continue
 
         return "\n\n".join(sections[:4])  # cap at 4 CSS files
+
+    @staticmethod
+    def _extract_target_file(spec: str) -> str:
+        """Extract the most likely target filename from a REQUIREMENTS_SPEC.
+
+        Looks for 'target:', 'Modify:', or file-path patterns in the spec
+        and returns the first match.  Used by the auto-investigation fallback
+        when the LLM keeps producing specs without using tools.
+        """
+        # Try explicit target/modify lines first
+        target_m = re.search(
+            r'(?:target|modify|file|component)\s*:\s*(\S+)',
+            spec, re.IGNORECASE,
+        )
+        if target_m:
+            return target_m.group(1).strip().rstrip(",;")
+        # Fall back to any file-path-like pattern
+        path_m = re.search(r'[\w/\\]+\.\w{1,5}', spec)
+        if path_m:
+            return path_m.group(0)
+        return ""
 
     @staticmethod
     def _check_root_cause_contradiction(spec: str, evidence: str) -> str:

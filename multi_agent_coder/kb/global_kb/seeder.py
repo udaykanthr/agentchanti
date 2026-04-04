@@ -122,6 +122,37 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="unbound,local,variable,scope,initialization,python",
     ),
 
+    ErrorFix(
+        error_type="IndexError",
+        language="python",
+        pattern=r"IndexError:\s*pop from an empty deque",
+        cause="A deterministic test RNG (DeterministicRandom) ran out of pre-scripted "
+              "choices.  This happens when the code under test calls the RNG more times "
+              "than the test fixture expected — typically because .reset() or collision "
+              "recovery calls _spawn_food() which consumes an extra random choice.",
+        fix_template="Count every code path that calls rng.choice() — including reset(), "
+                     "_spawn_food(), and collision handlers — and supply enough values in the "
+                     "DeterministicRandom fixture.  Alternatively, make the fixture's choice() "
+                     "method cycle or return a fallback instead of raising IndexError.",
+        severity="error",
+        tags="deque,random,deterministic,test,fixture,python",
+    ),
+    ErrorFix(
+        error_type="AttributeError",
+        language="python",
+        pattern=r"AttributeError:\s*'function'\s+object\s+has\s+no\s+attribute",
+        cause="The test imported a module alias that resolved to a function instead of "
+              "the module.  This happens when __init__.py re-exports a function with the "
+              "same name as the module (e.g. `from .main import main` in __init__.py makes "
+              "`import package.main as m` bind m to the function, not the module).",
+        fix_template="Use `import importlib; mod = importlib.import_module('package.module')` "
+                     "or `from package.module import specific_name` instead of "
+                     "`import package.module as alias`.  Alternatively, rename the re-export in "
+                     "__init__.py to avoid shadowing the module name.",
+        severity="error",
+        tags="import,module,function,shadow,init,python",
+    ),
+
     # ── JavaScript ──────────────────────────────────────────────────────
     ErrorFix(
         error_type="TypeError",
@@ -2342,109 +2373,12 @@ You can set multiple scripts in a single command if needed:
 `npm pkg set scripts.dev="vite" scripts.build="vite build"`
 """,
     },
-    "code-review-instructions.md": {
-        "title": "Code Review Instructions",
-        "tags": "code-review, instructions, behavioral, quality",
-        "content": """## Overview
-
-When performing code review, follow these structured instructions to
-ensure consistent, thorough, and constructive feedback.
-
-## Review Checklist
-
-### 1. Correctness
-- Does the code do what it's supposed to do?
-- Are edge cases handled?
-- Are there potential null/undefined access issues?
-- Are error conditions handled appropriately?
-
-### 2. Security
-- Is user input validated and sanitized?
-- Are there SQL injection or XSS vulnerabilities?
-- Are secrets hardcoded?
-- Are permissions checked appropriately?
-
-### 3. Performance
-- Are there N+1 query patterns?
-- Are expensive operations cached when appropriate?
-- Are there unnecessary allocations in hot paths?
-- Could data structures be more efficient?
-
-### 4. Readability
-- Are variable and function names descriptive?
-- Is the code self-documenting or well-commented?
-- Are functions at a single level of abstraction?
-- Is the control flow easy to follow?
-
-### 5. Maintainability
-- Does the code follow existing patterns in the codebase?
-- Are there duplicated code blocks that should be extracted?
-- Is the code testable?
-- Are dependencies minimized?
-
-## Giving Feedback
-
-### Be Specific
-Bad: "This function is too complex"
-Good: "This function has 3 levels of nesting — extract the inner loop into a helper"
-
-### Explain Why
-Don't just say what to change — explain why the change matters.
-
-### Distinguish Severity
-- **Blocker**: Must fix before merge (bugs, security issues)
-- **Suggestion**: Recommended improvement (naming, structure)
-- **Nit**: Minor style preference (formatting, comment wording)
-""",
-    },
-    "error-analysis-instructions.md": {
-        "title": "Error Analysis Instructions",
-        "tags": "error-analysis, debugging, instructions, behavioral",
-        "content": """## Overview
-
-When analyzing errors, follow this systematic approach to identify root
-causes and suggest effective fixes.
-
-## Step 1: Classify the Error
-
-Determine the error category:
-- **Syntax Error**: Code doesn't parse — missing brackets, typos
-- **Type Error**: Wrong data type for an operation
-- **Runtime Error**: Crash during execution — null access, index bounds
-- **Logic Error**: Code runs but produces wrong results
-- **Resource Error**: File not found, connection refused, timeout
-
-## Step 2: Read the Full Stack Trace
-
-- Start from the **bottom** of the stack trace (the actual error)
-- Work **upward** to find the originating call in user code
-- Identify if the error is in user code or library code
-- Note the file, line number, and function name
-
-## Step 3: Identify Root Cause
-
-Common root causes:
-- **Missing null check**: Object is None/null/nil when accessed
-- **Wrong assumption about data**: Expected format differs from actual
-- **Race condition**: Concurrent access to shared state
-- **State management**: Component lifecycle or state machine error
-- **Configuration**: Wrong environment, missing env vars, wrong paths
-
-## Step 4: Suggest a Fix
-
-A good fix suggestion includes:
-1. **What to change**: The specific code modification
-2. **Why it fixes the issue**: Connect the change to the root cause
-3. **How to prevent recurrence**: Tests, type guards, validation
-
-## Step 5: Suggest Preventive Measures
-
-- Add unit tests that reproduce the error
-- Add type annotations/guards at the boundary
-- Improve error messages for faster future diagnosis
-- Consider if similar bugs could exist elsewhere
-""",
-    },
+    # NOTE: Removed "code-review-instructions.md" and
+    # "error-analysis-instructions.md" — they contained generic best
+    # practices (review checklists, debugging methodology) that every LLM
+    # already knows.  Injecting them wasted ~800 tokens per step with
+    # zero incremental value.  Framework-specific instructions (React,
+    # Django, etc.) are kept because they encode non-obvious rules.
     "react-component-test-generation-instructions.md": {
         "title": "React Component Test Generation Instructions",
         "tags": "react, testing, vitest, jest, component, test-generation, behavioral, testing-library, getByText, getByRole, within, render, instructions",
@@ -3294,6 +3228,108 @@ with patch("bootstrap_homepage.home.views.render") as mock_render:
 
 **Rule**: always check the app directory name on disk and use that as-is.
 If `home/` is a sibling of `manage.py`, the import is `from home import ...`.
+""",
+    },
+    "python-test-generation-instructions.md": {
+        "title": "Python Test Generation Instructions",
+        "tags": "python, testing, pytest, test-generation, mock, patch, deterministic, behavioral, instructions",
+        "content": """## Overview
+
+When generating tests for Python projects, follow these rules to avoid the most
+common test failures.  These apply to pytest and unittest-style tests.
+
+## Rule 1: NEVER shadow a module with a re-exported function in __init__.py
+
+If `__init__.py` does `from .main import main`, then `import package.main as m`
+binds `m` to the **function** `main`, NOT the module `package/main.py`.
+`patch.object(m, "SomeClass")` will then fail with:
+`AttributeError: 'function' object has no attribute 'SomeClass'`.
+
+WRONG — alias resolves to the function, not the module:
+```python
+import snake_game.main as main_module    # ← main_module is the function!
+main_module.main()                        # AttributeError
+```
+
+CORRECT — import the module explicitly:
+```python
+import importlib
+main_module = importlib.import_module("snake_game.main")
+```
+
+Or use string-based patching which always resolves to the module:
+```python
+with patch("snake_game.main.SnakeWindow") as mock:
+    ...
+```
+
+## Rule 2: patch() target must match WHERE the name is looked up, not where it's defined
+
+`patch("package.module.ClassName")` replaces the name in `package.module`'s namespace.
+If the code under test does `from other_module import ClassName`, patching `other_module.ClassName`
+has no effect on the importing module — you must patch `package.module.ClassName`.
+
+## Rule 3: Deterministic test RNGs must supply enough values for ALL code paths
+
+When injecting a deterministic random source (e.g. `DeterministicRandom` with a
+fixed deque of choices), count EVERY call to `rng.choice()` across ALL code paths
+that will execute — including:
+- Initial `__init__` / `__post_init__` which may call `spawn_food()`
+- `reset()` which typically calls `spawn_food()` again
+- Collision recovery which may call `spawn_food()` after reducing lives
+- The actual test step itself
+
+WRONG — only supplies 1 choice but reset() + step() need 2:
+```python
+game = Game(random_factory=lambda: DeterministicRandom([(0, 0)]))
+game.reset()   # consumes (0, 0)
+game.step()    # IndexError: pop from empty deque
+```
+
+CORRECT — supply enough for init + reset + step:
+```python
+game = Game(random_factory=lambda: DeterministicRandom([(0, 0), (1, 1), (2, 2)]))
+```
+
+Or make the fixture cycle/fallback instead of crashing:
+```python
+class SafeRandom:
+    def __init__(self, values):
+        self._values = itertools.cycle(values)
+    def choice(self, items):
+        return next(self._values)
+```
+
+## Rule 4: Test files that use pyglet must handle the display/event loop
+
+pyglet window tests may hang or fail in headless CI.  When testing window classes:
+- Mock `pyglet.clock.schedule_interval` to prevent the game loop from starting
+- Use `try/finally` with `window.close()` to avoid resource leaks
+- Do NOT call `pyglet.app.run()` in tests — it blocks forever
+
+```python
+from unittest.mock import patch
+
+def test_window_creation():
+    with patch("pyglet.clock.schedule_interval"):
+        window = GameWindow()
+    try:
+        assert window.width == 800
+    finally:
+        window.close()
+```
+
+## Rule 5: When fixing test failures, verify the source API before rewriting
+
+Before modifying source code to "fix" a test failure:
+1. Read the actual source file to check what methods/attributes exist
+2. Verify the test is calling the correct method name
+3. Check if the failure is a TEST_BUG (wrong mock target, wrong assertion)
+   rather than a SOURCE_BUG (missing method)
+
+NEVER delete source methods to make tests pass.  If a method exists in the
+source but tests can't find it, the problem is usually an import issue or
+incorrect mock target — not a missing method.
 """,
     },
 }

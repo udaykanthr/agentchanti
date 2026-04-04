@@ -78,11 +78,15 @@ For EACH file, use EXACTLY this marker (no extra text after the path):
    values, network errors) where they'd cause crashes.
 6. **Edge cases**: Handle empty input, zero values, boundary conditions.
 """
-        # Add language-specific guidance
-        if language in ("javascript", "typescript"):
-            prompt += self._js_rules(language)
-        elif language == "python" or language is None:
-            prompt += self._python_rules()
+        # Add language-specific guidance via pluggable backend
+        from ..language_backend import get_backend
+        _coder_backend = get_backend(language)
+        _coder_rules = _coder_backend.get_coder_rules()
+        if _coder_rules:
+            prompt += (
+                f"\n═══════ {_coder_backend.display_name.upper()} RULES ═══════\n"
+                f"{_coder_rules}"
+            )
 
         prompt += f"""
 ═══════ STRICT PROHIBITIONS ═══════

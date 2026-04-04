@@ -31,6 +31,7 @@ class LMStudioClient(LLMClient):
             ],
             "temperature": 0.7,
             "stream": False,
+            "max_tokens": self.max_output_tokens,
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
@@ -72,6 +73,7 @@ class LMStudioClient(LLMClient):
             "temperature": 0.7,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "max_tokens": self.max_output_tokens,
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort

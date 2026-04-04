@@ -924,6 +924,72 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
                     # Not an error — could be an existing project file
                     pass
 
+    # ── Nested directory collision detection ─────────────────────────────
+    # Detect when a CMD step creates a workspace directory with the same
+    # name as a Python package created inside it (e.g. `mkdir snake_game`
+    # followed by `cd snake_game && mkdir -p snake_game/tests`).  This
+    # results in `snake_game/snake_game/` which causes import confusion.
+    import re as _re_plan
+
+    def _resolve_mkdir_paths(command: str) -> tuple[set[str], set[str]]:
+        """Parse a compound shell command and return (workspace_dirs, all_abs_dirs).
+
+        Tracks ``cd`` context so ``cd foo && mkdir bar`` yields ``foo/bar``.
+        ``workspace_dirs`` are top-level dirs created by ``mkdir`` without
+        a preceding ``cd`` (i.e. the project workspace root).
+        """
+        workspaces: set[str] = set()
+        all_dirs: set[str] = set()
+        cwd = ""
+        for seg in command.split('&&'):
+            seg = seg.strip()
+            cd_m = _re_plan.match(r'^\s*cd\s+(\S+)', seg)
+            if cd_m:
+                _cd_target = cd_m.group(1).strip().rstrip('/')
+                if cwd:
+                    cwd = cwd + '/' + _cd_target
+                else:
+                    cwd = _cd_target
+                continue
+            mk_m = _re_plan.match(r'^\s*mkdir\s+(?:-p\s+)?(.+)', seg)
+            if mk_m:
+                for d in mk_m.group(1).split():
+                    d = d.strip().rstrip('/')
+                    if not d or d.startswith('-'):
+                        continue
+                    abs_d = (cwd + '/' + d) if cwd else d
+                    all_dirs.add(abs_d)
+                    if not cwd:
+                        # Top-level mkdir = workspace dir
+                        workspaces.add(d.split('/')[0])
+        return workspaces, all_dirs
+
+    _workspace_dirs: set[str] = set()
+    _all_created_dirs: set[str] = set()
+    for step in steps:
+        if step.step_type == "CMD" and step.command:
+            ws, dirs = _resolve_mkdir_paths(step.command)
+            _workspace_dirs.update(ws)
+            _all_created_dirs.update(dirs)
+
+    if _workspace_dirs:
+        _reported: set[str] = set()
+        # Check created dirs for workspace/package name collision
+        for d in _all_created_dirs:
+            parts = d.replace('\\', '/').split('/')
+            if (len(parts) >= 2
+                    and parts[0] in _workspace_dirs
+                    and parts[1] == parts[0]
+                    and parts[0] not in _reported):
+                _reported.add(parts[0])
+                errors.append(
+                    f"Plan creates nested '{parts[0]}/{parts[1]}/' inside "
+                    f"workspace '{parts[0]}/' — Python will confuse the "
+                    f"workspace dir with the package dir, causing import "
+                    f"failures. Rename the workspace (e.g. '{parts[0]}-project') "
+                    f"or write package files directly without a wrapper dir."
+                )
+
     # Check inline code for truncation: if the parser never saw a closing
     # marker (---file-content-end---, ==END==, or next --STEP), the LLM
     # output was cut off.  Preserve the partial code as a hint for the coder
@@ -1070,6 +1136,174 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
             )
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix: nested workspace/package name collision
+# ---------------------------------------------------------------------------
+
+def fix_nested_workspace_collision(steps: list[PlanStep]) -> list[str]:
+    """Detect and fix ``mkdir X && cd X && mkdir X/...`` patterns.
+
+    When a CMD step creates a workspace directory with the same name as
+    the Python package inside it (e.g. ``mkdir snake_game`` followed by
+    ``cd snake_game && mkdir snake_game/``), imports break because Python
+    confuses the outer workspace with the inner package.
+
+    Fix strategy: rewrite CMD steps to drop the workspace ``mkdir`` and
+    ``cd`` prefix, so the package is created directly at the repo root.
+    All target_files, inline_code keys, and produces that reference the
+    nested path are adjusted accordingly.
+
+    Returns a list of human-readable descriptions of fixes applied.
+    """
+    import re as _re
+
+    fixes: list[str] = []
+
+    # Phase 1: detect workspace dirs and collisions (same logic as validate_plan)
+    def _resolve_mkdir_paths(command: str) -> tuple[set[str], set[str]]:
+        workspaces: set[str] = set()
+        all_dirs: set[str] = set()
+        cwd = ""
+        for seg in command.split('&&'):
+            seg = seg.strip()
+            cd_m = _re.match(r'^\s*cd\s+(\S+)', seg)
+            if cd_m:
+                _cd_target = cd_m.group(1).strip().rstrip('/')
+                cwd = (cwd + '/' + _cd_target) if cwd else _cd_target
+                continue
+            mk_m = _re.match(r'^\s*mkdir\s+(?:-p\s+)?(.+)', seg)
+            if mk_m:
+                for d in mk_m.group(1).split():
+                    d = d.strip().rstrip('/')
+                    if not d or d.startswith('-'):
+                        continue
+                    abs_d = (cwd + '/' + d) if cwd else d
+                    all_dirs.add(abs_d)
+                    if not cwd:
+                        workspaces.add(d.split('/')[0])
+        return workspaces, all_dirs
+
+    workspace_dirs: set[str] = set()
+    all_created: set[str] = set()
+    for step in steps:
+        if step.step_type == "CMD" and step.command:
+            ws, dirs = _resolve_mkdir_paths(step.command)
+            workspace_dirs.update(ws)
+            all_created.update(dirs)
+
+    # Find collision: workspace/workspace pattern
+    colliding: set[str] = set()
+    for d in all_created:
+        parts = d.replace('\\', '/').split('/')
+        if (len(parts) >= 2
+                and parts[0] in workspace_dirs
+                and parts[1] == parts[0]):
+            colliding.add(parts[0])
+
+    if not colliding:
+        return fixes
+
+    # Phase 2: rewrite steps to remove the workspace wrapper.
+    # IMPORTANT: only strip the workspace prefix from DOUBLE-NESTED paths
+    # (e.g. snake_game/snake_game/game.py → snake_game/game.py).
+    # Single-nested paths (e.g. snake_game/game.py) are legitimate package
+    # paths and must NOT be stripped — otherwise files end up at the repo
+    # root instead of inside the package directory.
+    for ws in colliding:
+        ws_prefix = ws + '/'
+        double_prefix = ws + '/' + ws + '/'
+
+        def _strip_double(path: str) -> tuple[str, bool]:
+            """Strip workspace prefix only from double-nested paths."""
+            if path.startswith(double_prefix):
+                return path[len(ws_prefix):], True
+            return path, False
+
+        for step in steps:
+            # Rewrite CMD commands: strip "cd <ws> &&" and "mkdir <ws>"
+            # IMPORTANT: only strip "cd <ws>" when the remaining segments
+            # are ALL directory/file creation commands (mkdir, touch).
+            # If any segment is a runtime command (pip, python, pytest,
+            # npm, etc.), keep the cd — the command needs to run inside
+            # the workspace even though the package prefix is stripped.
+            if step.step_type == "CMD" and step.command:
+                original = step.command
+                segments = step.command.split('&&')
+                cd_indices: list[int] = []
+                mkdir_indices: list[int] = []
+                other_indices: list[int] = []
+
+                for i, seg in enumerate(segments):
+                    seg_stripped = seg.strip()
+                    if _re.match(rf'^\s*cd\s+{_re.escape(ws)}\s*$', seg_stripped):
+                        cd_indices.append(i)
+                    elif _re.match(
+                        rf'^\s*mkdir\s+(?:-p\s+)?{_re.escape(ws)}\s*$',
+                        seg_stripped,
+                    ):
+                        mkdir_indices.append(i)
+                    else:
+                        other_indices.append(i)
+
+                # Always drop bare mkdir <workspace>
+                drop = set(mkdir_indices)
+                # Only drop cd <workspace> when all remaining segments
+                # are directory/file scaffolding, not runtime commands
+                _SCAFFOLD_RE = _re.compile(
+                    r'^\s*(mkdir|touch|ln|cp|mv)\b', _re.IGNORECASE)
+                _non_cd_non_mkdir = [
+                    segments[i].strip() for i in other_indices]
+                _all_scaffold = all(
+                    _SCAFFOLD_RE.match(s) for s in _non_cd_non_mkdir
+                ) if _non_cd_non_mkdir else True
+                if _all_scaffold:
+                    drop.update(cd_indices)
+
+                new_segments = [
+                    segments[i] for i in range(len(segments))
+                    if i not in drop
+                ]
+                if new_segments:
+                    step.command = ' && '.join(s.strip() for s in new_segments)
+                else:
+                    step.command = 'true'  # noop — all segments were workspace-related
+
+                if step.command != original:
+                    fixes.append(
+                        f"Step {step.id}: stripped workspace '{ws}/' "
+                        f"from CMD to avoid nested package collision"
+                    )
+
+            # Rewrite target_files: only strip double-nested prefix
+            new_targets: list[str] = []
+            changed_targets = False
+            for tf in step.target_files:
+                new_tf, changed = _strip_double(tf)
+                new_targets.append(new_tf)
+                if changed:
+                    changed_targets = True
+            if changed_targets:
+                step.target_files = new_targets
+
+            # Rewrite inline_code keys: only strip double-nested prefix
+            if step.inline_code:
+                new_inline: dict[str, str] = {}
+                for k, v in step.inline_code.items():
+                    new_k, _ = _strip_double(k)
+                    new_inline[new_k] = v
+                step.inline_code = new_inline
+
+            # Rewrite inline_edits keys: only strip double-nested prefix
+            if step.inline_edits:
+                new_edits: dict[str, list[tuple[str, str]]] = {}
+                for k, v in step.inline_edits.items():
+                    new_k, _ = _strip_double(k)
+                    new_edits[new_k] = v
+                step.inline_edits = new_edits
+
+    return fixes
 
 
 # ---------------------------------------------------------------------------

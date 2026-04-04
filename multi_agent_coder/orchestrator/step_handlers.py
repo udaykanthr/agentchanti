@@ -4,6 +4,7 @@ Step handlers — CMD, CODE, and TEST step execution logic.
 # Separate retry limit for test generation (lower than code to avoid pipeline halts)
 MAX_TEST_GEN_RETRIES = 2
 
+import ast
 import json
 import os
 import re
@@ -1147,17 +1148,33 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
             # Even if the name is in _NON_SUBPROJECT_DIRS (e.g. "app"),
             # treat it as a real sub-project if it contains a manifest
             is_blocked_name = subproject in _NON_SUBPROJECT_DIRS
-            if not is_blocked_name:
-                log.info(f"[SubProject] Detected sub-project root: {subproject}/")
-                return subproject
-            # Override the blocklist when a project manifest exists
+
+            # A directory that contains __init__.py is a Python package,
+            # not a standalone sub-project — unless it ALSO contains a
+            # project manifest (pyproject.toml, setup.py, etc.).
+            _is_python_package = os.path.isfile(
+                os.path.join(subproject, '__init__.py'))
+
+            _has_manifest = False
             for manifest in ('package.json', 'Cargo.toml', 'go.mod',
                              'requirements.txt', 'Gemfile', 'pyproject.toml',
-                             'composer.json', 'manage.py'):
+                             'composer.json', 'manage.py', 'setup.py',
+                             'setup.cfg'):
                 if os.path.isfile(os.path.join(subproject, manifest)):
+                    _has_manifest = True
                     log.info(f"[SubProject] Detected sub-project root "
-                             f"(manifest override, {manifest}): {subproject}/")
+                             f"({'manifest override, ' if is_blocked_name else ''}"
+                             f"{manifest}): {subproject}/")
                     return subproject
+
+            if _is_python_package and not _has_manifest:
+                log.debug(
+                    f"[SubProject] '{subproject}/' has __init__.py but no "
+                    f"project manifest — treating as Python package, not "
+                    f"sub-project")
+            elif not is_blocked_name:
+                log.info(f"[SubProject] Detected sub-project root: {subproject}/")
+                return subproject
 
     # Fallback 1: if memory contains files from multiple top-level directories
     # (e.g. search provider added files), look for a known project manifest
@@ -1206,9 +1223,55 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
             total = sum(counts.values())
             # Only use majority if it covers >70% of files
             if best_count > total * 0.7 and os.path.isdir(best):
-                log.info(f"[SubProject] Detected sub-project root via "
-                         f"majority ({best_count}/{total} files): {best}/")
-                return best
+                if best in _NON_SUBPROJECT_DIRS:
+                    # Blocklisted name — only allow if it contains a
+                    # project manifest (same logic as single-component
+                    # check at Fallback 0).
+                    for manifest in ('package.json', 'Cargo.toml', 'go.mod',
+                                     'requirements.txt', 'Gemfile',
+                                     'pyproject.toml', 'composer.json',
+                                     'manage.py'):
+                        if os.path.isfile(os.path.join(best, manifest)):
+                            log.info(
+                                f"[SubProject] Detected sub-project root via "
+                                f"majority ({best_count}/{total} files, "
+                                f"manifest override {manifest}): {best}/")
+                            return best
+                    # No manifest — not a real sub-project
+                    log.debug(
+                        f"[SubProject] Majority candidate '{best}' is a "
+                        f"common source directory name without a project "
+                        f"manifest — skipping")
+                else:
+                    # A directory that contains __init__.py is a Python
+                    # package, not a standalone sub-project — unless it
+                    # ALSO has a project manifest.  This mirrors the
+                    # single-component check in Fallback 0 above.
+                    _is_py_pkg = os.path.isfile(
+                        os.path.join(best, '__init__.py'))
+                    if _is_py_pkg:
+                        _has_mf = any(
+                            os.path.isfile(os.path.join(best, m))
+                            for m in ('package.json', 'Cargo.toml', 'go.mod',
+                                      'requirements.txt', 'Gemfile',
+                                      'pyproject.toml', 'composer.json',
+                                      'manage.py', 'setup.py', 'setup.cfg')
+                        )
+                        if not _has_mf:
+                            log.debug(
+                                f"[SubProject] Majority candidate '{best}' "
+                                f"has __init__.py but no project manifest "
+                                f"— treating as Python package, not sub-project")
+                        else:
+                            log.info(
+                                f"[SubProject] Detected sub-project root via "
+                                f"majority ({best_count}/{total} files): {best}/")
+                            return best
+                    else:
+                        log.info(
+                            f"[SubProject] Detected sub-project root via "
+                            f"majority ({best_count}/{total} files): {best}/")
+                        return best
 
     return None
 
@@ -4186,18 +4249,37 @@ _TEST_BUG_PATTERNS = re.compile(
 
 def _triage_test_failure(error_detail: str, source_summary: str,
                          test_summary: str, llm_client,
-                         display: CLIDisplay, step_idx: int) -> str:
+                         display: CLIDisplay, step_idx: int,
+                         language: str | None = None) -> str:
     """Determine whether a test failure is a TEST_BUG or SOURCE_BUG.
 
-    Returns 'TEST_BUG' or 'SOURCE_BUG'.
+    Returns 'TEST_BUG', 'SOURCE_BUG', or 'CONFIG_BUG'.
     """
     # Fast-path: known JS/RTL patterns that are unambiguously test bugs
     if _TEST_BUG_PATTERNS.search(error_detail):
         log.info(f"Step {step_idx+1}: Triage result: TEST_BUG (pattern match)")
         return "TEST_BUG"
 
+    # Fast-path: SyntaxError / IndentationError / circular import in a source
+    # file is always a SOURCE_BUG — never a config issue.  The LLM frequently
+    # misclassifies these as CONFIG_BUG because the test "cannot even run",
+    # but the real fix is always in the source file that has the problem.
+    if re.search(r'(?:IndentationError|SyntaxError)\b', error_detail):
+        log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG "
+                 f"(SyntaxError/IndentationError pattern match)")
+        return "SOURCE_BUG"
+
+    if re.search(r'(?:most likely due to a circular import|'
+                 r'cannot import name .* from partially initialized module)',
+                 error_detail):
+        log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG "
+                 f"(circular import pattern match)")
+        return "SOURCE_BUG"
+
+    lang_hint = f"Project language: {language}\n" if language else ""
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
+        f"{lang_hint}"
         "Answer with ONLY one word: TEST_BUG, SOURCE_BUG, or CONFIG_BUG\n\n"
         "- TEST_BUG    = the test assertion, selector, or import is wrong "
         "(e.g. looking for text/classes that do not match what the source renders)\n"
@@ -4294,7 +4376,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     # Django project detection: manage.py test is the canonical runner for Django.
     # It handles test DB setup/teardown and settings without requiring pytest.
     if (language == "python" or not language) and os.path.isfile(
-        os.path.join(subproject_cwd, "manage.py")
+        os.path.join(subproject_cwd, "manage.py") if subproject_cwd else "manage.py"
     ):
         test_cmd = "python manage.py test"
         log.info(
@@ -4775,10 +4857,26 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             )
 
         failed_files: list[str] = []
-        file_count = len(test_files)
+
+        # Filter out non-test files before the per-file loop.
+        # The LLM auto-fix can include config files (pytest.ini,
+        # conftest.py, __init__.py) alongside test files.  Running
+        # `python -m pytest pytest.ini` fails with "not found".
+        _TEST_FILE_RE = re.compile(r'(?:^|/)test[_.].*\.py$|\.test\.[jt]sx?$')
+        _runnable_test_files = {
+            fp: content for fp, content in test_files.items()
+            if _TEST_FILE_RE.search(os.path.basename(fp))
+        }
+        if not _runnable_test_files and test_files:
+            # Fallback: if no files match the pattern, run all .py files
+            _runnable_test_files = {
+                fp: content for fp, content in test_files.items()
+                if fp.endswith('.py') and not fp.endswith('__init__.py')
+            }
+        file_count = len(_runnable_test_files)
 
         for file_idx, (test_path, test_content) in enumerate(
-                list(test_files.items()), 1):
+                list(_runnable_test_files.items()), 1):
             f_basename = os.path.basename(test_path)
             display.step_info(
                 step_idx,
@@ -4847,7 +4945,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             # ── Per-file fix loop ──
             file_fixed = False
             prev_output = output
+            # Snapshot before attempting fixes so we can restore if a
+            # bad fix corrupts the source files across attempts.
+            _test_fix_snap = memory.snapshot()
             for fix_attempt in range(1, MAX_STEP_RETRIES + 1):
+                # Restore on retry to prevent compounding bad fixes
+                if fix_attempt > 1:
+                    memory.restore(_test_fix_snap, executor=executor)
+                    log.info(
+                        "Step %d: Restored file snapshot before fix "
+                        "attempt %d for %s",
+                        step_idx + 1, fix_attempt, f_basename)
+
                 display.step_info(
                     step_idx,
                     f"Fixing {f_basename} (attempt {fix_attempt}/{MAX_STEP_RETRIES})...")
@@ -4884,7 +4993,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 bug_origin = _triage_test_failure(
                     error_detail, source_ctx,
                     f"{test_path}:\n{current_content[:3000]}\n",
-                    coder.llm_client, display, step_idx)
+                    coder.llm_client, display, step_idx,
+                    language=language)
                 is_source_bug = (bug_origin == "SOURCE_BUG")
                 is_config_bug = (bug_origin == "CONFIG_BUG")
 
@@ -4914,14 +5024,22 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
 
                 if is_config_bug:
                     # ── CONFIG_BUG: fix the test environment config ──────────
-                    # Find the vitest/vite config file in memory or on disk
-                    display.step_info(
-                        step_idx, "Config bug — fixing vitest/vite environment config...")
-                    _cfg_candidates = [
-                        "vitest.config.js", "vitest.config.ts",
-                        "vite.config.js", "vite.config.ts",
-                    ]
                     subproject = _detect_subproject_root(memory)
+
+                    # Use pluggable LanguageBackend for CONFIG_BUG handling
+                    from ..language_backend import get_backend
+                    _lang_backend = get_backend(language)
+                    display.step_info(
+                        step_idx,
+                        f"Config bug — fixing {_lang_backend.display_name} "
+                        f"test environment config...")
+                    _cfg_candidates = _lang_backend.get_config_candidates()
+                    _cfg_lang_tag = _lang_backend.get_config_lang_tag()
+                    _no_cfg_msg = _lang_backend.get_config_no_found_msg()
+                    _fix_detail = _lang_backend.get_config_fix_detail()
+                    _fix_runner = f"Test runner: {test_cmd}\n"
+                    _fix_prompt_body = _lang_backend.get_config_fix_prompt(test_cmd)
+
                     _cfg_paths = []
                     for _cn in _cfg_candidates:
                         for _pfx in ([f"{subproject}/{_cn}"] if subproject else []) + [_cn]:
@@ -4942,26 +5060,18 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                             break
 
                     _cfg_ctx = (
-                        f"#### [FILE]: {_cfg_path}\n```js\n{_cfg_file}\n```\n\n"
+                        f"#### [FILE]: {_cfg_path}\n```{_cfg_lang_tag}\n{_cfg_file}\n```\n\n"
                         if _cfg_file and _cfg_path
-                        else f"(no vitest/vite config found — create one)\n\n"
+                        else _no_cfg_msg
                     )
                     fix_ctx = (
                         f"{_task_context_header}"
                         f"ALL tests are failing with:\n{error_detail}\n\n"
-                        f"This is caused by a missing or misconfigured test environment "
-                        f"(jsdom not enabled in vitest/vite config).\n\n"
+                        f"{_fix_detail}"
                         f"Current config:\n{_cfg_ctx}"
-                        f"Test runner: vitest\n"
+                        f"{_fix_runner}"
                     )
-                    fix_prompt = (
-                        f"Fix the vitest/vite configuration so tests run in a jsdom "
-                        f"browser-like environment.\n"
-                        f"Required: add `test: {{ environment: 'jsdom', globals: true, "
-                        f"setupFiles: './vitest.setup.js' }}` (or equivalent) to the config.\n"
-                        f"Return the corrected config file using #### [FILE]: format.\n"
-                        f"Do NOT modify test files or source files."
-                    )
+                    fix_prompt = _fix_prompt_body
                     sent_before, recv_before = token_tracker.snapshot()
                     fix_response = coder.process(
                         fix_prompt, context=fix_ctx, language=language)
@@ -5087,6 +5197,24 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     if not is_source_bug:
                         fix_files = _filter_test_only_files(
                             fix_files, test_files, memory)
+                    if fix_files:
+                        # Syntax guard: reject Python files with syntax errors
+                        _syntax_ok: dict[str, str] = {}
+                        for _fp, _fc in fix_files.items():
+                            _ext = os.path.splitext(_fp)[1].lower()
+                            if _ext in ('.py', '.pyw'):
+                                try:
+                                    ast.parse(_fc, filename=_fp)
+                                    _syntax_ok[_fp] = _fc
+                                except SyntaxError as _se:
+                                    log.warning(
+                                        "Step %d: Syntax error in fix for "
+                                        "%s: %s (line %s) — skipping",
+                                        step_idx + 1, _fp,
+                                        _se.msg, _se.lineno)
+                            else:
+                                _syntax_ok[_fp] = _fc
+                        fix_files = _syntax_ok
                     if fix_files:
                         show_diffs(fix_files, log_only=True)
                         executor.write_files(fix_files)

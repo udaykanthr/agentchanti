@@ -549,6 +549,157 @@ class ChunkEditor:
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines[-1] += "\n"
 
+            # ── Indentation repair ──
+            # When the LLM returns a chunk with wrong indentation (e.g.
+            # 3-space instead of 4-space), detect the mismatch against
+            # the original code and re-indent the new lines to match.
+            if not edit.is_new and new_lines:
+                s_idx = max(0, start - 1)
+                e_idx = min(len(lines), end)
+                orig_slice = lines[s_idx:e_idx]
+
+                def _indent_info(line_list: list[str]) -> tuple[int | None, int | None]:
+                    """Return (min_indent, body_indent) for a chunk.
+
+                    min_indent: the smallest indent (declaration lines
+                    like ``class`` or ``def`` at the chunk boundary).
+                    body_indent: the first indent level above min
+                    (actual code body).  If all lines have the same
+                    indent, body_indent == min_indent.
+                    """
+                    widths = []
+                    for ln in line_list:
+                        stripped = ln.lstrip()
+                        if stripped and not stripped.startswith('#'):
+                            widths.append(len(ln) - len(stripped))
+                    if not widths:
+                        return None, None
+                    min_w = min(widths)
+                    body_w = min_w
+                    for w in widths:
+                        if w > min_w:
+                            body_w = w
+                            break
+                    return min_w, body_w
+
+                orig_min, orig_body = _indent_info(orig_slice)
+                new_min, new_body = _indent_info(new_lines)
+
+                if (orig_body is not None
+                        and new_body is not None
+                        and orig_body != new_body
+                        # Skip re-indentation when the replacement has
+                        # broader scope than the original (e.g. LLM
+                        # included a class header at indent 0 but the
+                        # original range was a method at indent 4).
+                        # The reference frame is mismatched — any
+                        # correction would be wrong.
+                        and (new_min is None or orig_min is None
+                             or new_min >= orig_min)):
+                    # Determine whether declaration lines (at min
+                    # indent) should also be shifted.  When both chunks
+                    # have the same min indent (e.g. both start with
+                    # ``class`` at column 0), only body lines need
+                    # shifting.  When min indents also differ, shift
+                    # everything.
+                    shift_all = (orig_min != new_min)
+
+                    # Use proportional re-indentation to correctly
+                    # handle multi-level nesting.  A flat delta only
+                    # fixes the first indent level; deeper levels
+                    # diverge (e.g. 3-space body at depth-2 = 6, but
+                    # 4-space target at depth-2 = 8; flat +1 → 7 ✗).
+                    _new_step = (new_body - (new_min or 0))
+                    _orig_step = (orig_body - (orig_min or 0))
+                    _use_ratio = (_new_step > 0 and _orig_step > 0
+                                  and _new_step != _orig_step)
+                    _ratio = _orig_step / _new_step if _use_ratio else 1.0
+                    _base_delta = (orig_min or 0) - (new_min or 0)
+                    # Flat delta fallback (for same-step-size cases)
+                    delta = orig_body - new_body
+
+                    fixed: list[str] = []
+                    for ln in new_lines:
+                        if ln.strip() == "":
+                            fixed.append(ln)
+                        else:
+                            cur_indent = len(ln) - len(ln.lstrip())
+                            # Skip declaration-level lines when min
+                            # indents already match (they're correct)
+                            if (not shift_all
+                                    and new_min is not None
+                                    and cur_indent <= new_min):
+                                fixed.append(ln)
+                            elif _use_ratio:
+                                # Proportional: map indent relative to
+                                # new_min onto orig_min's scale.
+                                # Only apply ratio for clean nesting
+                                # levels (multiples of new_step).
+                                # Continuation lines (e.g. wrapped
+                                # function args) have arbitrary indent
+                                # and should use flat delta instead.
+                                _rel = cur_indent - (new_min or 0)
+                                if _new_step and _rel % _new_step == 0:
+                                    target = (orig_min or 0) + round(
+                                        _rel * _ratio)
+                                    target = max(0, target)
+                                    fixed.append(
+                                        " " * target + ln.lstrip())
+                                elif delta > 0:
+                                    fixed.append(" " * delta + ln)
+                                else:
+                                    removable = min(-delta, cur_indent)
+                                    fixed.append(ln[removable:])
+                            elif delta > 0:
+                                fixed.append(" " * delta + ln)
+                            else:
+                                removable = min(-delta, cur_indent)
+                                fixed.append(ln[removable:])
+                    new_lines = fixed
+                    logger.debug(
+                        "[ChunkEditor] Re-indented chunk for '%s' "
+                        "(original=%d, new=%d, delta=%+d, shift_all=%s)",
+                        edit.file_path, orig_body, new_body, delta,
+                        shift_all,
+                    )
+
+            # ── Duplicate decorator guard ──
+            # When the LLM includes a decorator (e.g. @dataclass) that
+            # already exists on the line just before the replacement
+            # range, the splice creates a duplicate.  Detect and strip.
+            # IMPORTANT: only strip when the decorator is NOT part of the
+            # original replaced range — if the original range started with
+            # the same decorator, the LLM is legitimately including it
+            # and stripping it would remove a required decorator.
+            if not edit.is_new and new_lines:
+                s_check = max(0, start - 1)
+                if s_check > 0 and new_lines:
+                    line_before = lines[s_check - 1].strip()
+                    first_new = new_lines[0].strip()
+                    # Check if the original replaced range also started
+                    # with this decorator — if so, it's not a duplicate.
+                    _orig_first = ""
+                    _orig_s = max(0, start - 1)
+                    _orig_e = min(len(lines), end)
+                    if _orig_s < _orig_e:
+                        for _ol in lines[_orig_s:_orig_e]:
+                            if _ol.strip():
+                                _orig_first = _ol.strip()
+                                break
+                    _orig_had_decorator = (
+                        _orig_first.startswith('@')
+                        and _orig_first == first_new
+                    )
+                    if (line_before == first_new
+                            and line_before.startswith('@')
+                            and len(new_lines) > 1
+                            and not _orig_had_decorator):
+                        new_lines = new_lines[1:]
+                        logger.debug(
+                            "[ChunkEditor] Stripped duplicate decorator "
+                            "'%s' from replacement", line_before,
+                        )
+
             if edit.is_new:
                 if edit.insert_after == 0 and lines:
                     # "after line 0" on an existing file means full replacement,
@@ -565,7 +716,25 @@ class ChunkEditor:
                 e = min(len(lines), end)
                 lines[s:e] = new_lines
 
-        return "".join(lines)
+        # ── Post-splice syntax sanity check (Python only) ──
+        # If the splice produced broken Python, warn and return the
+        # original content unchanged — downstream syntax guards will
+        # also catch this, but catching it here avoids writing broken
+        # files when the caller trusts apply_chunk_edits.
+        result = "".join(lines)
+        if any(e.file_path.endswith(('.py', '.pyw')) for _, _, e in resolved_edits):
+            import ast as _ast
+            try:
+                _ast.parse(result, filename=edits[0].file_path if edits else "<chunk>")
+            except SyntaxError as _se:
+                logger.warning(
+                    "[ChunkEditor] Post-splice syntax error in %s: %s "
+                    "(line %s) — returning original content",
+                    edits[0].file_path if edits else "?",
+                    _se.msg, _se.lineno,
+                )
+                return original_content
+        return result
 
     @staticmethod
     def _resolve_edit_lines(

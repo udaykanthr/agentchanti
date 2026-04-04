@@ -872,6 +872,17 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 _resolved,
                             )
                             continue
+                        # Skip no-op edits where FIND and REPLACE are identical.
+                        # These waste a step and, worse, silently claim success
+                        # without adding the methods/code the plan intended.
+                        if _find_str == _repl_str:
+                            _logger.warning(
+                                "[InlineEdit] Skipping no-op FIND/REPLACE pair in %s "
+                                "(FIND and REPLACE are identical — plan likely "
+                                "failed to include the intended changes)",
+                                _resolved,
+                            )
+                            continue
                         if _find_str in _patched:
                             _find_pos = _patched.index(_find_str)
                             _after_find = _patched[_find_pos + len(_find_str):]
@@ -1203,7 +1214,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                             for _sp in _inline_sources:
                                 if _source_covered_by_test_step(_sp, _ts):
                                     _covered.add(_sp)
-                        _uncovered = [p for p in _inline_sources if p not in _covered]
+                        # Skip __main__.py — trivial entry points are
+                        # notoriously hard to test with runpy + patch
+                        # and the auto-generated tests consistently fail.
+                        _uncovered = [
+                            p for p in _inline_sources
+                            if p not in _covered
+                            and not p.endswith('__main__.py')
+                        ]
                         if _uncovered:
                             _logger.info(
                                 "[Inline] Source files with no TEST-step coverage: %s",
@@ -1725,8 +1743,20 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
         error_route.confidence, error_route.reason,
     )
 
+    # Snapshot files before the diagnosis loop so we can restore them
+    # if a fix attempt corrupts source code (compounding failures).
+    _diag_snapshot = memory.snapshot()
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
+            # Restore snapshot at the start of each attempt so that a
+            # bad fix from the previous attempt doesn't compound.
+            if diag_attempt > 1:
+                memory.restore(_diag_snapshot, executor=executor)
+                log.info(
+                    "Task %d: Restored file snapshot before diagnosis "
+                    "attempt %d", step_idx + 1, diag_attempt)
+
             display.step_info(
                 step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")
             log.info(f"Task {step_idx+1}: Diagnosis attempt "
@@ -1740,7 +1770,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 previous_diagnosis=last_diagnosis_content,
                 kb_context_builder=kb_context_builder,
                 error_route=error_route,
-                intent_spec=intent_spec)
+                intent_spec=intent_spec,
+                executor=executor)
 
             # Extract the original failing command from error_info so
             # _apply_fix can filter it out (prevents re-running the same
@@ -1751,12 +1782,14 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             _orig_cmd = _orig_cmd_match.group(1) if _orig_cmd_match else None
 
             _task_goal = getattr(project_context, 'goal_summary', '') if project_context else ''
+            _step_targets = plan_step.target_files if plan_step else None
             fix_applied, cmds_succeeded, has_fix_commands, _fix_cmds_run = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type,
                 original_error_cmd=_orig_cmd,
                 step_text=step_text,
-                task=_task_goal)
+                task=_task_goal,
+                step_target_files=_step_targets)
 
             if not fix_applied:
                 last_diagnosis_content = diagnosis

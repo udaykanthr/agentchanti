@@ -254,6 +254,31 @@ class FileMemory:
         with self._lock:
             return dict(self._files)
 
+    def snapshot(self, keys: list[str] | None = None) -> dict[str, str]:
+        """Return a shallow copy of tracked files for later restore.
+
+        If *keys* is provided, only snapshot those specific file paths.
+        Otherwise, snapshot all tracked files.
+        """
+        with self._lock:
+            if keys is not None:
+                return {k: self._files[k] for k in keys if k in self._files}
+            return dict(self._files)
+
+    def restore(self, snap: dict[str, str], executor=None) -> None:
+        """Restore file contents from a previous snapshot.
+
+        Overwrites in-memory contents for each key in *snap*.  If
+        *executor* is provided, also writes the restored content back to
+        disk so the filesystem matches memory.
+        """
+        with self._lock:
+            for fpath, content in snap.items():
+                self._files[fpath] = content
+                self._skeleton_cache.pop(fpath, None)
+        if executor is not None:
+            executor.write_files(snap)
+
     def related_context(self, step_text: str, max_tokens: int | None = None) -> str:
         """Build a compact context string with the most relevant files.
 

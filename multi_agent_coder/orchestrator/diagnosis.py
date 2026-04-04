@@ -2,6 +2,7 @@
 Diagnosis and fix helpers — analyze step failures and apply fixes.
 """
 
+import ast
 import os
 import re
 
@@ -17,6 +18,255 @@ from .step_handlers import (
 from .classification import _extract_commands_from_text, _looks_like_command, resolve_cmd_placeholders
 
 
+# ---------------------------------------------------------------------------
+# Tier 1: Deterministic pre-investigation (0 LLM tokens)
+# ---------------------------------------------------------------------------
+
+# Regex patterns for extracting structured info from error output
+_IMPORT_ERROR_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError)[^'\"]*['\"]?([\w.\-/]+)",
+    re.IGNORECASE,
+)
+_CIRCULAR_IMPORT_RE = re.compile(
+    r"cannot import name .+ from partially initialized module",
+    re.IGNORECASE,
+)
+_ATTR_ERROR_RE = re.compile(
+    r"AttributeError: '(\w+)' object has no attribute '(\w+)'",
+)
+_TRACEBACK_FILE_RE = re.compile(
+    r'File\s+"([^"]+)",\s+line\s+(\d+)',
+)
+
+
+def _pre_investigate(error_info: str, memory: FileMemory,
+                     executor: Executor, step_idx: int,
+                     language: str | None = None) -> str:
+    """Run deterministic (zero-LLM-token) investigation before diagnosis.
+
+    Parses the error output for structured signals — import failures,
+    missing attributes, circular imports, file-not-found — and runs
+    targeted filesystem checks to discover the root cause.
+
+    Returns a human-readable evidence block to inject into the diagnosis
+    prompt, or empty string if nothing useful was found.
+    """
+    if not error_info:
+        return ""
+
+    findings: list[str] = []
+
+    # Check for circular import first — it's a specific sub-case of
+    # ImportError that needs different handling than "module not found".
+    _is_circular = bool(_CIRCULAR_IMPORT_RE.search(error_info))
+
+    # ── 1. Module/import errors: trace where the module actually lives ────
+    import_match = (
+        _IMPORT_ERROR_RE.search(error_info) if not _is_circular else None
+    )
+    if import_match:
+        module_name = import_match.group(1).strip("'\"")
+        findings.append(f"Import target: '{module_name}'")
+
+        # Convert dotted module to possible file paths
+        module_parts = module_name.replace('-', '_').split('.')
+        possible_paths = []
+        # e.g. "snake_game.effects" → snake_game/effects.py, snake_game/effects/__init__.py
+        rel_path = os.path.join(*module_parts)
+        possible_paths.append(rel_path + '.py')
+        possible_paths.append(os.path.join(rel_path, '__init__.py'))
+        # Also try with nested structure: snake_game/snake_game/effects.py
+        if len(module_parts) >= 2:
+            nested = os.path.join(module_parts[0], *module_parts)
+            possible_paths.append(nested + '.py')
+            possible_paths.append(os.path.join(nested, '__init__.py'))
+
+        # Check which paths actually exist on disk
+        found_at: list[str] = []
+        not_found: list[str] = []
+        for p in possible_paths:
+            if os.path.isfile(p):
+                found_at.append(p)
+            else:
+                not_found.append(p)
+
+        # Also do a broader search for the leaf module file
+        leaf_name = module_parts[-1] + '.py'
+        try:
+            success, find_output = executor.run_command(
+                f"find . -name '{leaf_name}' -not -path '*/venv/*' "
+                f"-not -path '*/.git/*' -not -path '*/__pycache__/*'",
+                timeout=5,
+            )
+            if success and find_output.strip():
+                disk_locations = [
+                    p.strip() for p in find_output.strip().splitlines()
+                    if p.strip()
+                ]
+                findings.append(
+                    f"File '{leaf_name}' found on disk at: "
+                    + ', '.join(disk_locations)
+                )
+                # Detect nested directory collision
+                for loc in disk_locations:
+                    parts = loc.replace('\\', '/').lstrip('./').split('/')
+                    if (len(parts) >= 3
+                            and parts[0] == parts[1]
+                            and parts[0] == module_parts[0]):
+                        findings.append(
+                            f"⚠ NESTED DIRECTORY COLLISION: '{parts[0]}/{parts[1]}/' — "
+                            f"Python resolves '{module_parts[0]}' to the outer "
+                            f"'{parts[0]}/' directory which has no '{leaf_name}'. "
+                            f"The actual file is nested inside "
+                            f"'{parts[0]}/{parts[1]}/{parts[2]}'. "
+                            f"Fix: move the package contents up one level, or "
+                            f"adjust sys.path / PYTHONPATH."
+                        )
+            elif not found_at:
+                findings.append(
+                    f"File '{leaf_name}' NOT found anywhere on disk — "
+                    f"the module was never created."
+                )
+        except Exception:
+            pass
+
+        if found_at:
+            findings.append(f"Module file exists at: {', '.join(found_at)}")
+            # Check if there's an __init__.py in the parent dirs
+            for fp in found_at:
+                parent = os.path.dirname(fp)
+                init_path = os.path.join(parent, '__init__.py')
+                if parent and not os.path.isfile(init_path):
+                    findings.append(
+                        f"⚠ Missing __init__.py in '{parent}/' — "
+                        f"Python won't treat it as a package."
+                    )
+        elif not_found and not found_at:
+            findings.append(
+                f"Expected locations checked (all missing): "
+                + ', '.join(not_found)
+            )
+
+        # List what's in the top-level module directory
+        top_dir = module_parts[0]
+        if os.path.isdir(top_dir):
+            try:
+                entries = sorted(os.listdir(top_dir))
+                # Filter out noise
+                entries = [
+                    e for e in entries
+                    if e not in ('__pycache__', 'venv', '.venv',
+                                 'node_modules', '.git', '.pytest_cache')
+                ]
+                findings.append(
+                    f"Contents of '{top_dir}/': {', '.join(entries)}"
+                )
+                # Check for nested same-name dir
+                if top_dir in entries and os.path.isdir(
+                    os.path.join(top_dir, top_dir)
+                ):
+                    inner_entries = sorted(os.listdir(
+                        os.path.join(top_dir, top_dir)
+                    ))
+                    inner_entries = [
+                        e for e in inner_entries
+                        if e not in ('__pycache__',)
+                    ]
+                    findings.append(
+                        f"Contents of '{top_dir}/{top_dir}/': "
+                        + ', '.join(inner_entries)
+                    )
+            except OSError:
+                pass
+
+    # ── 2. Circular import detection ──────────────────────────────────────
+    if _CIRCULAR_IMPORT_RE.search(error_info):
+        # Extract the import chain from the traceback
+        tb_files = _TRACEBACK_FILE_RE.findall(error_info)
+        if tb_files:
+            chain = [f"{f}:{line}" for f, line in tb_files]
+            findings.append(
+                f"⚠ CIRCULAR IMPORT detected. Import chain:\n  "
+                + '\n  → '.join(chain)
+            )
+            # Read the imports from the first and last file in the chain
+            for fpath, _line in [tb_files[0], tb_files[-1]]:
+                for mem_path, content in memory.all_files().items():
+                    if fpath.endswith(mem_path) or mem_path.endswith(
+                        fpath.lstrip('./')
+                    ):
+                        # Extract import lines
+                        imports = [
+                            l.strip() for l in content.splitlines()
+                            if l.strip().startswith(('import ', 'from '))
+                        ]
+                        if imports:
+                            findings.append(
+                                f"Imports in '{mem_path}':\n  "
+                                + '\n  '.join(imports[:10])
+                            )
+                        break
+
+    # ── 3. AttributeError: check if the class/method exists ──────────────
+    attr_match = _ATTR_ERROR_RE.search(error_info)
+    if attr_match:
+        class_name = attr_match.group(1)
+        attr_name = attr_match.group(2)
+        # Search memory files for the class definition
+        found_class = False
+        for fpath, content in memory.all_files().items():
+            if fpath.startswith('_'):
+                continue
+            if f'class {class_name}' in content:
+                found_class = True
+                has_attr = (
+                    f'def {attr_name}' in content
+                    or f'{attr_name} =' in content
+                    or f'{attr_name}:' in content
+                )
+                if has_attr:
+                    findings.append(
+                        f"'{class_name}.{attr_name}' EXISTS in '{fpath}' — "
+                        f"the error may be from a stale import or wrong class."
+                    )
+                else:
+                    # List what methods the class DOES have
+                    methods = re.findall(
+                        r'def (\w+)\s*\(', content
+                    )
+                    findings.append(
+                        f"'{class_name}' in '{fpath}' does NOT have "
+                        f"'{attr_name}'. Available methods: "
+                        + ', '.join(methods[:15])
+                    )
+                break
+        if not found_class:
+            findings.append(
+                f"Class '{class_name}' not found in any memory file."
+            )
+
+    # ── 4. Traceback file analysis: check file existence on disk ─────────
+    tb_files = _TRACEBACK_FILE_RE.findall(error_info)
+    if tb_files and not import_match and not attr_match:
+        for fpath, line_no in tb_files[:5]:
+            if not os.path.isfile(fpath):
+                findings.append(
+                    f"⚠ Traceback references '{fpath}' but file does "
+                    f"not exist on disk."
+                )
+
+    if not findings:
+        return ""
+
+    result = (
+        "PRE-INVESTIGATION FINDINGS (automated, 0 LLM tokens):\n"
+        + "\n".join(f"• {f}" for f in findings)
+        + "\n"
+    )
+    log.info("Step %d: Pre-investigation found %d finding(s)", step_idx + 1, len(findings))
+    return result
+
+
 def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       memory: FileMemory, llm_client, display: CLIDisplay,
                       step_idx: int,
@@ -25,8 +275,23 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
                       previous_diagnosis: str | None = None,
                       kb_context_builder=None,
                       error_route=None,
-                      intent_spec=None) -> str:
+                      intent_spec=None,
+                      executor: Executor | None = None) -> str:
     display.step_info(step_idx, "Analyzing failure root cause...")
+
+    # ── Tier 1: Deterministic pre-investigation ──────────────────────────
+    # Parse the error for structured signals and run filesystem checks
+    # before invoking the LLM.  Zero tokens, catches structural issues
+    # (nested dirs, missing __init__.py, wrong import paths) that the
+    # diagnosis LLM consistently misdiagnoses.
+    pre_investigation = ""
+    if executor is not None:
+        try:
+            pre_investigation = _pre_investigate(
+                error_info, memory, executor, step_idx, language=language,
+            )
+        except Exception as _pre_exc:
+            log.debug("Step %d: Pre-investigation failed: %s", step_idx + 1, _pre_exc)
 
     # ── KB error-fix lookup using actual error output ────
     # Pass the real error_info into build_context so the ErrorDict
@@ -135,6 +400,13 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
     )
+    if pre_investigation:
+        prompt += (
+            f"{pre_investigation}\n"
+            "The findings above were gathered by automated analysis (file system "
+            "checks, import tracing). Use them to ground your diagnosis — they "
+            "are FACTS, not guesses.\n\n"
+        )
     if error_route and error_route.source_type in ("code", "kb"):
         _hint_map = {
             "code": "a code/logic bug in the existing files — focus on the written code, not package installation",
@@ -273,6 +545,10 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     if _error_file_paths:
         _injected: list[str] = []
         for fpath, content in memory.all_files().items():
+            # Skip files already injected in context_files or earlier
+            # sections to avoid duplicating large code blocks in the prompt.
+            if f"#### [FILE]: {fpath}" in prompt:
+                continue
             for efp in _error_file_paths:
                 if fpath.endswith(efp) or efp.endswith(fpath):
                     _injected.append(
@@ -415,12 +691,53 @@ def _extract_echo_chain_file_writes(text: str) -> dict[str, str]:
     return result
 
 
+def _strip_file_blocks_for_command_extraction(text: str) -> str:
+    """Remove ``#### [FILE]:`` and ``#### [EDIT]:`` code blocks from *text*.
+
+    These blocks contain source code that should be written to disk, not
+    executed as shell commands.  Without stripping, Python/JS code with
+    ``if``/``for``/``while`` keywords gets misclassified as shell control
+    flow by ``_extract_commands_from_text`` and sent to the shell executor.
+
+    Returns the text with file/edit blocks replaced by empty strings so
+    that only genuine command blocks remain for command extraction.
+    """
+    # Match #### [FILE]: or #### [EDIT]: header followed by a code block
+    # The pattern: header line, optional blank lines, triple-backtick block
+    _FILE_BLOCK_RE = re.compile(
+        r'####\s*\[(?:FILE|EDIT)\]:.*?\n'   # header line
+        r'(?:.*?\n)*?'                        # optional lines between header and block
+        r'```(?:\w*)\n'                       # opening fence
+        r'.*?'                                # block content
+        r'```',                               # closing fence
+        re.DOTALL,
+    )
+    return _FILE_BLOCK_RE.sub('', text)
+
+
+def _check_syntax(filepath: str, content: str) -> str | None:
+    """Return an error message if *content* has a syntax error, else ``None``.
+
+    Only checks Python files (by extension).  For other languages, returns
+    ``None`` (assume valid) so we never block non-Python fixes.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext not in ('.py', '.pyw'):
+        return None
+    try:
+        ast.parse(content, filename=filepath)
+        return None
+    except SyntaxError as exc:
+        return f"{exc.msg} (line {exc.lineno})"
+
+
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                display: CLIDisplay, step_idx: int,
                step_type: str = "CODE",
                original_error_cmd: str | None = None,
                step_text: str = '',
-               task: str = '') -> tuple[bool, bool, bool]:
+               task: str = '',
+               step_target_files: list[str] | None = None) -> tuple[bool, bool, bool]:
     """Apply fixes from a diagnosis response.
 
     Returns ``(applied, cmds_succeeded, has_fix_commands)`` where *applied* is True if any
@@ -502,6 +819,143 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         files = _apply_content_fixes(files, content_fixes)
 
     if files:
+        # ── Syntax guard: reject files with syntax errors ──
+        # The LLM (especially during diagnosis) can produce broken Python
+        # that survives to disk and compounds across fix attempts.  Check
+        # with ast.parse before writing — revert to the original content
+        # for any file that fails.
+        _syntax_ok: dict[str, str] = {}
+        for _fp, _content in files.items():
+            _err = _check_syntax(_fp, _content)
+            if _err:
+                log.warning(
+                    "Step %d: Syntax error in diagnosis fix for %s: %s — "
+                    "reverting this file",
+                    step_idx + 1, _fp, _err,
+                )
+                display.step_info(
+                    step_idx,
+                    f"Rejected fix for {os.path.basename(_fp)}: {_err}")
+            else:
+                _syntax_ok[_fp] = _content
+        if len(_syntax_ok) < len(files):
+            log.info(
+                "Step %d: Syntax guard rejected %d/%d file(s)",
+                step_idx + 1, len(files) - len(_syntax_ok), len(files),
+            )
+        files = _syntax_ok
+
+    if files:
+        # ── Structural preservation guard ──
+        # Reject diagnosis edits that delete too many functions/classes
+        # from the original file.  This catches the common failure mode
+        # where the LLM replaces a large chunk and accidentally drops
+        # methods like step(), request_direction(), etc.
+        _DEF_CLASS_RE = re.compile(r'^\s*(?:def |class |async def )\w+', re.MULTILINE)
+        _struct_ok: dict[str, str] = {}
+        for _fp, _new_content in files.items():
+            _ext = os.path.splitext(_fp)[1].lower()
+            if _ext not in ('.py', '.pyw'):
+                _struct_ok[_fp] = _new_content
+                continue
+            # Read original file to compare structure
+            _orig = memory.get(_fp)
+            if _orig is None:
+                try:
+                    with open(os.path.join(".", _fp), "r",
+                              encoding="utf-8", errors="replace") as _f:
+                        _orig = _f.read()
+                except OSError:
+                    _orig = None
+            if _orig is None:
+                _struct_ok[_fp] = _new_content
+                continue
+            _orig_defs = set(_DEF_CLASS_RE.findall(_orig))
+            _new_defs = set(_DEF_CLASS_RE.findall(_new_content))
+            if len(_orig_defs) >= 3:
+                _lost = _orig_defs - _new_defs
+                _lost_ratio = len(_lost) / len(_orig_defs)
+                if _lost_ratio > 0.5:
+                    _lost_names = [d.strip() for d in sorted(_lost)][:5]
+                    log.warning(
+                        "Step %d: Structural guard rejected fix for %s — "
+                        "would delete %d/%d definitions: %s",
+                        step_idx + 1, _fp,
+                        len(_lost), len(_orig_defs), _lost_names,
+                    )
+                    display.step_info(
+                        step_idx,
+                        f"Rejected fix for {os.path.basename(_fp)}: "
+                        f"would delete {len(_lost)} definitions")
+                    continue
+            _struct_ok[_fp] = _new_content
+        if len(_struct_ok) < len(files):
+            log.info(
+                "Step %d: Structural guard rejected %d/%d file(s)",
+                step_idx + 1, len(files) - len(_struct_ok), len(files),
+            )
+        files = _struct_ok
+
+    if files and step_target_files:
+        # ── Scope guard: restrict diagnosis fixes to step-relevant files ──
+        # The diagnosis LLM receives context files for reference but should
+        # only modify files that the step targets or that are closely related
+        # (e.g. test files for the target, or files already written by the
+        # pipeline).  Without this guard, the LLM can (and does) completely
+        # rewrite unrelated files like game_window.py or particles.py when
+        # diagnosing a game_state.py failure.
+        #
+        # Skip the guard when targets are non-file descriptors (e.g. CMD
+        # steps with "produces: test results" or "produces: venv/").
+        # These are not real file paths and would block ALL fixes.
+        def _looks_like_file(path: str) -> bool:
+            """Return True if path looks like a real source file target.
+
+            Excludes dotdirs (e.g. .pytest_cache), directories without
+            extensions (e.g. venv/, test results), and descriptive text.
+            """
+            base = os.path.basename(path)
+            if base.startswith('.'):
+                return False  # dotdir like .pytest_cache
+            if '/' in path and not base:
+                return False  # trailing slash = directory
+            # Must have a real file extension (not just a leading dot)
+            _, ext = os.path.splitext(base)
+            return bool(ext)
+
+        _real_targets = [
+            tf for tf in step_target_files if _looks_like_file(tf)
+        ]
+        if _real_targets:
+            _allowed = set()
+            _memory_files = set(memory.all_files().keys()) if hasattr(memory, 'all_files') else set()
+            for tf in _real_targets:
+                _allowed.add(tf)
+                # Also allow the bare filename (steps often use relative paths)
+                _allowed.add(os.path.basename(tf))
+            # Allow files already tracked by memory (written in earlier steps)
+            _allowed.update(_memory_files)
+            scoped_files: dict[str, str] = {}
+            for filepath, content in files.items():
+                _basename = os.path.basename(filepath)
+                if filepath in _allowed or _basename in _allowed:
+                    scoped_files[filepath] = content
+                else:
+                    log.warning(
+                        "Step %d: Diagnosis fix for '%s' rejected — "
+                        "file not in step scope %s",
+                        step_idx + 1, filepath, _real_targets,
+                    )
+            if len(scoped_files) < len(files):
+                log.info(
+                    "Step %d: Scope guard filtered %d/%d diagnosis file(s)",
+                    step_idx + 1,
+                    len(files) - len(scoped_files),
+                    len(files),
+                )
+            files = scoped_files
+
+    if files:
         # Filter out files with hazardous diffs.
         # In diagnosis context, the LLM was specifically asked to fix a
         # failure — size reduction is often intentional (e.g. removing
@@ -519,13 +973,28 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                         old_content = f.read()
                     hazards = _detect_hazards(filepath, old_content, content)
                     if hazards:
-                        # Separate blocking hazards from size-reduction warnings
+                        # Separate blocking hazards from size-reduction warnings.
+                        # Also block catastrophic size reductions (>60%) —
+                        # these almost always indicate the diagnosis LLM
+                        # replaced source code with a stub to match broken
+                        # tests, deleting all the real game logic.
                         blocking = [
                             (sev, msg) for sev, msg in hazards
                             if sev == HAZARD_BLOCK
                             or "export" in msg.lower()
                             or "dependencies" in msg.lower()
                         ]
+                        # Promote severe size reductions to blocking
+                        old_len = len(old_content)
+                        new_len = len(content)
+                        if old_len > 200 and new_len < old_len * 0.4:
+                            pct = int((1 - new_len / old_len) * 100)
+                            blocking.append((
+                                HAZARD_BLOCK,
+                                f"Catastrophic size reduction ({pct}%: "
+                                f"{old_len} -> {new_len} chars). "
+                                f"Diagnosis likely replaced source with a stub.",
+                            ))
                         warn_only = [
                             (sev, msg) for sev, msg in hazards
                             if (sev, msg) not in blocking
@@ -557,8 +1026,16 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     # Extract and run fix commands.
     # For CMD steps, only extract from triple-backtick code blocks to avoid
     # picking up the *broken* original command or the new file contents.
+    #
+    # IMPORTANT: Strip [FILE]: and [EDIT]: code blocks from the diagnosis
+    # text before extracting commands.  These blocks contain source code
+    # (Python, JS, etc.) that _extract_commands_from_text would incorrectly
+    # classify as shell commands when they contain control-flow keywords
+    # like `if`, `for`, `while` — causing entire file contents to be
+    # executed as shell commands.
+    _cmd_text = _strip_file_blocks_for_command_extraction(diagnosis)
     fix_commands = _extract_commands_from_text(
-        diagnosis, code_blocks_only=(step_type == "CMD"))
+        _cmd_text, code_blocks_only=(step_type == "CMD"))
 
     # Filter out commands that exactly match the original failing command
     if original_error_cmd and fix_commands:

@@ -257,7 +257,7 @@ def perform_baseline_test_analysis(
     # Django project detection: prefer manage.py test over pytest
     import os as _os_ta
     if (not language or language == "python") and _os_ta.path.isfile(
-        _os_ta.path.join(subproject_cwd, "manage.py")
+        _os_ta.path.join(subproject_cwd, "manage.py") if subproject_cwd else "manage.py"
     ):
         test_cmd = "python manage.py test"
         _logger.info("Baseline: Django project detected — using 'python manage.py test'")

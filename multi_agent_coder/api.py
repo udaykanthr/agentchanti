@@ -127,11 +127,17 @@ def _run_task_impl(
     if not language:
         language = detect_language_from_task(task) or detect_language()
 
+    # Load custom language backends from config
+    if cfg.LANGUAGE_BACKENDS:
+        from .language_backend import load_custom_backends
+        load_custom_backends(cfg.LANGUAGE_BACKENDS)
+
     # Init LLM
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=cfg.STREAM_RESPONSES,
+        max_output_tokens=cfg.MAX_OUTPUT_TOKENS,
     )
 
     if provider == "ollama":
@@ -377,6 +383,7 @@ def _run_task_impl(
     # ── Parse plan: try structured format first, fall back to legacy ──
     from .orchestrator.plan_step import (
         parse_structured_plan, is_structured_plan, validate_plan,
+        fix_nested_workspace_collision,
         fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -397,6 +404,9 @@ def _run_task_impl(
             errors = validate_plan(plan_steps)
             if errors:
                 _logger.warning("[Plan] Validation warnings: %s", errors)
+            ws_fixes = fix_nested_workspace_collision(plan_steps)
+            if ws_fixes:
+                _logger.info("[Plan] Auto-fixed workspace collision: %s", ws_fixes)
             dep_fixes = fix_import_dependencies(plan_steps)
             if dep_fixes:
                 _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)

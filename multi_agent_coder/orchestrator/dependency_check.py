@@ -951,6 +951,39 @@ def find_gaps(
             likely_parent = plan_parent or _guess_parent_file(nf, step_text, memory_files)
             if plan_parent:
                 _logger.debug("[DepCheck] Plan-declared parent for '%s': %s", nf, plan_parent)
+
+            # ── Circular import guard (bidirectional) ──
+            # If the new file (nf) already imports from the likely parent,
+            # OR the parent already imports from the new file, wiring the
+            # parent to import nf back would create a circular dependency.
+            # Skip this gap entirely.
+            if likely_parent:
+                would_be_circular = False
+                parent_norm = likely_parent.replace("\\", "/")
+                # Direction 1: nf imports from parent
+                for imp_src in (nf_deps.imports or []):
+                    resolved = _normalize_import_path(imp_src, nf)
+                    if (_file_matches_import(parent_norm, resolved)
+                            or _file_matches_import(parent_norm, imp_src)):
+                        would_be_circular = True
+                        break
+                # Direction 2: parent already imports from nf
+                if not would_be_circular:
+                    parent_deps = after.file_deps.get(likely_parent)
+                    if parent_deps:
+                        for imp_src in (parent_deps.imports or []):
+                            resolved = _normalize_import_path(
+                                imp_src, likely_parent)
+                            if (_file_matches_import(nf_norm, resolved)
+                                    or _file_matches_import(nf_norm, imp_src)):
+                                would_be_circular = True
+                                break
+                if would_be_circular:
+                    _logger.info(
+                        "[DepCheck] Skipping orphaned_export for '%s' → '%s': "
+                        "would create circular import", nf, likely_parent)
+                    continue
+
             gaps.append(IntegrationGap(
                 gap_type="orphaned_export",
                 source_file=nf,
@@ -1126,6 +1159,8 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 - For component imports, use the correct relative path from importer to importee.
 - Do NOT modify package.json, go.mod, or other config/manifest files.
 - Do NOT add unnecessary imports — only fix the gaps listed above.
+- Do NOT create circular imports (A imports B and B imports A). If wiring \
+an import would create a cycle, skip that gap entirely.
 - Preserve ALL existing code, comments, and formatting in modified files.
 - For MISSING DEFAULT EXPORT gaps: add `export default ComponentName;` at the end \
 of the file. The component name should match the filename in PascalCase. \
@@ -1262,18 +1297,19 @@ def run_dependency_check(
         display.step_info(step_idx, "[DepCheck] All dependencies connected.")
         return {}
 
-    # LLM fallback: for orphaned exports where both plan and heuristic returned None,
-    # make a small targeted LLM call to identify the correct parent file.
+    # For orphaned exports where both plan and heuristic returned None,
+    # let the main fix prompt identify the correct parent (0 extra LLM
+    # calls — parent guessing is folded into the single fix call).
+    # Enrich the gap description so the fix LLM knows it must choose.
     for gap in gaps:
         if gap.gap_type == "orphaned_export" and gap.target_file is None:
-            _logger.debug("[DepCheck] Heuristic failed for '%s', trying LLM parent guess", gap.source_file)
-            nf_deps = dep_after.file_deps.get(gap.source_file)
-            symbols = nf_deps.exports[:5] if nf_deps else []
-            guessed = _llm_guess_parent_file(gap.source_file, symbols, memory_files, llm_client)
-            if guessed:
-                _logger.info("[DepCheck] LLM identified parent '%s' for '%s'", guessed, gap.source_file)
-                gap.target_file = guessed
-                gap.description += f" LLM-identified parent: '{guessed}'."
+            _logger.debug(
+                "[DepCheck] No parent identified for '%s' — "
+                "fix prompt will determine parent", gap.source_file)
+            gap.description += (
+                " No parent file identified — choose the most appropriate "
+                "existing file to add the import to."
+            )
 
     # Report gaps
     display.step_info(

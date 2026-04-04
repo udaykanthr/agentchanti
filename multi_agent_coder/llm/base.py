@@ -12,10 +12,11 @@ class LLMError(Exception):
 class LLMClient(ABC):
 
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
-                 stream: bool = True):
+                 stream: bool = True, max_output_tokens: int = 16384):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.stream = stream
+        self.max_output_tokens = max_output_tokens
         self._stream_callback: Optional[Callable[[int], None]] = None
 
     def set_stream_callback(self, callback: Callable[[int], None]) -> None:

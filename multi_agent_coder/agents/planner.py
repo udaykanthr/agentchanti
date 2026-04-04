@@ -700,6 +700,7 @@ class PlannerAgent(Agent):
                         categories=["doc", "pattern"],
                         top_k=15,
                         api_client=kb_context_builder._api_client,
+                        language=language,
                     ) or []
                     _blank_titles = [r.title for r in _blank_hits if r.title]
                     if _blank_titles:
@@ -750,11 +751,67 @@ class PlannerAgent(Agent):
                                 }
                                 _selected_lower = _selected.lower()
                                 _forced: list[str] = []
+                                # Build task tech keywords for framework
+                                # conflict filtering — reuse the same
+                                # normalize_tech_keywords used later in
+                                # the doc filter pipeline.
+                                try:
+                                    from ..orchestrator.plan_optimizer import (
+                                        _TECH_KEYWORDS as _TK_f,
+                                        has_framework_conflict as _hfc,
+                                        normalize_tech_keywords as _ntk,
+                                    )
+                                    _task_techs_f = _ntk(set(
+                                        w.lower() for w in _TK_f.findall(task)
+                                    ))
+                                except ImportError:
+                                    _task_techs_f = set()
+                                    _hfc = None  # type: ignore[assignment]
+                                    _TK_f = None  # type: ignore[assignment]
+                                    _ntk = None  # type: ignore[assignment]
                                 for _t in _blank_titles:
                                     _tl = _t.lower()
                                     if ("setup" in _tl or "install" in _tl) and \
                                             _t not in _selected:
                                         if any(kw in _tl for kw in _task_kw):
+                                            # Check framework conflict before
+                                            # force-including (e.g. don't add
+                                            # Django guide for a pyglet project
+                                            # or Anime.js for a Python project)
+                                            if _hfc and _TK_f and _ntk and _task_techs_f:
+                                                _doc_techs_f = _ntk(set(
+                                                    w.lower()
+                                                    for w in _TK_f.findall(_t)
+                                                ))
+                                                if _doc_techs_f and _hfc(
+                                                    _task_techs_f, _doc_techs_f
+                                                ):
+                                                    _logger.debug(
+                                                        "[PreAnalysis] Skipping "
+                                                        "force-include '%s' — "
+                                                        "framework conflict", _t,
+                                                    )
+                                                    continue
+                                            # Also check language mismatch:
+                                            # skip guides for a different
+                                            # language family
+                                            if language:
+                                                _hit = next(
+                                                    (r for r in _blank_hits
+                                                     if r.title == _t), None)
+                                                if (_hit
+                                                        and _hit.language != "all"
+                                                        and _hit.language.lower()
+                                                        != language.lower()):
+                                                    _logger.debug(
+                                                        "[PreAnalysis] Skipping "
+                                                        "force-include '%s' — "
+                                                        "language mismatch "
+                                                        "(doc=%s, project=%s)",
+                                                        _t, _hit.language,
+                                                        language,
+                                                    )
+                                                    continue
                                             _forced.append(_t)
                                 if _forced:
                                     _selected = _selected + ", " + ", ".join(_forced)

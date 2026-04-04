@@ -192,8 +192,8 @@ class ContextBuilder:
     # guides; CODE/TEST steps get the full set.
     _CATEGORY_LIMITS_BY_TYPE: dict[str, dict[str, int]] = {
         "CMD": {"doc": 2, "behavioral": 0, "pattern": 0, "adr": 0},
-        "CODE": {"doc": 4, "behavioral": 3, "pattern": 2, "adr": 1},
-        "TEST": {"doc": 3, "behavioral": 3, "pattern": 1, "adr": 0},
+        "CODE": {"doc": 4, "behavioral": 2, "pattern": 2, "adr": 1},
+        "TEST": {"doc": 3, "behavioral": 2, "pattern": 1, "adr": 0},
     }
     _DEFAULT_CATEGORY_LIMITS: dict[str, int] = {
         "doc": 4, "behavioral": 3, "pattern": 2, "adr": 1,
