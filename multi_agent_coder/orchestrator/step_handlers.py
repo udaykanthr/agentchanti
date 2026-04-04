@@ -4488,6 +4488,59 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         test_runner = js_env.get("test_runner")
         log.info(f"Step {step_idx+1}: JS project env: {js_env}")
 
+        # ── Auto-create vitest config when missing ──
+        # If the project uses Vitest (installed or Vite-based) but has no
+        # vitest.config.js, tests fail with "describe is not defined"
+        # because globals:true isn't set.  Create the config from KB
+        # templates (zero LLM calls) to prevent cascading failures.
+        if (test_runner == "vitest"
+                and not js_env.get("has_vitest_config")
+                and js_env.get("has_vitest")):
+            _cwd = subproject_cwd or "."
+            _vitest_cfg_path = os.path.join(_cwd, "vitest.config.js")
+            _vitest_setup_path = os.path.join(_cwd, "vitest.setup.js")
+
+            # Check if jsx/tsx files exist to decide on React plugin
+            _has_jsx = js_env.get("has_jsx") or js_env.get("has_tsx")
+
+            if not os.path.isfile(_vitest_cfg_path):
+                _cfg_content = (
+                    "import { defineConfig } from 'vitest/config'\n"
+                )
+                if _has_jsx:
+                    _cfg_content += (
+                        "import react from '@vitejs/plugin-react'\n"
+                    )
+                _cfg_content += (
+                    "\nexport default defineConfig({\n"
+                )
+                if _has_jsx:
+                    _cfg_content += "  plugins: [react()],\n"
+                _cfg_content += (
+                    "  test: {\n"
+                    "    environment: 'jsdom',\n"
+                    "    globals: true,\n"
+                    "    setupFiles: './vitest.setup.js',\n"
+                    "  },\n"
+                    "})\n"
+                )
+                _cfg_rel = os.path.relpath(_vitest_cfg_path, ".")
+                executor.write_files({_cfg_rel: _cfg_content})
+                memory.update({_cfg_rel: _cfg_content})
+                log.info(f"Step {step_idx+1}: Auto-created {_cfg_rel} "
+                         f"(vitest installed but no config found)")
+
+            if not os.path.isfile(_vitest_setup_path):
+                _setup_content = "import '@testing-library/jest-dom/vitest'\n"
+                _setup_rel = os.path.relpath(_vitest_setup_path, ".")
+                executor.write_files({_setup_rel: _setup_content})
+                memory.update({_setup_rel: _setup_content})
+                log.info(f"Step {step_idx+1}: Auto-created {_setup_rel}")
+
+            # Re-read env now that config exists
+            js_env = _read_js_project_env(subproject_cwd)
+            test_runner = js_env.get("test_runner")
+
     # Use language-aware defaults (fall back to Python only as last resort)
     lang_tag = get_code_block_lang(language) if language else "python"
     fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")

@@ -1025,11 +1025,13 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 if _kf.endswith(_ie_path) or _ie_path.endswith(os.path.basename(_kf)):
                                     _ie_resolved = _kf
                                     break
+                            # Collect ALL REPLACE blocks for this file and
+                            # concatenate them in order.  Plans often split
+                            # a file into multiple FIND/REPLACE pairs (e.g.
+                            # imports in pair 1, function body in pair 2).
+                            _repl_parts: list[str] = []
                             for _, _repl in _ie_pairs:
                                 _repl_stripped = _repl.strip()
-                                # A "complete file" REPLACE block has imports
-                                # or function/class defs — it's not just a
-                                # small patch fragment.
                                 _has_structure = (
                                     'import ' in _repl_stripped
                                     or 'export ' in _repl_stripped
@@ -1038,16 +1040,20 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     or 'def ' in _repl_stripped
                                     or 'from ' in _repl_stripped
                                 )
-                                _is_substantial = len(_repl_stripped) > 100
+                                _is_substantial = len(_repl_stripped) > 50
                                 if _has_structure and _is_substantial:
-                                    plan_step.inline_code[_ie_resolved] = _repl_stripped
-                                    _logger.info(
-                                        "[InlineEdit] FIND failed but REPLACE "
-                                        "looks like a complete file — promoting "
-                                        "REPLACE content for %s (%d chars)",
-                                        _ie_resolved, len(_repl_stripped),
-                                    )
-                                    _used_replace_fallback = True
+                                    _repl_parts.append(_repl_stripped)
+                            if _repl_parts:
+                                _combined = "\n\n".join(_repl_parts)
+                                plan_step.inline_code[_ie_resolved] = _combined
+                                _logger.info(
+                                    "[InlineEdit] FIND failed but REPLACE "
+                                    "looks like a complete file — promoting "
+                                    "%d REPLACE block(s) for %s (%d chars)",
+                                    len(_repl_parts),
+                                    _ie_resolved, len(_combined),
+                                )
+                                _used_replace_fallback = True
 
                     if _used_replace_fallback:
                         plan_step.inline_edits = {}
@@ -3258,6 +3264,85 @@ def run_bulk_test_execution_and_fix(
                     break
 
                 _sigs_for_test.add(_fix_sig)
+                # ── Source file protection ──
+                # BulkTest should only modify test files. When the LLM
+                # rewrites source files (Header.jsx, Hero.jsx) to make
+                # a test pass, it corrupts working components.
+                if fix_files:
+                    _bt_filtered = {}
+                    for _bt_fp, _bt_fc in fix_files.items():
+                        if _is_test_file(_bt_fp):
+                            _bt_filtered[_bt_fp] = _bt_fc
+                        else:
+                            _logger.warning(
+                                "[BulkTest] Blocked fix for source file "
+                                "%s — only test files may be modified",
+                                _bt_fp)
+                    fix_files = _bt_filtered
+                if not fix_files:
+                    # All fixes targeted source files — retry once with a
+                    # test-only constraint instead of giving up.  Common
+                    # case: Header uses <Link> but test doesn't wrap in
+                    # MemoryRouter.  LLM tries to remove Link from Header
+                    # instead of wrapping the test render.
+                    if not getattr(fix_attempt, '_retried_test_only', False):
+                        _logger.info(
+                            "[BulkTest] All fixes were source files for %s "
+                            "— retrying with test-only constraint", basename)
+                        _test_only_prompt = (
+                            f"{_bt_briefing_block}"
+                            f"Task: {task}\n\n"
+                            f"Test file `{test_path}` failed.\n\n"
+                            f"Error output:\n{file_error}\n\n"
+                            f"Relevant source files (READ-ONLY — do NOT modify these):\n"
+                            f"{source_ctx}\n\n"
+                            "CRITICAL CONSTRAINT: You MUST fix ONLY the test file.\n"
+                            "Do NOT output any source files. Do NOT modify components.\n\n"
+                            "Common fixes:\n"
+                            "- If the error mentions Router context (useHref, useLocation, "
+                            "basename is null), wrap the render in <MemoryRouter> from "
+                            "'react-router-dom'.\n"
+                            "- If the error mentions missing element/text, update the "
+                            "test assertions to match what the component actually renders.\n"
+                            "- Use getAllByText/getAllByRole if multiple elements match.\n\n"
+                            f"Output the COMPLETE fixed test file using:\n"
+                            f"#### [FILE]: {test_path}\n"
+                            f"```{lang_tag}\n// complete test file\n```"
+                        )
+                        try:
+                            _to_resp = coder.llm_client.generate_response(
+                                _test_only_prompt)
+                            _to_files = executor.parse_code_blocks(_to_resp)
+                            if not _to_files:
+                                _to_files = executor.parse_code_blocks_fuzzy(
+                                    _to_resp)
+                            if _to_files:
+                                if subproject_cwd:
+                                    from .step_handlers import (
+                                        _prefix_subproject_paths,
+                                    )
+                                    _to_files = _prefix_subproject_paths(
+                                        _to_files, subproject_cwd, memory)
+                                # Filter again — only test files
+                                _to_files = {
+                                    fp: fc for fp, fc in _to_files.items()
+                                    if _is_test_file(fp)
+                                }
+                            if _to_files:
+                                fix_files = _to_files
+                                _logger.info(
+                                    "[BulkTest] Test-only retry produced "
+                                    "fix for %s: %s",
+                                    basename, list(fix_files.keys()))
+                        except Exception as _to_exc:
+                            _logger.warning(
+                                "[BulkTest] Test-only retry failed: %s",
+                                _to_exc)
+                    if not fix_files:
+                        _logger.warning(
+                            "[BulkTest] All fix files were source files — "
+                            "skipping write for %s", basename)
+                        break
                 executor.write_files(fix_files)
                 memory.update(fix_files)
                 _logger.info(
@@ -3465,6 +3550,55 @@ def run_bulk_test_execution_and_fix(
                             from .step_handlers import _prefix_subproject_paths
                             fix_files = _prefix_subproject_paths(
                                 fix_files, subproject_cwd, memory)
+                        # ── Source file protection ──
+                        _bt2_filtered = {
+                            fp: fc for fp, fc in fix_files.items()
+                            if _is_test_file(fp)
+                        }
+                        _bt2_blocked = set(fix_files) - set(_bt2_filtered)
+                        if _bt2_blocked:
+                            _logger.warning(
+                                "[BulkTest] Blocked fix for source file(s): "
+                                "%s — only test files may be modified",
+                                list(_bt2_blocked))
+                        fix_files = _bt2_filtered
+                        if not fix_files:
+                            # Retry with test-only constraint (same
+                            # logic as Loop 1 — see detailed comments there)
+                            try:
+                                _to2_prompt = (
+                                    f"Test file `{test_path}` failed.\n\n"
+                                    f"Error:\n{current_output[:3000]}\n\n"
+                                    "CRITICAL: Fix ONLY the test file. "
+                                    "Do NOT modify source files.\n"
+                                    "If Router context is needed, wrap "
+                                    "renders in <MemoryRouter>.\n\n"
+                                    f"#### [FILE]: {test_path}\n"
+                                )
+                                _to2_resp = coder.llm_client.generate_response(
+                                    _to2_prompt)
+                                _to2_files = (
+                                    executor.parse_code_blocks(_to2_resp)
+                                    or executor.parse_code_blocks_fuzzy(_to2_resp)
+                                )
+                                if _to2_files and subproject_cwd:
+                                    from .step_handlers import _prefix_subproject_paths
+                                    _to2_files = _prefix_subproject_paths(
+                                        _to2_files, subproject_cwd, memory)
+                                if _to2_files:
+                                    _to2_files = {
+                                        fp: fc for fp, fc in _to2_files.items()
+                                        if _is_test_file(fp)
+                                    }
+                                if _to2_files:
+                                    fix_files = _to2_files
+                                    _logger.info(
+                                        "[BulkTest] Test-only retry produced "
+                                        "fix: %s", list(fix_files.keys()))
+                            except Exception:
+                                pass
+                        if not fix_files:
+                            break
                         executor.write_files(fix_files)
                         memory.update(fix_files)
                         _logger.info(
