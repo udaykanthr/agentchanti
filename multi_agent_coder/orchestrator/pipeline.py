@@ -1888,14 +1888,73 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                             "applied (likely diff guard) — retrying "
                             "with test-only constraint",
                             step_idx + 1)
+
+                        # Build context: step intent, source files
+                        # (read-only), and existing test content
+                        _dt_step_desc = ""
+                        if plan_step and plan_step.description:
+                            _dt_step_desc = (
+                                f"STEP INTENT: {plan_step.description}\n"
+                            )
+                        if step_text:
+                            _dt_step_desc += (
+                                f"STEP DESCRIPTION: {step_text[:1000]}\n"
+                            )
+
+                        _dt_briefing = ""
+                        if intent_spec:
+                            _brief = getattr(
+                                intent_spec, 'briefing', '') or ''
+                            if _brief:
+                                _dt_briefing = (
+                                    f"TASK BRIEFING (preserve these "
+                                    f"constraints):\n{_brief[:1000]}\n\n"
+                                )
+
+                        # Include source files the tests import so the
+                        # LLM knows what the components render
+                        _dt_source_ctx = ""
+                        _all_mem = memory.all_files()
+                        for _tp in _test_paths:
+                            _tc = _all_mem.get(_tp, "")
+                            if _tc:
+                                _dt_source_ctx += (
+                                    f"CURRENT TEST FILE (to fix):\n"
+                                    f"#### [FILE]: {_tp}\n"
+                                    f"```\n{_tc}\n```\n\n"
+                                )
+                        # Add source components as read-only context
+                        _dt_imports = (
+                            plan_step.imports_from
+                            if plan_step else {}
+                        )
+                        for _imp_path in _dt_imports:
+                            _imp_content = _all_mem.get(_imp_path, "")
+                            if _imp_content:
+                                _dt_source_ctx += (
+                                    f"SOURCE FILE (READ-ONLY — do NOT "
+                                    f"modify):\n"
+                                    f"#### [FILE]: {_imp_path}\n"
+                                    f"```\n{_imp_content[:3000]}\n"
+                                    f"```\n\n"
+                                )
+
                         _diag_test_prompt = (
+                            f"{_dt_briefing}"
+                            f"{_dt_step_desc}\n"
                             f"A test step failed. The previous fix "
                             f"attempt was rejected because it tried to "
                             f"rewrite source files too aggressively.\n\n"
                             f"Error:\n{error_info[:3000]}\n\n"
-                            f"CRITICAL: Fix ONLY the test file(s). "
-                            f"Source files are correct and must NOT be "
-                            f"modified.\n\n"
+                            f"{_dt_source_ctx}"
+                            f"CRITICAL RULES:\n"
+                            f"1. Fix ONLY the test file(s). Source "
+                            f"files are correct — do NOT modify them.\n"
+                            f"2. Do NOT remove or weaken test "
+                            f"assertions — the intended functionality "
+                            f"must still be verified.\n"
+                            f"3. Adapt assertions to match what the "
+                            f"source components ACTUALLY render.\n\n"
                             f"Common test fixes:\n"
                             f"- Wrap renders in <MemoryRouter> when "
                             f"components use react-router Link/NavLink\n"
@@ -3372,15 +3431,25 @@ def run_bulk_test_execution_and_fix(
                         _logger.info(
                             "[BulkTest] All fixes were source files for %s "
                             "— retrying with test-only constraint", basename)
+                        _bt_step_desc = ""
+                        if plan_step and plan_step.description:
+                            _bt_step_desc = (
+                                f"STEP INTENT: {plan_step.description}\n"
+                            )
                         _test_only_prompt = (
                             f"{_bt_briefing_block}"
                             f"Task: {task}\n\n"
+                            f"{_bt_step_desc}"
                             f"Test file `{test_path}` failed.\n\n"
                             f"Error output:\n{file_error}\n\n"
                             f"Relevant source files (READ-ONLY — do NOT modify these):\n"
                             f"{source_ctx}\n\n"
-                            "CRITICAL CONSTRAINT: You MUST fix ONLY the test file.\n"
-                            "Do NOT output any source files. Do NOT modify components.\n\n"
+                            "CRITICAL RULES:\n"
+                            "1. Fix ONLY the test file. Source files are correct.\n"
+                            "2. Do NOT remove or weaken test assertions — the intended "
+                            "functionality must still be verified.\n"
+                            "3. Adapt assertions to match what the source components "
+                            "ACTUALLY render (read the source files above).\n\n"
                             "Common fixes:\n"
                             "- If the error mentions Router context (useHref, useLocation, "
                             "basename is null), wrap the render in <MemoryRouter> from "
@@ -3650,12 +3719,23 @@ def run_bulk_test_execution_and_fix(
                             # logic as Loop 1 — see detailed comments there)
                             try:
                                 _to2_prompt = (
+                                    f"{_bt_briefing_block}"
                                     f"Test file `{test_path}` failed.\n\n"
                                     f"Error:\n{current_output[:3000]}\n\n"
-                                    "CRITICAL: Fix ONLY the test file. "
-                                    "Do NOT modify source files.\n"
-                                    "If Router context is needed, wrap "
-                                    "renders in <MemoryRouter>.\n\n"
+                                    f"Source files (READ-ONLY):\n"
+                                    f"{source_ctx}\n\n"
+                                    "CRITICAL RULES:\n"
+                                    "1. Fix ONLY the test file. Source "
+                                    "files are correct.\n"
+                                    "2. Do NOT remove or weaken "
+                                    "assertions — verify the intended "
+                                    "functionality.\n"
+                                    "3. Adapt to match what the source "
+                                    "components actually render.\n"
+                                    "- Use MemoryRouter for Router "
+                                    "context.\n"
+                                    "- Use getAllBy* for multiple "
+                                    "matches.\n\n"
                                     f"#### [FILE]: {test_path}\n"
                                 )
                                 _to2_resp = coder.llm_client.generate_response(
