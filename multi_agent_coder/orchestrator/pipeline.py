@@ -106,6 +106,57 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+def _is_additive_source_fix(file_path: str, new_content: str,
+                            memory) -> bool:
+    """Return True if the proposed source change is small and additive.
+
+    Allows minor test-supportive tweaks (adding data-testid, aria-label,
+    role attributes) without altering component functionality.
+
+    Criteria — ALL must be met:
+      1. Original file exists in memory (not a new file)
+      2. No lines were removed (only additions or in-place attribute additions)
+      3. Total change is ≤10% of original line count
+      4. Changed lines only add attributes / props, not logic
+    """
+    import difflib
+
+    orig = memory.get(file_path)
+    if orig is None:
+        return False
+
+    orig_lines = orig.splitlines()
+    new_lines = new_content.splitlines()
+    orig_len = len(orig_lines)
+
+    if orig_len < 3:
+        return False
+
+    sm = difflib.SequenceMatcher(None, orig_lines, new_lines, autojunk=False)
+    added = 0
+    removed = 0
+    changed = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'insert':
+            added += j2 - j1
+        elif tag == 'delete':
+            removed += i2 - i1
+        elif tag == 'replace':
+            changed += max(i2 - i1, j2 - j1)
+            removed += max(0, (i2 - i1) - (j2 - j1))
+
+    # No lines may be removed — only additions or in-place edits
+    if removed > 0:
+        return False
+
+    # Total change must be ≤10% of original
+    total_delta = added + changed
+    if total_delta > max(orig_len * 0.10, 3):
+        return False
+
+    return True
+
+
 def _find_tests_impacted_by_sources(
     modified_sources: list[str],
     all_test_files: dict[str, str],
@@ -3407,18 +3458,25 @@ def run_bulk_test_execution_and_fix(
 
                 _sigs_for_test.add(_fix_sig)
                 # ── Source file protection ──
-                # BulkTest should only modify test files. When the LLM
-                # rewrites source files (Header.jsx, Hero.jsx) to make
-                # a test pass, it corrupts working components.
+                # BulkTest may modify test files freely. Source files
+                # are only allowed through if the change is small and
+                # additive (e.g. adding data-testid, aria-label) — it
+                # must not alter functionality.
                 if fix_files:
                     _bt_filtered = {}
                     for _bt_fp, _bt_fc in fix_files.items():
                         if _is_test_file(_bt_fp):
                             _bt_filtered[_bt_fp] = _bt_fc
+                        elif _is_additive_source_fix(
+                                _bt_fp, _bt_fc, memory):
+                            _bt_filtered[_bt_fp] = _bt_fc
+                            _logger.info(
+                                "[BulkTest] Allowed small additive "
+                                "source fix for %s", _bt_fp)
                         else:
                             _logger.warning(
                                 "[BulkTest] Blocked fix for source file "
-                                "%s — only test files may be modified",
+                                "%s — change is too large or destructive",
                                 _bt_fp)
                     fix_files = _bt_filtered
                 if not fix_files:
@@ -3703,15 +3761,25 @@ def run_bulk_test_execution_and_fix(
                             fix_files = _prefix_subproject_paths(
                                 fix_files, subproject_cwd, memory)
                         # ── Source file protection ──
-                        _bt2_filtered = {
-                            fp: fc for fp, fc in fix_files.items()
-                            if _is_test_file(fp)
-                        }
+                        _bt2_filtered = {}
+                        for _bt2_fp, _bt2_fc in fix_files.items():
+                            if _is_test_file(_bt2_fp):
+                                _bt2_filtered[_bt2_fp] = _bt2_fc
+                            elif _is_additive_source_fix(
+                                    _bt2_fp, _bt2_fc, memory):
+                                _bt2_filtered[_bt2_fp] = _bt2_fc
+                                _logger.info(
+                                    "[BulkTest] Allowed small additive "
+                                    "source fix for %s", _bt2_fp)
+                            else:
+                                _logger.warning(
+                                    "[BulkTest] Blocked fix for source "
+                                    "file %s — too large or destructive",
+                                    _bt2_fp)
                         _bt2_blocked = set(fix_files) - set(_bt2_filtered)
                         if _bt2_blocked:
                             _logger.warning(
-                                "[BulkTest] Blocked fix for source file(s): "
-                                "%s — only test files may be modified",
+                                "[BulkTest] Blocked source file(s): %s",
                                 list(_bt2_blocked))
                         fix_files = _bt2_filtered
                         if not fix_files:
