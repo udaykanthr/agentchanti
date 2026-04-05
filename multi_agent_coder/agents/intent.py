@@ -601,10 +601,10 @@ class IntentAgent(Agent):
                                 if _gs is not None:
                                     _kb_docs = _gs.get_by_titles(
                                         _matched_titles) or []
-                                    for _title, _content in _kb_docs.items():
+                                    for _doc in _kb_docs:
                                         accumulated_context += (
-                                            f"── {_title} (from KB) ──\n"
-                                            f"{_content}\n\n"
+                                            f"── {_doc.title} (from KB) ──\n"
+                                            f"{_doc.content}\n\n"
                                         )
                                     _logger.info(
                                         "[IntentAnalysis] Loaded %d KB doc(s) "
