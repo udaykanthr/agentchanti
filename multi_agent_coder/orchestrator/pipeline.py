@@ -1386,13 +1386,26 @@ def _execute_step(step_idx: int, step_text: str, *,
                             for _sp in _inline_sources:
                                 if _source_covered_by_test_step(_sp, _ts):
                                     _covered.add(_sp)
-                        # Skip __main__.py — trivial entry points are
-                        # notoriously hard to test with runpy + patch
-                        # and the auto-generated tests consistently fail.
+                        # Skip files that are inherently untestable or
+                        # produce fragile/circular tests:
+                        # - __main__.py: trivial entry points, runpy+patch fails
+                        # - Config/scaffold files: importing vitest.config
+                        #   inside vitest creates circular issues; postcss/
+                        #   tailwind/vite configs are validated by the build
+                        _CONFIG_SKIP = (
+                            'vitest.config', 'vite.config', 'postcss.config',
+                            'tailwind.config', 'jest.config', 'vitest.setup',
+                            'setupTests', 'babel.config', 'tsconfig',
+                            '.eslintrc', 'eslint.config',
+                        )
                         _uncovered = [
                             p for p in _inline_sources
                             if p not in _covered
                             and not p.endswith('__main__.py')
+                            and not any(
+                                cfg in p.replace("\\", "/").rsplit("/", 1)[-1]
+                                for cfg in _CONFIG_SKIP
+                            )
                         ]
                         if _uncovered:
                             _logger.info(
