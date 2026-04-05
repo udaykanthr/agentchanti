@@ -1262,6 +1262,105 @@ def run_dependency_check(
         display.step_info(step_idx, "[DepCheck] All dependencies connected.")
         return {}
 
+    # ── Filter premature gaps against pending plan steps ─────────────
+    # Two gap types fire prematurely when steps run in parallel waves:
+    #
+    # 1. **orphaned_export** — a file exports symbols but no other file
+    #    imports it *yet*.  If a pending step declares ``imports_from``
+    #    that file, the wiring step simply hasn't run.
+    #
+    # 2. **broken_import** — a file imports a path that doesn't resolve to
+    #    any known file *yet*.  If a pending step will CREATE that file
+    #    (it's in the step's ``target_files``), the import will resolve
+    #    once that step executes.
+    #
+    # Both use stem matching (basename without extension) so they work
+    # across JS/TS, Python, Go, etc.
+    if all_plan_steps and gaps:
+        _pending_import_stems: set[str] = set()
+        _pending_target_stems: set[str] = set()
+        for _ps in all_plan_steps:
+            if _ps.status not in ("pending", "in_progress"):
+                continue
+            for _src in (_ps.imports_from or {}):
+                _stem = os.path.splitext(
+                    os.path.basename(_src.replace("\\", "/"))
+                )[0].lower()
+                _pending_import_stems.add(_stem)
+            for _tf in (_ps.target_files or []):
+                _stem = os.path.splitext(
+                    os.path.basename(_tf.replace("\\", "/"))
+                )[0].lower()
+                _pending_target_stems.add(_stem)
+
+        _pre_count = len(gaps)
+        _kept: list[IntegrationGap] = []
+        for g in gaps:
+            if g.gap_type == "orphaned_export":
+                _src_stem = os.path.splitext(
+                    os.path.basename(g.source_file)
+                )[0].lower()
+                if _src_stem in _pending_import_stems:
+                    continue   # future step will import it
+            elif g.gap_type == "broken_import" and g.symbol:
+                _imp_stem = os.path.splitext(
+                    os.path.basename(g.symbol.replace("\\", "/"))
+                )[0].lower()
+                if _imp_stem in _pending_target_stems:
+                    continue   # future step will create the file
+            _kept.append(g)
+        _suppressed = _pre_count - len(_kept)
+        if _suppressed:
+            _logger.info(
+                "[DepCheck] Suppressed %d premature gap(s) — "
+                "pending plan steps will resolve them",
+                _suppressed,
+            )
+        gaps = _kept
+
+    # ── Filter scaffold-overwrite orphans ─────────────────────────────
+    # Files that already existed on disk before the agent wrote them
+    # (e.g. App.jsx from a Vite/CRA scaffold) are not in watcher_created.
+    # The scaffold's entry point (main.jsx, index.js, etc.) already
+    # imports them, but those entry points aren't in FileMemory so the
+    # snapshot can't see the import edge.  Suppress the false positive.
+    # Only active when the runtime watcher was initialised (attribute set
+    # explicitly); otherwise we can't distinguish scaffold from agent files.
+    _watcher_attr = getattr(memory, "watcher_created_files", None)
+    _watcher_active = _watcher_attr is not None
+    watcher_created: set[str] = _watcher_attr or set()
+    if _watcher_active and gaps:
+        _pre_count2 = len(gaps)
+        _filtered = []
+        for g in gaps:
+            if g.gap_type == "orphaned_export":
+                _src_norm = g.source_file.replace("\\", "/")
+                _was_created = any(
+                    _src_norm.endswith(_wf) or _wf.endswith(os.path.basename(_src_norm))
+                    for _wf in watcher_created
+                )
+                if not _was_created:
+                    _logger.debug(
+                        "[DepCheck] Suppressing orphan for '%s' — "
+                        "file pre-existed on disk (scaffold overwrite)",
+                        g.source_file,
+                    )
+                    continue
+            _filtered.append(g)
+        _scaffold_suppressed = _pre_count2 - len(_filtered)
+        if _scaffold_suppressed:
+            _logger.info(
+                "[DepCheck] Suppressed %d orphan(s) for scaffold-"
+                "overwritten files (already wired by scaffold entry point)",
+                _scaffold_suppressed,
+            )
+        gaps = _filtered
+
+    if not gaps:
+        _logger.debug("[DepCheck] No integration gaps for step %d (after filtering)", step_idx + 1)
+        display.step_info(step_idx, "[DepCheck] All dependencies connected.")
+        return {}
+
     # LLM fallback: for orphaned exports where both plan and heuristic returned None,
     # make a small targeted LLM call to identify the correct parent file.
     for gap in gaps:
@@ -1322,15 +1421,19 @@ def run_dependency_check(
         if root:
             project_roots.add(root)
 
-    # Files the runtime watcher saw being CREATED on disk this session
-    watcher_created: set[str] = getattr(memory, "watcher_created_files", set()) or set()
-    # Allow wiring files only when at least one orphaned-export source was
-    # freshly created by the agent (not just modified).
+    # watcher_created already resolved above (before premature-orphan filter).
+    # Allow wiring files when at least one orphaned-export source was freshly
+    # created by the agent (watcher-created) OR was written by the agent
+    # (present in memory — covers scaffold overwrites where the watcher saw
+    # an on_modified, not on_created).
     has_watcher_created_sources = any(
-        gap.gap_type == "orphaned_export" and any(
-            gap.source_file.replace("\\", "/").endswith(wf)
-            or wf.endswith(os.path.basename(gap.source_file))
-            for wf in watcher_created
+        gap.gap_type == "orphaned_export" and (
+            any(
+                gap.source_file.replace("\\", "/").endswith(wf)
+                or wf.endswith(os.path.basename(gap.source_file))
+                for wf in watcher_created
+            )
+            or gap.source_file in memory_files  # agent wrote it this session
         )
         for gap in gaps
     )
@@ -1391,12 +1494,15 @@ def run_dependency_check(
             validated[matched] = content
             _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
             continue
-        # Tier 3: wiring file for watcher-created sources
+        # Tier 3: wiring file within the project boundary.
+        # Previously required ``not_yet_written`` which blocked legitimate
+        # modifications to scaffold entry points (e.g. main.jsx adding
+        # <BrowserRouter>).  Safety is maintained by the pending-inline-edit
+        # guard and the tool-config guard above.
         in_project = any(norm_matched.startswith(root + "/") for root in project_roots)
-        not_yet_written = matched not in memory_files
-        if has_watcher_created_sources and in_project and not_yet_written:
+        if has_watcher_created_sources and in_project:
             validated[matched] = content
-            _logger.debug("[DepCheck] Accepted new wiring file from fix: %s", fpath)
+            _logger.debug("[DepCheck] Accepted wiring file from fix: %s", fpath)
         else:
             _logger.warning("[DepCheck] Ignoring unexpected file in fix: %s", fpath)
 

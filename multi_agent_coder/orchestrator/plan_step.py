@@ -680,13 +680,20 @@ def _derive_imported_by(steps: list[PlanStep]) -> None:
     """
     import os as _os
 
-    # Build file → step map (normalized paths + basenames for fuzzy lookup)
+    # Build file → step map (normalized paths + basenames + stems for fuzzy lookup).
+    # Stems (basename without extension) handle extensionless import paths common
+    # in JS/TS (e.g. ``import './Header'`` for ``Header.jsx``), Python dotted
+    # imports, and Go package paths.
     file_to_step: dict[str, PlanStep] = {}
     for step in steps:
         for tf in step.target_files:
             norm = tf.replace("\\", "/")
             file_to_step[norm] = step
-            file_to_step[_os.path.basename(norm)] = step
+            basename = _os.path.basename(norm)
+            file_to_step[basename] = step
+            stem = _os.path.splitext(basename)[0]
+            if stem != basename:          # has extension → also register stem
+                file_to_step.setdefault(stem, step)
 
     for consumer_step in steps:
         consumer_files = consumer_step.target_files
@@ -695,7 +702,12 @@ def _derive_imported_by(steps: list[PlanStep]) -> None:
         for src_file in consumer_step.imports_from:
             src_norm = src_file.replace("\\", "/")
             src_basename = _os.path.basename(src_norm)
-            producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
+            src_stem = _os.path.splitext(src_basename)[0]
+            producer = (
+                file_to_step.get(src_norm)
+                or file_to_step.get(src_basename)
+                or file_to_step.get(src_stem)
+            )
             if producer is None:
                 continue
             for cf in consumer_files:
