@@ -4,7 +4,7 @@ Step classification and command extraction utilities.
 
 import re
 
-from ..cli_display import CLIDisplay, token_tracker
+from ..cli_display import CLIDisplay, token_tracker, log
 
 
 # ── Deterministic classification: test runner commands ──────────
@@ -34,9 +34,12 @@ _TEST_CMD_RE = re.compile(
 # and should be classified by the LLM, not fast-tracked as TEST.
 _TEST_CONFIG_RE = re.compile(
     r'('
+    # Command line config mutations
+    r'npm\s+set-script\b'
+    r'|npm\s+pkg\s+set\s+scripts\.'
     # Script/package.json edits
-    r'add\s+.*scripts?\s+to\b'
-    r'|update\s+.*scripts?\s+in\b'
+    r'|add\s+.*scripts?\b'
+    r'|update\s+.*scripts?\b'
     r'|modify\s+.*package\.json'
     r'|add\s+.*to\s+.*package\.json'
     r'|edit\s+.*package\.json'
@@ -158,6 +161,95 @@ def _looks_like_command(text: str) -> bool:
         'pytest', 'jest', 'tox', 'mypy', 'flake8', 'black', 'ruff',
     }
     return first_token in known_commands
+
+
+# ── Placeholder resolution ────────────────────────────────────────────────────
+# Small/cheap LLMs sometimes output template tokens like <project-name> instead
+# of filling them with actual values.  We detect and resolve these before running
+# commands so they don't fail on the OS level (Windows treats < as redirection).
+
+_PLACEHOLDER_RE = re.compile(r'<([a-zA-Z][a-zA-Z0-9_-]*)>')
+
+_NAME_PLACEHOLDERS = frozenset({
+    'project-name', 'project_name', 'app-name', 'app_name',
+    'name', 'project', 'app', 'dir', 'directory',
+    'repo-name', 'repo_name', 'my-app', 'app-directory',
+    'project-directory', 'package-name', 'module-name',
+    'app-folder', 'folder-name', 'project-folder',
+})
+
+
+def _extract_project_name_from_text(text: str) -> str | None:
+    """Try to pull a concrete project/app name out of a description string."""
+    if not text:
+        return None
+    for pat in (
+        r'(?:named?|called|project\s+name(?:\s+is)?|app\s+name(?:\s+is)?)'
+        r'\s+["\']?([A-Za-z][A-Za-z0-9_-]+)["\']?',
+        r'"([A-Za-z][A-Za-z0-9_-]+)"',
+        r"'([A-Za-z][A-Za-z0-9_-]+)'",
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            if name.lower() not in ('the', 'a', 'an', 'new', 'project', 'app', 'name',
+                                    'from', 'for', 'in', 'of', 'at', 'by', 'to',
+                                    'with', 'on', 'is', 'are', 'its', 'this',
+                                    'exact', 'given', 'task', 'my', 'your'):
+                return name.lower().replace('_', '-')
+    return None
+
+
+def resolve_cmd_placeholders(cmd: str, step_text: str = '', task: str = '') -> str:
+    """Replace unresolved <placeholder> tokens left by small/dumb LLMs.
+
+    Only touches name-like placeholders (project-name, app-name, dir, …).
+    Genuine I/O redirections and other angle-bracket uses are left alone.
+    """
+    if '<' not in cmd:
+        return cmd
+
+    found = _PLACEHOLDER_RE.findall(cmd)
+    if not found:
+        return cmd
+
+    name_phs = [p for p in found if p.lower() in _NAME_PLACEHOLDERS]
+    if not name_phs:
+        return cmd
+
+    resolved = (
+        _extract_project_name_from_text(task)
+        or _extract_project_name_from_text(step_text)
+    )
+
+    if not resolved:
+        combined = (task + ' ' + step_text).lower()
+        if 'next' in combined:
+            resolved = 'next-app'
+        elif 'vite' in combined and 'react' in combined:
+            resolved = 'vite-react-app'
+        elif 'react' in combined:
+            resolved = 'react-app'
+        elif 'vue' in combined:
+            resolved = 'vue-app'
+        elif 'angular' in combined:
+            resolved = 'angular-app'
+        elif 'svelte' in combined:
+            resolved = 'svelte-app'
+        elif 'nuxt' in combined:
+            resolved = 'nuxt-app'
+        elif 'django' in combined:
+            resolved = 'django-project'
+        elif 'rails' in combined:
+            resolved = 'rails-app'
+        else:
+            resolved = 'my-app'
+
+    for ph in name_phs:
+        cmd = cmd.replace(f'<{ph}>', resolved)
+
+    log.info("Resolved placeholder(s) %s → '%s' in command", name_phs, resolved)
+    return cmd
 
 
 def _cleanup_shell_command(cmd: str) -> str:

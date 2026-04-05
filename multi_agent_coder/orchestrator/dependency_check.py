@@ -88,6 +88,18 @@ _TEST_FILE_SUFFIXES = (
     "_test.go", "_test.py",
 )
 
+# Config files consumed by tools by convention — never imported by other
+# project files.  Flagging them as "orphaned exports" is always a false
+# positive and can cause DepCheck to regenerate them without KB context,
+# silently downgrading version-specific syntax (e.g. Tailwind v4 → v3).
+_TOOL_CONFIG_STEMS = frozenset({
+    "postcss.config", "tailwind.config", "vite.config", "vitest.config",
+    "jest.config", "babel.config", "webpack.config", "rollup.config",
+    "eslint.config", ".eslintrc", "prettier.config", ".prettierrc",
+    "stylelint.config", "svelte.config", "next.config", "nuxt.config",
+    "astro.config", "remix.config", "wrangler.config",
+})
+
 
 def _is_test_file(file_path: str) -> bool:
     """Return ``True`` if *file_path* looks like a test file."""
@@ -98,6 +110,22 @@ def _is_test_file(file_path: str) -> bool:
         if basename.endswith(suffix):
             return True
     return False
+
+
+def _is_tool_config_file(file_path: str) -> bool:
+    """Return True if *file_path* is a tool-convention config file.
+
+    These files are read by build tools (PostCSS, Vite, Tailwind, …) via
+    filesystem convention, never imported by other source files.  They must
+    NOT be flagged as orphaned exports.
+    """
+    name = os.path.basename(file_path).lower()
+    # Strip known JS/TS/JSON/CJS/MJS extensions to get the stem
+    for ext in (".js", ".ts", ".cjs", ".mjs", ".json", ".yaml", ".yml"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name in _TOOL_CONFIG_STEMS
 
 
 # ── Data structures ──────────────────────────────────────────────
@@ -770,6 +798,17 @@ def _guess_parent_file(
         if index_path in memory_files:
             return index_path
 
+    # Strategy 2b: Angular/NgModule — component files are declared in
+    # the nearest *.module.ts, not imported by main.ts directly.
+    if ext in (".ts", ".js") and stem.endswith(".component"):
+        for fpath in memory_files:
+            if fpath.endswith(".module.ts") and fpath != new_file:
+                # Prefer a module in the same project subtree
+                if os.path.dirname(fpath).startswith(
+                    parent_dir.rsplit("/", 1)[0] if "/" in parent_dir else ""
+                ):
+                    return fpath
+
     # Strategy 3: common root files
     if ext in (".tsx", ".jsx", ".ts", ".js"):
         for root_name in ("App.tsx", "App.jsx", "App.ts", "App.js",
@@ -859,6 +898,7 @@ def find_gaps(
     step_text: str,
     memory_files: dict[str, str],
     plan_imported_by: dict[str, str] | None = None,
+    pending_target_files: set[str] | None = None,
 ) -> list[IntegrationGap]:
     """Compare before/after snapshots to detect integration gaps.
 
@@ -872,11 +912,17 @@ def find_gaps(
     """
     gaps: list[IntegrationGap] = []
     all_known_files = set(memory_files.keys())
+    # Include files that pending plan steps will create — these are not
+    # broken imports, just files that haven't been written yet.
+    if pending_target_files:
+        all_known_files |= pending_target_files
 
     # ── 1. Orphaned exports ──
     for nf in new_files:
         if _is_test_file(nf):
             continue
+        if _is_tool_config_file(nf):
+            continue  # config files are read by tools, never imported
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
             continue
@@ -921,6 +967,39 @@ def find_gaps(
             likely_parent = plan_parent or _guess_parent_file(nf, step_text, memory_files)
             if plan_parent:
                 _logger.debug("[DepCheck] Plan-declared parent for '%s': %s", nf, plan_parent)
+
+            # ── Circular import guard (bidirectional) ──
+            # If the new file (nf) already imports from the likely parent,
+            # OR the parent already imports from the new file, wiring the
+            # parent to import nf back would create a circular dependency.
+            # Skip this gap entirely.
+            if likely_parent:
+                would_be_circular = False
+                parent_norm = likely_parent.replace("\\", "/")
+                # Direction 1: nf imports from parent
+                for imp_src in (nf_deps.imports or []):
+                    resolved = _normalize_import_path(imp_src, nf)
+                    if (_file_matches_import(parent_norm, resolved)
+                            or _file_matches_import(parent_norm, imp_src)):
+                        would_be_circular = True
+                        break
+                # Direction 2: parent already imports from nf
+                if not would_be_circular:
+                    parent_deps = after.file_deps.get(likely_parent)
+                    if parent_deps:
+                        for imp_src in (parent_deps.imports or []):
+                            resolved = _normalize_import_path(
+                                imp_src, likely_parent)
+                            if (_file_matches_import(nf_norm, resolved)
+                                    or _file_matches_import(nf_norm, imp_src)):
+                                would_be_circular = True
+                                break
+                if would_be_circular:
+                    _logger.info(
+                        "[DepCheck] Skipping orphaned_export for '%s' → '%s': "
+                        "would create circular import", nf, likely_parent)
+                    continue
+
             gaps.append(IntegrationGap(
                 gap_type="orphaned_export",
                 source_file=nf,
@@ -1078,7 +1157,7 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 
 ## Step Context
 {step_text}
-
+{kb_context_section}
 ## Integration Gaps Found
 {gaps_formatted}
 
@@ -1096,6 +1175,8 @@ but have integration gaps that must be fixed. Fix ALL gaps with minimal changes.
 - For component imports, use the correct relative path from importer to importee.
 - Do NOT modify package.json, go.mod, or other config/manifest files.
 - Do NOT add unnecessary imports — only fix the gaps listed above.
+- Do NOT create circular imports (A imports B and B imports A). If wiring \
+an import would create a cycle, skip that gap entirely.
 - Preserve ALL existing code, comments, and formatting in modified files.
 - For MISSING DEFAULT EXPORT gaps: add `export default ComponentName;` at the end \
 of the file. The component name should match the filename in PascalCase. \
@@ -1111,6 +1192,7 @@ def build_fix_prompt(
     memory_files: dict[str, str],
     step_text: str,
     language: str | None,
+    kb_context: str = "",
 ) -> str:
     """Build a single LLM prompt to fix all integration gaps."""
     gap_lines: list[str] = []
@@ -1147,8 +1229,15 @@ def build_fix_prompt(
     elif language == "go":
         module_system_note = "Go project. Use standard import syntax."
 
+    kb_context_section = (
+        f"\n## Project Knowledge Base\n{kb_context.strip()}\n"
+        if kb_context and kb_context.strip()
+        else ""
+    )
+
     return _FIX_PROMPT_TEMPLATE.format(
         step_text=step_text,
+        kb_context_section=kb_context_section,
         gaps_formatted=gaps_formatted,
         files_formatted=files_formatted,
         module_system_note=module_system_note,
@@ -1170,6 +1259,7 @@ def run_dependency_check(
     language: str | None,
     cfg=None,
     all_plan_steps=None,
+    kb_context: str = "",
 ) -> dict[str, str]:
     """Run post-step dependency validation and return fixes.
 
@@ -1196,11 +1286,17 @@ def run_dependency_check(
     # Build plan_imported_by map: source_file → consumer_file (first declared wins)
     # Uses PlanStep.imported_by which is auto-derived from imports_from relationships
     # plus any explicit imported_by: lines the planner wrote.
+    # Also collect pending target files so find_gaps() can suppress false
+    # broken_import gaps for files that a future step will create.
     plan_imported_by: dict[str, str] = {}
+    _pending_targets: set[str] = set()
     if all_plan_steps:
         for ps in all_plan_steps:
             for tf in (ps.target_files or []):
-                session_files.add(tf.replace("\\", "/"))
+                _ntf = tf.replace("\\", "/")
+                session_files.add(_ntf)
+                if ps.status in ("pending", "in_progress"):
+                    _pending_targets.add(_ntf)
             for consumer_file in (ps.imported_by or []):
                 for tf in (ps.target_files or []):
                     norm_tf = tf.replace("\\", "/")
@@ -1213,6 +1309,7 @@ def run_dependency_check(
         gaps = find_gaps(
             dep_before, dep_after, new_files, step_text, memory_files,
             plan_imported_by=plan_imported_by or None,
+            pending_target_files=_pending_targets or None,
         )
     except Exception as exc:
         _logger.warning("[DepCheck] Gap detection failed: %s", exc)
@@ -1223,18 +1320,19 @@ def run_dependency_check(
         display.step_info(step_idx, "[DepCheck] All dependencies connected.")
         return {}
 
-    # LLM fallback: for orphaned exports where both plan and heuristic returned None,
-    # make a small targeted LLM call to identify the correct parent file.
+    # For orphaned exports where both plan and heuristic returned None,
+    # let the main fix prompt identify the correct parent (0 extra LLM
+    # calls — parent guessing is folded into the single fix call).
+    # Enrich the gap description so the fix LLM knows it must choose.
     for gap in gaps:
         if gap.gap_type == "orphaned_export" and gap.target_file is None:
-            _logger.debug("[DepCheck] Heuristic failed for '%s', trying LLM parent guess", gap.source_file)
-            nf_deps = dep_after.file_deps.get(gap.source_file)
-            symbols = nf_deps.exports[:5] if nf_deps else []
-            guessed = _llm_guess_parent_file(gap.source_file, symbols, memory_files, llm_client)
-            if guessed:
-                _logger.info("[DepCheck] LLM identified parent '%s' for '%s'", guessed, gap.source_file)
-                gap.target_file = guessed
-                gap.description += f" LLM-identified parent: '{guessed}'."
+            _logger.debug(
+                "[DepCheck] No parent identified for '%s' — "
+                "fix prompt will determine parent", gap.source_file)
+            gap.description += (
+                " No parent file identified — choose the most appropriate "
+                "existing file to add the import to."
+            )
 
     # Report gaps
     display.step_info(
@@ -1246,7 +1344,7 @@ def run_dependency_check(
 
     # Single LLM call
     try:
-        prompt = build_fix_prompt(gaps, memory_files, step_text, language)
+        prompt = build_fix_prompt(gaps, memory_files, step_text, language, kb_context=kb_context)
         display.step_info(step_idx, "[DepCheck] Fixing dependency gaps (LLM)...")
         response = llm_client.generate_response(prompt)
     except Exception as exc:
@@ -1296,6 +1394,26 @@ def run_dependency_check(
         for gap in gaps
     )
 
+    # Build set of files protected by pending plan steps.
+    # DepCheck must not overwrite a file that a later planned step will write
+    # (via inline_edits, inline_code, or as a target_file) — doing so clobbers
+    # content the planner already decided on, causing race-condition corruption
+    # when multiple CODE steps execute in the same parallel wave.
+    # A common case: main.jsx imports ./index.css which doesn't exist yet, but
+    # step 2.2 will write the correct Tailwind v4 content.  Without this guard
+    # DepCheck's LLM generates old Tailwind v3 directives that overwrite the
+    # planner's correct version.
+    _pending_inline_targets: set[str] = set()
+    if all_plan_steps:
+        for _ps in all_plan_steps:
+            if _ps.status in ("pending", "in_progress"):
+                for _ef in (_ps.inline_edits or {}).keys():
+                    _pending_inline_targets.add(_ef.replace("\\", "/"))
+                for _tf in (_ps.target_files or []):
+                    _pending_inline_targets.add(_tf.replace("\\", "/"))
+                for _ic in (_ps.inline_code or {}).keys():
+                    _pending_inline_targets.add(_ic.replace("\\", "/"))
+
     validated: dict[str, str] = {}
     for fpath, content in fix_files.items():
         matched = fpath
@@ -1306,18 +1424,50 @@ def run_dependency_check(
                     matched = known
                     norm_matched = matched.replace("\\", "/")
                     break
+        # Skip files that a future plan step will edit via inline_edits — let
+        # the planned step handle the content rather than clobbering it here.
+        if _pending_inline_targets and (
+            norm_matched in _pending_inline_targets
+            or any(
+                pit.endswith("/" + norm_matched) or norm_matched.endswith("/" + pit)
+                for pit in _pending_inline_targets
+            )
+        ):
+            _logger.debug(
+                "[DepCheck] Skipping fix for '%s' — protected by pending plan step", fpath
+            )
+            continue
+        # Never regenerate an existing tool-config file — DepCheck has no KB
+        # context to reproduce version-specific syntax (e.g. Tailwind v4 vs v3,
+        # Vite vs Vitest config). If the LLM erroneously emits one, discard it.
+        if _is_tool_config_file(norm_matched) and matched in memory_files:
+            _logger.debug(
+                "[DepCheck] Skipping fix for existing tool config '%s'", fpath
+            )
+            continue
         # Tier 1: gap source/target
         if matched in relevant_files:
             validated[matched] = content
             continue
-        # Tier 2: planned session file
+        # Tier 2: planned session file — but ONLY if it's not already in
+        # memory with correct content.  If a file was already written by a
+        # completed step (e.g. index.css with Tailwind v4 syntax), the
+        # DepCheck LLM may "fix" it using outdated training data (e.g.
+        # Tailwind v3 directives).  Only allow overwrites for files that
+        # have an actual gap or are not yet written.
         is_session_file = norm_matched in session_files or any(
             sf.endswith("/" + norm_matched) or norm_matched.endswith("/" + sf)
             for sf in session_files
         )
         if is_session_file:
-            validated[matched] = content
-            _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            if matched not in memory_files:
+                validated[matched] = content
+                _logger.debug("[DepCheck] Accepted planned session file from fix: %s", fpath)
+            else:
+                _logger.debug(
+                    "[DepCheck] Skipping fix for '%s' — already in memory "
+                    "with no detected gap (preventing LLM overwrite of "
+                    "correct content)", fpath)
             continue
         # Tier 3: wiring file for watcher-created sources
         in_project = any(norm_matched.startswith(root + "/") for root in project_roots)

@@ -192,8 +192,8 @@ class ContextBuilder:
     # guides; CODE/TEST steps get the full set.
     _CATEGORY_LIMITS_BY_TYPE: dict[str, dict[str, int]] = {
         "CMD": {"doc": 2, "behavioral": 0, "pattern": 0, "adr": 0},
-        "CODE": {"doc": 4, "behavioral": 3, "pattern": 2, "adr": 1},
-        "TEST": {"doc": 3, "behavioral": 3, "pattern": 1, "adr": 0},
+        "CODE": {"doc": 4, "behavioral": 2, "pattern": 2, "adr": 1},
+        "TEST": {"doc": 3, "behavioral": 2, "pattern": 1, "adr": 0},
     }
     _DEFAULT_CATEGORY_LIMITS: dict[str, int] = {
         "doc": 4, "behavioral": 3, "pattern": 2, "adr": 1,
@@ -320,11 +320,17 @@ class ContextBuilder:
                     logger.debug("[KB] Error lookup failed: %s", exc)
 
         # 5. Batched global KB search (Phase 3)
-        # Single embedding + single vector scan for all categories,
-        # saving 2 embedding API calls compared to separate searches.
-        # Category limits are tuned by step_type so CMD steps only
-        # receive setup/install docs, not coding patterns or behavioral
-        # instructions that waste tokens.
+        # When the planner pre-loaded docs via the IntentAgent fast-path,
+        # those docs are the authoritative set for this task — skip
+        # batch_search for doc/pattern categories entirely and use them
+        # directly.  Only search for behavioral instructions, which are
+        # step-type specific and not covered by the pre-loaded set.
+        # Without this guard, batch_search injects loosely-matched docs
+        # (e.g. "React State Management Patterns" for a CSS animation step)
+        # while simultaneously blocking the IntentAgent's recommended docs
+        # via the topic filter.
+        _preloaded_planning = getattr(self, '_preloaded_docs', None)
+
         if self._global_store is not None:
             try:
                 category_limits: dict[str, int] = (
@@ -333,55 +339,109 @@ class ContextBuilder:
                     else self._DEFAULT_CATEGORY_LIMITS
                 ).copy()
 
-                buckets = self._global_store.batch_search(
-                    task_description,
-                    category_limits=category_limits,
-                    language=language,
-                    api_client=self._api_client,
-                )
+                # Stem-prefix helper and topic filter (used for behavioral
+                # instructions in both fast-path and fallback).
+                _intent_topics: list = getattr(self, "_intent_topics", None) or []
 
-                # Distribute results into ctx fields — all categories
-                # contribute regardless of intent so that any relevant KB
-                # doc reaches every step and every agent.
-                # Build a NEW list to avoid shared-reference mutations.
-                patterns = buckets.get("pattern", []) + buckets.get("adr", [])
-                docs = buckets.get("doc", [])
-                behavioral = buckets.get("behavioral", [])
+                def _cb_stem_match(a: str, b: str) -> bool:
+                    n = min(len(a), len(b))
+                    if n < 3:
+                        return False
+                    return a[:min(n, 5)] == b[:min(n, 5)]
 
-                # Deduplicate across categories by title
-                all_docs: list = []
-                _seen_titles: set[str] = set()
-                for item in patterns + docs:
-                    t = getattr(item, "title", "")
-                    if t and t in _seen_titles:
-                        continue
-                    if t:
-                        _seen_titles.add(t)
-                    all_docs.append(item)
-
-                if all_docs:
-                    ctx.global_patterns = all_docs
-                    ctx.sources_used.append("global_kb")
-                    logger.debug(
-                        "[KB] Global docs injected: %s",
-                        [r.title for r in all_docs],
+                def _passes_topic_filter(item) -> bool:
+                    if not _intent_topics:
+                        return True
+                    title_kws = set(
+                        w.lower()
+                        for w in (getattr(item, "title", "") or "").replace("-", " ").split()
+                        if len(w) >= 3
                     )
-                if behavioral:
-                    ctx.behavioral_instructions = behavioral
-                    logger.debug(
-                        "[KB] Behavioral instructions injected: %s",
-                        [r.title for r in behavioral],
+                    for topic_kws in _intent_topics:
+                        threshold = max(1, min(2, len(topic_kws)))
+                        matches = sum(
+                            1 for tw in title_kws
+                            if any(_cb_stem_match(tw, tk) for tk in topic_kws)
+                        )
+                        if matches >= threshold:
+                            return True
+                    return False
+
+                if _preloaded_planning and step_type != "CMD":
+                    # Fast-path: planning already curated the docs.
+                    # Only fetch behavioral instructions (step-type specific).
+                    behavioral_limit = category_limits.get("behavioral", 2)
+                    if behavioral_limit > 0:
+                        beh_buckets = self._global_store.batch_search(
+                            task_description,
+                            category_limits={"behavioral": behavioral_limit},
+                            language=language,
+                            api_client=self._api_client,
+                        )
+                        behavioral = [
+                            b for b in beh_buckets.get("behavioral", [])
+                            if _passes_topic_filter(b)
+                        ]
+                        if behavioral:
+                            ctx.behavioral_instructions = behavioral
+                            logger.debug(
+                                "[KB] Behavioral instructions injected: %s",
+                                [r.title for r in behavioral],
+                            )
+                    # global_patterns will be populated from preloaded in step 6
+                else:
+                    # Fallback: full batch_search with topic filtering.
+                    buckets = self._global_store.batch_search(
+                        task_description,
+                        category_limits=category_limits,
+                        language=language,
+                        api_client=self._api_client,
                     )
+
+                    patterns = buckets.get("pattern", []) + buckets.get("adr", [])
+                    docs = buckets.get("doc", [])
+                    behavioral = buckets.get("behavioral", [])
+
+                    # Deduplicate across categories by title, apply topic filter
+                    all_docs: list = []
+                    _seen_titles: set[str] = set()
+                    for item in patterns + docs:
+                        t = getattr(item, "title", "")
+                        if t and t in _seen_titles:
+                            continue
+                        if t:
+                            _seen_titles.add(t)
+                        if not _passes_topic_filter(item):
+                            logger.debug(
+                                "[KB] Skipping global doc '%s' — not in intent topics",
+                                t,
+                            )
+                            continue
+                        all_docs.append(item)
+
+                    behavioral = [b for b in behavioral if _passes_topic_filter(b)]
+
+                    if all_docs:
+                        ctx.global_patterns = all_docs
+                        ctx.sources_used.append("global_kb")
+                        logger.debug(
+                            "[KB] Global docs injected: %s",
+                            [r.title for r in all_docs],
+                        )
+                    if behavioral:
+                        ctx.behavioral_instructions = behavioral
+                        logger.debug(
+                            "[KB] Behavioral instructions injected: %s",
+                            [r.title for r in behavioral],
+                        )
             except Exception as exc:
                 logger.debug("[KB] Batched global KB search failed: %s", exc)
 
         # 6. Merge pre-loaded docs from planning pre-analysis.
-        # The planner's title-relevance filter already identified the most
-        # task-relevant KB docs.  Merge them so every step has access,
-        # regardless of whether this step's search query matches them.
-        # Skip for CMD steps — install commands don't need the full
-        # planning doc set and it wastes tokens.
-        preloaded = getattr(self, '_preloaded_docs', None)
+        # In the fast-path these ARE the authoritative docs; in the fallback
+        # they supplement the batch_search results.
+        # Skip for CMD steps — install commands don't need them.
+        preloaded = _preloaded_planning
         if preloaded and step_type != "CMD":
             existing_titles = {
                 getattr(r, "title", "") for r in ctx.global_patterns
@@ -397,7 +457,7 @@ class ContextBuilder:
                 if "global_kb" not in ctx.sources_used:
                     ctx.sources_used.append("global_kb")
                 logger.debug(
-                    "[KB] Merged %d pre-loaded doc(s) from planning",
+                    "[KB] Injected %d pre-loaded doc(s) from planning",
                     merged,
                 )
 

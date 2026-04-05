@@ -122,6 +122,37 @@ _ERROR_SEEDS: list[ErrorFix] = [
         tags="unbound,local,variable,scope,initialization,python",
     ),
 
+    ErrorFix(
+        error_type="IndexError",
+        language="python",
+        pattern=r"IndexError:\s*pop from an empty deque",
+        cause="A deterministic test RNG (DeterministicRandom) ran out of pre-scripted "
+              "choices.  This happens when the code under test calls the RNG more times "
+              "than the test fixture expected — typically because .reset() or collision "
+              "recovery calls _spawn_food() which consumes an extra random choice.",
+        fix_template="Count every code path that calls rng.choice() — including reset(), "
+                     "_spawn_food(), and collision handlers — and supply enough values in the "
+                     "DeterministicRandom fixture.  Alternatively, make the fixture's choice() "
+                     "method cycle or return a fallback instead of raising IndexError.",
+        severity="error",
+        tags="deque,random,deterministic,test,fixture,python",
+    ),
+    ErrorFix(
+        error_type="AttributeError",
+        language="python",
+        pattern=r"AttributeError:\s*'function'\s+object\s+has\s+no\s+attribute",
+        cause="The test imported a module alias that resolved to a function instead of "
+              "the module.  This happens when __init__.py re-exports a function with the "
+              "same name as the module (e.g. `from .main import main` in __init__.py makes "
+              "`import package.main as m` bind m to the function, not the module).",
+        fix_template="Use `import importlib; mod = importlib.import_module('package.module')` "
+                     "or `from package.module import specific_name` instead of "
+                     "`import package.module as alias`.  Alternatively, rename the re-export in "
+                     "__init__.py to avoid shadowing the module name.",
+        severity="error",
+        tags="import,module,function,shadow,init,python",
+    ),
+
     # ── JavaScript ──────────────────────────────────────────────────────
     ErrorFix(
         error_type="TypeError",
@@ -508,6 +539,44 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "Check if you are in the correct directory (sub-project root) where package.json resides.",
         severity="error",
         tags="npm,script,missing,package-json,test,vitest,jest",
+    ),
+    ErrorFix(
+        error_type="ViteScaffoldDirectoryMissing",
+        language="javascript",
+        pattern=r"(The system cannot find the path specified|no such file or directory|ENOENT).*npm create vite",
+        cause="The scaffold command used `cd <name> && npm create vite@latest .` but the "
+              "target directory does not exist yet. The `cd` fails before npm runs, so no "
+              "files are created.",
+        fix_template="NEVER use `cd <folder> && npm create vite@latest .` when the folder "
+                     "doesn't exist yet.\n\n"
+                     "CORRECT form — creates the folder automatically:\n"
+                     "  npm create vite@latest <project-name> -- --template react --no-interactive\n\n"
+                     "If you need the in-directory form, create the folder first:\n"
+                     "  mkdir <project-name> && cd <project-name> && npm create vite@latest . -- --template react\n\n"
+                     "The KB doc `Vite React Setup Guide` shows the correct single-command form. "
+                     "Always prefer `npm create vite@latest <name>` over the `cd && .` pattern.",
+        severity="error",
+        tags="vite,scaffold,mkdir,directory,not,found,npm,create,cd,enoent,javascript",
+    ),
+    ErrorFix(
+        error_type="PostcssConfigCreatedEmpty",
+        language="javascript",
+        pattern=r"(type nul\s*>.*postcss\.config|touch.*postcss\.config|echo\s*>.*postcss\.config)",
+        cause="A CMD step used `type nul >`, `touch`, or `echo >` to create postcss.config.mjs "
+              "as an empty file. This produces a zero-byte config with no plugin entry, so "
+              "Tailwind CSS generates no styles and no error is thrown — the breakage is silent.",
+        fix_template="DELETE the empty postcss.config.mjs and recreate it as a CODE step "
+                     "with the correct content. NEVER use shell commands to create config files "
+                     "that need content.\n\n"
+                     "CORRECT postcss.config.mjs content:\n"
+                     "  export default {\n"
+                     "    plugins: {\n"
+                     "      '@tailwindcss/postcss': {},\n"
+                     "    },\n"
+                     "  }\n\n"
+                     "The plan step must be [CODE] type with a content: block, not [CMD].",
+        severity="error",
+        tags="postcss,tailwindcss,empty,config,touch,type-nul,cmd,code,step,javascript",
     ),
     ErrorFix(
         error_type="TailwindCSSDeprecatedDirectives",
@@ -918,6 +987,87 @@ _ERROR_SEEDS: list[ErrorFix] = [
                      "vitest.config.ts or a setup file referenced by setupFiles.",
         severity="error",
         tags="vitest,jest,test,suite,empty,setup,scaffold,no,found,javascript,typescript",
+    ),
+    ErrorFix(
+        error_type="ViteAutoTestUsedNodeTestRunner",
+        language="javascript",
+        pattern=r"(import\s+\{[^}]*\}\s+from\s+'node:test'|require\('node:test'\)|import\s+\w+\s+from\s+'node:assert')",
+        cause="An auto-generated test file imported Node's built-in `node:test` / `node:assert` "
+              "instead of Vitest. These are incompatible test runners — `node:test` blocks are "
+              "invisible to `npx vitest run`, causing the baseline test run to fail with "
+              "'No test suite found' or simply producing no output for those files.",
+        fix_template="NEVER import from 'node:test' or 'node:assert' in a Vitest project.\n\n"
+                     "Replace with Vitest imports:\n"
+                     "  // WRONG\n"
+                     "  import { describe, it } from 'node:test'\n"
+                     "  import assert from 'node:assert/strict'\n\n"
+                     "  // CORRECT\n"
+                     "  import { describe, it, expect } from 'vitest'\n\n"
+                     "Replace assert calls with expect():\n"
+                     "  assert.equal(x, y)        →  expect(x).toBe(y)\n"
+                     "  assert.ok(x)              →  expect(x).toBeTruthy()\n"
+                     "  assert.deepEqual(a, b)    →  expect(a).toEqual(b)\n"
+                     "  assert.strictEqual(a, b)  →  expect(a).toBe(b)\n\n"
+                     "This error is most common in auto-generated tests for config files "
+                     "(postcss.config.mjs, vitest.config.js). The best fix is to DELETE those "
+                     "tests entirely — config files are scaffolding, not application logic.",
+        severity="error",
+        tags="vitest,node:test,assert,test-runner,wrong-framework,auto-test,javascript",
+    ),
+    ErrorFix(
+        error_type="ViteEsmRequireInTest",
+        language="javascript",
+        pattern=r"require\(\s*['\"][^'\"]*(?:vitest\.config|vite\.config|postcss\.config)[^'\"]*['\"]\s*\)",
+        cause="A test is calling require() on an ESM config file (vitest.config.js, vite.config.js, "
+              "postcss.config.mjs). These files use `export default` (ESM syntax) and cannot be "
+              "loaded with require(). The test was likely auto-generated for a config file that "
+              "has no business logic worth testing.",
+        fix_template="Config files that use `export default` (ESM) cannot be require()'d.\n\n"
+                     "Option 1 — DELETE the test (recommended):\n"
+                     "  vitest.config.js, postcss.config.mjs, and vite.config.js are framework "
+                     "scaffolding. They do not contain application logic and should NOT have unit "
+                     "tests. Delete the test file.\n\n"
+                     "Option 2 — Replace require() with dynamic import():\n"
+                     "  // WRONG\n"
+                     "  const config = require('../vitest.config.js')\n\n"
+                     "  // CORRECT\n"
+                     "  it('...', async () => {\n"
+                     "    const { default: config } = await import('../vitest.config.js')\n"
+                     "    expect(config.test.environment).toBe('jsdom')\n"
+                     "  })",
+        severity="error",
+        tags="vitest,esm,require,import,config,postcss,vite,module,javascript",
+    ),
+    ErrorFix(
+        error_type="VitestMainJsxModuleCaching",
+        language="javascript",
+        pattern=r"expected.*vi\.fn\(\).*to not be called.*but actually been called.*\d+ time",
+        cause="main.jsx (or index.js) is executed once and cached by the ESM module system. "
+              "vi.resetModules() in afterEach does NOT cause a subsequent `await import('../main.jsx')` "
+              "to re-execute the module — it returns the cached version without running createRoot() again. "
+              "The first test's renderMock call count bleeds into the second test because mockClear/resetMocks "
+              "was not called.",
+        fix_template="Use vi.clearAllMocks() (clears call counts) instead of vi.resetModules() "
+                     "(which doesn't work for already-resolved dynamic imports in the same file).\n\n"
+                     "CORRECT pattern for main.jsx tests:\n"
+                     "  afterEach(() => {\n"
+                     "    vi.clearAllMocks()          // resets mock call counts\n"
+                     "    document.body.innerHTML = '' // resets DOM\n"
+                     "  })\n\n"
+                     "  it('renders the App into the root element', async () => {\n"
+                     "    document.body.innerHTML = '<div id=\"root\"></div>'\n"
+                     "    await import('../main.jsx')  // executes once, then cached\n"
+                     "    expect(renderMock).toHaveBeenCalledTimes(1)\n"
+                     "  })\n\n"
+                     "  it('second test — module cached, createRoot not called again', async () => {\n"
+                     "    document.body.innerHTML = ''\n"
+                     "    await import('../main.jsx')  // returns cached, does NOT re-run\n"
+                     "    expect(renderMock).not.toHaveBeenCalled()  // cleared by afterEach\n"
+                     "  })\n\n"
+                     "KEY INSIGHT: vi.clearAllMocks() resets call counts so the second test starts "
+                     "fresh. The module not re-executing is the EXPECTED behavior, not a bug.",
+        severity="error",
+        tags="vitest,main,jsx,module,cache,resetModules,clearAllMocks,esm,createRoot,javascript",
     ),
     # ── Vitest + @testing-library/jest-dom ──────────────────────────────
     ErrorFix(
@@ -2192,109 +2342,43 @@ When adding any new Django page, verify **all** of the following:
 }
 
 _BEHAVIORAL_DOCS = {
-    "code-review-instructions.md": {
-        "title": "Code Review Instructions",
-        "tags": "code-review, instructions, behavioral, quality",
-        "content": """## Overview
+    "npm-scripts-instructions.md": {
+        "title": "NPM Scripts Instructions",
+        "tags": "npm, scripts, package.json, set-script, commands, behavioral, instructions, javascript, typescript",
+        "content": """## CRITICAL: NPM Scripts Rules
 
-When performing code review, follow these structured instructions to
-ensure consistent, thorough, and constructive feedback.
+When generating terminal commands to add or modify scripts in a `package.json` file, you MUST follow these rules.
 
-## Review Checklist
+## Rule 1: NEVER use `npm set-script`
 
-### 1. Correctness
-- Does the code do what it's supposed to do?
-- Are edge cases handled?
-- Are there potential null/undefined access issues?
-- Are error conditions handled appropriately?
+The `npm set-script` command was deprecated and completely removed in npm v7+. It will cause an "Unknown command" error and fail the pipeline.
+NEVER generate commands like `npm set-script test "vitest"`.
 
-### 2. Security
-- Is user input validated and sanitized?
-- Are there SQL injection or XSS vulnerabilities?
-- Are secrets hardcoded?
-- Are permissions checked appropriately?
+## Rule 2: ALWAYS use `npm pkg set` to modify scripts
 
-### 3. Performance
-- Are there N+1 query patterns?
-- Are expensive operations cached when appropriate?
-- Are there unnecessary allocations in hot paths?
-- Could data structures be more efficient?
+To add or modify a script via the command line, you MUST use the `npm pkg set` command:
 
-### 4. Readability
-- Are variable and function names descriptive?
-- Is the code self-documenting or well-commented?
-- Are functions at a single level of abstraction?
-- Is the control flow easy to follow?
+WRONG (fails in modern npm):
+`npm set-script start "vite"`
+`npm run set-script test "jest"`
 
-### 5. Maintainability
-- Does the code follow existing patterns in the codebase?
-- Are there duplicated code blocks that should be extracted?
-- Is the code testable?
-- Are dependencies minimized?
+CORRECT (works in modern npm):
+`npm pkg set scripts.start="vite"`
+`npm pkg set scripts.build="vite build"`
+`npm pkg set scripts.test="vitest run"`
 
-## Giving Feedback
+## Rule 3: Multiple scripts
 
-### Be Specific
-Bad: "This function is too complex"
-Good: "This function has 3 levels of nesting — extract the inner loop into a helper"
-
-### Explain Why
-Don't just say what to change — explain why the change matters.
-
-### Distinguish Severity
-- **Blocker**: Must fix before merge (bugs, security issues)
-- **Suggestion**: Recommended improvement (naming, structure)
-- **Nit**: Minor style preference (formatting, comment wording)
+You can set multiple scripts in a single command if needed:
+`npm pkg set scripts.dev="vite" scripts.build="vite build"`
 """,
     },
-    "error-analysis-instructions.md": {
-        "title": "Error Analysis Instructions",
-        "tags": "error-analysis, debugging, instructions, behavioral",
-        "content": """## Overview
-
-When analyzing errors, follow this systematic approach to identify root
-causes and suggest effective fixes.
-
-## Step 1: Classify the Error
-
-Determine the error category:
-- **Syntax Error**: Code doesn't parse — missing brackets, typos
-- **Type Error**: Wrong data type for an operation
-- **Runtime Error**: Crash during execution — null access, index bounds
-- **Logic Error**: Code runs but produces wrong results
-- **Resource Error**: File not found, connection refused, timeout
-
-## Step 2: Read the Full Stack Trace
-
-- Start from the **bottom** of the stack trace (the actual error)
-- Work **upward** to find the originating call in user code
-- Identify if the error is in user code or library code
-- Note the file, line number, and function name
-
-## Step 3: Identify Root Cause
-
-Common root causes:
-- **Missing null check**: Object is None/null/nil when accessed
-- **Wrong assumption about data**: Expected format differs from actual
-- **Race condition**: Concurrent access to shared state
-- **State management**: Component lifecycle or state machine error
-- **Configuration**: Wrong environment, missing env vars, wrong paths
-
-## Step 4: Suggest a Fix
-
-A good fix suggestion includes:
-1. **What to change**: The specific code modification
-2. **Why it fixes the issue**: Connect the change to the root cause
-3. **How to prevent recurrence**: Tests, type guards, validation
-
-## Step 5: Suggest Preventive Measures
-
-- Add unit tests that reproduce the error
-- Add type annotations/guards at the boundary
-- Improve error messages for faster future diagnosis
-- Consider if similar bugs could exist elsewhere
-""",
-    },
+    # NOTE: Removed "code-review-instructions.md" and
+    # "error-analysis-instructions.md" — they contained generic best
+    # practices (review checklists, debugging methodology) that every LLM
+    # already knows.  Injecting them wasted ~800 tokens per step with
+    # zero incremental value.  Framework-specific instructions (React,
+    # Django, etc.) are kept because they encode non-obvious rules.
     "react-component-test-generation-instructions.md": {
         "title": "React Component Test Generation Instructions",
         "tags": "react, testing, vitest, jest, component, test-generation, behavioral, testing-library, getByText, getByRole, within, render, instructions",
@@ -2672,6 +2756,92 @@ expect(nav).toHaveClass('-translate-x-full')
 expect(nav).toHaveClass('md:flex')
 expect(nav).not.toHaveClass('hidden')
 ```
+
+## Rule 17: NEVER use `document.getElementById` in @testing-library tests
+
+`@testing-library/react`'s `render()` renders into a temporary `<div>` container that
+is NOT `#root`. `document.getElementById('root')` always returns `null` in tests.
+
+**WRONG — always null, test will fail at `toBeTruthy()`:**
+```js
+render(<App />)
+const root = document.getElementById('root')
+expect(root).toBeTruthy()  // FAILS — root is null
+```
+
+**CORRECT — use screen queries or container from render:**
+```js
+const { container } = render(<App />)
+// Option A: assert on visible content
+expect(screen.getByRole('main')).toBeInTheDocument()
+
+// Option B: assert on the render container itself
+expect(container.firstChild).toBeInTheDocument()
+```
+
+## Rule 18: `toHaveClass()` MUST be called with at least one class name argument
+
+Calling `toHaveClass()` with **zero arguments** throws a hard error in
+`@testing-library/jest-dom` v6+:
+
+```
+Error: toHaveClass must be called with at least one argument
+```
+
+This often appears as a meaningless assertion like:
+```js
+expect(document.body).toHaveClass()  // ← WRONG — always throws
+```
+
+**CORRECT — always pass the expected class name:**
+```js
+expect(document.body).toHaveClass('some-class')  // specific assertion
+// OR — if you only want to confirm the element is in the document, use:
+expect(document.body).toBeInTheDocument()
+```
+
+If you were trying to assert that opening a modal does *something* to the body
+(e.g. adds a scroll-lock class), verify which class the component actually adds
+and assert on that. If no class is added, remove the assertion entirely.
+
+## Rule 19: Slide-over panels render in the DOM even when visually hidden
+
+Components that use CSS transforms (e.g. Tailwind's `translate-x-full`) or opacity
+to "hide" panels keep those elements in the DOM at all times. This means:
+
+- `getByText('Brand')` will find BOTH the desktop brand link AND the mobile panel title
+- `getByRole('navigation')` may find BOTH the desktop nav AND the mobile nav panel
+
+**WRONG — fails when desktop and mobile both render the same text:**
+```js
+// Header renders brand in desktop <a> AND mobile <aside> (both inside <header>)
+screen.getByText('ColorWave')  // Error: Found multiple elements with text 'ColorWave'
+
+// ALSO WRONG — within(banner) still finds both when the mobile aside is inside <header>
+const header = screen.getByRole('banner')
+within(header).getByText('ColorWave')  // STILL finds two — aside is inside <header>!
+```
+
+**CORRECT — use role-based query or getAllByText:**
+```js
+// 1. BEST: Use getByRole('link') to target the desktop brand anchor specifically
+//    The mobile panel title is a <span>, not an <a> — roles distinguish them
+screen.getByRole('link', { name: 'ColorWave' })
+
+// 2. Or use getAllByText and assert count when both occurrences are expected
+const allBrand = screen.getAllByText('ColorWave')
+expect(allBrand.length).toBeGreaterThanOrEqual(1)
+
+// 3. For mobile-panel-specific assertions, scope to the mobile panel element directly
+//    (e.g. by its id or data-testid, NOT by getByRole('banner'))
+const mobileMenu = document.querySelector('[data-testid="mobile-menu"]')
+//    or: const mobileMenu = container.querySelector('#mobile-menu')
+expect(within(mobileMenu).getByText('ColorWave')).toBeInTheDocument()
+```
+
+**Key insight:** `within(header)` / `within(banner)` does NOT help when the mobile
+slide-over `<aside>` is rendered inside the `<header>` tag — it will still find all
+occurrences of the text in both desktop and mobile elements.
 """,
     },
     "react-export-default-instructions.md": {
@@ -2735,6 +2905,130 @@ Named export → named import: `import { Dashboard } from './Dashboard'`
 ## Rule 6: Avoid mixed default and named exports for the same component
 
 Use `export default` for the main component. Named exports for helpers/constants only.
+""",
+    },
+    "react-router-setup-instructions.md": {
+        "title": "React Router Setup Instructions",
+        "tags": "react, react-router, BrowserRouter, HashRouter, MemoryRouter, main.jsx, App.jsx, entry-point, singleton, nested, router, behavioral, instructions, javascript, typescript",
+        "content": """## CRITICAL: React Router Setup Rules
+
+When generating or modifying React apps that use React Router, follow these rules to
+prevent the "You cannot render a <Router> inside another <Router>" runtime error.
+
+## Rule 1: Only ONE BrowserRouter in the entire app — always in main.jsx/index.jsx
+
+The BrowserRouter (or HashRouter) MUST be placed only at the app entry point:
+```jsx
+// main.jsx or index.jsx — CORRECT placement
+import { BrowserRouter } from 'react-router-dom';
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>
+);
+```
+
+NEVER place BrowserRouter inside App.jsx or any child component — it causes a
+"You cannot render a <Router> inside another <Router>" runtime error:
+```jsx
+// App.jsx — WRONG: causes nested Router runtime error
+export default function App() {
+  return (
+    <BrowserRouter>   {/* Remove this */}
+      <div>...</div>
+    </BrowserRouter>
+  );
+}
+```
+
+## Rule 2: When removing a BrowserRouter wrapper, return the inner element directly
+
+Return the inner element as a single JSX root — do NOT leave JSX comments floating
+before the root element:
+
+```jsx
+// BEFORE (broken — BrowserRouter wraps a comment + div):
+return (
+  <BrowserRouter>
+    {/* some comment */}
+    <div className="min-h-screen">...</div>
+  </BrowserRouter>
+);
+
+// CORRECT — move comment INSIDE the div, return div directly:
+return (
+  <div className="min-h-screen">
+    {/* some comment */}
+    ...
+  </div>
+);
+```
+
+## Rule 3: NEVER leave a JSX comment before the root JSX element in a return
+
+`{/* comment */}` MUST be inside an open JSX element. Placing it before the
+opening tag of the root element causes a syntax error:
+
+```jsx
+// WRONG — syntax error: {/* */} floats before root element
+return (
+  {/* this causes a parse error */}
+  <div>...</div>
+);
+
+// CORRECT — comment is inside the root element
+return (
+  <div>
+    {/* this is valid */}
+    ...
+  </div>
+);
+```
+
+## Rule 4: Use MemoryRouter in tests — never BrowserRouter
+
+Tests that render components should always use MemoryRouter:
+```jsx
+import { MemoryRouter } from 'react-router-dom';
+render(<MemoryRouter><ComponentUnderTest /></MemoryRouter>);
+```
+
+## Rule 5: When writing main.jsx inline code in a plan — ALWAYS include BrowserRouter
+
+This is the most commonly missed rule with concise LLMs.
+
+If ANY component in the plan uses `<Link>`, `<NavLink>`, `<Route>`, `<Routes>`,
+`useNavigate()`, `useLocation()`, or `useParams()` from `react-router-dom`, the
+`main.jsx` inline code MUST wrap `<App />` in `<BrowserRouter>`.
+
+Omitting this causes this runtime crash:
+```
+TypeError: Cannot destructure property 'basename' of useContext(...) as it is null
+```
+
+CORRECT main.jsx when react-router-dom is installed:
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+```
+
+CHECKLIST before writing main.jsx inline code:
+- [ ] Is `react-router-dom` in the npm install step? → add BrowserRouter to main.jsx
+- [ ] Does any component step use `<Link>` or `<NavLink>`? → add BrowserRouter to main.jsx
+- [ ] BrowserRouter goes in main.jsx ONLY — never in App.jsx or children
 """,
     },
     "django-test-generation-instructions.md": {
@@ -2934,6 +3228,108 @@ with patch("bootstrap_homepage.home.views.render") as mock_render:
 
 **Rule**: always check the app directory name on disk and use that as-is.
 If `home/` is a sibling of `manage.py`, the import is `from home import ...`.
+""",
+    },
+    "python-test-generation-instructions.md": {
+        "title": "Python Test Generation Instructions",
+        "tags": "python, testing, pytest, test-generation, mock, patch, deterministic, behavioral, instructions",
+        "content": """## Overview
+
+When generating tests for Python projects, follow these rules to avoid the most
+common test failures.  These apply to pytest and unittest-style tests.
+
+## Rule 1: NEVER shadow a module with a re-exported function in __init__.py
+
+If `__init__.py` does `from .main import main`, then `import package.main as m`
+binds `m` to the **function** `main`, NOT the module `package/main.py`.
+`patch.object(m, "SomeClass")` will then fail with:
+`AttributeError: 'function' object has no attribute 'SomeClass'`.
+
+WRONG — alias resolves to the function, not the module:
+```python
+import snake_game.main as main_module    # ← main_module is the function!
+main_module.main()                        # AttributeError
+```
+
+CORRECT — import the module explicitly:
+```python
+import importlib
+main_module = importlib.import_module("snake_game.main")
+```
+
+Or use string-based patching which always resolves to the module:
+```python
+with patch("snake_game.main.SnakeWindow") as mock:
+    ...
+```
+
+## Rule 2: patch() target must match WHERE the name is looked up, not where it's defined
+
+`patch("package.module.ClassName")` replaces the name in `package.module`'s namespace.
+If the code under test does `from other_module import ClassName`, patching `other_module.ClassName`
+has no effect on the importing module — you must patch `package.module.ClassName`.
+
+## Rule 3: Deterministic test RNGs must supply enough values for ALL code paths
+
+When injecting a deterministic random source (e.g. `DeterministicRandom` with a
+fixed deque of choices), count EVERY call to `rng.choice()` across ALL code paths
+that will execute — including:
+- Initial `__init__` / `__post_init__` which may call `spawn_food()`
+- `reset()` which typically calls `spawn_food()` again
+- Collision recovery which may call `spawn_food()` after reducing lives
+- The actual test step itself
+
+WRONG — only supplies 1 choice but reset() + step() need 2:
+```python
+game = Game(random_factory=lambda: DeterministicRandom([(0, 0)]))
+game.reset()   # consumes (0, 0)
+game.step()    # IndexError: pop from empty deque
+```
+
+CORRECT — supply enough for init + reset + step:
+```python
+game = Game(random_factory=lambda: DeterministicRandom([(0, 0), (1, 1), (2, 2)]))
+```
+
+Or make the fixture cycle/fallback instead of crashing:
+```python
+class SafeRandom:
+    def __init__(self, values):
+        self._values = itertools.cycle(values)
+    def choice(self, items):
+        return next(self._values)
+```
+
+## Rule 4: Test files that use pyglet must handle the display/event loop
+
+pyglet window tests may hang or fail in headless CI.  When testing window classes:
+- Mock `pyglet.clock.schedule_interval` to prevent the game loop from starting
+- Use `try/finally` with `window.close()` to avoid resource leaks
+- Do NOT call `pyglet.app.run()` in tests — it blocks forever
+
+```python
+from unittest.mock import patch
+
+def test_window_creation():
+    with patch("pyglet.clock.schedule_interval"):
+        window = GameWindow()
+    try:
+        assert window.width == 800
+    finally:
+        window.close()
+```
+
+## Rule 5: When fixing test failures, verify the source API before rewriting
+
+Before modifying source code to "fix" a test failure:
+1. Read the actual source file to check what methods/attributes exist
+2. Verify the test is calling the correct method name
+3. Check if the failure is a TEST_BUG (wrong mock target, wrong assertion)
+   rather than a SOURCE_BUG (missing method)
+
+NEVER delete source methods to make tests pass.  If a method exists in the
+source but tests can't find it, the problem is usually an import issue or
+incorrect mock target — not a missing method.
 """,
     },
 }

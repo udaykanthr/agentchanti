@@ -43,7 +43,10 @@ from .project_scanner import scan_project, format_scan_for_planner, collect_sour
 from .checkpoint import save_checkpoint, load_checkpoint, clear_checkpoint
 
 from .orchestrator.memory import FileMemory
-from .orchestrator.pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .orchestrator.pipeline import (
+    build_step_waves, _execute_step, _run_diagnosis_loop,
+    run_wiring_verification,
+)
 from .orchestrator.test_analyzer import perform_baseline_test_analysis
 from .orchestrator.plan_step import build_waves as _build_plan_waves
 
@@ -57,6 +60,7 @@ class TaskResult:
     token_usage: dict = field(default_factory=dict)
     log_file: str = ""
     error: str = ""
+    answer: str = ""  # populated for QUESTION tasks that produce no code changes
 
 
 def run_task(
@@ -123,11 +127,17 @@ def _run_task_impl(
     if not language:
         language = detect_language_from_task(task) or detect_language()
 
+    # Load custom language backends from config
+    if cfg.LANGUAGE_BACKENDS:
+        from .language_backend import load_custom_backends
+        load_custom_backends(cfg.LANGUAGE_BACKENDS)
+
     # Init LLM
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=cfg.STREAM_RESPONSES,
+        max_output_tokens=cfg.MAX_OUTPUT_TOKENS,
     )
 
     if provider == "ollama":
@@ -184,6 +194,10 @@ def _run_task_impl(
     planner = PlannerAgent("Planner", "Senior Software Architect",
                            "Create a step-by-step plan for the coding task.",
                            _make_llm("planner"))
+    from .agents.intent import IntentAgent, parse_intent_spec
+    intent_agent = IntentAgent("IntentAnalyzer", "Requirements Analyst",
+                               "Analyze the prompt and search the web if intent is ambiguous to produce a formal REQUIREMENTS_SPEC.",
+                               _make_llm("intent"))
     coder = CoderAgent("Coder", "Senior Software Developer",
                        f"Write clean {get_language_name(language)} code for a single step.",
                        _make_llm("coder"))
@@ -294,10 +308,8 @@ def _run_task_impl(
         if project_context:
             planner_context += f"\nCurrent directory contents:\n{project_context}"
 
-    if knowledge_base and knowledge_base.size > 0:
-        kb_ctx = knowledge_base.format_for_planner()
-        if kb_ctx:
-            planner_context += f"\n\n{kb_ctx}"
+    # KB injection deferred — done after pre_analyze so the IntentAgent's
+    # "KB topics:" field can filter it down to relevant entries only.
 
     # Baseline test analysis before planning
     from .agents.planner import _classify_task_intent
@@ -313,6 +325,12 @@ def _run_task_impl(
         except Exception as test_exc:
             _logger.warning("[Analysis] Baseline test analysis failed: %s", test_exc)
 
+    _api_subproject: str | None = None
+    try:
+        from .orchestrator.step_handlers import _detect_subproject_root
+        _api_subproject = _detect_subproject_root(memory)
+    except Exception:
+        pass
     analysis_context = planner.pre_analyze(
         task,
         source_files=source_files,
@@ -320,9 +338,35 @@ def _run_task_impl(
         knowledge_base=knowledge_base,
         test_analysis=test_analysis,
         language=language,
+        intent_agent=intent_agent,
+        search_agent=search_agent,
+        subproject_cwd=_api_subproject,
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context
+
+    # ── QUESTION short-circuit ────────────────────────────────────────────────
+    # The IntentAgent already produced the answer — no planner call needed.
+    if getattr(planner, '_is_question_task', False):
+        _answer = getattr(planner, '_question_answer', '')
+        return TaskResult(success=True, answer=_answer)
+
+    # Update task if IntentAgent enriched it during pre_analyze
+    task = getattr(planner, '_enriched_task', task)
+    intent_spec = parse_intent_spec(task)
+
+    # ── Filtered KB injection ─────────────────────────────────────────────────
+    if knowledge_base and knowledge_base.size > 0:
+        import re as _re_kb
+        from .orchestrator.cli import _parse_kb_topics
+        _kb_topics: list[str] = _parse_kb_topics(task, _re_kb)
+        kb_ctx = (
+            knowledge_base.format_for_task(_kb_topics)
+            if _kb_topics
+            else knowledge_base.format_stack_only()
+        )
+        if kb_ctx:
+            planner_context += f"\n\n{kb_ctx}"
 
     # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
     _llm_detected = getattr(planner, '_detected_language', None)
@@ -346,6 +390,7 @@ def _run_task_impl(
     # ── Parse plan: try structured format first, fall back to legacy ──
     from .orchestrator.plan_step import (
         parse_structured_plan, is_structured_plan, validate_plan,
+        fix_nested_workspace_collision,
         fix_import_dependencies,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -366,6 +411,9 @@ def _run_task_impl(
             errors = validate_plan(plan_steps)
             if errors:
                 _logger.warning("[Plan] Validation warnings: %s", errors)
+            ws_fixes = fix_nested_workspace_collision(plan_steps)
+            if ws_fixes:
+                _logger.info("[Plan] Auto-fixed workspace collision: %s", ws_fixes)
             dep_fixes = fix_import_dependencies(plan_steps)
             if dep_fixes:
                 _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)
@@ -512,6 +560,7 @@ def _run_task_impl(
                 project_context=project_context_obj,
                 plan_step=_ps,
                 all_plan_steps=plan_steps,
+                intent_spec=intent_spec,
             )
 
             if success:
@@ -537,6 +586,7 @@ def _run_task_impl(
                     project_context=project_context_obj,
                     plan_step=_ps,
                     all_plan_steps=plan_steps,
+                    intent_spec=intent_spec,
                 )
                 if fixed:
                     display.complete_step(idx, "done")
@@ -568,10 +618,30 @@ def _run_task_impl(
             cfg=cfg,
             project_context=project_context_obj,
             kb_context_builder=kb_context_builder,
+            all_plan_steps=plan_steps,
         )
         if not verif_ok:
             pipeline_success = False
             log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
+
+    # ── Wiring verification ──
+    # One LLM call that checks all fix-scope files together for cross-file
+    # integration issues (entry-point mounts, import/export mismatches, etc.).
+    # Resolves files not in memory via disk read → glob → KB semantic search.
+    if pipeline_success and cfg.WIRING_VERIFICATION_ENABLED:
+        wv_ok, wv_err = run_wiring_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            task=task,
+            language=language,
+            cfg=cfg,
+            kb_context_builder=kb_context_builder,
+            project_root=os.getcwd(),
+        )
+        if not wv_ok:
+            log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
 
     # Stop KB runtime watcher
     if kb_runtime_watcher is not None:

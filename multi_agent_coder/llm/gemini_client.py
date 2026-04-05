@@ -33,7 +33,7 @@ class GeminiClient(LLMClient):
                 }
             ],
             "generationConfig": {
-                # "temperature": 0.7,
+                "maxOutputTokens": self.max_output_tokens,
             },
         }
         url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
@@ -75,7 +75,7 @@ class GeminiClient(LLMClient):
                 }
             ],
             "generationConfig": {
-                # "temperature": 0.7,
+                "maxOutputTokens": self.max_output_tokens,
             },
         }
         url = (

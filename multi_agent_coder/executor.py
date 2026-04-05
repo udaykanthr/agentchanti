@@ -565,6 +565,24 @@ class Executor:
             # Repair mojibake before writing
             content = Executor._repair_mojibake(content)
 
+            # Hard block: never write internal memory-only paths to disk.
+            # These are in-memory tracking entries (_cmd_output/, etc.)
+            # that should never appear in the project directory.
+            _norm_filename = filename.replace("\\", "/")
+            if _norm_filename.startswith((
+                    "_cmd_output/", "_fix_output/", "_search_context/")):
+                continue
+
+            # Hard block: never write inside node_modules/.
+            # LLM-generated stubs placed here shadow real installed packages,
+            # introducing import errors worse than the original failure.
+            if "node_modules/" in _norm_filename or _norm_filename.startswith("node_modules"):
+                log.warning(
+                    f"[Executor] Blocked write to node_modules/: {filename} "
+                    f"— writing here shadows real packages and corrupts the project."
+                )
+                continue
+
             # Guard: never overwrite dependency manifests / lock files
             basename = os.path.basename(filename)
             if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(filepath):

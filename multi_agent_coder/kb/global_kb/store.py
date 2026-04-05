@@ -258,6 +258,120 @@ class GlobalKBStore:
         edict = self._get_error_dict()
         return edict.get_content_fixes(language)
 
+    def get_by_titles(
+        self,
+        titles: list[str],
+    ) -> list[GlobalKBResult]:
+        """
+        Fetch KB docs by exact title match (case-insensitive).
+
+        Used when the planner has already declared which KB docs are
+        needed for a step via ``kb_docs:`` in the structured plan.
+        Avoids a semantic embedding search — pure title lookup against
+        the frontmatter cache, falling back to a directory scan when a
+        title isn't cached yet.
+
+        Parameters
+        ----------
+        titles:
+            List of KB doc titles declared by the planner.
+
+        Returns
+        -------
+        list[GlobalKBResult]
+            Matched docs in the same order as *titles*.
+            Titles with no matching doc are silently skipped.
+        """
+        if not titles:
+            return []
+
+        from .seeder import _REGISTRY_DIR, _parse_frontmatter
+
+        registry_dir = (
+            os.path.join(self._base_dir, "registry")
+            if self._base_dir else _REGISTRY_DIR
+        )
+        global_dir = self._base_dir or _GLOBAL_DIR
+
+        wanted = {t.strip().lower() for t in titles if t.strip()}
+        if not wanted:
+            return []
+
+        category_dirs = {
+            "pattern": "patterns",
+            "adr": "adrs",
+            "doc": "docs",
+            "behavioral": "behavioral",
+        }
+
+        matched: dict[str, GlobalKBResult] = {}  # title_lower -> result
+
+        for cat, dirname in category_dirs.items():
+            cat_dir = os.path.join(registry_dir, dirname)
+            if not os.path.isdir(cat_dir):
+                continue
+
+            for fname in os.listdir(cat_dir):
+                if not fname.endswith(".md"):
+                    continue
+
+                filepath = os.path.join(cat_dir, fname)
+                try:
+                    mtime = os.path.getmtime(filepath)
+                except OSError:
+                    continue
+
+                cached = self._fm_cache.get(filepath)
+                if cached and cached[0] == mtime:
+                    meta = cached[1]
+                else:
+                    try:
+                        with open(filepath, encoding="utf-8") as fh:
+                            raw = fh.read()
+                    except OSError:
+                        continue
+                    meta = _parse_frontmatter(raw)
+                    self._fm_cache[filepath] = (mtime, meta)
+
+                title = meta.get("title", "")
+                title_lower = title.lower().strip()
+                if title_lower not in wanted or title_lower in matched:
+                    continue
+
+                try:
+                    with open(filepath, encoding="utf-8") as fh:
+                        content = fh.read()
+                except OSError:
+                    continue
+
+                body = content
+                if content.startswith("---"):
+                    end = content.find("---", 3)
+                    if end != -1:
+                        body = content[end + 3:].strip()
+
+                tags_str = meta.get("tags", "")
+                tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+                rel_path = os.path.relpath(filepath, global_dir).replace("\\", "/")
+
+                matched[title_lower] = GlobalKBResult(
+                    title=title,
+                    category=cat,
+                    content=body[:4000],
+                    file=rel_path,
+                    score=1.0,
+                    tags=tags,
+                    language=meta.get("language", "all"),
+                )
+
+        # Preserve the planner-declared order
+        results = []
+        for t in titles:
+            r = matched.get(t.strip().lower())
+            if r:
+                results.append(r)
+        return results
+
     def batch_search(
         self,
         query: str,

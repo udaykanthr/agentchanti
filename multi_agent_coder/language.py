@@ -273,9 +273,18 @@ def detect_language_from_task(task: str) -> str | None:
 def get_test_framework(language: str, test_runner: str | None = None) -> dict:
     """Return test framework config for *language*, defaulting to pytest.
 
+    Uses the pluggable LanguageBackend system first, falls back to the
+    static TEST_FRAMEWORKS dict for backward compatibility.
+
     When *test_runner* is ``"vitest"`` and the language is JS or TS, returns
     the Vitest-specific framework config instead of Jest.
     """
+    # Try the pluggable backend first
+    from .language_backend import get_backend
+    backend = get_backend(language)
+    if backend.language == language or backend.language == language.split(":")[0]:
+        return backend.get_test_framework(test_runner)
+    # Fallback to static dict
     if test_runner == "vitest" and language in ("javascript", "typescript"):
         return TEST_FRAMEWORKS[f"{language}:vitest"]
     return TEST_FRAMEWORKS.get(language, TEST_FRAMEWORKS["python"])

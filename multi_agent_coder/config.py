@@ -15,6 +15,7 @@ _DEFAULTS = {
     "provider": "lm_studio",
     "model": "deepseek-coder-v2-lite-instruct",
     "context_window": 8192,
+    "max_output_tokens": 16384,
     "embedding_model": "nomic-embed-text",
     "embedding_provider": None,  # if set, overrides 'provider' for KB embeddings only
     "embedding_top_k": 5,
@@ -37,6 +38,7 @@ _DEFAULTS = {
     "step_cache_ttl_hours": 24,
     "planner_context_chars": 6000,
     "plugins": [],
+    "language_backends": [],
     "planner_suffix": "Do not create meta-steps (e.g., 'Review code', 'Identify issues'). Focus on implementation. Combine analysis and action.",
     "budget_limit": 0.0,
     "search_enabled": True,
@@ -68,6 +70,7 @@ _DEFAULTS = {
     "review_mode": "static",
     "dependency_check_enabled": True,
     "analyser_enabled": False,
+    "wiring_verification_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -155,6 +158,8 @@ class Config:
         self.DEFAULT_MODEL = _get("DEFAULT_MODEL", "model", _DEFAULTS["model"])
         self.CONTEXT_WINDOW = _get("CONTEXT_WINDOW", "context_window",
                                    _DEFAULTS["context_window"], cast=int)
+        self.MAX_OUTPUT_TOKENS = _get("MAX_OUTPUT_TOKENS", "max_output_tokens",
+                                      _DEFAULTS["max_output_tokens"], cast=int)
         self.EMBEDDING_MODEL = _get("EMBEDDING_MODEL", "embedding_model",
                                     _DEFAULTS["embedding_model"])
         self.EMBEDDING_PROVIDER = _get("EMBEDDING_PROVIDER", "embedding_provider",
@@ -389,10 +394,27 @@ class Config:
             analyser_section.get("enabled", _DEFAULTS["analyser_enabled"]),
         )
 
+        # Wiring verification — cross-file integration check after all steps
+        # (on by default; disable via `wiring_verification: {enabled: false}`
+        # or WIRING_VERIFICATION_ENABLED=false env var)
+        _wv_section = yd.get("wiring_verification", {})
+        if not isinstance(_wv_section, dict):
+            _wv_section = {}
+        self.WIRING_VERIFICATION_ENABLED = _get_bool(
+            "WIRING_VERIFICATION_ENABLED", "wiring_verification_enabled",
+            _wv_section.get("enabled", _DEFAULTS["wiring_verification_enabled"]),
+        )
+
         # Plugins
         self.PLUGINS: list[str] = yd.get("plugins", _DEFAULTS["plugins"])
         if not isinstance(self.PLUGINS, list):
             self.PLUGINS = []
+
+        # Language backends (custom LanguageBackend subclass paths)
+        self.LANGUAGE_BACKENDS: list[str] = yd.get(
+            "language_backends", _DEFAULTS["language_backends"])
+        if not isinstance(self.LANGUAGE_BACKENDS, list):
+            self.LANGUAGE_BACKENDS = []
 
     def to_dict(self) -> dict:
         """Return the current configuration as a dictionary."""
@@ -466,6 +488,9 @@ class Config:
             },
             "analyser": {
                 "enabled": self.ANALYSER_ENABLED,
+            },
+            "wiring_verification": {
+                "enabled": self.WIRING_VERIFICATION_ENABLED,
             },
         }
 

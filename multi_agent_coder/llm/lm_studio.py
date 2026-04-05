@@ -31,6 +31,7 @@ class LMStudioClient(LLMClient):
             ],
             "temperature": 0.7,
             "stream": False,
+            "max_tokens": self.max_output_tokens,
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
@@ -72,6 +73,7 @@ class LMStudioClient(LLMClient):
             "temperature": 0.7,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "max_tokens": self.max_output_tokens,
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
@@ -159,7 +161,7 @@ class LMStudioClient(LLMClient):
         payload = {"model": embed_model, "input": texts}
         headers = {"Content-Type": "application/json"}
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=300)
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])

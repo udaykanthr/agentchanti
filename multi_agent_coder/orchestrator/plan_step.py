@@ -284,7 +284,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     _upper = text.upper()
     _last_plan = _upper.rfind("==PLAN==")
     if _last_plan >= 0:
-        _end_after = _upper.find("==END==", _last_plan)
+        # Use rfind so that small LLMs that emit ==END== after EVERY step
+        # (instead of only once at the end) don't cause premature truncation.
+        _end_after = _upper.rfind("==END==", _last_plan)
         if _end_after > _last_plan:
             text = text[_last_plan + len("==PLAN=="):_end_after]
         else:
@@ -392,6 +394,10 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             else:
                 # Strip markdown fences (```js, ```) that wrap inline code
                 if line.startswith("```"):
+                    if in_markdown_fence:
+                        # Closing fence — mark boundary so multi-target steps
+                        # can split blocks even without // filename.ext headers.
+                        code_lines.append(_FENCE_BOUNDARY)
                     in_markdown_fence = not in_markdown_fence
                     continue
                 # Strip "> " prefix from code lines — the LLM sometimes
@@ -794,48 +800,78 @@ _FILE_COMMENT_RE = re.compile(
     r"^//\s*([\w./-]+\.\w{1,5})\s*$"
 )
 
+# Sentinel inserted into code_lines at each closing ``` fence boundary
+# so _assign_inline_code can split multiple files without // header comments.
+_FENCE_BOUNDARY = "\x00FENCE_BOUNDARY\x00"
+
 
 def _assign_inline_code(step: PlanStep, code_lines: list[str]) -> None:
     """Assign captured inline code to a step's ``inline_code`` dict.
 
     For single-target steps, all code goes to that target file.
-    For multi-target steps, the parser splits on ``// FileName.ext``
-    comment headers to map code to each file.
+    For multi-target steps the parser tries three strategies in order:
+
+    1. ``// FileName.ext`` comment headers between blocks.
+    2. Fence boundaries (``_FENCE_BOUNDARY`` sentinels inserted at each
+       closing `` ``` `` fence) — if the number of non-empty fence blocks
+       matches the number of targets, assign block N to target N.
+    3. Fallback: everything goes to ``targets[0]``.
     """
-    full_code = "\n".join(code_lines).strip()
+    targets = step.target_files
+
+    # ── Strategy 1: // filename.ext comment headers ──
+    if len(targets) > 1:
+        current_file: Optional[str] = None
+        file_lines: dict[str, list[str]] = {}
+        for line in code_lines:
+            if line == _FENCE_BOUNDARY:
+                continue
+            m = _FILE_COMMENT_RE.match(line.strip())
+            if m:
+                fname = m.group(1)
+                matched = _match_target(fname, targets)
+                current_file = matched or fname
+                file_lines.setdefault(current_file, [])
+                continue
+            if current_file is not None:
+                file_lines[current_file] = file_lines.get(current_file, [])
+                file_lines[current_file].append(line)
+        if file_lines:
+            for fpath, lines in file_lines.items():
+                content = "\n".join(lines).strip()
+                if content:
+                    step.inline_code[fpath] = content
+            return
+
+    # ── Strategy 2: fence boundary splitting (no // headers) ──
+    if len(targets) > 1:
+        fence_blocks: list[list[str]] = []
+        current_block: list[str] = []
+        for line in code_lines:
+            if line == _FENCE_BOUNDARY:
+                if current_block:
+                    fence_blocks.append(current_block)
+                current_block = []
+            else:
+                current_block.append(line)
+        if current_block:
+            fence_blocks.append(current_block)
+
+        non_empty = [b for b in fence_blocks if any(ln.strip() for ln in b)]
+        if len(non_empty) == len(targets):
+            for target, block_lines in zip(targets, non_empty):
+                content = "\n".join(block_lines).strip()
+                if content:
+                    step.inline_code[target] = content
+            return
+
+    # ── Strategy 3: fallback — all code to first target ──
+    clean_lines = [ln for ln in code_lines if ln != _FENCE_BOUNDARY]
+    full_code = "\n".join(clean_lines).strip()
     if not full_code:
         return
 
-    targets = step.target_files
-
-    if len(targets) == 1:
-        step.inline_code[targets[0]] = full_code
-        return
-
-    # Multi-target: try splitting on // filename.ext comment headers
-    current_file: Optional[str] = None
-    file_lines: dict[str, list[str]] = {}
-
-    for line in code_lines:
-        m = _FILE_COMMENT_RE.match(line.strip())
-        if m:
-            fname = m.group(1)
-            # Match against known targets or use as-is
-            matched = _match_target(fname, targets)
-            current_file = matched or fname
-            file_lines.setdefault(current_file, [])
-            continue
-        if current_file is not None:
-            file_lines[current_file] = file_lines.get(current_file, [])
-            file_lines[current_file].append(line)
-
-    if file_lines:
-        for fpath, lines in file_lines.items():
-            content = "\n".join(lines).strip()
-            if content:
-                step.inline_code[fpath] = content
-    elif len(targets) > 0:
-        # No file headers found — assign all code to first target
+    if len(targets) >= 1:
         step.inline_code[targets[0]] = full_code
 
 
@@ -887,6 +923,72 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
                 if not producers:
                     # Not an error — could be an existing project file
                     pass
+
+    # ── Nested directory collision detection ─────────────────────────────
+    # Detect when a CMD step creates a workspace directory with the same
+    # name as a Python package created inside it (e.g. `mkdir snake_game`
+    # followed by `cd snake_game && mkdir -p snake_game/tests`).  This
+    # results in `snake_game/snake_game/` which causes import confusion.
+    import re as _re_plan
+
+    def _resolve_mkdir_paths(command: str) -> tuple[set[str], set[str]]:
+        """Parse a compound shell command and return (workspace_dirs, all_abs_dirs).
+
+        Tracks ``cd`` context so ``cd foo && mkdir bar`` yields ``foo/bar``.
+        ``workspace_dirs`` are top-level dirs created by ``mkdir`` without
+        a preceding ``cd`` (i.e. the project workspace root).
+        """
+        workspaces: set[str] = set()
+        all_dirs: set[str] = set()
+        cwd = ""
+        for seg in command.split('&&'):
+            seg = seg.strip()
+            cd_m = _re_plan.match(r'^\s*cd\s+(\S+)', seg)
+            if cd_m:
+                _cd_target = cd_m.group(1).strip().rstrip('/')
+                if cwd:
+                    cwd = cwd + '/' + _cd_target
+                else:
+                    cwd = _cd_target
+                continue
+            mk_m = _re_plan.match(r'^\s*mkdir\s+(?:-p\s+)?(.+)', seg)
+            if mk_m:
+                for d in mk_m.group(1).split():
+                    d = d.strip().rstrip('/')
+                    if not d or d.startswith('-'):
+                        continue
+                    abs_d = (cwd + '/' + d) if cwd else d
+                    all_dirs.add(abs_d)
+                    if not cwd:
+                        # Top-level mkdir = workspace dir
+                        workspaces.add(d.split('/')[0])
+        return workspaces, all_dirs
+
+    _workspace_dirs: set[str] = set()
+    _all_created_dirs: set[str] = set()
+    for step in steps:
+        if step.step_type == "CMD" and step.command:
+            ws, dirs = _resolve_mkdir_paths(step.command)
+            _workspace_dirs.update(ws)
+            _all_created_dirs.update(dirs)
+
+    if _workspace_dirs:
+        _reported: set[str] = set()
+        # Check created dirs for workspace/package name collision
+        for d in _all_created_dirs:
+            parts = d.replace('\\', '/').split('/')
+            if (len(parts) >= 2
+                    and parts[0] in _workspace_dirs
+                    and parts[1] == parts[0]
+                    and parts[0] not in _reported):
+                _reported.add(parts[0])
+                errors.append(
+                    f"Plan creates nested '{parts[0]}/{parts[1]}/' inside "
+                    f"workspace '{parts[0]}/' — Python will confuse the "
+                    f"workspace dir with the package dir, causing import "
+                    f"failures. Rename the workspace (e.g. '{parts[0]}-project') "
+                    f"or write package files directly without a wrapper dir."
+                )
 
     # Check inline code for truncation: if the parser never saw a closing
     # marker (---file-content-end---, ==END==, or next --STEP), the LLM
@@ -1034,6 +1136,174 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
             )
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix: nested workspace/package name collision
+# ---------------------------------------------------------------------------
+
+def fix_nested_workspace_collision(steps: list[PlanStep]) -> list[str]:
+    """Detect and fix ``mkdir X && cd X && mkdir X/...`` patterns.
+
+    When a CMD step creates a workspace directory with the same name as
+    the Python package inside it (e.g. ``mkdir snake_game`` followed by
+    ``cd snake_game && mkdir snake_game/``), imports break because Python
+    confuses the outer workspace with the inner package.
+
+    Fix strategy: rewrite CMD steps to drop the workspace ``mkdir`` and
+    ``cd`` prefix, so the package is created directly at the repo root.
+    All target_files, inline_code keys, and produces that reference the
+    nested path are adjusted accordingly.
+
+    Returns a list of human-readable descriptions of fixes applied.
+    """
+    import re as _re
+
+    fixes: list[str] = []
+
+    # Phase 1: detect workspace dirs and collisions (same logic as validate_plan)
+    def _resolve_mkdir_paths(command: str) -> tuple[set[str], set[str]]:
+        workspaces: set[str] = set()
+        all_dirs: set[str] = set()
+        cwd = ""
+        for seg in command.split('&&'):
+            seg = seg.strip()
+            cd_m = _re.match(r'^\s*cd\s+(\S+)', seg)
+            if cd_m:
+                _cd_target = cd_m.group(1).strip().rstrip('/')
+                cwd = (cwd + '/' + _cd_target) if cwd else _cd_target
+                continue
+            mk_m = _re.match(r'^\s*mkdir\s+(?:-p\s+)?(.+)', seg)
+            if mk_m:
+                for d in mk_m.group(1).split():
+                    d = d.strip().rstrip('/')
+                    if not d or d.startswith('-'):
+                        continue
+                    abs_d = (cwd + '/' + d) if cwd else d
+                    all_dirs.add(abs_d)
+                    if not cwd:
+                        workspaces.add(d.split('/')[0])
+        return workspaces, all_dirs
+
+    workspace_dirs: set[str] = set()
+    all_created: set[str] = set()
+    for step in steps:
+        if step.step_type == "CMD" and step.command:
+            ws, dirs = _resolve_mkdir_paths(step.command)
+            workspace_dirs.update(ws)
+            all_created.update(dirs)
+
+    # Find collision: workspace/workspace pattern
+    colliding: set[str] = set()
+    for d in all_created:
+        parts = d.replace('\\', '/').split('/')
+        if (len(parts) >= 2
+                and parts[0] in workspace_dirs
+                and parts[1] == parts[0]):
+            colliding.add(parts[0])
+
+    if not colliding:
+        return fixes
+
+    # Phase 2: rewrite steps to remove the workspace wrapper.
+    # IMPORTANT: only strip the workspace prefix from DOUBLE-NESTED paths
+    # (e.g. snake_game/snake_game/game.py → snake_game/game.py).
+    # Single-nested paths (e.g. snake_game/game.py) are legitimate package
+    # paths and must NOT be stripped — otherwise files end up at the repo
+    # root instead of inside the package directory.
+    for ws in colliding:
+        ws_prefix = ws + '/'
+        double_prefix = ws + '/' + ws + '/'
+
+        def _strip_double(path: str) -> tuple[str, bool]:
+            """Strip workspace prefix only from double-nested paths."""
+            if path.startswith(double_prefix):
+                return path[len(ws_prefix):], True
+            return path, False
+
+        for step in steps:
+            # Rewrite CMD commands: strip "cd <ws> &&" and "mkdir <ws>"
+            # IMPORTANT: only strip "cd <ws>" when the remaining segments
+            # are ALL directory/file creation commands (mkdir, touch).
+            # If any segment is a runtime command (pip, python, pytest,
+            # npm, etc.), keep the cd — the command needs to run inside
+            # the workspace even though the package prefix is stripped.
+            if step.step_type == "CMD" and step.command:
+                original = step.command
+                segments = step.command.split('&&')
+                cd_indices: list[int] = []
+                mkdir_indices: list[int] = []
+                other_indices: list[int] = []
+
+                for i, seg in enumerate(segments):
+                    seg_stripped = seg.strip()
+                    if _re.match(rf'^\s*cd\s+{_re.escape(ws)}\s*$', seg_stripped):
+                        cd_indices.append(i)
+                    elif _re.match(
+                        rf'^\s*mkdir\s+(?:-p\s+)?{_re.escape(ws)}\s*$',
+                        seg_stripped,
+                    ):
+                        mkdir_indices.append(i)
+                    else:
+                        other_indices.append(i)
+
+                # Always drop bare mkdir <workspace>
+                drop = set(mkdir_indices)
+                # Only drop cd <workspace> when all remaining segments
+                # are directory/file scaffolding, not runtime commands
+                _SCAFFOLD_RE = _re.compile(
+                    r'^\s*(mkdir|touch|ln|cp|mv)\b', _re.IGNORECASE)
+                _non_cd_non_mkdir = [
+                    segments[i].strip() for i in other_indices]
+                _all_scaffold = all(
+                    _SCAFFOLD_RE.match(s) for s in _non_cd_non_mkdir
+                ) if _non_cd_non_mkdir else True
+                if _all_scaffold:
+                    drop.update(cd_indices)
+
+                new_segments = [
+                    segments[i] for i in range(len(segments))
+                    if i not in drop
+                ]
+                if new_segments:
+                    step.command = ' && '.join(s.strip() for s in new_segments)
+                else:
+                    step.command = 'true'  # noop — all segments were workspace-related
+
+                if step.command != original:
+                    fixes.append(
+                        f"Step {step.id}: stripped workspace '{ws}/' "
+                        f"from CMD to avoid nested package collision"
+                    )
+
+            # Rewrite target_files: only strip double-nested prefix
+            new_targets: list[str] = []
+            changed_targets = False
+            for tf in step.target_files:
+                new_tf, changed = _strip_double(tf)
+                new_targets.append(new_tf)
+                if changed:
+                    changed_targets = True
+            if changed_targets:
+                step.target_files = new_targets
+
+            # Rewrite inline_code keys: only strip double-nested prefix
+            if step.inline_code:
+                new_inline: dict[str, str] = {}
+                for k, v in step.inline_code.items():
+                    new_k, _ = _strip_double(k)
+                    new_inline[new_k] = v
+                step.inline_code = new_inline
+
+            # Rewrite inline_edits keys: only strip double-nested prefix
+            if step.inline_edits:
+                new_edits: dict[str, list[tuple[str, str]]] = {}
+                for k, v in step.inline_edits.items():
+                    new_k, _ = _strip_double(k)
+                    new_edits[new_k] = v
+                step.inline_edits = new_edits
+
+    return fixes
 
 
 # ---------------------------------------------------------------------------
@@ -1716,6 +1986,10 @@ _PKG_JSON_NON_DEP_FIELDS = frozenset({
     'name', 'version', 'description', 'main', 'module', 'browser',
     'type', 'author', 'license', 'homepage', 'repository', 'bugs',
     'private', 'engines', 'os', 'cpu',
+    # Script names and the "scripts" key itself are not packages
+    'scripts', 'dev', 'build', 'start', 'test', 'lint', 'preview',
+    'pretest', 'posttest', 'prebuild', 'postbuild', 'prepare',
+    'prepublishOnly', 'preinstall', 'postinstall',
 })
 
 
@@ -1733,9 +2007,17 @@ def _extract_packages_from_inline_edits(step: 'PlanStep') -> list:
                     continue
                 if basename == 'package.json':
                     # Match: "animejs": "^4.2.0"
-                    m = re.match(r'^"([^"]+)"\s*:\s*"[^"]*"$', stripped)
+                    m = re.match(r'^"([^"]+)"\s*:\s*"([^"]*)"$', stripped)
                     if m and m.group(1) not in _PKG_JSON_NON_DEP_FIELDS:
-                        packages.append(m.group(1))
+                        # Reject entries whose value looks like a script
+                        # command (e.g. "vite build") rather than a semver
+                        # version (e.g. "^4.2.0").  Script values contain
+                        # spaces or don't start with a version-range prefix.
+                        val = m.group(2)
+                        _is_version = bool(re.match(
+                            r'^[\^~>=<*0-9]', val)) and ' ' not in val
+                        if _is_version:
+                            packages.append(m.group(1))
                 elif basename in ('requirements.txt', 'Pipfile', 'pyproject.toml', 'setup.py'):
                     # Match: animejs==4.2.0  or  animejs>=3
                     m = re.match(r'^([A-Za-z0-9_.-]+)', stripped)

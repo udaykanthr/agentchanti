@@ -37,7 +37,7 @@ class AnthropicClient(LLMClient):
 
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": self.max_output_tokens,
             "messages": [
                 {"role": "user", "content": prompt},
             ],
@@ -76,7 +76,7 @@ class AnthropicClient(LLMClient):
 
         payload = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": self.max_output_tokens,
             "messages": [
                 {"role": "user", "content": prompt},
             ],

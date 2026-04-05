@@ -12,10 +12,11 @@ class LLMError(Exception):
 class LLMClient(ABC):
 
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
-                 stream: bool = True):
+                 stream: bool = True, max_output_tokens: int = 16384):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.stream = stream
+        self.max_output_tokens = max_output_tokens
         self._stream_callback: Optional[Callable[[int], None]] = None
 
     def set_stream_callback(self, callback: Callable[[int], None]) -> None:
@@ -33,18 +34,34 @@ class LLMClient(ABC):
         """
         last_error: Exception | None = None
         use_stream = self.stream  # mutable — falls back on failure
+        # Prompt sent to the model — may be prefixed on empty-response retries
+        # to suppress reasoning-only output (e.g. <think> tags that get stripped).
+        active_prompt = prompt
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 if use_stream:
-                    result = self._generate_stream(prompt)
+                    result = self._generate_stream(active_prompt)
                 else:
-                    result = self._generate(prompt)
+                    result = self._generate(active_prompt)
 
                 if not result or not result.strip():
                     log.warning(
                         f"[LLM] Empty response on attempt {attempt}/{self.max_retries}")
                     if attempt < self.max_retries:
+                        # Prefix the prompt with an explicit instruction to
+                        # suppress reasoning-only output.  Some models (e.g.
+                        # deepseek-r1 variants) emit all tokens inside <think>
+                        # blocks that get stripped, leaving an empty response.
+                        # Telling the model to skip the thinking step on retry
+                        # is the most reliable way to get visible output.
+                        active_prompt = (
+                            "[IMPORTANT: Your previous response was empty. "
+                            "Do NOT use <think> tags, reasoning blocks, or any "
+                            "XML-style wrapper tags. Output your answer directly "
+                            "with no preamble.]\n\n"
+                            + prompt
+                        )
                         # Jittered exponential backoff
                         import random
                         wait = self.retry_delay * (2 ** (attempt - 1))

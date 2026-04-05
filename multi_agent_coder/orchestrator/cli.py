@@ -33,7 +33,10 @@ from ..report import generate_html_report, StepReport
 from ..plugins.registry import PluginRegistry
 
 from .memory import FileMemory
-from .pipeline import build_step_waves, _execute_step, _run_diagnosis_loop
+from .pipeline import (
+    build_step_waves, _execute_step, _run_diagnosis_loop,
+    run_wiring_verification,
+)
 from .plan_step import build_waves as _build_plan_waves
 from ..agents.analyser import build_project_context, AnalyseAgent, parse_briefing_packages
 
@@ -109,6 +112,89 @@ def _blank_project_scaffold_hint(language: str | None) -> str:
         return "e.g. `cargo init`, `cargo add <crates>`"
     # Generic fallback
     return "e.g. project init command, package install, framework setup"
+
+
+def _parse_kb_topics(task: str, re_mod) -> list[str]:
+    """
+    Extract KB topics from a REQUIREMENTS_SPEC embedded in *task*.
+
+    Handles both formats the LLM may output:
+
+    Comma-separated (preferred):
+      KB topics: Tailwind CSS, React hooks, Vitest
+
+    Bullet list (common LLM habit):
+      KB topics:
+      - Tailwind CSS
+      - React hooks
+      - Vitest
+
+    Returns a list of clean topic strings, empty if 'none' or not found.
+    """
+    m = re_mod.search(
+        r'KB topics[^:\n]*:\s*(.*?)(?=\n[A-Z][^\n]*:|$)',
+        task,
+        re_mod.IGNORECASE | re_mod.DOTALL,
+    )
+    if not m:
+        return []
+
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ('none', 'n/a'):
+        return []
+
+    # Detect bullet list: any line starting with "- "
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.startswith('- ') for l in lines):
+        topics = [
+            l.lstrip('- ').strip().rstrip('.')
+            for l in lines
+            if l.startswith('- ')
+        ]
+    else:
+        # Comma-separated — may span multiple lines
+        flat = ' '.join(lines)
+        topics = [t.strip().rstrip('.') for t in flat.split(',')]
+
+    return [t for t in topics if t and t.lower() not in ('none', 'n/a')]
+
+
+def _parse_kb_doc_titles(task: str) -> list[str]:
+    """
+    Extract explicit KB doc titles from a REQUIREMENTS_SPEC embedded in *task*.
+
+    Parses the `KB docs:` line that IntentAgent emits when it was given a list
+    of available global KB doc titles and selected the relevant ones.
+
+    Handles both formats:
+      KB docs: Tailwind CSS v4 Setup Guide, React Component Patterns
+      KB docs:
+      - Tailwind CSS v4 Setup Guide
+      - React Component Patterns
+
+    Returns exact title strings ready for GlobalKBStore.get_by_titles().
+    """
+    import re as _re
+    m = _re.search(
+        r'KB docs[^:\n]*:\s*(.*?)(?=\n[A-Z][^\n]*:|$)',
+        task,
+        _re.IGNORECASE | _re.DOTALL,
+    )
+    if not m:
+        return []
+
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ('none', 'n/a'):
+        return []
+
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if any(l.startswith('- ') for l in lines):
+        titles = [l.lstrip('- ').strip().rstrip('.') for l in lines if l.startswith('- ')]
+    else:
+        flat = ' '.join(lines)
+        titles = [t.strip().rstrip('.') for t in flat.split(',')]
+
+    return [t for t in titles if t and t.lower() not in ('none', 'n/a')]
 
 
 def main():
@@ -214,12 +300,18 @@ def main():
         language = detect_language_from_task(args.task) or detect_language()
     log.info(f"Language: {language} ({get_language_name(language)})")
 
+    # Load custom language backends from config
+    if cfg.LANGUAGE_BACKENDS:
+        from ..language_backend import load_custom_backends
+        load_custom_backends(cfg.LANGUAGE_BACKENDS)
+
     # ── 2. Init LLM client ──
     stream_enabled = cfg.STREAM_RESPONSES and not args.no_stream
     llm_kwargs = dict(
         max_retries=cfg.LLM_MAX_RETRIES,
         retry_delay=cfg.LLM_RETRY_DELAY,
         stream=stream_enabled,
+        max_output_tokens=cfg.MAX_OUTPUT_TOKENS,
     )
 
     provider = args.provider or cfg.PROVIDER
@@ -410,6 +502,10 @@ def main():
                            "Create a step-by-step plan for the coding task and related testcases.",
                            _make_llm_for_agent("planner"),
                            prompt_suffix=planner_suffix)
+    from ..agents.intent import IntentAgent, parse_intent_spec
+    intent_agent = IntentAgent("IntentAnalyzer", "Requirements Analyst",
+                               "Analyze the prompt and search the web if intent is ambiguous to produce a formal REQUIREMENTS_SPEC.",
+                               _make_llm_for_agent("intent"))
     coder = CoderAgent("Coder", "Senior Software Developer",
                        f"Write clean {get_language_name(language)} code for a single step.",
                        _make_llm_for_agent("coder"),
@@ -541,12 +637,10 @@ def main():
             if project_context:
                 planner_context += f"\nCurrent directory contents:\n{project_context}"
 
-        # Inject knowledge base context
-        if knowledge_base and knowledge_base.size > 0:
-            kb_context = knowledge_base.format_for_planner()
-            if kb_context:
-                planner_context += f"\n\n{kb_context}"
-                log.info(f"Injected {knowledge_base.size} knowledge entries into planner")
+        # KB injection is deferred to after pre_analyze so the IntentAgent's
+        # REQUIREMENTS_SPEC (which includes a "KB topics:" field) can be used
+        # to filter down to only the relevant entries.  Placeholder comment
+        # here — actual injection happens below after pre_analyze completes.
 
         # Baseline test analysis before planning — run existing tests to
         # identify which files pass/fail so the planner only touches broken ones.
@@ -574,6 +668,15 @@ def main():
 
         # Pre-analysis: map relevant files, classify intent, enrich context
         _pre_mem_local = locals().get('_pre_memory')
+        # Detect subproject root so IntentAgent can run npm commands from the
+        # correct directory (e.g. angular-bootstrap-app/ instead of repo root).
+        _intent_subproject: str | None = None
+        if _pre_mem_local is not None:
+            try:
+                from .step_handlers import _detect_subproject_root
+                _intent_subproject = _detect_subproject_root(_pre_mem_local)
+            except Exception:
+                pass
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -586,10 +689,56 @@ def main():
             baseline_failing_files=getattr(
                 _pre_mem_local, '_tester_baseline_failing_files', None),
             search_agent=search_agent,
+            intent_agent=intent_agent,
+            cli_display=display,
+            subproject_cwd=_intent_subproject,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context
-            log.info("[Planning] Pre-analysis context injected")
+
+        # ── QUESTION short-circuit ────────────────────────────────────────────
+        # If IntentAgent classified the task as QUESTION, the answer is already
+        # in the REQUIREMENTS_SPEC.  Skip briefing, global KB, and the planner.
+        if getattr(planner, '_is_question_task', False):
+            _answer = getattr(planner, '_question_answer', '')
+            if _answer:
+                print(f"\n{'─' * 60}")
+                print(_answer)
+                print(f"{'─' * 60}\n")
+            display.finish()
+            return
+
+        # Update task if IntentAgent enriched it during pre_analyze
+        args.task = getattr(planner, '_enriched_task', args.task)
+        intent_spec = parse_intent_spec(args.task)
+
+        # ── Filtered KB injection ─────────────────────────────────────────────
+        # Parse "KB topics:" from the REQUIREMENTS_SPEC the IntentAgent just
+        # produced.  Use those topics to filter knowledge_base entries so the
+        # planner only sees docs relevant to this specific task — not the full
+        # 83-entry dump which includes irrelevant framework docs and old fixes.
+        if knowledge_base and knowledge_base.size > 0:
+            import re as _re_kb
+            _kb_topics: list[str] = []
+            _kb_topics = _parse_kb_topics(args.task, _re_kb)
+
+            if _kb_topics:
+                # Targeted injection: only entries whose text overlaps with the
+                # stated topics.  Always include the stack summary (1 entry).
+                kb_context = knowledge_base.format_for_task(_kb_topics)
+                log.info(
+                    "Filtered KB injection: topics=%s", _kb_topics,
+                )
+            else:
+                # "none" or no KB topics field → inject only stack + packages
+                # (no patterns/fixes which tend to be task-specific noise).
+                kb_context = knowledge_base.format_stack_only()
+                log.info("KB topics: none — injecting stack summary only")
+
+            if kb_context:
+                planner_context += f"\n\n{kb_context}"
+
+        log.info("[Planning] Pre-analysis context injected")
 
         # Apply LLM-corrected language (set by pre_analyze when heuristics were wrong)
         _llm_detected = getattr(planner, '_detected_language', None)
@@ -632,6 +781,7 @@ def main():
             # ── 10. Parse steps + dependencies ──
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
+                fix_nested_workspace_collision,
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -651,6 +801,9 @@ def main():
                     errors = validate_plan(plan_steps_parsed)
                     if errors:
                         log.warning(f"[Plan] Validation warnings: {errors}")
+                    ws_fixes = fix_nested_workspace_collision(plan_steps_parsed)
+                    if ws_fixes:
+                        log.info(f"[Plan] Auto-fixed workspace collision: {ws_fixes}")
                     dep_fixes = fix_import_dependencies(plan_steps_parsed)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
@@ -685,7 +838,11 @@ def main():
                 print("\n  [ERROR] Could not parse any steps. Check the log file.\n")
                 return
 
-            # Validate plan quality
+            # Validate plan quality — skip for structured plans, which are
+            # already validated by validate_plan() above and whose step
+            # descriptions don't populate the legacy text list reliably.
+            if plan_steps_parsed is not None:
+                break
             is_valid, reason = Executor.validate_plan_quality(raw_steps)
             if is_valid:
                 break
@@ -957,6 +1114,7 @@ def main():
                 project_context=project_context,
                 plan_step=_ps,
                 all_plan_steps=plan_steps_parsed,
+                intent_spec=intent_spec,
             )
 
             if success:
@@ -988,6 +1146,7 @@ def main():
                     project_context=project_context,
                     plan_step=_ps,
                     all_plan_steps=plan_steps_parsed,
+                    intent_spec=intent_spec,
                 )
                 if fixed:
                     display.complete_step(idx, "done")
@@ -1035,6 +1194,7 @@ def main():
                         project_context=project_context,
                         plan_step=_ps,
                         all_plan_steps=plan_steps_parsed,
+                        intent_spec=intent_spec,
                     )
                     futures[f] = idx
 
@@ -1078,6 +1238,7 @@ def main():
                     project_context=project_context,
                     plan_step=_ps,
                     all_plan_steps=plan_steps_parsed,
+                    intent_spec=intent_spec,
                 )
                 if fixed:
                     display.complete_step(idx, "done")
@@ -1118,10 +1279,32 @@ def main():
             cfg=cfg,
             project_context=project_context,
             kb_context_builder=kb_context_builder,
+            all_plan_steps=plan_steps_parsed,
+            search_agent=search_agent,
         )
         if not verif_ok:
             pipeline_success = False
             log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
+
+    # ── 13.6. Wiring verification ──
+    # One LLM call that checks all fix-scope files together for cross-file
+    # integration issues (entry-point mounts, import/export mismatches, etc.).
+    # Resolves files not in memory via disk read → glob → KB semantic search.
+    if pipeline_success and cfg.WIRING_VERIFICATION_ENABLED:
+        import os as _os
+        wv_ok, wv_err = run_wiring_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            task=args.task,
+            language=language,
+            cfg=cfg,
+            kb_context_builder=kb_context_builder,
+            project_root=_os.getcwd(),
+        )
+        if not wv_ok:
+            log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

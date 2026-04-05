@@ -237,6 +237,10 @@ class CLIDisplay:
         self._test_results: list[dict] = []   # [{file, passed, total, failures, duration}]
         self._wave_info: tuple[int, int] = (0, 0)
         self._model_info: str = ""
+        # Intent investigation trail (shown in INVESTIGATING panel)
+        self._intent_events: list[dict] = []  # {kind, label, result_info, done}
+        self._intent_iteration: tuple[int, int] = (0, 0)  # (current, max)
+        self._intent_last_response: str = ""   # full LLM response, shown below events
         self._lock = threading.RLock()
         self._last_stream_render: float = 0.0
 
@@ -357,6 +361,62 @@ class CLIDisplay:
             self.status_message = message
         self.render()
         self._start_spinner(message)
+
+    # ── Intent investigation trail ─────────────────────────────────────────────
+
+    _INTENT_ICONS = {
+        "preseed": ("⚡", "yellow"),
+        "think":   ("◉",  "bright_yellow"),
+        "reason":  ("  ↳", "dim"),   # LLM reasoning before tool call
+        "kb":      ("🔍", "cyan"),
+        "web":     ("🌐", "blue"),
+        "cmd":     ("💻", "magenta"),
+        "usage":   ("🔗", "cyan"),
+        "spec":    ("✅", "green"),
+        "reject":  ("✗",  "red"),
+        "detail":  ("  ·", "dim"),   # indented detail line under spec
+    }
+
+    def show_intent_event(self, kind: str, label: str, result_info: str = "",
+                          iteration: int = 0, max_iterations: int = 0):
+        """Append a new row to the investigation trail panel.
+
+        *kind* selects the icon (preseed/kb/web/cmd/usage/spec/reject).
+        *label* is the short description shown on the left.
+        *result_info* (optional) is appended on the right once the result arrives.
+        Call update_last_intent_event() to fill in result_info after the fact.
+        """
+        with self._lock:
+            self._intent_events.append({
+                "kind": kind,
+                "label": label,
+                "result_info": result_info,
+            })
+            if iteration or max_iterations:
+                self._intent_iteration = (iteration, max_iterations)
+            self.status_message = label
+        self.render()
+        self._start_spinner(label)
+
+    def update_last_intent_event(self, result_info: str):
+        """Set result_info on the most recently added intent event."""
+        with self._lock:
+            if self._intent_events:
+                self._intent_events[-1]["result_info"] = result_info
+        self.render()
+
+    def set_intent_response(self, text: str):
+        """Store the latest full LLM response for display in the investigation panel."""
+        with self._lock:
+            self._intent_last_response = text
+        self.render()
+
+    def clear_intent_events(self):
+        """Remove investigation trail (called when planning phase ends)."""
+        with self._lock:
+            self._intent_events = []
+            self._intent_iteration = (0, 0)
+            self._intent_last_response = ""
 
     def start_step(self, index: int, step_type: str = "?"):
         with self._lock:
@@ -763,18 +823,97 @@ class CLIDisplay:
             padding=(0, 0),
         )
 
+    def _build_investigation_section(self) -> Panel:
+        """Rich panel showing the IntentAgent's investigation trail."""
+        with self._lock:
+            events = list(self._intent_events)
+            iteration, max_iter = self._intent_iteration
+
+        spin = self._spinner_char()
+        table = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+        table.add_column("icon",   width=3,  no_wrap=True)
+        table.add_column("label",  ratio=1)
+        table.add_column("result", width=28, no_wrap=True)
+
+        for ev in events:
+            kind        = ev.get("kind", "kb")
+            label       = ev.get("label", "")
+            result_info = ev.get("result_info", "")
+
+            icon_char, icon_color = self._INTENT_ICONS.get(kind, ("·", "dim"))
+            icon_text = Text(f" {icon_char}", style=icon_color)
+
+            # Truncate long labels
+            if len(label) > 72:
+                label = label[:69] + "…"
+
+            if kind in ("detail", "reason"):
+                label_style = "dim"
+            elif kind == "spec":
+                label_style = "bold green"
+            elif kind == "reject":
+                label_style = "red"
+            elif kind == "think":
+                label_style = "bright_yellow"
+            else:
+                label_style = "white"
+
+            label_text = Text(label, style=label_style, no_wrap=True,
+                              overflow="ellipsis")
+            result_text = Text(
+                result_info[:26] if result_info else "",
+                style="dim", no_wrap=True)
+            table.add_row(icon_text, label_text, result_text)
+
+        # Full LLM response sub-panel (shown below the event trail)
+        with self._lock:
+            last_response = self._intent_last_response
+
+        body_parts = [table]
+        if last_response:
+            resp_text = Text(last_response, style="dim", no_wrap=False)
+            resp_panel = Panel(
+                resp_text,
+                title=Text("LLM Response", style="dim cyan"),
+                title_align="left",
+                border_style="dim",
+                box=rich_box.SIMPLE,
+                padding=(0, 1),
+            )
+            body_parts.append(resp_panel)
+
+        # Title with iteration counter and spinner
+        title = Text()
+        title.append("◈ ", style="dim cyan")
+        title.append("INVESTIGATING", style="bold cyan")
+        if iteration:
+            title.append(f"  iteration {iteration}", style="dim")
+        title.append(f"  {spin}", style=_CLR["active"])
+
+        return Panel(
+            Group(*body_parts),
+            title=title,
+            title_align="left",
+            border_style="cyan",
+            box=rich_box.ROUNDED,
+            padding=(0, 0),
+        )
+
     def _build_panels(self) -> list:
         """Assemble all Rich renderables for the current state."""
         parts = []
         parts.append(self._build_header())
 
         with self._lock:
-            has_steps   = bool(self.steps)
-            has_status  = bool(self.status_message)
-            has_tests   = bool(self._test_results)
+            has_steps       = bool(self.steps)
+            has_status      = bool(self.status_message)
+            has_tests       = bool(self._test_results)
+            has_intent      = bool(self._intent_events)
 
         if has_steps:
             parts.append(self._build_execution_section())
+        elif has_intent:
+            parts.append(self._build_investigation_section())
         elif has_status:
             parts.append(self._build_planning_section())
 

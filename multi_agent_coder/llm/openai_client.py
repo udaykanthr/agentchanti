@@ -41,9 +41,20 @@ class OpenAIClient(LLMClient):
             ],
             "stream": False,
         }
+        # Newer OpenAI models (GPT-4o+, o1+, GPT-5+) require
+        # max_completion_tokens; older models and compatible APIs use
+        # max_tokens.  Try the new name first, fall back on 400 error.
+        _tok_key = "max_completion_tokens"
+        payload[_tok_key] = self.max_output_tokens
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
+        if response.status_code == 400 and _tok_key == "max_completion_tokens":
+            # Fall back to legacy parameter name
+            del payload[_tok_key]
+            payload["max_tokens"] = self.max_output_tokens
+            response = requests.post(url, headers=self._headers(), json=payload,
+                                     timeout=(10, 300))
         response.raise_for_status()
         data = response.json()
 
@@ -58,7 +69,7 @@ class OpenAIClient(LLMClient):
         log.debug(f"[OpenAI] Usage: prompt={prompt_tokens} completion={completion_tokens}")
 
         response_text = data["choices"][0]["message"]["content"]
-        log.debug(f"[OpenAI] Response:\n{response_text}")
+        log.debug(f"[OpenAI] Response:\n{completion_tokens}")
         return response_text
 
     # ── Streaming generation ──
@@ -77,6 +88,7 @@ class OpenAIClient(LLMClient):
             ],
             "stream": True,
             "stream_options": {"include_usage": True},
+            "max_completion_tokens": self.max_output_tokens,
         }
         url = f"{self.base_url}/chat/completions"
 
@@ -87,6 +99,12 @@ class OpenAIClient(LLMClient):
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
+        if response.status_code == 400 and "max_completion_tokens" in payload:
+            # Fall back to legacy parameter name for older models/APIs
+            del payload["max_completion_tokens"]
+            payload["max_tokens"] = self.max_output_tokens
+            response = requests.post(url, headers=self._headers(), json=payload,
+                                     stream=True, timeout=(10, 120))
         response.raise_for_status()
 
         for line in response.iter_lines(decode_unicode=True):
@@ -120,7 +138,7 @@ class OpenAIClient(LLMClient):
             model_name=self.model,
         )
         log.debug(f"[OpenAI] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
-        log.debug(f"[OpenAI] Response:\n{result}")
+        log.debug(f"[OpenAI] Response:\n{completion_tokens}")
 
         if self._stream_callback:
             self._stream_callback(tokens_generated)
@@ -165,7 +183,7 @@ class OpenAIClient(LLMClient):
         if dimensions:
             payload["dimensions"] = dimensions
         try:
-            response = requests.post(url, headers=self._headers(), json=payload, timeout=120)
+            response = requests.post(url, headers=self._headers(), json=payload, timeout=60)
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])

@@ -37,7 +37,8 @@ class SearchAgent:
     def search_for_error(self, error_info: str,
                          step_text: str = "",
                          language: str | None = None,
-                         kb_context: str = "") -> str:
+                         kb_context: str = "",
+                         query_override: str | None = None) -> str:
         """Search the web for information about an error.
 
         Args:
@@ -53,8 +54,10 @@ class SearchAgent:
             string if nothing useful was found or on any error.
         """
         try:
-            query = self._build_search_query(error_info, language,
-                                             kb_context=kb_context)
+            query = (query_override.strip()
+                     if query_override and query_override.strip()
+                     else self._build_search_query(error_info, language,
+                                                   kb_context=kb_context))
             if not query:
                 return ""
 

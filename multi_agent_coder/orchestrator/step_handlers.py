@@ -4,6 +4,7 @@ Step handlers — CMD, CODE, and TEST step execution logic.
 # Separate retry limit for test generation (lower than code to avoid pipeline halts)
 MAX_TEST_GEN_RETRIES = 2
 
+import ast
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from .test_analyzer import perform_baseline_test_analysis, _count_test_failures,
 from .memory import FileMemory
 from .classification import (
     _extract_command_from_step, _extract_commands_from_text,
-    _looks_like_command, _cleanup_shell_command
+    _looks_like_command, _cleanup_shell_command, resolve_cmd_placeholders,
 )
 
 from ..diff_display import show_diffs, prompt_diff_approval, _detect_hazards
@@ -317,6 +318,7 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         "has_vitest_config": False,
         "has_tsx": False,
         "has_jsx": False,
+        "test_script": None,     # raw "scripts.test" from package.json
     }
 
     # Read package.json
@@ -332,6 +334,12 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         if pkg.get("type") == "module":
             env["is_esm"] = True
             env["module_type"] = "module"
+
+        # Read scripts.test — the canonical test command defined by the project
+        _scripts = pkg.get("scripts", {})
+        _test_script = _scripts.get("test", "")
+        if _test_script:
+            env["test_script"] = _test_script
 
         # Dependency detection
         all_deps = {}
@@ -389,14 +397,32 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
             env["has_jest_config"] = True
             break
 
-    # Determine test runner: prefer Vitest if detected
-    if env["has_vitest_config"] or env["has_vitest"]:
-        env["test_runner"] = "vitest"
-    elif env.get("has_vite") and not env["has_jest_config"]:
-        # Vite project without explicit Jest config → default to Vitest
-        env["test_runner"] = "vitest"
-    elif env["has_jest_config"] or env["has_jest"]:
-        env["test_runner"] = "jest"
+    # Determine test runner: prefer scripts.test > config files > dependencies
+    # The scripts.test field is the most authoritative signal — it's what
+    # `npm test` actually runs, so it covers Angular (ng test), Karma,
+    # Mocha, and any other runner without hardcoded framework checks.
+    _ts = (env.get("test_script") or "").lower()
+    if _ts:
+        if "vitest" in _ts:
+            env["test_runner"] = "vitest"
+        elif "ng test" in _ts or "karma" in _ts:
+            env["test_runner"] = "ng"
+        elif "mocha" in _ts:
+            env["test_runner"] = "mocha"
+        elif "jest" in _ts:
+            env["test_runner"] = "jest"
+        # else: fall through to config/dependency heuristics below
+
+    if env["test_runner"] == "jest":
+        # Config / dependency heuristics (fallback when scripts.test is absent
+        # or doesn't name a recognisable runner).
+        if env["has_vitest_config"] or env["has_vitest"]:
+            env["test_runner"] = "vitest"
+        elif env.get("has_vite") and not env["has_jest_config"]:
+            # Vite project without explicit Jest config → default to Vitest
+            env["test_runner"] = "vitest"
+        elif env["has_jest_config"] or env["has_jest"]:
+            env["test_runner"] = "jest"
 
     # Check for .tsx/.jsx files (useful for React testing guidance)
     scan_dir = cwd or "."
@@ -471,7 +497,142 @@ def _apply_content_fixes(
     return result
 
 
-def _strip_protected_files(files: dict[str, str]) -> dict[str, str]:
+def _inject_browser_router_if_needed(
+    files: dict[str, str],
+    memory: "FileMemory",
+    all_plan_steps=None,
+) -> dict[str, str]:
+    """Wrap <App /> in <BrowserRouter> when Link/NavLink is used but BrowserRouter is absent.
+
+    When the planner's inline code for main.jsx/index.jsx includes ``createRoot``
+    but omits ``BrowserRouter``, any component that uses ``<Link>`` or ``<NavLink>``
+    from ``react-router-dom`` will crash at runtime with:
+
+        useHref() may only be used within a <Router> context.
+
+    This helper scans the entry-point file written in *files*, detects the omission,
+    then patches the file by:
+      1. Adding ``import { BrowserRouter } from 'react-router-dom'``
+      2. Wrapping the ``<App />`` JSX element with ``<BrowserRouter>``.
+
+    Only runs when memory contains at least one file that imports from
+    ``react-router-dom`` and references ``Link`` or ``NavLink``.
+    """
+    result = dict(files)
+
+    for filepath, content in list(result.items()):
+        basename = filepath.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if basename not in ("main.jsx", "main.tsx", "index.jsx", "index.tsx"):
+            continue
+
+        # Already has a Router — nothing to do
+        if "BrowserRouter" in content or "HashRouter" in content:
+            continue
+
+        # Only applies to React 18 createRoot entry points
+        if "createRoot" not in content:
+            continue
+
+        # Check if any memory file uses Link / NavLink from react-router-dom
+        all_memory_files = memory.all_files()
+        uses_router_link = any(
+            "react-router-dom" in c and bool(
+                re.search(r'\b(?:Link|NavLink)\b', c)
+            )
+            for c in all_memory_files.values()
+        )
+        if not uses_router_link:
+            continue
+
+        # Check if any OTHER memory file already wraps with BrowserRouter
+        # (e.g. Root.jsx or App.jsx).  If so, skip injection — the router
+        # is already provided deeper in the component tree.
+        child_has_router = any(
+            ("BrowserRouter" in c or "HashRouter" in c)
+            and fpath_key != filepath
+            for fpath_key, c in all_memory_files.items()
+        )
+
+        # Also check pending plan steps' inline code — App.jsx may not
+        # be in memory yet (written in a later wave) but the plan already
+        # contains its content with BrowserRouter.
+        if not child_has_router and all_plan_steps:
+            for ps in all_plan_steps:
+                for _ps_path, _ps_content in (ps.inline_code or {}).items():
+                    if _ps_path != filepath and (
+                        "BrowserRouter" in _ps_content
+                        or "HashRouter" in _ps_content
+                    ):
+                        child_has_router = True
+                        break
+                if child_has_router:
+                    break
+
+        if child_has_router:
+            log.debug(
+                "BrowserRouter injection skipped for %s — "
+                "a child component already provides BrowserRouter",
+                filepath,
+            )
+            continue
+
+        patched = content
+
+        # ── 1. Add BrowserRouter import ──
+        rrd_import_re = re.compile(
+            r"(import\s+\{)([^}]+?)(\}\s+from\s+['\"]react-router-dom['\"])"
+        )
+        rrd_match = rrd_import_re.search(patched)
+        if rrd_match and "BrowserRouter" not in rrd_match.group(2):
+            patched = rrd_import_re.sub(
+                lambda m: m.group(1) + m.group(2).rstrip() + ", BrowserRouter" + m.group(3),
+                patched,
+                count=1,
+            )
+        elif not rrd_match:
+            # Insert after last React-related import line
+            react_imports = list(re.finditer(
+                r"^import .+['\"]react(?:-dom)?['\"].*$", patched, re.MULTILINE
+            ))
+            if react_imports:
+                insert_pos = react_imports[-1].end()
+                patched = (
+                    patched[:insert_pos]
+                    + "\nimport { BrowserRouter } from 'react-router-dom'"
+                    + patched[insert_pos:]
+                )
+            else:
+                patched = "import { BrowserRouter } from 'react-router-dom'\n" + patched
+
+        # ── 2. Wrap the root component with <BrowserRouter> ──
+        # Detect the root component rendered inside createRoot().render()
+        # It could be <App />, <Root />, or any PascalCase component.
+        _root_comp_re = re.compile(
+            r'(<(?:App|Root|[A-Z]\w*)\s*/>)'
+        )
+        patched = _root_comp_re.sub(
+            r'<BrowserRouter>\n      \1\n    </BrowserRouter>',
+            patched,
+            count=1,
+        )
+
+        if patched != content:
+            result[filepath] = patched
+            log.info(
+                "BrowserRouter injection: patched %s "
+                "(Link/NavLink detected in project memory)",
+                filepath,
+            )
+
+    return result
+
+
+def _looks_like_file_path(s: str) -> bool:
+    """Return True if *s* looks like a file path (has extension or path separator)."""
+    return bool(re.search(r'\.\w{2,6}$', s) or '/' in s or os.sep in s)
+
+
+def _strip_protected_files(files: dict[str, str], intent_spec=None) -> dict[str, str]:
     """Handle protected manifest files from parsed LLM output.
 
     For lock files (package-lock.json, yarn.lock, etc.) — fully blocked.
@@ -517,7 +678,7 @@ def _strip_protected_files(files: dict[str, str]) -> dict[str, str]:
     for fpath, content in files.items():
         basename = os.path.basename(fpath)
 
-        # Not a protected file — pass through
+        # Not a core protected file — pass through
         if basename not in Executor._PROTECTED_FILENAMES:
             filtered[fpath] = content
             continue
@@ -862,13 +1023,19 @@ def _all_non_code_files(filenames: list[str]) -> bool:
 
 
 def _build_prior_steps_context(memory: FileMemory, step_idx: int) -> str:
-    """Collect outputs of prior steps from memory for context."""
+    """Collect outputs of prior steps (CMD + SEARCH) from memory for context."""
     parts: list[str] = []
     all_files = memory.all_files()
     for i in range(step_idx):
-        key = f"_cmd_output/step_{i+1}.txt"
-        if key in all_files:
-            parts.append(f"Step {i+1} output:\n{all_files[key]}")
+        # CMD step output
+        cmd_key = f"_cmd_output/step_{i+1}.txt"
+        if cmd_key in all_files:
+            parts.append(f"Step {i+1} output:\n{all_files[cmd_key]}")
+        # SEARCH step output — propagate search results to dependent steps
+        search_key = f"_search_context/step_{i+1}.txt"
+        if search_key in all_files:
+            parts.append(
+                f"Step {i+1} search results:\n{all_files[search_key]}")
     if not parts:
         return ""
     return "Previously executed steps:\n" + "\n\n".join(parts) + "\n\n"
@@ -1029,17 +1196,33 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
             # Even if the name is in _NON_SUBPROJECT_DIRS (e.g. "app"),
             # treat it as a real sub-project if it contains a manifest
             is_blocked_name = subproject in _NON_SUBPROJECT_DIRS
-            if not is_blocked_name:
-                log.info(f"[SubProject] Detected sub-project root: {subproject}/")
-                return subproject
-            # Override the blocklist when a project manifest exists
+
+            # A directory that contains __init__.py is a Python package,
+            # not a standalone sub-project — unless it ALSO contains a
+            # project manifest (pyproject.toml, setup.py, etc.).
+            _is_python_package = os.path.isfile(
+                os.path.join(subproject, '__init__.py'))
+
+            _has_manifest = False
             for manifest in ('package.json', 'Cargo.toml', 'go.mod',
                              'requirements.txt', 'Gemfile', 'pyproject.toml',
-                             'composer.json', 'manage.py'):
+                             'composer.json', 'manage.py', 'setup.py',
+                             'setup.cfg'):
                 if os.path.isfile(os.path.join(subproject, manifest)):
+                    _has_manifest = True
                     log.info(f"[SubProject] Detected sub-project root "
-                             f"(manifest override, {manifest}): {subproject}/")
+                             f"({'manifest override, ' if is_blocked_name else ''}"
+                             f"{manifest}): {subproject}/")
                     return subproject
+
+            if _is_python_package and not _has_manifest:
+                log.debug(
+                    f"[SubProject] '{subproject}/' has __init__.py but no "
+                    f"project manifest — treating as Python package, not "
+                    f"sub-project")
+            elif not is_blocked_name:
+                log.info(f"[SubProject] Detected sub-project root: {subproject}/")
+                return subproject
 
     # Fallback 1: if memory contains files from multiple top-level directories
     # (e.g. search provider added files), look for a known project manifest
@@ -1088,9 +1271,55 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
             total = sum(counts.values())
             # Only use majority if it covers >70% of files
             if best_count > total * 0.7 and os.path.isdir(best):
-                log.info(f"[SubProject] Detected sub-project root via "
-                         f"majority ({best_count}/{total} files): {best}/")
-                return best
+                if best in _NON_SUBPROJECT_DIRS:
+                    # Blocklisted name — only allow if it contains a
+                    # project manifest (same logic as single-component
+                    # check at Fallback 0).
+                    for manifest in ('package.json', 'Cargo.toml', 'go.mod',
+                                     'requirements.txt', 'Gemfile',
+                                     'pyproject.toml', 'composer.json',
+                                     'manage.py'):
+                        if os.path.isfile(os.path.join(best, manifest)):
+                            log.info(
+                                f"[SubProject] Detected sub-project root via "
+                                f"majority ({best_count}/{total} files, "
+                                f"manifest override {manifest}): {best}/")
+                            return best
+                    # No manifest — not a real sub-project
+                    log.debug(
+                        f"[SubProject] Majority candidate '{best}' is a "
+                        f"common source directory name without a project "
+                        f"manifest — skipping")
+                else:
+                    # A directory that contains __init__.py is a Python
+                    # package, not a standalone sub-project — unless it
+                    # ALSO has a project manifest.  This mirrors the
+                    # single-component check in Fallback 0 above.
+                    _is_py_pkg = os.path.isfile(
+                        os.path.join(best, '__init__.py'))
+                    if _is_py_pkg:
+                        _has_mf = any(
+                            os.path.isfile(os.path.join(best, m))
+                            for m in ('package.json', 'Cargo.toml', 'go.mod',
+                                      'requirements.txt', 'Gemfile',
+                                      'pyproject.toml', 'composer.json',
+                                      'manage.py', 'setup.py', 'setup.cfg')
+                        )
+                        if not _has_mf:
+                            log.debug(
+                                f"[SubProject] Majority candidate '{best}' "
+                                f"has __init__.py but no project manifest "
+                                f"— treating as Python package, not sub-project")
+                        else:
+                            log.info(
+                                f"[SubProject] Detected sub-project root via "
+                                f"majority ({best_count}/{total} files): {best}/")
+                            return best
+                    else:
+                        log.info(
+                            f"[SubProject] Detected sub-project root via "
+                            f"majority ({best_count}/{total} files): {best}/")
+                        return best
 
     return None
 
@@ -1128,8 +1357,10 @@ def _prefix_subproject_paths(files: dict[str, str],
             corrected[fpath] = content
             continue
 
-        # Already has the sub-project prefix
-        if fpath.startswith(prefix):
+        # Already has the sub-project prefix (normalise backslashes so
+        # Windows paths like 'my-app\src\foo.js' match 'my-app/')
+        norm_fpath = fpath.replace("\\", "/")
+        if norm_fpath.startswith(prefix):
             corrected[fpath] = content
             continue
 
@@ -1167,6 +1398,22 @@ def _prefix_subproject_paths(files: dict[str, str],
                 log.warning(f"[SubProject] Fixed embedded subproject: "
                             f"'{fpath}' → '{candidate}'")
                 corrected[candidate] = content
+                continue
+
+        # Bare filename (no directory component): the fuzzy parser may
+        # extract just "Header.jsx" from LLM prose like "Here is Header.jsx:".
+        # Before blindly prefixing to "subproject/Header.jsx", check memory
+        # for a file whose basename matches — if exactly one exists, use it.
+        norm_basename = os.path.basename(norm)
+        if norm_basename == norm:  # no directory component
+            basename_matches = [
+                kp for kp in known_paths
+                if os.path.basename(kp.replace("\\", "/")) == norm_basename
+            ]
+            if len(basename_matches) == 1:
+                resolved = basename_matches[0]
+                log.info(f"[SubProject] Resolved bare filename '{fpath}' → '{resolved}'")
+                corrected[resolved] = content
                 continue
 
         # Prefix with sub-project root
@@ -1377,7 +1624,8 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                      display: CLIDisplay, step_idx: int,
                      language: str | None = None,
                      project_context=None,
-                     plan_step=None) -> tuple[bool, str]:
+                     plan_step=None,
+                     intent_spec=None) -> tuple[bool, str]:
     # Prefer the structured plan's explicit command field
     cmd = (plan_step.command if plan_step is not None and plan_step.command
            else _extract_command_from_step(step_text))
@@ -1450,6 +1698,24 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # ── Normalize command ──
     # Clean up bash-style line continuations and dangling operators
     cmd = _cleanup_shell_command(cmd)
+
+    # ── Resolve LLM placeholders ──
+    # Dumb/small LLMs sometimes output <project-name> instead of the real name.
+    _task_desc = getattr(project_context, 'goal_summary', '') if project_context else ''
+    cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=_task_desc)
+
+    # ── Strip dead `cd <dir> &&` before scaffold commands ──
+    # LLMs often generate `cd <name> && npm create vite@latest <name>` but the
+    # directory doesn't exist yet — `npm create vite@latest` is what creates it.
+    # Strip the leading `cd` so the scaffold command can run correctly.
+    _SCAFFOLD_CD_RE = re.compile(
+        r'^cd\s+\S+\s*&&\s*(npm\s+create\s+(?:vite|react-app|next-app|expo)\b)',
+        re.IGNORECASE,
+    )
+    _m = _SCAFFOLD_CD_RE.match(cmd)
+    if _m:
+        cmd = cmd[_m.start(1):]
+        log.info(f"Step {step_idx+1}: Stripped dead `cd` prefix from scaffold command")
 
     # ── Idempotency check ──
     # Detect the subproject root early so idempotency checks resolve
@@ -1525,8 +1791,20 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         display.step_info(step_idx, f"Running: {cmd}{cwd_note}")
         log.info(f"Step {step_idx+1}: Running command: {cmd}")
 
+    # Scaffold commands (ng new, create-vite, npm create, etc.) run
+    # `npm install` internally, which can take 2-5 minutes on slow
+    # networks.  Use a longer timeout so they don't get killed.
+    _is_scaffold = bool(re.search(
+        r'\b(ng\s+new|npm\s+create|npx\s+create-|npm\s+init'
+        r'|npx\s+.*@angular/cli.*\s+new'    # npx @angular/cli@latest new ...
+        r'|npm\s+install\b)',                 # npm install (can be slow)
+        cmd, re.IGNORECASE,
+    ))
+    _cmd_timeout = 300 if _is_scaffold else 120
+
     success, output = executor.run_command(
-        cmd, background=is_background, cwd=subproject_cwd)
+        cmd, background=is_background, cwd=subproject_cwd,
+        timeout=_cmd_timeout)
     log.info(f"Step {step_idx+1}: Command output:\n{output}")
 
     # ── Semantic failure check ──
@@ -1556,29 +1834,48 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         # Mark scaffold files: when a project-creation command succeeds, record
         # the subproject so that _auto_fix_hazards can skip hazard checks for
         # npm/framework-generated template files on their first modification.
-        if not getattr(memory, '_scaffolded_subproject', None):
-            _SCAFFOLD_PATTERNS = [
-                re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),
-                re.compile(r'create-react-app\s+(\S+)'),
-                re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),
-                re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
-                re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),
-                re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),
-                re.compile(r'vue\s+create\s+(\S+)'),
-                re.compile(r'ng\s+new\s+(\S+)'),
-                re.compile(r'rails\s+new\s+(\S+)'),
-                re.compile(r'cargo\s+new\s+(\S+)'),
-                re.compile(r'django-admin\s+startproject\s+(\S+)'),
-            ]
-            for _pat in _SCAFFOLD_PATTERNS:
-                _m = _pat.search(cmd)
-                if _m:
-                    _candidate = _m.group(1).strip().rstrip('/')
+        # Also verify the expected sentinel file exists — some scaffold CLIs
+        # (e.g. `npx create vite@latest`) exit 0 but produce nothing.
+        _SCAFFOLD_PATTERNS = [
+            (re.compile(r'create-next-app(?:@\S+)?\s+(\S+)'),        'package.json'),
+            (re.compile(r'create-react-app\s+(\S+)'),                 'package.json'),
+            (re.compile(r'create-vite(?:@\S+)?\s+(\S+)'),            'package.json'),
+            (re.compile(r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),    'package.json'),
+            (re.compile(r'npx\s+create-vite(?:@\S+)?\s+(\S+)'),      'package.json'),
+            (re.compile(r'create-vue(?:@\S+)?\s+(\S+)'),             'package.json'),
+            (re.compile(r'npm\s+create\s+vue(?:@\S+)?\s+(\S+)'),     'package.json'),
+            (re.compile(r'vue\s+create\s+(\S+)'),                     'package.json'),
+            (re.compile(r'ng\s+new\s+(\S+)'),                         'package.json'),
+            (re.compile(r'rails\s+new\s+(\S+)'),                      'Gemfile'),
+            (re.compile(r'cargo\s+new\s+(\S+)'),                      'Cargo.toml'),
+            (re.compile(r'django-admin\s+startproject\s+(\S+)'),      'manage.py'),
+        ]
+        for _pat, _sentinel in _SCAFFOLD_PATTERNS:
+            _m = _pat.search(cmd)
+            if _m:
+                _candidate = _m.group(1).strip().rstrip('/')
+                # Resolve sentinel path: for `.` target use cwd, else subdir
+                _base = subproject_cwd or '.'
+                if _candidate in ('.', './', ''):
+                    _sentinel_path = os.path.join(_base, _sentinel)
+                else:
+                    _sentinel_path = os.path.join(_base, _candidate, _sentinel)
+                if not os.path.exists(_sentinel_path):
+                    log.warning(
+                        f"[Scaffold] Exit code 0 but sentinel '{_sentinel}' not found "
+                        f"at '{_sentinel_path}' — scaffold did not produce expected output. "
+                        f"Treating as failure."
+                    )
+                    success = False
+                elif not getattr(memory, '_scaffolded_subproject', None):
                     if _candidate not in ('.', './', '') and not _candidate.startswith('./'):
                         memory._scaffolded_subproject = _candidate
                         log.info(f"[Scaffold] Marked '{_candidate}' as freshly "
                                  f"scaffolded — hazard check skipped on first write")
-                    break
+                break
+
+    if success:
+        display.step_info(step_idx, "Command succeeded.")
         return True, ""
     else:
         display.step_info(step_idx, "Command failed. See log.")
@@ -3038,7 +3335,9 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       plan_step=None,
                       all_plan_steps=None,
                       kb_context_builder=None,
-                      partial_inline_code: dict[str, str] | None = None) -> tuple[bool, str]:
+                      partial_inline_code: dict[str, str] | None = None,
+                      initial_error: str = "",
+                      intent_spec=None) -> tuple[bool, str]:
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -3050,26 +3349,30 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             subproject_cwd=subproject_cwd, language=language,
         )
 
-    # Pre-fetch KB docs for code generation — scoped to behavioral +
-    # doc categories only (no patterns/ADRs) and filtered by relevance
-    # to the specific step description so that unrelated docs (e.g. test
-    # generation instructions for a CSS step) are excluded.
+    # Pre-fetch KB docs for code generation — use planner-declared titles
+    # (plan_step.kb_docs) when available for an exact lookup so that only
+    # the docs the planner actually referenced are injected.  Fall back to
+    # a broad semantic search only when the planner declared no titles.
     _code_behavioral_ctx = ""
     if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _step_query = (
-                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
-                    or step_text.split("\n")[0].strip()
-                )
-                _beh_results = _gstore.search(
-                    query=_step_query,
-                    categories=["behavioral", "doc"],
-                    top_k=4,
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                    language=language,
-                )
+                _declared_kb = getattr(plan_step, 'kb_docs', None) if plan_step else None
+                if _declared_kb:
+                    _beh_results = _gstore.get_by_titles(_declared_kb)
+                else:
+                    _step_query = (
+                        (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                        or step_text.split("\n")[0].strip()
+                    )
+                    _beh_results = _gstore.search(
+                        query=_step_query,
+                        categories=["behavioral", "doc"],
+                        top_k=4,
+                        api_client=getattr(kb_context_builder, '_api_client', None),
+                        language=language,
+                    )
                 if _beh_results:
                     _beh_parts = []
                     for item in _beh_results:
@@ -3092,6 +3395,11 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         _targets_hint = " ".join(plan_step.target_files)
         _edit_step_text = f"[targets: {_targets_hint}]\n{step_text}"
 
+    # When falling back from inline static-check failure, prepend the specific
+    # errors so all edit tiers (chunk, diff, full-file) know what to fix.
+    if initial_error:
+        _edit_step_text = f"{_edit_step_text}\n\n[ERRORS TO FIX]\n{initial_error}"
+
     # Detect primary target file to see if we should force DiffEdit for non-AST
     target_for_route = _detect_target_file(_edit_step_text, memory)
     is_non_ast = False
@@ -3113,6 +3421,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             memory=memory, display=display, step_idx=step_idx,
             language=language, cfg=cfg, code_graph=code_graph,
             project_profile=project_profile,
+            kb_context_builder=kb_context_builder,
         )
         if diff_result is not None:
             return diff_result
@@ -3133,7 +3442,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
             return chunk_result
 
     # --- Tier 3: Full-file flow (fallback) ---
-    feedback = ""
+    feedback = initial_error  # Pre-seed with inline static errors when falling back
     context_window = cfg.CONTEXT_WINDOW if cfg else 8192
     ctx_budget = int(context_window * 0.8)
     prev_files: dict[str, str] = {}  # Track files from previous attempt
@@ -3213,6 +3522,18 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 f"\nONLY output `#### [FILE]: ...` blocks for the target file(s) above."
                 f"\nAll other files in context are READ-ONLY reference — do NOT output `#### [FILE]:` blocks for them."
             )
+
+        # ── Inject search context from prior SEARCH steps ──
+        # When a SEARCH step ran before this CODE step, its results contain
+        # setup guides, API docs, etc. that the coder needs.
+        _all_mem = memory.all_files()
+        for _sk, _sv in _all_mem.items():
+            if _sk.startswith('_search_context/') and _sv.strip():
+                context += (
+                    f"\n\nReference Documentation (from prior search step):\n"
+                    f"{_sv}\n"
+                )
+                break  # inject once — multiple search steps are rare
 
         # ── Plan-aware context injection ──
         # When a structured plan step is available, use plan-declared
@@ -3347,7 +3668,7 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
         # Strip protected manifest files (package.json, etc.) to prevent
         # LLM from overwriting them with corrupted versions
-        files = _strip_protected_files(files)
+        files = _strip_protected_files(files, intent_spec=intent_spec)
 
         # Apply KB-driven content fixes (e.g. Tailwind v3→v4 directives)
         content_fixes = getattr(memory, '_content_fixes', None)
@@ -3656,7 +3977,104 @@ def _remap_test_to_existing(test_files: dict[str, str],
             target = existing[basename]
             log.warning(f"[TestPathRemap] '{norm}' -> '{target}' "
                         f"(matched existing test file)")
+            # Rewrite relative import paths to account for the new
+            # directory location.  Without this, imports like
+            #   import X from '../components/Foo'
+            # that were correct for the OLD path become broken at
+            # the NEW path (e.g. src/__tests__/ → src/components/__tests__/).
+            content = _rewrite_imports_for_remap(content, norm, target)
             remapped[target] = content
+        else:
+            remapped[fpath] = content
+
+    return remapped
+
+
+def _rewrite_imports_for_remap(content: str, old_path: str,
+                               new_path: str) -> str:
+    """Rewrite relative import paths in *content* when a file moves.
+
+    Given that a file was originally at *old_path* but is being written
+    to *new_path*, adjust all relative imports (``./`` or ``../``) so
+    they resolve to the same target from the new location.
+
+    Only processes JS/TS-style imports (``import … from '…'`` and
+    ``require('…')``).  Python relative imports are not handled here
+    because Python test files rarely get remapped.
+    """
+    import posixpath
+
+    old_dir = posixpath.dirname(old_path.replace("\\", "/"))
+    new_dir = posixpath.dirname(new_path.replace("\\", "/"))
+
+    if old_dir == new_dir:
+        return content  # same directory — nothing to rewrite
+
+    # Pattern matches:  from '...'  or  from "..."  or  require('...')
+    _IMPORT_PATH_RE = re.compile(
+        r"""((?:from\s+|require\s*\(\s*)['"])"""   # prefix: from ' or require('
+        r"""(\.\.?/.+?)"""                          # the relative path
+        r"""(['")]\s*\)?)""",                       # closing quote (and optional paren)
+    )
+
+    def _rebase(match: re.Match) -> str:
+        prefix = match.group(1)
+        rel_path = match.group(2)
+        suffix = match.group(3)
+
+        # Resolve the import target as an absolute posix path relative
+        # to the OLD directory, then compute a new relative path from
+        # the NEW directory.
+        abs_target = posixpath.normpath(
+            posixpath.join(old_dir, rel_path))
+        new_rel = posixpath.relpath(abs_target, new_dir)
+
+        # Ensure it starts with ./ or ../ (bare names are treated as
+        # package imports by bundlers).
+        if not new_rel.startswith("."):
+            new_rel = "./" + new_rel
+
+        if new_rel != rel_path:
+            log.debug("[TestPathRemap] Rewrote import: '%s' → '%s' "
+                      "(file moved %s → %s)",
+                      rel_path, new_rel, old_path, new_path)
+
+        return prefix + new_rel + suffix
+
+    return _IMPORT_PATH_RE.sub(_rebase, content)
+
+
+def _fix_subproject_test_paths(test_files: dict[str, str],
+                                subproject: str | None) -> dict[str, str]:
+    """Remap test paths that the LLM placed outside the subproject directory.
+
+    When source files live at ``{subproject}/src/...``, LLMs often mirror
+    the full workspace-relative path under ``__tests__/``, producing paths
+    like ``__tests__/{subproject}/src/Foo.test.jsx``.  These files land
+    outside the subproject and are invisible to the test runner that
+    executes inside ``{subproject}/``.
+
+    This function rewrites such paths to
+    ``{subproject}/__tests__/src/Foo.test.jsx`` so the test runner can
+    find and execute them.
+    """
+    if not subproject:
+        return test_files
+
+    sub_norm = subproject.replace("\\", "/").rstrip("/")
+    prefix = f"__tests__/{sub_norm}/"
+
+    remapped: dict[str, str] = {}
+    for fpath, content in test_files.items():
+        norm = fpath.replace("\\", "/")
+        if norm.startswith(prefix):
+            rest = norm[len(prefix):]
+            new_path = f"{sub_norm}/__tests__/{rest}"
+            log.warning(
+                f"[SubprojectTestPath] '{norm}' -> '{new_path}' "
+                f"(moved inside subproject dir)"
+            )
+            remapped[new_path] = content
         else:
             remapped[fpath] = content
 
@@ -3825,13 +4243,20 @@ def _cleanup_ghost_test_files(
 
 # ── Enhancement #6: Import-trace context injection ──────────────
 def _extract_imported_sources(test_files: dict[str, str],
-                              memory: FileMemory) -> dict[str, str]:
+                              memory: FileMemory,
+                              resolve_from_disk: bool = False) -> dict[str, str]:
     """Parse import statements in test files to identify tested source files.
 
     Returns a dict of {filepath: content} for source files that are
     directly imported by the test files.
+
+    When *resolve_from_disk* is True, imports that are not found in memory
+    are resolved relative to the test file's directory on disk and read
+    directly.  This covers checkpoint-resume runs where source files written
+    in a previous session are no longer tracked in FileMemory.
     """
     import re as _re
+    import os as _os
 
     # Python: from src.snake_game import ... / import snake_game
     _PY_IMPORT_RE = _re.compile(
@@ -3840,20 +4265,26 @@ def _extract_imported_sources(test_files: dict[str, str],
     _JS_IMPORT_RE = _re.compile(
         r'''(?:from\s+['"](.+?)['"]|require\s*\(\s*['"](.+?)['"]\s*\))''')
 
+    _JS_EXTS = ('.jsx', '.js', '.tsx', '.ts', '.mjs', '.cjs')
+    _PY_EXTS = ('.py',)
+
     all_files = memory.all_files()
     imported_sources: dict[str, str] = {}
 
     for _tpath, tcontent in test_files.items():
         # Collect candidate module paths from imports
         candidates: set[str] = set()
+        # Also keep the raw relative paths for disk resolution
+        raw_rel_imports: list[str] = []
+
         for m in _PY_IMPORT_RE.finditer(tcontent):
             mod = m.group(1) or m.group(2)
             if mod:
                 candidates.add(mod.replace('.', '/'))
         for m in _JS_IMPORT_RE.finditer(tcontent):
             rel = m.group(1) or m.group(2)
-            if rel:
-                # Strip leading ./ or ../
+            if rel and not rel.startswith(('@', 'react', 'vitest', 'jest', 'node:')):
+                raw_rel_imports.append(rel)
                 clean = _re.sub(r'^\.\.?/', '', rel)
                 candidates.add(clean)
 
@@ -3868,6 +4299,34 @@ def _extract_imported_sources(test_files: dict[str, str],
                 if cand in fpath or fpath.endswith(cand) or fpath.endswith(cand + '.py'):
                     imported_sources[fpath] = content
                     break
+
+        # Disk fallback: resolve relative imports from the test file's directory
+        if resolve_from_disk and raw_rel_imports:
+            test_dir = _os.path.dirname(_tpath)
+            for rel in raw_rel_imports:
+                # Only resolve relative paths (start with . or ..)
+                if not rel.startswith('.'):
+                    continue
+                resolved_base = _os.path.normpath(
+                    _os.path.join(test_dir, rel)).replace('\\', '/')
+                # Skip if already found via memory
+                if any(resolved_base in fp or fp.startswith(resolved_base)
+                       for fp in imported_sources):
+                    continue
+                # Try common source extensions
+                exts = _JS_EXTS if _tpath.endswith(
+                    ('.jsx', '.js', '.tsx', '.ts', '.mjs')) else _PY_EXTS
+                for ext in ('', *exts):
+                    candidate_path = resolved_base + ext
+                    if candidate_path in imported_sources:
+                        break
+                    try:
+                        with open(candidate_path, 'r', encoding='utf-8',
+                                  errors='replace') as _f:
+                            imported_sources[candidate_path] = _f.read()
+                        break
+                    except OSError:
+                        continue
 
     return imported_sources
 
@@ -3914,34 +4373,101 @@ _TEST_BUG_PATTERNS = re.compile(
     r"|Unable to find role"
     r"|Expected.*to have class"
     r"|Expected.*to have attribute"
-    r"|Expected.*to be in the document",
+    r"|Expected.*to be in the document"
+    # Import resolution failures in test files — almost always a wrong
+    # relative path in the test, not a missing source file.
+    r"|Failed to resolve import .* from .*\.(?:test|spec)\."
+    r"|Cannot find module .* from .*\.(?:test|spec)\."
+    r"|Module not found:.*\.(?:test|spec)\.",
     re.DOTALL,
 )
 
 
+# ── Error signature extraction for oscillation detection ──────────
+_ERROR_SIG_PATTERNS = re.compile(
+    r"(?:Failed to resolve import .+? from .+)"
+    r"|(?:Cannot find module .+? from .+)"
+    r"|(?:Module not found:.+)"
+    r"|(?:TestingLibraryElementError:.+)"
+    r"|(?:Unable to find (?:an element|role).+)"
+    r"|(?:Error: .+? is not (?:a function|defined|a constructor))"
+    r"|(?:(?:TypeError|ReferenceError|SyntaxError):.+)"
+    r"|(?:Expected .+? (?:to (?:be|have|equal|match)|not to).+)",
+)
+
+
+def _extract_error_signature(output: str) -> str | None:
+    """Extract a short, stable signature from test failure output.
+
+    Returns a normalised string that identifies the *class* of error
+    (e.g. the failing import path, the missing element query, the
+    TypeError message) without being sensitive to line numbers or
+    whitespace differences.  Returns ``None`` if no recognisable
+    error pattern is found.
+    """
+    # Try structured patterns first
+    m = _ERROR_SIG_PATTERNS.search(output)
+    if m:
+        sig = m.group(0).strip()
+        # Normalise whitespace and truncate to keep signatures comparable
+        sig = re.sub(r'\s+', ' ', sig)[:200]
+        return sig
+
+    # Fallback: grab the first FAIL line (Vitest / Jest style)
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FAIL") or "FAILED" in stripped:
+            return re.sub(r'\s+', ' ', stripped)[:200]
+
+    return None
+
+
 def _triage_test_failure(error_detail: str, source_summary: str,
                          test_summary: str, llm_client,
-                         display: CLIDisplay, step_idx: int) -> str:
+                         display: CLIDisplay, step_idx: int,
+                         language: str | None = None) -> str:
     """Determine whether a test failure is a TEST_BUG or SOURCE_BUG.
 
-    Returns 'TEST_BUG' or 'SOURCE_BUG'.
+    Returns 'TEST_BUG', 'SOURCE_BUG', or 'CONFIG_BUG'.
     """
-    # Fast-path: known patterns that are always test bugs — skip LLM call
+    # Fast-path: known JS/RTL patterns that are unambiguously test bugs
     if _TEST_BUG_PATTERNS.search(error_detail):
         log.info(f"Step {step_idx+1}: Triage result: TEST_BUG (pattern match)")
         return "TEST_BUG"
 
+    # Fast-path: SyntaxError / IndentationError / circular import in a source
+    # file is always a SOURCE_BUG — never a config issue.  The LLM frequently
+    # misclassifies these as CONFIG_BUG because the test "cannot even run",
+    # but the real fix is always in the source file that has the problem.
+    if re.search(r'(?:IndentationError|SyntaxError)\b', error_detail):
+        log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG "
+                 f"(SyntaxError/IndentationError pattern match)")
+        return "SOURCE_BUG"
+
+    if re.search(r'(?:most likely due to a circular import|'
+                 r'cannot import name .* from partially initialized module)',
+                 error_detail):
+        log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG "
+                 f"(circular import pattern match)")
+        return "SOURCE_BUG"
+
+    lang_hint = f"Project language: {language}\n" if language else ""
     triage_prompt = (
         "A test has failed. Analyze the error and determine the root cause.\n"
-        "Answer with ONLY one word: TEST_BUG or SOURCE_BUG\n\n"
-        "- TEST_BUG = the test assertion, setup, or import is incorrect (e.g. looking for wrong text/classes)\n"
-        "- SOURCE_BUG = the source code under test has a logic, syntax, "
-        "or implementation error\n\n"
-        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an element "
-        "(text, role, test-id, etc.) or asserts for specific CSS classes/styles that do not "
-        "exist in the provided source code, it is ALMOST ALWAYS a TEST_BUG. The source "
-        "code is the ground truth for content and theme. Do NOT label as SOURCE_BUG just to force "
-        "the source code to match dumb, brittle test assertions or ruin the project aesthetics.\n\n"
+        f"{lang_hint}"
+        "Answer with ONLY one word: TEST_BUG, SOURCE_BUG, or CONFIG_BUG\n\n"
+        "- TEST_BUG    = the test assertion, selector, or import is wrong "
+        "(e.g. looking for text/classes that do not match what the source renders)\n"
+        "- SOURCE_BUG  = the source code under test has a logic, syntax, or "
+        "implementation error that the test correctly exposes\n"
+        "- CONFIG_BUG  = the test framework or environment is misconfigured — "
+        "the test cannot even run (e.g. missing jsdom environment so `document` "
+        "is undefined, missing pytest fixture, missing test setup file, wrong "
+        "config key, missing required package for the test runner)\n\n"
+        "CRITICAL FOR UI COMPONENTS: If a test fails because it cannot find an "
+        "element (text, role, test-id, etc.) or asserts specific CSS classes that "
+        "do not exist in the source, it is ALMOST ALWAYS a TEST_BUG — do NOT label "
+        "SOURCE_BUG just to force the source to match brittle assertions.\n\n"
         f"Test output:\n{error_detail[:3000]}\n\n"
     )
     if source_summary:
@@ -3949,7 +4475,7 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     if test_summary:
         triage_prompt += f"Test files:\n{test_summary[:4000]}\n"
 
-    display.step_info(step_idx, "Analyzing failure origin (test vs source)...")
+    display.step_info(step_idx, "Analyzing failure origin (test / source / config)...")
 
     sent_before, recv_before = token_tracker.snapshot()
     response = llm_client.generate_response(triage_prompt).strip().upper()
@@ -3957,6 +4483,9 @@ def _triage_test_failure(error_detail: str, source_summary: str,
     display.step_tokens(step_idx, sent_after - sent_before,
                         recv_after - recv_before)
 
+    if "CONFIG_BUG" in response:
+        log.info(f"Step {step_idx+1}: Triage result: CONFIG_BUG")
+        return "CONFIG_BUG"
     if "SOURCE_BUG" in response:
         log.info(f"Step {step_idx+1}: Triage result: SOURCE_BUG")
         return "SOURCE_BUG"
@@ -3974,7 +4503,8 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       kb_context_builder=None,
                       plan_step=None,
                       all_plan_steps=None,
-                      project_profile=None) -> tuple[bool, str]:
+                      project_profile=None,
+                      intent_spec=None) -> tuple[bool, str]:
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 
@@ -4013,6 +4543,59 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         test_runner = js_env.get("test_runner")
         log.info(f"Step {step_idx+1}: JS project env: {js_env}")
 
+        # ── Auto-create vitest config when missing ──
+        # If the project uses Vitest (installed or Vite-based) but has no
+        # vitest.config.js, tests fail with "describe is not defined"
+        # because globals:true isn't set.  Create the config from KB
+        # templates (zero LLM calls) to prevent cascading failures.
+        if (test_runner == "vitest"
+                and not js_env.get("has_vitest_config")
+                and js_env.get("has_vitest")):
+            _cwd = subproject_cwd or "."
+            _vitest_cfg_path = os.path.join(_cwd, "vitest.config.js")
+            _vitest_setup_path = os.path.join(_cwd, "vitest.setup.js")
+
+            # Check if jsx/tsx files exist to decide on React plugin
+            _has_jsx = js_env.get("has_jsx") or js_env.get("has_tsx")
+
+            if not os.path.isfile(_vitest_cfg_path):
+                _cfg_content = (
+                    "import { defineConfig } from 'vitest/config'\n"
+                )
+                if _has_jsx:
+                    _cfg_content += (
+                        "import react from '@vitejs/plugin-react'\n"
+                    )
+                _cfg_content += (
+                    "\nexport default defineConfig({\n"
+                )
+                if _has_jsx:
+                    _cfg_content += "  plugins: [react()],\n"
+                _cfg_content += (
+                    "  test: {\n"
+                    "    environment: 'jsdom',\n"
+                    "    globals: true,\n"
+                    "    setupFiles: './vitest.setup.js',\n"
+                    "  },\n"
+                    "})\n"
+                )
+                _cfg_rel = os.path.relpath(_vitest_cfg_path, ".")
+                executor.write_files({_cfg_rel: _cfg_content})
+                memory.update({_cfg_rel: _cfg_content})
+                log.info(f"Step {step_idx+1}: Auto-created {_cfg_rel} "
+                         f"(vitest installed but no config found)")
+
+            if not os.path.isfile(_vitest_setup_path):
+                _setup_content = "import '@testing-library/jest-dom/vitest'\n"
+                _setup_rel = os.path.relpath(_vitest_setup_path, ".")
+                executor.write_files({_setup_rel: _setup_content})
+                memory.update({_setup_rel: _setup_content})
+                log.info(f"Step {step_idx+1}: Auto-created {_setup_rel}")
+
+            # Re-read env now that config exists
+            js_env = _read_js_project_env(subproject_cwd)
+            test_runner = js_env.get("test_runner")
+
     # Use language-aware defaults (fall back to Python only as last resort)
     lang_tag = get_code_block_lang(language) if language else "python"
     fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")
@@ -4021,7 +4604,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     # Django project detection: manage.py test is the canonical runner for Django.
     # It handles test DB setup/teardown and settings without requiring pytest.
     if (language == "python" or not language) and os.path.isfile(
-        os.path.join(subproject_cwd, "manage.py")
+        os.path.join(subproject_cwd, "manage.py") if subproject_cwd else "manage.py"
     ):
         test_cmd = "python manage.py test"
         log.info(
@@ -4248,25 +4831,30 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
     prev_gen_error = None  # Track errors across gen attempts for early exit
     prev_step_test_files: set[str] = set()  # Files from earlier gen attempts of THIS step
 
-    # Pre-fetch KB docs for test generation — scoped to behavioral +
-    # doc categories and filtered by relevance to the specific step
-    # description so unrelated docs are excluded.
+    # Pre-fetch KB docs for test generation — use planner-declared titles
+    # (plan_step.kb_docs) when available for an exact lookup so that only
+    # the docs the planner actually referenced are injected.  Fall back to
+    # a broad semantic search only when the planner declared no titles.
     _behavioral_ctx = ""
     if kb_context_builder is not None:
         try:
             _gstore = getattr(kb_context_builder, '_global_store', None)
             if _gstore is not None:
-                _step_query = (
-                    (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
-                    or step_text.split("\n")[0].strip()
-                )
-                _beh_results = _gstore.search(
-                    query=_step_query,
-                    categories=["behavioral", "doc"],
-                    top_k=4,
-                    api_client=getattr(kb_context_builder, '_api_client', None),
-                    language=language,
-                )
+                _declared_kb = getattr(plan_step, 'kb_docs', None) if plan_step else None
+                if _declared_kb:
+                    _beh_results = _gstore.get_by_titles(_declared_kb)
+                else:
+                    _step_query = (
+                        (plan_step.description if plan_step and getattr(plan_step, 'description', None) else None)
+                        or step_text.split("\n")[0].strip()
+                    )
+                    _beh_results = _gstore.search(
+                        query=_step_query,
+                        categories=["behavioral", "doc"],
+                        top_k=4,
+                        api_client=getattr(kb_context_builder, '_api_client', None),
+                        language=language,
+                    )
                 if _beh_results:
                     _beh_parts = []
                     for item in _beh_results:
@@ -4363,7 +4951,7 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             continue
 
         # Strip protected manifest files before they reach memory
-        test_files = _strip_protected_files(test_files)
+        test_files = _strip_protected_files(test_files, intent_spec=intent_spec)
 
         # Apply KB-driven content fixes (e.g. jest-dom → jest-dom/vitest)
         content_fixes = getattr(memory, '_content_fixes', None)
@@ -4381,6 +4969,11 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         test_files = _remap_test_to_existing(
             test_files, memory,
             base_dir=getattr(memory, 'base_dir', "."))
+
+        # Fix paths the LLM placed outside the subproject.
+        # e.g. __tests__/{subproject}/src/Foo.test.jsx
+        #   -> {subproject}/__tests__/src/Foo.test.jsx
+        test_files = _fix_subproject_test_paths(test_files, subproject_cwd)
 
         # Filter: only allow test files (block any source/config files)
         test_files = _filter_test_only_files(test_files, test_files, memory)
@@ -4492,10 +5085,26 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             )
 
         failed_files: list[str] = []
-        file_count = len(test_files)
+
+        # Filter out non-test files before the per-file loop.
+        # The LLM auto-fix can include config files (pytest.ini,
+        # conftest.py, __init__.py) alongside test files.  Running
+        # `python -m pytest pytest.ini` fails with "not found".
+        _TEST_FILE_RE = re.compile(r'(?:^|/)test[_.].*\.py$|\.test\.[jt]sx?$')
+        _runnable_test_files = {
+            fp: content for fp, content in test_files.items()
+            if _TEST_FILE_RE.search(os.path.basename(fp))
+        }
+        if not _runnable_test_files and test_files:
+            # Fallback: if no files match the pattern, run all .py files
+            _runnable_test_files = {
+                fp: content for fp, content in test_files.items()
+                if fp.endswith('.py') and not fp.endswith('__init__.py')
+            }
+        file_count = len(_runnable_test_files)
 
         for file_idx, (test_path, test_content) in enumerate(
-                list(test_files.items()), 1):
+                list(_runnable_test_files.items()), 1):
             f_basename = os.path.basename(test_path)
             display.step_info(
                 step_idx,
@@ -4564,7 +5173,23 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
             # ── Per-file fix loop ──
             file_fixed = False
             prev_output = output
+            # Track error signatures across attempts for oscillation
+            # detection.  An "error signature" is the first meaningful
+            # error line (import failure, assertion, etc.) — if it
+            # recurs across two non-consecutive attempts, we're stuck.
+            _seen_error_sigs: list[str] = []
+            # Snapshot before attempting fixes so we can restore if a
+            # bad fix corrupts the source files across attempts.
+            _test_fix_snap = memory.snapshot()
             for fix_attempt in range(1, MAX_STEP_RETRIES + 1):
+                # Restore on retry to prevent compounding bad fixes
+                if fix_attempt > 1:
+                    memory.restore(_test_fix_snap, executor=executor)
+                    log.info(
+                        "Step %d: Restored file snapshot before fix "
+                        "attempt %d for %s",
+                        step_idx + 1, fix_attempt, f_basename)
+
                 display.step_info(
                     step_idx,
                     f"Fixing {f_basename} (attempt {fix_attempt}/{MAX_STEP_RETRIES})...")
@@ -4601,8 +5226,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 bug_origin = _triage_test_failure(
                     error_detail, source_ctx,
                     f"{test_path}:\n{current_content[:3000]}\n",
-                    coder.llm_client, display, step_idx)
+                    coder.llm_client, display, step_idx,
+                    language=language)
                 is_source_bug = (bug_origin == "SOURCE_BUG")
+                is_config_bug = (bug_origin == "CONFIG_BUG")
 
                 # KB error-fix lookup
                 kb_fix_context = ""
@@ -4628,7 +5255,76 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                 if pre_analysis_results:
                     _task_context_header += f"{pre_analysis_results}\n\n"
 
-                if is_source_bug:
+                if is_config_bug:
+                    # ── CONFIG_BUG: fix the test environment config ──────────
+                    subproject = _detect_subproject_root(memory)
+
+                    # Use pluggable LanguageBackend for CONFIG_BUG handling
+                    from ..language_backend import get_backend
+                    _lang_backend = get_backend(language)
+                    display.step_info(
+                        step_idx,
+                        f"Config bug — fixing {_lang_backend.display_name} "
+                        f"test environment config...")
+                    _cfg_candidates = _lang_backend.get_config_candidates()
+                    _cfg_lang_tag = _lang_backend.get_config_lang_tag()
+                    _no_cfg_msg = _lang_backend.get_config_no_found_msg()
+                    _fix_detail = _lang_backend.get_config_fix_detail()
+                    _fix_runner = f"Test runner: {test_cmd}\n"
+                    _fix_prompt_body = _lang_backend.get_config_fix_prompt(test_cmd)
+
+                    _cfg_paths = []
+                    for _cn in _cfg_candidates:
+                        for _pfx in ([f"{subproject}/{_cn}"] if subproject else []) + [_cn]:
+                            _cfg_paths.append(_pfx)
+
+                    _cfg_file = ""
+                    _cfg_path = ""
+                    for _cp in _cfg_paths:
+                        _cfg_file = memory.get(_cp) or ""
+                        if not _cfg_file:
+                            try:
+                                with open(_cp, "r", encoding="utf-8", errors="replace") as _cf:
+                                    _cfg_file = _cf.read()
+                            except OSError:
+                                pass
+                        if _cfg_file:
+                            _cfg_path = _cp
+                            break
+
+                    _cfg_ctx = (
+                        f"#### [FILE]: {_cfg_path}\n```{_cfg_lang_tag}\n{_cfg_file}\n```\n\n"
+                        if _cfg_file and _cfg_path
+                        else _no_cfg_msg
+                    )
+                    fix_ctx = (
+                        f"{_task_context_header}"
+                        f"ALL tests are failing with:\n{error_detail}\n\n"
+                        f"{_fix_detail}"
+                        f"Current config:\n{_cfg_ctx}"
+                        f"{_fix_runner}"
+                    )
+                    fix_prompt = _fix_prompt_body
+                    sent_before, recv_before = token_tracker.snapshot()
+                    fix_response = coder.process(
+                        fix_prompt, context=fix_ctx, language=language)
+                    sent_after, recv_after = token_tracker.snapshot()
+                    display.step_tokens(step_idx,
+                                        sent_after - sent_before,
+                                        recv_after - recv_before)
+                    fix_files = executor.parse_code_blocks(fix_response)
+                    if not fix_files:
+                        fix_files = executor.parse_code_blocks_fuzzy(fix_response)
+                    if fix_files:
+                        if subproject:
+                            fix_files = _prefix_subproject_paths(fix_files, subproject, memory)
+                        executor.write_files(fix_files)
+                        memory.update(fix_files)
+                        log.info("Step %d: CONFIG_BUG fix applied: %s",
+                                 step_idx + 1, list(fix_files.keys()))
+                    continue  # re-run the test file after config fix
+
+                elif is_source_bug:
                     display.step_info(
                         step_idx,
                         f"Bug in SOURCE for {f_basename}, fixing source...")
@@ -4725,14 +5421,102 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     if not fix_files:
                         fix_files = executor.parse_code_blocks_fuzzy(fix_response)
                 if fix_files:
-                    fix_files = _strip_protected_files(fix_files)
+                    fix_files = _strip_protected_files(fix_files, intent_spec=intent_spec)
                     fix_files = _normalize_fix_paths(fix_files, memory)
                     fix_files = _remap_test_to_existing(
                         fix_files, memory,
                         base_dir=getattr(memory, 'base_dir', "."))
+                    fix_files = _fix_subproject_test_paths(fix_files, subproject_cwd)
                     if not is_source_bug:
                         fix_files = _filter_test_only_files(
                             fix_files, test_files, memory)
+                    else:
+                        # ── Source-file protection during test diagnosis ──
+                        # When triage says SOURCE_BUG, the LLM is allowed to
+                        # edit source files.  But we must guard against two
+                        # failure modes:
+                        #   1) Full-file replacement — the LLM rewrites the
+                        #      entire source instead of a surgical fix.
+                        #   2) Excessive diff — the fix changes >40% of lines,
+                        #      which almost always means the LLM is rewriting
+                        #      the component to match brittle test assertions.
+                        _guarded: dict[str, str] = {}
+                        for _fp, _fc in fix_files.items():
+                            _basename = os.path.basename(_fp)
+                            _is_test = any(p in _fp for p in (
+                                '__tests__', '/tests/', '/test/', '.test.', '.spec.', 'test_'))
+                            if _is_test:
+                                _guarded[_fp] = _fc
+                                continue
+                            # Check 1: block full-file replacement of source files
+                            _orig = memory.get(_fp)
+                            if _orig is None:
+                                try:
+                                    with open(_fp, 'r', encoding='utf-8',
+                                              errors='replace') as _f:
+                                        _orig = _f.read()
+                                except OSError:
+                                    _orig = None
+                            if _orig is not None:
+                                _orig_lines = _orig.splitlines()
+                                _new_lines = _fc.splitlines()
+                                _orig_len = len(_orig_lines)
+                                _new_len = len(_new_lines)
+                                # Full-file replacement: new content shares <30%
+                                # of original lines — reject it.
+                                if _orig_len >= 10:
+                                    _shared = sum(1 for ln in _new_lines
+                                                  if ln in set(_orig_lines))
+                                    _shared_ratio = _shared / max(_orig_len, 1)
+                                    if _shared_ratio < 0.30:
+                                        log.warning(
+                                            "Step %d: Blocked full-file "
+                                            "replacement of source %s during "
+                                            "test diagnosis (shared %.0f%% of "
+                                            "%d lines) — skipping",
+                                            step_idx + 1, _basename,
+                                            _shared_ratio * 100, _orig_len)
+                                        continue
+                                # Check 2: diff-size circuit breaker (>40% changed)
+                                if _orig_len >= 5:
+                                    import difflib as _dl
+                                    _sm = _dl.SequenceMatcher(
+                                        None, _orig_lines, _new_lines)
+                                    _changed = sum(
+                                        max(j2 - j1, i2 - i1)
+                                        for tag, i1, i2, j1, j2
+                                        in _sm.get_opcodes()
+                                        if tag != 'equal')
+                                    _change_ratio = _changed / max(_orig_len, 1)
+                                    if _change_ratio > 0.40:
+                                        log.warning(
+                                            "Step %d: Rejected source fix for "
+                                            "%s — changes %.0f%% of lines "
+                                            "(threshold 40%%) during test "
+                                            "diagnosis",
+                                            step_idx + 1, _basename,
+                                            _change_ratio * 100)
+                                        continue
+                            _guarded[_fp] = _fc
+                        fix_files = _guarded
+                    if fix_files:
+                        # Syntax guard: reject Python files with syntax errors
+                        _syntax_ok: dict[str, str] = {}
+                        for _fp, _fc in fix_files.items():
+                            _ext = os.path.splitext(_fp)[1].lower()
+                            if _ext in ('.py', '.pyw'):
+                                try:
+                                    ast.parse(_fc, filename=_fp)
+                                    _syntax_ok[_fp] = _fc
+                                except SyntaxError as _se:
+                                    log.warning(
+                                        "Step %d: Syntax error in fix for "
+                                        "%s: %s (line %s) — skipping",
+                                        step_idx + 1, _fp,
+                                        _se.msg, _se.lineno)
+                            else:
+                                _syntax_ok[_fp] = _fc
+                        fix_files = _syntax_ok
                     if fix_files:
                         show_diffs(fix_files, log_only=True)
                         executor.write_files(fix_files)
@@ -4765,9 +5549,9 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                     file_fixed = True
                     break
 
-                # Stuck detection: same errors after fix — only bail on the
-                # last attempt, so earlier retries still get a chance.
-                if output == prev_output and fix_attempt == MAX_STEP_RETRIES:
+                # ── Stuck / oscillation detection ──
+                # 1) Identical output: bail immediately (no point retrying).
+                if output == prev_output:
                     log.warning(
                         f"Step {step_idx+1}: [{f_basename}] identical "
                         f"output after fix attempt {fix_attempt}, stopping.")
@@ -4775,6 +5559,25 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                         step_idx,
                         f"{f_basename}: same error after fix — skipping.")
                     break
+
+                # 2) Error-class oscillation: extract a short signature
+                #    from the error output and check if we've seen it
+                #    before.  Two occurrences of the same signature means
+                #    the fix loop is going in circles.
+                _err_sig = _extract_error_signature(output)
+                if _err_sig and _err_sig in _seen_error_sigs:
+                    log.warning(
+                        f"Step {step_idx+1}: [{f_basename}] error "
+                        f"signature recurred after fix attempt "
+                        f"{fix_attempt}: {_err_sig!r} — stopping.")
+                    display.step_info(
+                        step_idx,
+                        f"{f_basename}: recurring error pattern — "
+                        f"skipping.")
+                    break
+                if _err_sig:
+                    _seen_error_sigs.append(_err_sig)
+
                 prev_output = output
 
             if not file_fixed:
@@ -4904,6 +5707,7 @@ def _try_diff_edit(
     cfg: Config,
     code_graph,
     project_profile=None,
+    kb_context_builder=None,
 ) -> tuple[bool, str] | None:
     """Attempt a diff-aware edit.  Returns ``(success, error_info)`` on
     success, or ``None`` to signal the caller should fall back to the
@@ -4921,8 +5725,9 @@ def _try_diff_edit(
         log.debug("[DiffEdit] editing module not available: %s", exc)
         return None
 
-    # Identify target file from step text or memory
-    target_file = _detect_target_file(step_text, memory)
+    # Identify target file from step text or memory (KB fallback if needed)
+    target_file = _detect_target_file(step_text, memory,
+                                      kb_context_builder=kb_context_builder)
     if not target_file:
         log.debug("[DiffEdit] No target file identified from step text")
         return None
@@ -5102,7 +5907,53 @@ def _try_diff_edit(
     return True, ""
 
 
-def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
+def _resolve_from_kb(step_text: str, memory: FileMemory, kb_context_builder) -> list[str]:
+    """Use KB semantic search to find project files not yet tracked in memory.
+
+    Extracts filename hints from *step_text*, asks the KB for the most
+    relevant project files, cross-references by basename, reads matching
+    files from disk, and loads them into *memory* so subsequent context
+    builders can include them.
+
+    Returns the list of file paths that were resolved and loaded.
+    """
+    import re as _re
+
+    # Extract bare filenames mentioned in the step text (e.g. "main.jsx")
+    filename_hints: set[str] = set()
+    for m in _re.finditer(r'[\w/\\]+\.\w{1,5}', step_text):
+        filename_hints.add(os.path.basename(m.group().replace("\\", "/")))
+
+    if not filename_hints:
+        return []
+
+    try:
+        kb_files = kb_context_builder.get_relevant_files(step_text, max_files=10)
+    except Exception as exc:
+        log.debug("[TargetResolve] KB get_relevant_files failed: %s", exc)
+        return []
+
+    to_load: dict[str, str] = {}
+    existing = memory.all_files()
+    for fpath in kb_files:
+        if os.path.basename(fpath) in filename_hints and fpath not in existing:
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                        to_load[fpath] = _f.read()
+                except Exception:
+                    pass
+
+    if to_load:
+        memory.update(to_load)
+        log.debug("[TargetResolve] KB resolved %d file(s) into memory: %s",
+                  len(to_load), list(to_load.keys()))
+
+    return list(to_load.keys())
+
+
+def _detect_target_file(step_text: str, memory: FileMemory,
+                        kb_context_builder=None) -> str | None:
     """Try to identify the target file for editing from the step text."""
     import re as _re
 
@@ -5131,6 +5982,12 @@ def _detect_target_file(step_text: str, memory: FileMemory) -> str | None:
     # If only one file in memory, use it
     if len(known_files) == 1:
         return known_files[0]
+
+    # Fallback: ask KB to find the file on disk and load it into memory
+    if kb_context_builder is not None:
+        resolved = _resolve_from_kb(step_text, memory, kb_context_builder)
+        if resolved:
+            return resolved[0]
 
     return None
 
@@ -5221,7 +6078,8 @@ def _find_css_conflicts(
 
 
 def _detect_target_files(step_text: str, memory: FileMemory,
-                         max_files: int = 3) -> list[str]:
+                         max_files: int = 3,
+                         kb_context_builder=None) -> list[str]:
     """Identify ALL target files for editing from the step text."""
     import re as _re
 
@@ -5253,6 +6111,11 @@ def _detect_target_files(step_text: str, memory: FileMemory,
 
     if not found and len(known_files) == 1:
         _add(known_files[0])
+
+    # Fallback: ask KB to find files on disk and load them into memory
+    if not found and kb_context_builder is not None:
+        for fpath in _resolve_from_kb(step_text, memory, kb_context_builder):
+            _add(fpath)
 
     return found
 
@@ -5407,7 +6270,8 @@ def _try_chunk_edit(
         return None
 
     max_files = getattr(cfg, "EDITING_MAX_CHUNK_FILES", 3)
-    target_files = _detect_target_files(step_text, memory, max_files=max_files)
+    target_files = _detect_target_files(step_text, memory, max_files=max_files,
+                                        kb_context_builder=kb_context_builder)
     if not target_files:
         log.debug("[ChunkEdit] No target files identified")
         return None

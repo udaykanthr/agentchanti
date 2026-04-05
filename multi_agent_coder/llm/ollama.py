@@ -30,6 +30,7 @@ class OllamaClient(LLMClient):
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "options": {"num_predict": self.max_output_tokens},
         }
         response = requests.post(self.base_url, json=payload, timeout=(10, 300))
         response.raise_for_status()
@@ -58,6 +59,7 @@ class OllamaClient(LLMClient):
             "model": self.model,
             "prompt": prompt,
             "stream": True,
+            "options": {"num_predict": self.max_output_tokens},
         }
         content_parts: list[str] = []
         tokens_generated = 0
