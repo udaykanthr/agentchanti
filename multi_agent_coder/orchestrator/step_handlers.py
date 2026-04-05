@@ -318,6 +318,7 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         "has_vitest_config": False,
         "has_tsx": False,
         "has_jsx": False,
+        "test_script": None,     # raw "scripts.test" from package.json
     }
 
     # Read package.json
@@ -333,6 +334,12 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
         if pkg.get("type") == "module":
             env["is_esm"] = True
             env["module_type"] = "module"
+
+        # Read scripts.test — the canonical test command defined by the project
+        _scripts = pkg.get("scripts", {})
+        _test_script = _scripts.get("test", "")
+        if _test_script:
+            env["test_script"] = _test_script
 
         # Dependency detection
         all_deps = {}
@@ -390,14 +397,32 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
             env["has_jest_config"] = True
             break
 
-    # Determine test runner: prefer Vitest if detected
-    if env["has_vitest_config"] or env["has_vitest"]:
-        env["test_runner"] = "vitest"
-    elif env.get("has_vite") and not env["has_jest_config"]:
-        # Vite project without explicit Jest config → default to Vitest
-        env["test_runner"] = "vitest"
-    elif env["has_jest_config"] or env["has_jest"]:
-        env["test_runner"] = "jest"
+    # Determine test runner: prefer scripts.test > config files > dependencies
+    # The scripts.test field is the most authoritative signal — it's what
+    # `npm test` actually runs, so it covers Angular (ng test), Karma,
+    # Mocha, and any other runner without hardcoded framework checks.
+    _ts = (env.get("test_script") or "").lower()
+    if _ts:
+        if "vitest" in _ts:
+            env["test_runner"] = "vitest"
+        elif "ng test" in _ts or "karma" in _ts:
+            env["test_runner"] = "ng"
+        elif "mocha" in _ts:
+            env["test_runner"] = "mocha"
+        elif "jest" in _ts:
+            env["test_runner"] = "jest"
+        # else: fall through to config/dependency heuristics below
+
+    if env["test_runner"] == "jest":
+        # Config / dependency heuristics (fallback when scripts.test is absent
+        # or doesn't name a recognisable runner).
+        if env["has_vitest_config"] or env["has_vitest"]:
+            env["test_runner"] = "vitest"
+        elif env.get("has_vite") and not env["has_jest_config"]:
+            # Vite project without explicit Jest config → default to Vitest
+            env["test_runner"] = "vitest"
+        elif env["has_jest_config"] or env["has_jest"]:
+            env["test_runner"] = "jest"
 
     # Check for .tsx/.jsx files (useful for React testing guidance)
     scan_dir = cwd or "."
@@ -998,13 +1023,19 @@ def _all_non_code_files(filenames: list[str]) -> bool:
 
 
 def _build_prior_steps_context(memory: FileMemory, step_idx: int) -> str:
-    """Collect outputs of prior steps from memory for context."""
+    """Collect outputs of prior steps (CMD + SEARCH) from memory for context."""
     parts: list[str] = []
     all_files = memory.all_files()
     for i in range(step_idx):
-        key = f"_cmd_output/step_{i+1}.txt"
-        if key in all_files:
-            parts.append(f"Step {i+1} output:\n{all_files[key]}")
+        # CMD step output
+        cmd_key = f"_cmd_output/step_{i+1}.txt"
+        if cmd_key in all_files:
+            parts.append(f"Step {i+1} output:\n{all_files[cmd_key]}")
+        # SEARCH step output — propagate search results to dependent steps
+        search_key = f"_search_context/step_{i+1}.txt"
+        if search_key in all_files:
+            parts.append(
+                f"Step {i+1} search results:\n{all_files[search_key]}")
     if not parts:
         return ""
     return "Previously executed steps:\n" + "\n\n".join(parts) + "\n\n"
@@ -1760,8 +1791,20 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         display.step_info(step_idx, f"Running: {cmd}{cwd_note}")
         log.info(f"Step {step_idx+1}: Running command: {cmd}")
 
+    # Scaffold commands (ng new, create-vite, npm create, etc.) run
+    # `npm install` internally, which can take 2-5 minutes on slow
+    # networks.  Use a longer timeout so they don't get killed.
+    _is_scaffold = bool(re.search(
+        r'\b(ng\s+new|npm\s+create|npx\s+create-|npm\s+init'
+        r'|npx\s+.*@angular/cli.*\s+new'    # npx @angular/cli@latest new ...
+        r'|npm\s+install\b)',                 # npm install (can be slow)
+        cmd, re.IGNORECASE,
+    ))
+    _cmd_timeout = 300 if _is_scaffold else 120
+
     success, output = executor.run_command(
-        cmd, background=is_background, cwd=subproject_cwd)
+        cmd, background=is_background, cwd=subproject_cwd,
+        timeout=_cmd_timeout)
     log.info(f"Step {step_idx+1}: Command output:\n{output}")
 
     # ── Semantic failure check ──
@@ -3479,6 +3522,18 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 f"\nONLY output `#### [FILE]: ...` blocks for the target file(s) above."
                 f"\nAll other files in context are READ-ONLY reference — do NOT output `#### [FILE]:` blocks for them."
             )
+
+        # ── Inject search context from prior SEARCH steps ──
+        # When a SEARCH step ran before this CODE step, its results contain
+        # setup guides, API docs, etc. that the coder needs.
+        _all_mem = memory.all_files()
+        for _sk, _sv in _all_mem.items():
+            if _sk.startswith('_search_context/') and _sv.strip():
+                context += (
+                    f"\n\nReference Documentation (from prior search step):\n"
+                    f"{_sv}\n"
+                )
+                break  # inject once — multiple search steps are rare
 
         # ── Plan-aware context injection ──
         # When a structured plan step is available, use plan-declared

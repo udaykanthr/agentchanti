@@ -939,18 +939,27 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                     step_idx,
                     f"Blocked full rewrite of {os.path.basename(_fp)}")
                 continue
-            # Check change ratio — reject >40% changed
+            # Check change ratio — use a sliding threshold that is more
+            # lenient for small files (which legitimately need proportionally
+            # larger changes, e.g. adding implementation to a skeleton).
+            # ≤15 lines → 80%, 16-40 lines → 60%, 41+ lines → 40%.
+            if _orig_len <= 15:
+                _threshold = 0.80
+            elif _orig_len <= 40:
+                _threshold = 0.60
+            else:
+                _threshold = 0.40
             _sm = _dl.SequenceMatcher(None, _orig_lines, _new_lines)
             _changed = sum(
                 max(j2 - j1, i2 - i1)
                 for tag, i1, i2, j1, j2 in _sm.get_opcodes()
                 if tag != 'equal')
             _change_ratio = _changed / max(_orig_len, 1)
-            if _change_ratio > 0.40:
+            if _change_ratio > _threshold:
                 log.warning(
                     "Step %d: Diff guard rejected diagnosis fix for %s — "
-                    "changes %.0f%% of lines (threshold 40%%)",
-                    step_idx + 1, _fp, _change_ratio * 100)
+                    "changes %.0f%% of lines (threshold %.0f%%)",
+                    step_idx + 1, _fp, _change_ratio * 100, _threshold * 100)
                 display.step_info(
                     step_idx,
                     f"Rejected fix for {os.path.basename(_fp)}: "

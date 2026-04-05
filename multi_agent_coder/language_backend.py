@@ -197,6 +197,29 @@ class JavaScriptBackend(LanguageBackend):
                     "in every test file. Use .jsx extension for JSX."
                 ),
             }
+        if test_runner == "ng":
+            return {
+                "command": "npx ng test --watch=false",
+                "dir": "src/app",
+                "ext": ".ts",
+                "prefix": "",
+                "suffix": ".spec",
+                "config_note": (
+                    "Angular CLI test runner. "
+                    "Tests use `describe`/`it`/`expect`. "
+                    "Use TestBed for component testing."
+                ),
+            }
+        if test_runner == "mocha":
+            return {
+                "command": "npx mocha",
+                "dir": "test",
+                "ext": ".js",
+                "prefix": "",
+                "suffix": ".test",
+                "setup_cmd": "npm install --save-dev mocha",
+                "config_note": "Mocha test runner. Use assert or chai for assertions.",
+            }
         return {
             "command": "npx jest --forceExit --watchAll=false",
             "dir": "__tests__",
@@ -295,15 +318,14 @@ class TypeScriptBackend(JavaScriptBackend):
 
     def get_test_framework(self, test_runner: str | None = None) -> dict:
         fw = super().get_test_framework(test_runner)
-        if test_runner != "vitest":
-            fw["ext"] = ".ts"
+        fw["ext"] = ".ts"
+        # Only add ts-jest setup for plain Jest — vitest, ng, mocha handle TS natively
+        if test_runner not in ("vitest", "ng", "mocha"):
             fw["setup_cmd"] = "npm install --save-dev jest ts-jest @types/jest"
             fw["config_note"] = (
                 "TypeScript projects need ts-jest configured. "
                 "Ensure jest.config has `transform` set for .ts files."
             )
-        else:
-            fw["ext"] = ".ts"
         return fw
 
 

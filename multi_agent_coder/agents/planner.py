@@ -239,7 +239,8 @@ class PlannerAgent(Agent):
                     baseline_failing_files: list[str] | None = None,
                     search_agent=None,
                     intent_agent=None,
-                    cli_display=None) -> str:
+                    cli_display=None,
+                    subproject_cwd: str | None = None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -301,11 +302,13 @@ class PlannerAgent(Agent):
                     parts.append(f"  ^ This file may need modification for the new feature")
 
         # 2b. Intent Analysis — runs BEFORE task briefing so the enriched
-        # task is available for the briefing LLM call.  Skipped for empty
-        # folders: there is nothing for the agent to investigate, and every
-        # tool call would return empty results, wasting LLM budget.
+        # task is available for the briefing LLM call.
+        # For blank folders: IntentAgent runs in "scaffold mode" — skips
+        # local KB search (nothing exists) but uses web search to fetch
+        # setup guides for the frameworks mentioned in the task, and
+        # version detection to find the right docs.
         _raw_task = task  # preserve original for clean KB search queries
-        if intent_agent is not None and source_files:
+        if intent_agent is not None:
             if cli_display:
                 cli_display.show_status("Analyzing intent and gathering requirements...")
 
@@ -358,6 +361,7 @@ class PlannerAgent(Agent):
                 kb_context=_full_semantic_context,
                 cli_display=cli_display,
                 available_kb_docs=_available_kb_titles or None,
+                subproject_cwd=subproject_cwd,
             )
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")

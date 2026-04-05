@@ -325,6 +325,12 @@ def _run_task_impl(
         except Exception as test_exc:
             _logger.warning("[Analysis] Baseline test analysis failed: %s", test_exc)
 
+    _api_subproject: str | None = None
+    try:
+        from .orchestrator.step_handlers import _detect_subproject_root
+        _api_subproject = _detect_subproject_root(memory)
+    except Exception:
+        pass
     analysis_context = planner.pre_analyze(
         task,
         source_files=source_files,
@@ -334,6 +340,7 @@ def _run_task_impl(
         language=language,
         intent_agent=intent_agent,
         search_agent=search_agent,
+        subproject_cwd=_api_subproject,
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context

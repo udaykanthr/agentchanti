@@ -668,6 +668,15 @@ def main():
 
         # Pre-analysis: map relevant files, classify intent, enrich context
         _pre_mem_local = locals().get('_pre_memory')
+        # Detect subproject root so IntentAgent can run npm commands from the
+        # correct directory (e.g. angular-bootstrap-app/ instead of repo root).
+        _intent_subproject: str | None = None
+        if _pre_mem_local is not None:
+            try:
+                from .step_handlers import _detect_subproject_root
+                _intent_subproject = _detect_subproject_root(_pre_mem_local)
+            except Exception:
+                pass
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -682,6 +691,7 @@ def main():
             search_agent=search_agent,
             intent_agent=intent_agent,
             cli_display=display,
+            subproject_cwd=_intent_subproject,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context

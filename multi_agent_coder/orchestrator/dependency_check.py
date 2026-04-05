@@ -798,6 +798,17 @@ def _guess_parent_file(
         if index_path in memory_files:
             return index_path
 
+    # Strategy 2b: Angular/NgModule — component files are declared in
+    # the nearest *.module.ts, not imported by main.ts directly.
+    if ext in (".ts", ".js") and stem.endswith(".component"):
+        for fpath in memory_files:
+            if fpath.endswith(".module.ts") and fpath != new_file:
+                # Prefer a module in the same project subtree
+                if os.path.dirname(fpath).startswith(
+                    parent_dir.rsplit("/", 1)[0] if "/" in parent_dir else ""
+                ):
+                    return fpath
+
     # Strategy 3: common root files
     if ext in (".tsx", ".jsx", ".ts", ".js"):
         for root_name in ("App.tsx", "App.jsx", "App.ts", "App.js",

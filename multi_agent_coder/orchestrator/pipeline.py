@@ -953,7 +953,12 @@ def _execute_step(step_idx: int, step_text: str, *,
                             _repl_is_full_rewrite = (
                                 _repl_str.lstrip('\n').startswith(_find_str.lstrip('\n'))
                                 and _after_find.strip()
-                                and len(_repl_str) > len(_find_str) * 2
+                                # REPLACE must be large enough to plausibly
+                                # contain the rest of the file.  If it's
+                                # shorter than the content after the FIND
+                                # anchor it's clearly a small insertion, not
+                                # a full-file rewrite.
+                                and len(_repl_str) > len(_after_find)
                             )
                             if _repl_is_full_rewrite:
                                 _patched = _patched[:_find_pos] + _repl_str
@@ -1070,6 +1075,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                     )
 
                 if not _edit_all_ok:
+                    import os as _os_inline_fb
                     # ── REPLACE-as-full-file fallback ──
                     # When the FIND block doesn't match (e.g. scaffold template
                     # changed between Vite versions), check if the REPLACE block
@@ -1082,7 +1088,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                             _ie_resolved = _ie_path
                             # Find the matching resolved path
                             for _kf in (plan_step.target_files or []):
-                                if _kf.endswith(_ie_path) or _ie_path.endswith(os.path.basename(_kf)):
+                                if _kf.endswith(_ie_path) or _ie_path.endswith(_os_inline_fb.path.basename(_kf)):
                                     _ie_resolved = _kf
                                     break
                             # Collect ALL REPLACE blocks for this file and
@@ -1105,15 +1111,57 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     _repl_parts.append(_repl_stripped)
                             if _repl_parts:
                                 _combined = "\n\n".join(_repl_parts)
-                                plan_step.inline_code[_ie_resolved] = _combined
-                                _logger.info(
-                                    "[InlineEdit] FIND failed but REPLACE "
-                                    "looks like a complete file — promoting "
-                                    "%d REPLACE block(s) for %s (%d chars)",
-                                    len(_repl_parts),
-                                    _ie_resolved, len(_combined),
-                                )
-                                _used_replace_fallback = True
+                                # Safety check: verify the combined REPLACE
+                                # text looks like a complete file, not a
+                                # fragment from an incremental edit.
+                                #
+                                # For JS/JSX/TS/TSX files a complete module
+                                # must contain an export statement.  Without
+                                # one the REPLACE is just a fragment (e.g.
+                                # import lines from the first edit pair)
+                                # and would produce a corrupt file.
+                                #
+                                # For multi-block concatenations also check
+                                # balanced braces — fragments like "add
+                                # import" + "add plugin line" won't close.
+                                _ext = _os_inline_fb.path.splitext(_ie_resolved)[1].lower()
+                                _js_like = _ext in {
+                                    '.js', '.jsx', '.ts', '.tsx', '.mjs',
+                                    '.cjs', '.mts', '.cts',
+                                }
+                                _is_complete = True
+                                # JS/TS modules must have an export
+                                if _js_like:
+                                    _has_export = (
+                                        'export ' in _combined
+                                        or 'module.exports' in _combined
+                                    )
+                                    if not _has_export:
+                                        _is_complete = False
+                                # Multi-block: also need balanced delimiters
+                                if _is_complete and len(_repl_parts) > 1:
+                                    _opens = _combined.count('{') + _combined.count('(')
+                                    _closes = _combined.count('}') + _combined.count(')')
+                                    if _opens == 0 or _opens != _closes:
+                                        _is_complete = False
+                                if _is_complete:
+                                    plan_step.inline_code[_ie_resolved] = _combined
+                                    _logger.info(
+                                        "[InlineEdit] FIND failed but REPLACE "
+                                        "looks like a complete file — promoting "
+                                        "%d REPLACE block(s) for %s (%d chars)",
+                                        len(_repl_parts),
+                                        _ie_resolved, len(_combined),
+                                    )
+                                    _used_replace_fallback = True
+                                else:
+                                    _logger.warning(
+                                        "[InlineEdit] FIND failed and %d REPLACE "
+                                        "block(s) for %s look like fragments "
+                                        "(unbalanced delimiters) — falling "
+                                        "through to coder LLM",
+                                        len(_repl_parts), _ie_resolved,
+                                    )
 
                     if _used_replace_fallback:
                         plan_step.inline_edits = {}
@@ -2416,22 +2464,32 @@ def run_final_test_verification(
     )
     print(f"\n  [FinalVerify] Re-running {len(test_files)} test file(s) for cross-step regression check...")
 
-    # Determine test command (mirror _handle_test_step detection logic)
+    # Determine test command — read package.json scripts.test for JS/TS projects
     lang = language
     if lang is None:
         lang = detect_language_from_files(list(test_files.keys()))
 
-    fw = get_test_framework(lang) if lang else get_test_framework("python")
+    # Detect subproject root (needed for reading package.json)
+    subproject_cwd = _detect_subproject_root(memory)
+
+    _test_runner_fv = None
+    if lang in ("javascript", "typescript"):
+        from .step_handlers import _read_js_project_env
+        _js_env_fv = _read_js_project_env(subproject_cwd)
+        _test_runner_fv = _js_env_fv.get("test_runner")
+        if _test_runner_fv and _test_runner_fv != "jest":
+            _logger.info("[FinalVerify] Detected test runner from package.json: %s", _test_runner_fv)
+
+    fw = get_test_framework(lang, test_runner=_test_runner_fv) if lang else get_test_framework("python")
     base_cmd = fw["command"]
 
-    # Vitest override: check imports, config files, and package.json
+    # Vitest fallback override: catch cases where test files import vitest directly
+    uses_vitest = False
     if "jest" in base_cmd.lower():
-        # 1. Explicit vitest imports (works when globals:false)
         uses_vitest = any(
             "from 'vitest'" in c or 'from "vitest"' in c
             for c in test_files.values()
         )
-        # 2. vitest.config.* present in session memory (covers globals:true setups)
         if not uses_vitest:
             _vitest_configs = (
                 "vitest.config.js", "vitest.config.ts",
@@ -2441,19 +2499,9 @@ def run_final_test_verification(
                 any(f.endswith(cfg) for cfg in _vitest_configs)
                 for f in all_files
             )
-        # 3. vitest listed in package.json (covers installed-but-config-not-in-memory)
-        if not uses_vitest:
-            pkg_content = next(
-                (c for f, c in all_files.items() if f.endswith("package.json")),
-                "",
-            )
-            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
         if uses_vitest:
             base_cmd = "npx vitest run"
-            _logger.info("[FinalVerify] Overriding to vitest (detected vitest config/package)")
-
-    # Detect subproject root
-    subproject_cwd = _detect_subproject_root(memory)
+            _logger.info("[FinalVerify] Overriding to vitest (import/config fallback)")
 
     test_cmd = _build_scoped_test_cmd(base_cmd, test_files, subproject_cwd)
     _logger.info("[FinalVerify] Test command: %s", test_cmd)
@@ -2969,18 +3017,30 @@ def run_bulk_test_execution_and_fix(
     if lang is None:
         lang = detect_language_from_files(list(test_files.keys()))
 
-    fw = get_test_framework(lang) if lang else get_test_framework("python")
+    # For JS/TS projects, read package.json to detect the actual test runner
+    # (covers Angular/ng, Karma, Mocha, Vitest, Jest, etc. without hardcoding).
+    import os as _os_bt
+    _test_runner = None
+    if lang in ("javascript", "typescript"):
+        from .step_handlers import _read_js_project_env
+        _js_env = _read_js_project_env(subproject_cwd)
+        _test_runner = _js_env.get("test_runner")
+        if _test_runner and _test_runner != "jest":
+            _logger.info("[BulkTest] Detected test runner from package.json: %s", _test_runner)
+
+    fw = get_test_framework(lang, test_runner=_test_runner) if lang else get_test_framework("python")
     base_cmd = fw["command"]
 
     # Django project detection: prefer manage.py test over pytest
-    import os as _os_bt
     if (not lang or lang == "python") and _os_bt.path.isfile(
         _os_bt.path.join(subproject_cwd, "manage.py")
     ):
         base_cmd = "python manage.py test"
         _logger.info("[BulkTest] Django project detected — using 'python manage.py test'")
 
-    # Vitest override (mirrors run_final_test_verification detection logic)
+    # Vitest fallback override: catch cases where _read_js_project_env
+    # didn't detect vitest but test files import from it directly.
+    uses_vitest = False
     if "jest" in base_cmd.lower():
         uses_vitest = any(
             "from 'vitest'" in c or 'from "vitest"' in c
@@ -2995,15 +3055,9 @@ def run_bulk_test_execution_and_fix(
                 any(f.endswith(vc) for vc in _vitest_cfgs)
                 for f in all_files
             )
-        if not uses_vitest:
-            pkg_content = next(
-                (c for f, c in all_files.items() if f.endswith("package.json")),
-                "",
-            )
-            uses_vitest = '"vitest"' in pkg_content or "'vitest'" in pkg_content
         if uses_vitest:
             base_cmd = "npx vitest run"
-            _logger.info("[BulkTest] Overriding to vitest")
+            _logger.info("[BulkTest] Overriding to vitest (import/config fallback)")
 
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
@@ -3564,6 +3618,14 @@ def run_bulk_test_execution_and_fix(
                             _bt_step_desc = (
                                 f"STEP INTENT: {_ps_desc}\n"
                             )
+                        _vitest_hint = ""
+                        if uses_vitest:
+                            _vitest_hint = (
+                                "- This project uses VITEST (not Jest). "
+                                "Use `vi.mock()` instead of `jest.mock()`, "
+                                "`vi.fn()` instead of `jest.fn()`, and "
+                                "import `{ vi }` from 'vitest' if needed.\n"
+                            )
                         _test_only_prompt = (
                             f"{_bt_briefing_block}"
                             f"Task: {task}\n\n"
@@ -3579,6 +3641,7 @@ def run_bulk_test_execution_and_fix(
                             "3. Adapt assertions to match what the source components "
                             "ACTUALLY render (read the source files above).\n\n"
                             "Common fixes:\n"
+                            f"{_vitest_hint}"
                             "- If the error mentions Router context (useHref, useLocation, "
                             "basename is null), wrap the render in <MemoryRouter> from "
                             "'react-router-dom'.\n"
@@ -3861,6 +3924,13 @@ def run_bulk_test_execution_and_fix(
                                 if _to2_ps:
                                     _to2_step_desc = (
                                         f"STEP INTENT: {_to2_ps}\n")
+                                _to2_vitest_hint = ""
+                                if uses_vitest:
+                                    _to2_vitest_hint = (
+                                        "- VITEST project: use `vi.mock()` "
+                                        "not `jest.mock()`, `vi.fn()` not "
+                                        "`jest.fn()`.\n"
+                                    )
                                 _to2_prompt = (
                                     f"{_bt_briefing_block}"
                                     f"{_to2_step_desc}"
@@ -3876,6 +3946,7 @@ def run_bulk_test_execution_and_fix(
                                     "functionality.\n"
                                     "3. Adapt to match what the source "
                                     "components actually render.\n"
+                                    f"{_to2_vitest_hint}"
                                     "- Use MemoryRouter for Router "
                                     "context.\n"
                                     "- Use getAllBy* for multiple "

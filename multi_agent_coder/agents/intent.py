@@ -17,6 +17,7 @@ _SAFE_CMD_PATTERNS: list[re.Pattern] = [
     re.compile(r'^(grep|findstr)\b'),                        # text search
     re.compile(r'^npx\s+(vitest|jest)\s+(run|--run)\b'),     # test runner (no install)
     re.compile(r'^python\s+-m\s+pytest\b'),                  # pytest read-only run
+    re.compile(r'^npm\s+run\s+(build|lint|start|dev)\b'),    # safe npm scripts (read-only / diagnostics)
 ]
 
 # Shell tokens that are never allowed anywhere in the command string, regardless
@@ -24,7 +25,8 @@ _SAFE_CMD_PATTERNS: list[re.Pattern] = [
 _FORBIDDEN_TOKENS: frozenset[str] = frozenset({
     "rm", "del", "rmdir", "rd", "mv", "move", "cp", "copy",
     "chmod", "chown", "sudo", "su", "eval", "exec",
-    "npm", "pip", "yarn", "pnpm",           # no installs
+    "pip", "yarn", "pnpm",                  # no installs (npm handled via allowlist)
+    "npm install", "npm ci", "npm publish", "npm exec",  # block dangerous npm sub-commands
     ">", ">>", "2>", "&>", "|",             # no output redirection or pipes
     "`", "$(", "${",                         # no command substitution
     ";", "&&", "||",                         # no command chaining
@@ -46,6 +48,181 @@ _STOP_WORDS = {
     "want", "should", "will", "would", "could", "there", "here", "has",
     "have", "been", "does", "did", "then", "than", "so", "about", "which",
 }
+
+
+def _detect_unknown_frameworks(
+    cwd: str | None,
+    llm_client=None,
+) -> list[dict]:
+    """Detect framework dependencies whose versions post-date the LLM's training.
+
+    Asks the LLM itself which packages it doesn't recognise, so the cutoff
+    table stays accurate regardless of which model or provider is in use.
+
+    Returns a list of dicts:
+        [{"name": "@angular/core", "version": "^21.2.0", "major": 21, "query": "..."}]
+    """
+    import json
+    pkg_path = os.path.join(cwd, "package.json") if cwd else "package.json"
+    if not os.path.isfile(pkg_path):
+        return []
+    try:
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    all_deps: dict[str, str] = {}
+    all_deps.update(pkg.get("dependencies", {}))
+    all_deps.update(pkg.get("devDependencies", {}))
+    if not all_deps:
+        return []
+
+    # Filter to framework / runtime packages only — skip generic tooling
+    # and utility libs that rarely have breaking-change impact.
+    _FRAMEWORK_KEYWORDS = {
+        "angular", "react", "vue", "svelte", "next", "nuxt", "gatsby",
+        "astro", "nest", "express", "fastify", "vite", "vitest",
+        "solid", "ember", "remix", "qwik", "lit", "stencil",
+        "webpack", "rollup", "esbuild", "typescript",
+        "django", "flask", "fastapi", "rails",
+    }
+    framework_deps: dict[str, str] = {}
+    for name, ver in all_deps.items():
+        lower = name.lower().replace("@", "").replace("/", " ")
+        if any(kw in lower for kw in _FRAMEWORK_KEYWORDS):
+            framework_deps[name] = ver
+    if not framework_deps:
+        return []
+
+    # ── Ask the LLM which versions it doesn't know ───────────────────────
+    if llm_client is None:
+        return []
+
+    dep_lines = "\n".join(f"  {n}: {v}" for n, v in sorted(framework_deps.items()))
+    prompt = (
+        "Below are framework/runtime dependencies from a project's package.json.\n"
+        "For each package, compare the version listed against the latest version\n"
+        "you have reliable knowledge about from your training data.\n\n"
+        f"{dep_lines}\n\n"
+        "Reply with ONLY the packages whose listed major version is HIGHER than\n"
+        "the latest major version you know. Use this exact format, one per line:\n"
+        "  UNKNOWN: <package_name> <project_version> <latest_version_you_know>\n\n"
+        "If ALL packages are within your known versions, reply with exactly:\n"
+        "  ALL_KNOWN\n\n"
+        "Do not explain. Do not add commentary. Only output the lines above."
+    )
+
+    try:
+        response = llm_client.generate_response(prompt)
+    except Exception as exc:
+        _logger.debug("[VersionCheck] LLM call failed: %s", exc)
+        return []
+
+    if "ALL_KNOWN" in response:
+        _logger.info("[VersionCheck] LLM reports all framework versions are known.")
+        return []
+
+    # Parse response lines like: UNKNOWN: @angular/core ^21.2.0 19
+    unknown: list[dict] = []
+    for line in response.splitlines():
+        m = re.match(
+            r'\s*UNKNOWN:\s*(\S+)\s+(\S+)\s+(\S+)',
+            line.strip(),
+        )
+        if not m:
+            continue
+        pkg_name = m.group(1)
+        project_ver = m.group(2)
+        # Extract major from project version
+        major_match = re.search(r'(\d+)', project_ver)
+        if not major_match:
+            continue
+        major = int(major_match.group(1))
+        display_name = pkg_name.replace("@", "").replace("/", " ")
+        query = (
+            f"{display_name} version {major} breaking changes "
+            f"migration guide defaults"
+        )
+        unknown.append({
+            "name": pkg_name,
+            "version": project_ver,
+            "major": major,
+            "llm_knows": m.group(3),
+            "query": query,
+        })
+
+    if unknown:
+        _logger.info(
+            "[VersionCheck] LLM flagged %d unknown framework(s): %s",
+            len(unknown),
+            [(u["name"], u["version"]) for u in unknown],
+        )
+    return unknown
+
+
+def _read_dependency_versions(cwd: str | None) -> str:
+    """Read package.json and return a compact summary of key dependency versions.
+
+    Returns a string like:
+        @angular/core: ^19.2.0, @angular/common: ^19.2.0, rxjs: ~7.8.0, typescript: ~5.5.0
+    Only includes framework/runtime deps (not dev tooling like eslint).
+    Returns empty string if package.json is missing or unreadable.
+    """
+    import json
+    pkg_path = os.path.join(cwd, "package.json") if cwd else "package.json"
+    if not os.path.isfile(pkg_path):
+        return ""
+    try:
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ""
+    deps = {}
+    deps.update(pkg.get("dependencies", {}))
+    deps.update(pkg.get("devDependencies", {}))
+    if not deps:
+        return ""
+    # Filter to framework/runtime packages — skip dev tooling noise
+    _SKIP = {
+        "eslint", "prettier", "husky", "lint-staged", "concurrently",
+        "nodemon", "ts-node", "webpack", "babel",
+    }
+    lines = []
+    for name, version in sorted(deps.items()):
+        base = name.split("/")[-1].lower()
+        if base in _SKIP:
+            continue
+        lines.append(f"  {name}: {version}")
+    # Cap at 30 entries to avoid flooding context
+    if len(lines) > 30:
+        lines = lines[:30] + [f"  ... and {len(lines) - 30} more"]
+    return "\n".join(lines)
+
+
+def _extract_error_files(cmd_output: str) -> list[str]:
+    """Extract unique source file paths referenced in build/compiler error output.
+
+    Matches patterns like:
+      src/app/app.component.ts:8:14:
+      src/app/hero/hero.component.html:7:46:
+      angular-compiler errors pointing to template files
+    """
+    # Match file:line:col patterns common in tsc, Angular compiler, ESLint, etc.
+    hits = re.findall(
+        r'(?:^|\s)((?:src|app|lib|components?|pages?|modules?)/\S+?'
+        r'\.(?:ts|tsx|js|jsx|html|css|scss|vue|svelte))'
+        r'(?::\d+:\d+|(?=\s|$))',
+        cmd_output,
+    )
+    seen: set[str] = set()
+    result: list[str] = []
+    for h in hits:
+        normalized = h.strip().rstrip(":")
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
 
 
 def _extract_reasoning(response: str) -> str:
@@ -171,23 +348,46 @@ def _run_cmd(cmd: str, cwd: str | None = None) -> str:
     Execute *cmd* in a subprocess and return its output (stdout + stderr),
     capped at _CMD_MAX_LINES lines / _CMD_MAX_CHARS characters.
 
+    Long-running commands (e.g. ``npm run start``, ``npm run dev``) are killed
+    after *_CMD_TIMEOUT_SECS* and whatever output was captured is returned so
+    the IntentAgent can still diagnose startup errors.
+
     Caller MUST validate with _is_safe_cmd before calling this.
     """
+    import signal
+
     translated = _translate_cmd_for_os(cmd)
     try:
-        result = subprocess.run(
+        # Use Popen so we can kill the entire process group on timeout.
+        proc = subprocess.Popen(
             translated,
             shell=True,
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_CMD_TIMEOUT_SECS,
             encoding="utf-8",
             errors="replace",
+            start_new_session=True,  # new process group for clean kill
         )
-        output = result.stdout
-        if result.stderr:
-            output += ("\n--- stderr ---\n" + result.stderr) if output else result.stderr
+        try:
+            stdout, stderr = proc.communicate(timeout=_CMD_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group (server + child processes)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.kill()
+            stdout, stderr = proc.communicate(timeout=5)
+            _timed_out = True
+        else:
+            _timed_out = False
+
+        output = stdout or ""
+        if stderr:
+            output += ("\n--- stderr ---\n" + stderr) if output else stderr
+        if _timed_out:
+            output += f"\n... (process killed after {_CMD_TIMEOUT_SECS}s — output above is partial)"
         if not output.strip():
             return "(no output)"
         lines = output.splitlines()
@@ -196,8 +396,6 @@ def _run_cmd(cmd: str, cwd: str | None = None) -> str:
         if len(output) > _CMD_MAX_CHARS:
             output = output[:_CMD_MAX_CHARS] + "\n... (truncated)"
         return output
-    except subprocess.TimeoutExpired:
-        return f"(command timed out after {_CMD_TIMEOUT_SECS}s)"
     except Exception as exc:
         return f"(command failed: {exc})"
 
@@ -249,6 +447,7 @@ class IntentAgent(Agent):
         kb_context: str = "",
         cli_display=None,
         available_kb_docs: list[str] | None = None,
+        subproject_cwd: str | None = None,
     ) -> str:
         """
         Investigate the task and produce a grounded REQUIREMENTS_SPEC.
@@ -353,11 +552,302 @@ class IntentAgent(Agent):
                     if cli_display:
                         cli_display.show_intent_event("preseed", "CSS/style files loaded")
 
+        # ── Pre-seed: blank folder scaffold — search for setup guides ─────
+        # When the project is empty, the most valuable context is setup
+        # guides for the frameworks mentioned in the task.  The LLM needs
+        # to know the latest CLI commands, project structure, and defaults
+        # (e.g. Angular 21 uses standalone by default, Vite replaces CRA).
+        _is_blank_project = not kb_context or "0 entries" in (kb_context or "")
+        if _is_blank_project:
+            # Extract framework/technology names from the task
+            _tech_prompt = (
+                f"Task: {raw_task}\n\n"
+                "List ONLY the framework/library names mentioned in this task "
+                "that need a setup guide for a new project. "
+                "Output comma-separated names (e.g. 'angular, bootstrap'). "
+                "If the task mentions a specific version include it "
+                "(e.g. 'angular 19, bootstrap 5'). "
+                "Output NONE if no frameworks are mentioned."
+            )
+            try:
+                _tech_resp = self.llm_client.generate_response(_tech_prompt).strip()
+                if _tech_resp.upper() != "NONE" and _tech_resp:
+                    _techs = [t.strip() for t in _tech_resp.split(",") if t.strip()]
+                    _logger.info(
+                        "[IntentAnalysis] Blank project — detected frameworks: %s",
+                        _techs,
+                    )
+                    # ── Step 1: Check KB docs first ──────────────────────────
+                    # For each framework, look for matching setup/guide docs
+                    # in the global KB. Only search the web for frameworks
+                    # that don't have KB docs.
+                    _kb_titles = available_kb_docs or []
+                    _techs_needing_web: list[str] = []
+                    for _tech in _techs:
+                        _tech_lower = _tech.lower().split()[0]  # "tailwind css" → "tailwind"
+                        _matched_titles = [
+                            t for t in _kb_titles
+                            if _tech_lower in t.lower()
+                            and any(kw in t.lower() for kw in
+                                    ("setup", "guide", "install", "config",
+                                     "responsive", "component", "hero",
+                                     "header", "pattern"))
+                        ]
+                        if _matched_titles and kb_context_builder is not None:
+                            # Load KB docs for this framework
+                            try:
+                                kb_context_builder._ensure_global()
+                                _gs = kb_context_builder._global_store
+                                if _gs is not None:
+                                    _kb_docs = _gs.get_by_titles(
+                                        _matched_titles) or []
+                                    for _title, _content in _kb_docs.items():
+                                        accumulated_context += (
+                                            f"── {_title} (from KB) ──\n"
+                                            f"{_content}\n\n"
+                                        )
+                                    _logger.info(
+                                        "[IntentAnalysis] Loaded %d KB doc(s) "
+                                        "for '%s': %s",
+                                        len(_kb_docs), _tech, _matched_titles,
+                                    )
+                                    if cli_display:
+                                        cli_display.show_intent_event(
+                                            "kb",
+                                            f"KB docs: {_tech} ({len(_kb_docs)} docs)")
+                            except Exception as _kb_exc:
+                                _logger.debug(
+                                    "[IntentAnalysis] KB doc load failed for "
+                                    "'%s': %s", _tech, _kb_exc)
+                                _techs_needing_web.append(_tech)
+                        else:
+                            _techs_needing_web.append(_tech)
+
+                    # ── Step 2: Web search for frameworks without KB docs ────
+                    if _techs_needing_web and search_agent is not None:
+                        for _tech in _techs_needing_web[:3]:
+                            _setup_query = (
+                                f"{_tech} latest version setup guide new project "
+                                f"CLI exact install commands with version numbers "
+                                f"config file format 2024 2025"
+                            )
+                            _logger.info(
+                                "[IntentAnalysis] No KB docs for '%s' — "
+                                "searching web", _tech)
+                            if cli_display:
+                                cli_display.show_intent_event(
+                                    "web", f"Setup guide: {_tech}")
+                            _guide = search_agent.search_for_task(
+                                _setup_query, kb_context=kb_context)
+                            if _guide:
+                                accumulated_context += (
+                                    f"── {_tech} Setup Guide (web search) ──\n"
+                                    f"{_guide}\n\n"
+                                )
+                                _logger.info(
+                                    "[IntentAnalysis] Injected %d chars of "
+                                    "setup guide for %s",
+                                    len(_guide), _tech)
+                                if cli_display:
+                                    cli_display.update_last_intent_event(
+                                        f"{len(_guide):,} chars")
+                    elif _techs_needing_web:
+                        _logger.info(
+                            "[IntentAnalysis] No search agent — skipping web "
+                            "search for: %s", _techs_needing_web)
+
+                    # After fetching all guides, add version pinning directive
+                    if _techs:
+                        accumulated_context += (
+                            "VERSION PINNING (CRITICAL for new projects):\n"
+                            "The setup guides above mention specific version "
+                            "numbers. Your REQUIREMENTS_SPEC MUST:\n"
+                            "1. Extract the EXACT version numbers from the "
+                            "guides above (e.g. 'bootstrap@5.3.8', "
+                            "'tailwindcss@3.4.x', 'react@19.x')\n"
+                            "2. List them in the Packages/versions section "
+                            "with PINNED versions, not '@latest'\n"
+                            "3. Use those PINNED versions in install commands "
+                            "(e.g. 'npm install tailwindcss@3.4.17' not "
+                            "'npm install tailwindcss@latest')\n"
+                            "4. Ensure ALL config file patterns (e.g. "
+                            "tailwind.config, postcss.config, vite.config) "
+                            "match the PINNED version's documented format — "
+                            "NOT patterns from older/newer versions\n"
+                            "WHY: If guides describe v3 patterns but "
+                            "'@latest' installs v4, config files will be "
+                            "incompatible and the build will fail.\n"
+                            "If the user's prompt specifies a version, use "
+                            "that version. If no version is specified and the "
+                            "guide doesn't name one, use the latest stable "
+                            "version mentioned in the guide.\n\n"
+                        )
+            except Exception as _tech_exc:
+                _logger.debug(
+                    "[IntentAnalysis] Blank project tech detection failed: %s",
+                    _tech_exc)
+
+        # ── Pre-seed: auto-run build/lint command when task mentions one ────
+        # When the user says "npm run build has errors", the most valuable
+        # context is the actual error output.  Auto-run the command so the
+        # LLM sees real errors instead of guessing from source code alone.
+        #
+        # Guard: only trigger when the task signals a bug-fix intent (errors,
+        # fix, failing, broken, etc.).  Tasks like "add npm run build to CI"
+        # or "document npm run build" should NOT auto-run the command.
+        _cmd_preseeded: str | None = None  # tracks what was auto-run
+        _FIX_SIGNALS = re.compile(
+            r'error|fail|fix|broken|issue|bug|crash|not\s+work|wrong|'
+            r'problem|trouble|doesn.t\s+work|does\s+not\s+work',
+            re.IGNORECASE,
+        )
+        _cmd_preseed_match = re.search(
+            r'\b(npm\s+run\s+(?:build|lint))\b', raw_task, re.IGNORECASE,
+        )
+        if _cmd_preseed_match and _FIX_SIGNALS.search(raw_task):
+            _preseed_cmd = _cmd_preseed_match.group(1).strip()
+            safe, _reason = _is_safe_cmd(_preseed_cmd)
+            if safe:
+                project_root = (
+                    getattr(kb_context_builder, "_project_root", None)
+                    if kb_context_builder is not None else None
+                )
+                _preseed_cwd = project_root
+                if subproject_cwd:
+                    _preseed_cwd = (
+                        os.path.join(project_root, subproject_cwd)
+                        if project_root else subproject_cwd
+                    )
+                _logger.info(
+                    "[IntentAnalysis] Pre-seeding with RUN_CMD '%s' (cwd=%s)",
+                    _preseed_cmd, _preseed_cwd,
+                )
+                if cli_display:
+                    cli_display.show_intent_event(
+                        "preseed", f"Running: {_preseed_cmd}")
+                _preseed_output = _run_cmd(_preseed_cmd, cwd=_preseed_cwd)
+                _cmd_preseeded = _preseed_cmd
+                accumulated_context += (
+                    f"RUN_CMD output for `{_preseed_cmd}` (auto-executed):\n"
+                    f"```\n{_preseed_output}\n```\n\n"
+                )
+                if cli_display:
+                    _lines = _preseed_output.count("\n") + 1
+                    cli_display.update_last_intent_event(f"{_lines} lines")
+                # Auto-load source files referenced in errors
+                if (kb_context_builder is not None
+                        and ("ERROR" in _preseed_output or "error" in _preseed_output)):
+                    _err_files = _extract_error_files(_preseed_output)
+                    if _err_files:
+                        _loaded = []
+                        for _ef in _err_files:
+                            _ef_content = self._read_full_file(
+                                kb_context_builder, os.path.basename(_ef))
+                            if _ef_content:
+                                _loaded.append(_ef_content)
+                        if _loaded:
+                            accumulated_context += (
+                                "── Source files referenced in build errors "
+                                "(auto-loaded) ──\n"
+                                + "\n\n".join(_loaded) + "\n\n"
+                            )
+                            _logger.info(
+                                "[IntentAnalysis] Auto-loaded %d file(s) from "
+                                "build errors",
+                                len(_loaded),
+                            )
+                        _error_count = _preseed_output.count("ERROR")
+                        accumulated_context += (
+                            f"IMPORTANT: The build output contains "
+                            f"{_error_count} error(s). Your REQUIREMENTS_SPEC "
+                            f"MUST address EVERY error listed above.\n"
+                            f"NOTE: If the build error says a component/class "
+                            f"HAS a property (e.g. 'is standalone') but you "
+                            f"cannot find that property explicitly in the "
+                            f"source code, it is likely an IMPLICIT DEFAULT "
+                            f"in the framework version being used. The fix is "
+                            f"to EXPLICITLY SET the opposite value (e.g. add "
+                            f"'standalone: false'), NOT to 'remove' something "
+                            f"that isn't there.\n\n"
+                        )
+                # ── Inject dependency versions from package.json ──────────
+                # The LLM needs to know the framework version to apply the
+                # correct fix patterns (e.g. Angular 19 defaults standalone
+                # to true, React 18 vs 19 has different APIs, etc.).
+                _pkg_versions = _read_dependency_versions(_preseed_cwd)
+                if _pkg_versions:
+                    accumulated_context += (
+                        f"Project dependency versions (from package.json):\n"
+                        f"{_pkg_versions}\n\n"
+                    )
+                    _logger.info(
+                        "[IntentAnalysis] Injected dependency versions from "
+                        "package.json"
+                    )
+
+                # ── Auto-search for unknown framework versions ────────────
+                # If framework versions exceed the LLM's training cutoff,
+                # search for migration guides / breaking changes so the LLM
+                # gets accurate info instead of guessing.
+                _unknowns = _detect_unknown_frameworks(
+                    _preseed_cwd, llm_client=self.llm_client,
+                )
+                if _unknowns and search_agent is not None:
+                    for _uf in _unknowns[:3]:  # cap at 3 searches
+                        _logger.info(
+                            "[IntentAnalysis] %s %s exceeds LLM-known %s — "
+                            "searching for docs",
+                            _uf["name"], _uf["version"], _uf["llm_knows"],
+                        )
+                        if cli_display:
+                            cli_display.show_intent_event(
+                                "web",
+                                f"Searching: {_uf['name']} v{_uf['major']} docs"
+                            )
+                        _search_result = search_agent.search_for_task(
+                            _uf["query"], kb_context=kb_context,
+                        )
+                        if _search_result:
+                            accumulated_context += (
+                                f"── {_uf['name']} v{_uf['major']} docs "
+                                f"(auto-searched — LLM only knows up to "
+                                f"v{_uf['llm_knows']}) ──\n"
+                                f"{_search_result}\n\n"
+                            )
+                            _logger.info(
+                                "[IntentAnalysis] Injected %d chars of docs "
+                                "for %s v%d",
+                                len(_search_result),
+                                _uf["name"], _uf["major"],
+                            )
+                            if cli_display:
+                                cli_display.update_last_intent_event(
+                                    f"{len(_search_result):,} chars")
+                elif _unknowns:
+                    # No search agent — at least warn the LLM
+                    _names = ", ".join(
+                        f"{u['name']} v{u['major']}" for u in _unknowns
+                    )
+                    accumulated_context += (
+                        f"WARNING: The following frameworks are newer than "
+                        f"your training data: {_names}. Their defaults and "
+                        f"APIs may differ from what you know. When unsure, "
+                        f"use SEARCH to look up the correct patterns.\n\n"
+                    )
+            else:
+                _logger.debug(
+                    "[IntentAnalysis] Pre-seed command '%s' rejected: %s",
+                    _preseed_cmd, _reason,
+                )
+
         # ── Iterative investigation loop ──────────────────────────────────────
         last_response = ""
         # Track commands already executed to prevent the LLM from looping on
         # the same tool call repeatedly without making progress.
+        # Include any commands auto-executed during pre-seed.
         executed_commands: set[str] = set()
+        if _cmd_preseeded:
+            executed_commands.add(f"RUN_CMD:{_cmd_preseeded.lower()}")
         # After the first duplicate is detected, force conclude on the very
         # next iteration so the LLM doesn't burn more rounds ignoring the note.
         force_conclude = False
@@ -571,7 +1061,15 @@ class IntentAgent(Agent):
                         getattr(kb_context_builder, "_project_root", None)
                         if kb_context_builder is not None else None
                     )
-                    cmd_output = _run_cmd(raw_cmd, cwd=project_root)
+                    # Use subproject directory for npm/npx commands so they
+                    # run where package.json actually lives.
+                    _cmd_cwd = project_root
+                    if subproject_cwd and raw_cmd.strip().startswith(("npm ", "npx ")):
+                        _cmd_cwd = (
+                            os.path.join(project_root, subproject_cwd)
+                            if project_root else subproject_cwd
+                        )
+                    cmd_output = _run_cmd(raw_cmd, cwd=_cmd_cwd)
                     accumulated_context += (
                         f"RUN_CMD output for `{raw_cmd}`:\n"
                         f"```\n{cmd_output}\n```\n\n"
@@ -579,6 +1077,44 @@ class IntentAgent(Agent):
                     if cli_display:
                         lines = cmd_output.count("\n") + 1
                         cli_display.update_last_intent_event(f"{lines} lines")
+
+                    # ── Auto-load source files referenced in build errors ─────
+                    # When a build/compile command fails, its error output
+                    # references specific source files (e.g. "src/app/foo.ts:8:14").
+                    # Auto-load these files so the LLM has the actual code to
+                    # reason about instead of guessing architecture.
+                    if (raw_cmd.strip().startswith(("npm run build", "npm run lint"))
+                            and kb_context_builder is not None
+                            and ("ERROR" in cmd_output or "error" in cmd_output)):
+                        _err_files = _extract_error_files(cmd_output)
+                        if _err_files:
+                            _loaded = []
+                            for _ef in _err_files:
+                                _ef_content = self._read_full_file(
+                                    kb_context_builder, os.path.basename(_ef))
+                                if _ef_content:
+                                    _loaded.append(_ef_content)
+                            if _loaded:
+                                accumulated_context += (
+                                    "── Source files referenced in build errors "
+                                    "(auto-loaded for investigation) ──\n"
+                                    + "\n\n".join(_loaded) + "\n\n"
+                                )
+                                _logger.info(
+                                    "[IntentAnalysis] Auto-loaded %d source file(s) "
+                                    "from build errors: %s",
+                                    len(_loaded),
+                                    [os.path.basename(f) for f in _err_files[:10]],
+                                )
+                            # Add a directive so the LLM addresses every error
+                            _error_count = cmd_output.count("ERROR")
+                            accumulated_context += (
+                                f"IMPORTANT: The build output above contains "
+                                f"{_error_count} error(s). Your REQUIREMENTS_SPEC "
+                                f"MUST address EVERY error — not just the first few. "
+                                f"Read each error message and the auto-loaded source "
+                                f"files above to understand the root cause of each.\n\n"
+                            )
                     continue
 
                 # ── FIND_USAGES command ───────────────────────────────────────
@@ -1025,12 +1561,16 @@ class IntentAgent(Agent):
             "        RUN_CMD: <command>\n"
             "          When: you need live project state that KB_SEARCH cannot provide.\n"
             "          Allowed: git diff, git log, git status, git blame, git show,\n"
-            "                   ls/dir, grep/findstr, npx vitest run, python -m pytest\n"
+            "                   ls/dir, grep/findstr, npx vitest run, python -m pytest,\n"
+            "                   npm run build, npm run lint, npm run start, npm run dev\n"
+            "          Long-running commands (start/dev) are auto-killed after 15s and\n"
+            "          partial output is returned — use them to capture startup errors.\n"
             "          Examples:\n"
+            "            RUN_CMD: npm run build\n"
             "            RUN_CMD: git diff HEAD -- src/components/Header.jsx\n"
             "            RUN_CMD: git log --oneline -10 src/components/Header.jsx\n"
             "            RUN_CMD: grep -r 'useHeader' src/\n"
-            "          NOT allowed: npm install, rm, pipes (|), redirects (>)\n\n"
+            "          NOT allowed: npm install, npm ci, rm, pipes (|), redirects (>)\n\n"
             "        SEARCH: <query>\n"
             "          When: you need external docs or package versions.\n\n"
             "        Example:\n"
