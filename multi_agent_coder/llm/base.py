@@ -1,8 +1,50 @@
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
 from ..cli_display import log
+
+
+# Matches well-formed <think>...</think> blocks (including newlines).
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Matches a leading reasoning block where the opening <think> was lost
+# (e.g. truncated by streaming) but the closing tag survived.
+_DANGLING_CLOSE_RE = re.compile(r"\A.*?</think>", re.DOTALL | re.IGNORECASE)
+# Matches an unterminated <think> at the very start with no closer anywhere.
+_DANGLING_OPEN_RE = re.compile(r"\A\s*<think\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks emitted by reasoning models.
+
+    Handles three cases:
+      1. Well-formed paired tags anywhere in the response.
+      2. A dangling </think> at/near the start (opener lost to truncation).
+      3. An unterminated <think> at the start with no closer (drop the rest
+         of the response is too aggressive — instead just drop the opener
+         and let downstream parsers see the raw text).
+
+    Non-reasoning models are unaffected: if no <think> tag is present, the
+    input is returned unchanged.
+    """
+    if not text:
+        return text
+    lowered = text.lower()
+    if "<think" not in lowered and "</think>" not in lowered:
+        return text
+
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+
+    # If a stray </think> still appears (opener was truncated), drop everything
+    # from the start of the response up to and including that closer.
+    if "</think>" in cleaned.lower():
+        cleaned = _DANGLING_CLOSE_RE.sub("", cleaned, count=1)
+
+    # Drop a stray opener with no closer.
+    cleaned = _DANGLING_OPEN_RE.sub("", cleaned, count=1)
+
+    return cleaned.lstrip()
 
 
 class LLMError(Exception):
@@ -44,6 +86,8 @@ class LLMClient(ABC):
                     result = self._generate_stream(active_prompt)
                 else:
                     result = self._generate(active_prompt)
+
+                result = _strip_reasoning(result) if result else result
 
                 if not result or not result.strip():
                     log.warning(
