@@ -37,6 +37,68 @@ _CMD_MAX_LINES = 80
 _CMD_MAX_CHARS = 4000
 _CMD_TIMEOUT_SECS = 15
 
+# ── Directive argument sanitization ──────────────────────────────────────────
+# Reasoning models occasionally leak fake system banners or hallucinated tool
+# output into their responses (e.g. "</think>│─ SAVED CONTEXT ─│" or fabricated
+# error messages). Without sanitization the directive parser captures that
+# garbage as part of the query and either re-runs the same investigation
+# forever or sends nonsense to the KB.
+#
+# Tokens that, if seen, mark the boundary between the legitimate argument and
+# leaked / hallucinated content. We truncate at the first occurrence.
+_DIRECTIVE_TRUNCATE_TOKENS = (
+    "</think>",
+    "<think",
+    "│",          # vertical bar used in fake "system reminder" banners
+    "<|",         # ChatML / OpenAI tool-call sentinels
+    "```",        # fenced code block — directives are single-line
+)
+# Hard cap on directive argument length. 500 covers all realistic
+# natural-language KB queries while still bounding worst-case garbage.
+_DIRECTIVE_MAX_LEN = 500
+# Whitespace normalization for dedup keys.
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _sanitize_directive_arg(raw: str) -> str:
+    """Clean a directive argument captured by the `.+$` regex tail.
+
+    Truncates at the first hallucination boundary token, strips control
+    chars, collapses internal whitespace, and caps length. Returns an
+    empty string if nothing usable remains — callers should treat that
+    as a parse failure and skip the directive.
+    """
+    if not raw:
+        return ""
+    arg = raw.strip()
+    lowered = arg.lower()
+    cut = len(arg)
+    for token in _DIRECTIVE_TRUNCATE_TOKENS:
+        idx = lowered.find(token)
+        if idx != -1 and idx < cut:
+            cut = idx
+    arg = arg[:cut].strip()
+    # Drop control chars (newlines already excluded by the MULTILINE regex,
+    # but tabs and other C0 control chars can sneak in).
+    arg = "".join(ch for ch in arg if ch == " " or ch >= " ")
+    if len(arg) > _DIRECTIVE_MAX_LEN:
+        arg = arg[:_DIRECTIVE_MAX_LEN].rstrip()
+    return arg
+
+
+def _normalize_dedup_key(query: str) -> str:
+    """Normalize a directive argument for the executed_commands cache.
+
+    Lowercase + collapse whitespace + strip trailing punctuation. Two
+    queries that differ only in spacing or trailing punctuation collapse
+    to the same key, so the LLM can't bypass the dedup guard by adding a
+    trailing space or period.
+    """
+    if not query:
+        return ""
+    norm = _WHITESPACE_RE.sub(" ", query.strip().lower())
+    return norm.rstrip(" .,:;!?-")
+
 # Stop-words filtered out when extracting a search query from the raw task
 _STOP_WORDS = {
     "a", "an", "the", "is", "it", "in", "on", "at", "to", "for", "of",
@@ -850,7 +912,7 @@ class IntentAgent(Agent):
         # Include any commands auto-executed during pre-seed.
         executed_commands: set[str] = set()
         if _cmd_preseeded:
-            executed_commands.add(f"RUN_CMD:{_cmd_preseeded.lower()}")
+            executed_commands.add(f"RUN_CMD:{_normalize_dedup_key(_cmd_preseeded)}")
         # After the first duplicate is detected, force conclude on the very
         # next iteration so the LLM doesn't burn more rounds ignoring the note.
         force_conclude = False
@@ -908,8 +970,18 @@ class IntentAgent(Agent):
                     re.MULTILINE | re.IGNORECASE,
                 )
                 if kb_match and kb_context_builder is not None:
-                    query = kb_match.group(1).strip()
-                    cmd_key = f"KB_SEARCH:{query.lower()}"
+                    query = _sanitize_directive_arg(kb_match.group(1))
+                    if not query:
+                        _logger.warning(
+                            "[IntentAnalysis] Iteration %d: KB_SEARCH directive was "
+                            "malformed after sanitization — skipping.", iteration,
+                        )
+                        accumulated_context += (
+                            "[Last KB_SEARCH directive was malformed and skipped. "
+                            "Reissue with a clean query or write REQUIREMENTS_SPEC.]\n\n"
+                        )
+                        continue
+                    cmd_key = f"KB_SEARCH:{_normalize_dedup_key(query)}"
                     if cmd_key in executed_commands:
                         _logger.info(
                             "[IntentAnalysis] Iteration %d: KB_SEARCH '%s' already executed — forcing conclude.",
@@ -969,8 +1041,18 @@ class IntentAgent(Agent):
                     re.MULTILINE | re.IGNORECASE,
                 )
                 if search_match and search_agent is not None:
-                    query = search_match.group(1).strip()
-                    cmd_key = f"SEARCH:{query.lower()}"
+                    query = _sanitize_directive_arg(search_match.group(1))
+                    if not query:
+                        _logger.warning(
+                            "[IntentAnalysis] Iteration %d: SEARCH directive was "
+                            "malformed after sanitization — skipping.", iteration,
+                        )
+                        accumulated_context += (
+                            "[Last SEARCH directive was malformed and skipped. "
+                            "Reissue with a clean query or write REQUIREMENTS_SPEC.]\n\n"
+                        )
+                        continue
+                    cmd_key = f"SEARCH:{_normalize_dedup_key(query)}"
                     if cmd_key in executed_commands:
                         _logger.info(
                             "[IntentAnalysis] Iteration %d: SEARCH '%s' already executed — forcing conclude.",
@@ -1022,8 +1104,18 @@ class IntentAgent(Agent):
                     re.MULTILINE | re.IGNORECASE,
                 )
                 if cmd_match:
-                    raw_cmd = cmd_match.group(1).strip()
-                    cmd_key = f"RUN_CMD:{raw_cmd.lower()}"
+                    raw_cmd = _sanitize_directive_arg(cmd_match.group(1))
+                    if not raw_cmd:
+                        _logger.warning(
+                            "[IntentAnalysis] Iteration %d: RUN_CMD directive was "
+                            "malformed after sanitization — skipping.", iteration,
+                        )
+                        accumulated_context += (
+                            "[Last RUN_CMD directive was malformed and skipped. "
+                            "Reissue with a clean command or write REQUIREMENTS_SPEC.]\n\n"
+                        )
+                        continue
+                    cmd_key = f"RUN_CMD:{_normalize_dedup_key(raw_cmd)}"
                     if cmd_key in executed_commands:
                         _logger.info(
                             "[IntentAnalysis] Iteration %d: RUN_CMD '%s' already executed — forcing conclude.",
@@ -1129,8 +1221,18 @@ class IntentAgent(Agent):
                     re.MULTILINE | re.IGNORECASE,
                 )
                 if usages_match and kb_context_builder is not None:
-                    name = usages_match.group(1).strip()
-                    cmd_key = f"FIND_USAGES:{name.lower()}"
+                    name = _sanitize_directive_arg(usages_match.group(1))
+                    if not name:
+                        _logger.warning(
+                            "[IntentAnalysis] Iteration %d: FIND_USAGES directive was "
+                            "malformed after sanitization — skipping.", iteration,
+                        )
+                        accumulated_context += (
+                            "[Last FIND_USAGES directive was malformed and skipped. "
+                            "Reissue with a clean symbol name or write REQUIREMENTS_SPEC.]\n\n"
+                        )
+                        continue
+                    cmd_key = f"FIND_USAGES:{_normalize_dedup_key(name)}"
                     if cmd_key in executed_commands:
                         _logger.info(
                             "[IntentAnalysis] Iteration %d: FIND_USAGES '%s' already executed — forcing conclude.",

@@ -3046,7 +3046,7 @@ def run_bulk_test_execution_and_fix(
 
     # Django project detection: prefer manage.py test over pytest
     if (not lang or lang == "python") and _os_bt.path.isfile(
-        _os_bt.path.join(subproject_cwd, "manage.py")
+        _os_bt.path.join(subproject_cwd or "", "manage.py")
     ):
         base_cmd = "python manage.py test"
         _logger.info("[BulkTest] Django project detected — using 'python manage.py test'")
