@@ -10,6 +10,7 @@ Design goals:
 
 from __future__ import annotations
 
+import os
 import re
 import logging
 from dataclasses import dataclass, field
@@ -149,14 +150,10 @@ def _classify(
         # Check if package is a local project module (directory or .py file)
         # before triggering web search.  Local project modules like
         # "snake_game" are not pip-installable — searching the web for
-        # them wastes tokens.
-        import os as _os_er
-        _is_local = (
-            _os_er.path.isdir(pkg_name)
-            or _os_er.path.isfile(f"{pkg_name}.py")
-            or _os_er.path.isfile(f"{pkg_name}/__init__.py")
-        )
-        if _is_local:
+        # them wastes tokens.  The walker descends a few levels so it
+        # catches modules nested under package dirs (e.g. game/controller.py
+        # for `from controller import Controller`).
+        if _find_local_module(pkg_name):
             _logger.info(
                 "[ErrorRouter] %r is a local project module → code (skip web)", pkg_name)
             return ErrorRoute(
@@ -275,6 +272,54 @@ def _extract_exception_class(text: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+# Directories that should never be walked when looking for a local module —
+# they either belong to the toolchain (venv, node_modules) or are noise (build
+# outputs, caches).  Excluded from os.walk via in-place dirs[:] mutation.
+_LOCAL_MODULE_SKIP_DIRS = frozenset({
+    'node_modules', 'venv', '.venv', 'env',
+    '__pycache__', 'dist', 'build', 'out',
+    '.git', '.agentchanti', '.tox', '.pytest_cache',
+    '.next', '.nuxt', 'coverage', 'site-packages',
+    '.mypy_cache', '.ruff_cache', 'target',
+})
+
+
+def _find_local_module(name: str, max_depth: int = 4) -> bool:
+    """True if ``<name>.py`` or ``<name>/__init__.py`` exists anywhere in the
+    project tree (CWD-rooted, depth-limited, noise dirs pruned).
+
+    The shallow CWD-only check this replaces missed modules nested under
+    package directories — e.g. ``game/controller.py`` would not satisfy
+    ``isfile('controller.py')`` and the router would mistakenly route to web
+    search for a missing PyPI package.
+    """
+    if not name or "/" in name or "\\" in name or name.startswith("@"):
+        # Empty, scoped npm pkg, or already a path — fall through to web check.
+        return False
+    target_py = f"{name}.py"
+    try:
+        for root, dirs, files in os.walk(".", followlinks=False):
+            rel = os.path.relpath(root, ".").replace("\\", "/")
+            depth = 0 if rel == "." else rel.count("/") + 1
+            if depth > max_depth:
+                dirs.clear()
+                continue
+            # Prune noise dirs in place so os.walk doesn't descend into them.
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".") and d not in _LOCAL_MODULE_SKIP_DIRS
+            ]
+            if target_py in files:
+                return True
+            if name in dirs and os.path.isfile(
+                os.path.join(root, name, "__init__.py")
+            ):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _clean_pkg_name(raw: str) -> str:
