@@ -137,6 +137,9 @@ All storage is local SQLite -- no external vector database required. See [docume
 **Option 1: Automatic Installer (recommended)**
 
 ```bash
+git clone https://github.com/udaykanthr/agentchanti.git
+cd agentchanti
+
 # Linux / macOS
 chmod +x install.sh && ./install.sh
 
