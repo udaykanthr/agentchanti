@@ -998,8 +998,39 @@ class Executor:
             return proc.returncode == 0, output.strip()
         except subprocess.TimeoutExpired:
             log.warning(f"[Executor] Command timed out after {timeout}s: {cmd}")
-            proc.kill()
-            stdout_bytes, _ = proc.communicate()
+            # Kill the entire process tree, not just the direct child.  On
+            # Windows, proc.kill() only kills the immediate process — any
+            # grandchildren (e.g. pyglet/pygame GUI threads spawned by a
+            # hung pytest) inherit the stdout pipe and keep it open, which
+            # makes the subsequent communicate() block indefinitely.  This
+            # mirrors the cleanup() path which already does the right thing.
+            if os.name == 'nt':
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                        capture_output=True, timeout=5,
+                    )
+                except (subprocess.TimeoutExpired, OSError) as kill_exc:
+                    log.warning(
+                        f"[Executor] taskkill failed ({kill_exc}) — "
+                        f"falling back to proc.kill()")
+                    proc.kill()
+            else:
+                proc.kill()
+            # Even after killing the tree, bound communicate() with a short
+            # timeout in case any reader/writer is still in a weird state.
+            try:
+                stdout_bytes, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning(
+                    "[Executor] Process still holding stdout pipe after "
+                    "kill — closing pipes and abandoning collected output.")
+                try:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                except OSError:
+                    pass
+                stdout_bytes = b""
             output = Executor._decode_output(stdout_bytes)
             return False, f"Command timed out after {timeout} seconds.\n{output}".strip()
         except Exception as e:

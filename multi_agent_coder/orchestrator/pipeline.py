@@ -405,15 +405,60 @@ def _generate_test_coverage_for_inline_changes(
         src_stem = src_basename.rsplit(".", 1)[0]
 
         # ── Find best existing test file ──
+        # Two strict heuristics, in order:
+        #   1. Canonical naming convention — `test_<stem>.py` for Python or
+        #      `<stem>.test.<ext>` / `<stem>.spec.<ext>` for JS/TS.
+        #   2. Explicit import statement referencing the source module.
+        # A loose substring match (the previous behaviour) clobbered
+        # unrelated test files when the source basename happened to appear
+        # anywhere in their content — e.g. matching `src/game.py` against
+        # `test_renderer_base.py` because the latter referenced `GameState`,
+        # then overwriting the renderer test with the game tests.
         existing_test_path: str | None = None
         existing_test_content: str = ""
+
+        _src_ext = src_basename.rsplit(".", 1)[-1] if "." in src_basename else ""
+        _canonical_basenames: set[str] = set()
+        if _src_ext == "py":
+            _canonical_basenames.add(f"test_{src_stem}.py")
+            _canonical_basenames.add(f"{src_stem}_test.py")
+        elif _src_ext:
+            _canonical_basenames.add(f"{src_stem}.test.{_src_ext}")
+            _canonical_basenames.add(f"{src_stem}.spec.{_src_ext}")
+            _canonical_basenames.add(f"test_{src_stem}.{_src_ext}")
+
+        # Pass 1 — canonical filename match.
         for fpath, content in all_files.items():
             if not _is_test_file(fpath):
                 continue
-            if src_stem in content or src_basename in content:
+            fbasename = fpath.replace("\\", "/").rsplit("/", 1)[-1]
+            if fbasename in _canonical_basenames:
                 existing_test_path = fpath
                 existing_test_content = content
                 break
+
+        # Pass 2 — explicit import statement match.
+        if existing_test_path is None:
+            _src_no_ext = src_path_norm.rsplit(".", 1)[0]      # "src/game"
+            _src_dotted = _src_no_ext.replace("/", ".")        # "src.game"
+            _import_patterns = (
+                f"from {_src_dotted} import",
+                f"import {_src_dotted}",
+                f"from .{src_stem} import",
+                f"from '{_src_no_ext}'",
+                f'from "{_src_no_ext}"',
+                f"from './{src_stem}'",
+                f'from "./{src_stem}"',
+                f"from '../{src_stem}'",
+                f'from "../{src_stem}"',
+            )
+            for fpath, content in all_files.items():
+                if not _is_test_file(fpath):
+                    continue
+                if any(p in content for p in _import_patterns):
+                    existing_test_path = fpath
+                    existing_test_content = content
+                    break
 
         target_test_path = existing_test_path or _infer_test_file_path(src_path, language)
         target_test_basename = target_test_path.replace("\\", "/").rsplit("/", 1)[-1]
