@@ -1235,6 +1235,106 @@ def _execute_step(step_idx: int, step_text: str, *,
                         plan_step.inline_code.clear()
                         _logger.info("[InlineEdit] Falling through to coder (edit failed)")
 
+            # ── User approval gate for inline code (pre-write) ──
+            # The inline fast path skips the Coder LLM, but writes still
+            # need user approval unless --auto.  Build a preview of the
+            # resolved files and show the diff editor first.  On rejection,
+            # clear plan_step.inline_code so the inline `if` below evaluates
+            # False and execution falls through to the Coder path for a
+            # fresh attempt.  Mirrors the existing rejection pattern at
+            # plan_step.py:1005 (clear-inline_code-to-fall-back-to-coder).
+            if (plan_step is not None
+                    and plan_step.inline_code
+                    and len(plan_step.inline_code) > 0
+                    and not auto):
+                # Build the same resolved files dict the inline path will
+                # write, so the diff preview shows accurate paths/contents.
+                # Resolution work is duplicated below — that is intentional:
+                # it keeps the existing 325-line inline body untouched and
+                # the resolution is cheap (string ops + memory scan).
+                _preview_files = dict(plan_step.inline_code)
+                from .classification import (
+                    resolve_cmd_placeholders as _resolve_ph_pre,
+                )
+                _ph_task_pre = task or ''
+                if any('<' in k for k in _preview_files):
+                    _preview_files = {
+                        _resolve_ph_pre(
+                            k, step_text=step_text, task=_ph_task_pre
+                        ): v
+                        for k, v in _preview_files.items()
+                    }
+                _preview_subproject = _detect_subproject_root(memory)
+                if not _preview_subproject:
+                    import re as _re_pre
+                    _mem_all_pre = memory.all_files()
+                    _scaffold_pats_pre = [
+                        _re_pre.compile(
+                            r'npm\s+create\s+vite(?:@\S+)?\s+(\S+)'),
+                        _re_pre.compile(
+                            r'create-vite(?:@\S+)?\s+(\S+)'),
+                        _re_pre.compile(
+                            r'create-next-app(?:@\S+)?\s+(\S+)'),
+                        _re_pre.compile(
+                            r'create-react-app\s+(\S+)'),
+                        _re_pre.compile(r'ng\s+new\s+(\S+)'),
+                    ]
+                    import os as _os_pre
+                    for _fp_pre, _ct_pre in _mem_all_pre.items():
+                        if not _fp_pre.startswith('_cmd_output/'):
+                            continue
+                        _first_pre = (
+                            _ct_pre.split('\n')[0] if _ct_pre else ''
+                        )
+                        for _pat_pre in _scaffold_pats_pre:
+                            _m_pre = _pat_pre.search(_first_pre)
+                            if _m_pre:
+                                _cand_pre = (
+                                    _m_pre.group(1).strip().rstrip('/')
+                                )
+                                if _cand_pre and _os_pre.path.isdir(
+                                        _cand_pre):
+                                    _preview_subproject = _cand_pre
+                                    break
+                        if _preview_subproject:
+                            break
+                if _preview_subproject:
+                    _preview_files = _prefix_subproject_paths(
+                        _preview_files, _preview_subproject, memory)
+                from .dependency_check import (
+                    clean_diff_markers as _clean_diff_pre,
+                )
+                _preview_files = {
+                    path: _clean_diff_pre(content)
+                    for path, content in _preview_files.items()
+                }
+
+                # Show the diff and wait for approval.
+                from ..diff_display import (
+                    prompt_diff_approval as _prompt_inline_approval,
+                )
+                display.stop_spinner()
+                _inline_user_approved = _prompt_inline_approval(
+                    _preview_files, auto=False, display=display,
+                    base_dir=getattr(memory, 'base_dir', "."),
+                )
+                display.step_info(step_idx, "Processing...")
+                if not _inline_user_approved:
+                    _logger.info(
+                        "[Inline] User rejected inline code for step %s "
+                        "— falling back to Coder for fresh attempt",
+                        plan_step.id if plan_step else step_idx,
+                    )
+                    display.step_info(
+                        step_idx,
+                        "Inline code rejected — running Coder",
+                    )
+                    # Clear so the inline `if` below evaluates False and
+                    # execution naturally falls into the Coder `else:`
+                    # branch.  Coder will regenerate from scratch instead
+                    # of starting from the rejected planner draft.
+                    plan_step.inline_code.clear()
+
             # ── Inline code fast path ──
             # If the planner already provided complete code in the plan,
             # write it directly — zero Coder LLM calls needed.
