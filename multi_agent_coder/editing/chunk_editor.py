@@ -1034,29 +1034,53 @@ class ChunkEditor:
     def _strip_diff_markers(code: str) -> str:
         """If *code* looks like a unified diff, apply it and return clean code.
 
-        Detects unified-diff format by checking whether the majority of
-        non-blank lines start with '+', '-', or ' ' (space context prefix).
-        When detected:
-          - Lines starting with '+' (but not '+++') → keep, strip leading '+'
-          - Lines starting with '-' (but not '---') → discard
-          - Lines starting with ' ' (context)        → keep, strip leading ' '
-          - '---'/'+++ ' headers and '\\ No newline' → skip
+        Detects unified-diff format by requiring **at least one genuine
+        diff signal**:
+          - a ``@@`` hunk header, OR
+          - a ``--- a/...`` / ``+++ b/...`` file header, OR
+          - clear ``+``/``-`` add/remove markers (where every non-blank
+            line is a + addition or a - removal — pure-context blocks
+            do not count).
 
-        If the content does NOT look like a diff it is returned unchanged.
+        Plain indented code (no ``@@``, no ``+/-`` markers) is **not**
+        a diff and is returned unchanged.  This guards against the
+        pre-2026-04 bug where any indented code block was misclassified
+        as a unified diff because most lines started with a space, and
+        the function then stripped one leading space from every body
+        line — corrupting indentation across fix-loop attempts and
+        causing the chunk editor's re-indenter to compound the drift.
+
+        When detected as a real diff, the function applies it:
+          - Lines starting with '+' (but not '+++') → keep, strip '+'
+          - Lines starting with '-' (but not '---') → discard
+          - Context lines starting with ' '         → keep, strip ' '
+          - '---' / '+++ ' headers and '\\ No newline' → skip
         """
         lines = code.splitlines()
         non_blank = [l for l in lines if l.strip()]
         if not non_blank:
             return code
 
-        diff_lines = sum(
-            1 for l in non_blank
-            if l.startswith(("+", "-", " "))
-            and not l.startswith(("---", "+++"))
+        # Strong signal #1: a @@ hunk header.
+        has_hunk_header = any(l.startswith("@@") for l in non_blank)
+
+        # Strong signal #2: a --- a/... / +++ b/... file header pair.
+        has_file_header = any(
+            l.startswith("--- ") or l.startswith("+++ ")
+            for l in non_blank
         )
-        # Require >60% diff-style lines to avoid false positives on code that
-        # legitimately starts with '-' or '+' (e.g. shell scripts, CSS).
-        if diff_lines / len(non_blank) < 0.6:
+
+        # Strong signal #3: every non-blank line is a +/- add/remove
+        # marker (pure-additions or pure-deletions block).  Pure context
+        # is intentionally rejected — indented code is "all context"
+        # and that was the false positive being fixed here.
+        all_addremove = all(
+            (l.startswith("+") and not l.startswith("+++"))
+            or (l.startswith("-") and not l.startswith("---"))
+            for l in non_blank
+        )
+
+        if not (has_hunk_header or has_file_header or all_addremove):
             return code
 
         result: list[str] = []
@@ -1065,6 +1089,8 @@ class ChunkEditor:
                 continue  # diff header
             if line.startswith("\\ "):
                 continue  # "\ No newline at end of file"
+            if line.startswith("@@"):
+                continue  # hunk header
             if line.startswith("+"):
                 result.append(line[1:])
             elif line.startswith("-"):
