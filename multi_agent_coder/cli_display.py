@@ -356,11 +356,24 @@ class CLIDisplay:
         self.render()
 
     def show_status(self, message: str):
-        """Show a planning/status message (before steps are loaded)."""
+        """Show a planning/status message.
+
+        Works in both phases:
+          • Pre-step (no steps loaded yet): renders as the sole PLANNING panel
+            via the if/elif chain in ``_build_panels``.
+          • Post-step (after all steps complete): renders as a STATUS footer
+            panel below the execution section, so long post-pipeline phases
+            like wiring verification do not appear frozen.
+
+        Pass an empty string to clear the message and stop the spinner.
+        """
         with self._lock:
             self.status_message = message
         self.render()
-        self._start_spinner(message)
+        if message:
+            self._start_spinner(message)
+        else:
+            self._stop_spinner()
 
     # ── Intent investigation trail ─────────────────────────────────────────────
 
@@ -587,7 +600,7 @@ class CLIDisplay:
             padding=(0, 1),
         )
 
-    def _build_planning_section(self) -> Panel:
+    def _build_planning_section(self, title_text: str = "PLANNING") -> Panel:
         spin = self._spinner_char()
         elapsed = _time.monotonic() - self.start_time
         t = Text()
@@ -598,7 +611,7 @@ class CLIDisplay:
 
         title = Text()
         title.append("◈ ", style="dim cyan")
-        title.append("PLANNING", style="bold cyan")
+        title.append(title_text, style="bold cyan")
 
         return Panel(
             t,
@@ -916,6 +929,14 @@ class CLIDisplay:
             parts.append(self._build_investigation_section())
         elif has_status:
             parts.append(self._build_planning_section())
+
+        # Post-step status footer.  After all steps complete, long-running
+        # phases like wiring verification or learning extraction call
+        # show_status() to indicate progress.  Render those messages as a
+        # STATUS panel below the execution section so the UI does not look
+        # frozen during 60-90s LLM calls.
+        if has_steps and has_status:
+            parts.append(self._build_planning_section(title_text="STATUS"))
 
         if has_tests:
             parts.append(self._build_tests_section())
