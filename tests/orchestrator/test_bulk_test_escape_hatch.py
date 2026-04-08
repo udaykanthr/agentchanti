@@ -22,7 +22,14 @@ from multi_agent_coder.orchestrator.pipeline import (
     _extract_stack_trace_files,
     _extract_top_level_exports,
     _is_additive_source_fix,
+    _should_trigger_escape_hatch,
 )
+
+
+class _FakeRoute:
+    """Tiny stand-in for ErrorRoute — only needs source_type."""
+    def __init__(self, source_type):
+        self.source_type = source_type
 
 
 # ── Helper unit tests ─────────────────────────────────────────────────────
@@ -417,6 +424,107 @@ class TestAttemptTargetedSourceFix(unittest.TestCase):
             files={},  # not in memory and not on disk
         )
         self.assertIsNone(result)
+
+
+# ── Trigger function ──────────────────────────────────────────────────────
+
+
+class TestShouldTriggerEscapeHatch(unittest.TestCase):
+    """Pin the trigger preconditions. The trigger is the single
+    decision point that decides whether the escape hatch fires —
+    every guard added here is the only thing standing between the
+    LLM and the project's source files."""
+
+    def _ok_kwargs(self, **overrides):
+        """Baseline kwargs that satisfy every precondition."""
+        kwargs = dict(
+            used_escape_hatch=False,
+            did_test_only_retry=True,
+            error_sig_history=["sig_a", "sig_a"],
+            route=_FakeRoute("code"),
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_baseline_fires(self):
+        """The happy path — every condition met."""
+        self.assertTrue(_should_trigger_escape_hatch(**self._ok_kwargs()))
+
+    def test_already_used_blocks(self):
+        """One shot per test file — second invocation must skip."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(used_escape_hatch=True)))
+
+    def test_test_only_retry_not_yet_done_blocks(self):
+        """Test-only retry must be tried first (cheaper, safer)."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(did_test_only_retry=False)))
+
+    def test_history_too_short_blocks(self):
+        """First attempt has only one signature — can't compare yet."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(error_sig_history=["sig_a"])))
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(error_sig_history=[])))
+
+    def test_signature_drift_blocks(self):
+        """Different errors → loop is making progress, don't escalate."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(error_sig_history=["sig_a", "sig_b"])))
+
+    def test_empty_signature_blocks(self):
+        """Empty error string → can't trust the comparison."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(error_sig_history=["", ""])))
+
+    def test_no_route_blocks(self):
+        """ErrorRouter unavailable → don't take risky source action."""
+        self.assertFalse(_should_trigger_escape_hatch(
+            **self._ok_kwargs(route=None)))
+
+    def test_non_code_route_blocks(self):
+        """Hatch is for code bugs only — env / data / web get other
+        remedies."""
+        for source_type in ("web", "kb", "web+code", "data", "unknown"):
+            with self.subTest(source_type=source_type):
+                self.assertFalse(_should_trigger_escape_hatch(
+                    **self._ok_kwargs(route=_FakeRoute(source_type))))
+
+    def test_three_repeats_still_fires(self):
+        """Stable error across 3+ attempts — definitely a stuck loop."""
+        self.assertTrue(_should_trigger_escape_hatch(
+            **self._ok_kwargs(
+                error_sig_history=["sig_a", "sig_a", "sig_a"])))
+
+    def test_only_last_two_matter(self):
+        """If the last two match (loop just stalled), fire — even if
+        earlier attempts had different errors."""
+        self.assertTrue(_should_trigger_escape_hatch(
+            **self._ok_kwargs(
+                error_sig_history=["sig_x", "sig_y", "sig_a", "sig_a"])))
+
+    def test_fires_on_final_attempt(self):
+        """Regression: an earlier version of the trigger had a
+        ``fix_attempt < MAX_BULK_TEST_FIX_ATTEMPTS`` guard which
+        prevented the hatch from firing on the very attempt it was
+        most needed — the last one, after test-only retries had
+        demonstrably failed.  The signature of the function does NOT
+        take fix_attempt anymore.  This test pins that absence: any
+        future attempt to add a budget guard will need to update the
+        signature, and these kwargs will then fail to bind."""
+        # If a fix_attempt kwarg sneaks back in, this call still works
+        # (because the function takes **kwargs in the future?) — guard
+        # against that by also asserting the call signature explicitly.
+        import inspect
+        sig = inspect.signature(_should_trigger_escape_hatch)
+        self.assertNotIn(
+            "fix_attempt", sig.parameters,
+            "fix_attempt budget guard must not be reintroduced — see "
+            "the bugfix branch commit message for the failure mode it "
+            "caused (hatch could never fire on the final attempt).",
+        )
+        # And the trigger must say "yes" on a stale-error case.
+        self.assertTrue(_should_trigger_escape_hatch(**self._ok_kwargs()))
 
 
 if __name__ == "__main__":
