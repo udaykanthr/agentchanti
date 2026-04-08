@@ -3320,8 +3320,8 @@ def run_bulk_test_execution_and_fix(
                 # Read the current config file content
                 _cfg_candidates = [
                     _shared_config,
-                    os.path.join(subproject_cwd or "", _shared_config.split("/")[-1]),
-                    os.path.join(subproject_cwd or "", _shared_config),
+                    _os_bt.path.join(subproject_cwd or "", _shared_config.split("/")[-1]),
+                    _os_bt.path.join(subproject_cwd or "", _shared_config),
                 ]
                 _cfg_content = ""
                 _cfg_path = ""

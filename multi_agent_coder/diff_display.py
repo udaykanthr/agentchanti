@@ -13,7 +13,11 @@ import difflib
 import threading
 import time
 import logging
+from typing import TYPE_CHECKING
 from .config import Config
+
+if TYPE_CHECKING:
+    from .cli_display import CLIDisplay
 
 # Hazards that block execution or require explicit confirmation
 HAZARD_BLOCK = "BLOCK"
@@ -284,7 +288,7 @@ _approval_lock = threading.Lock()
 
 
 def prompt_diff_approval(files: dict[str, str], base_dir: str = ".",
-                         auto: bool = False, display: "CLIDisplay" | None = None) -> bool:
+                         auto: bool = False, display: CLIDisplay | None = None) -> bool:
     """Show diffs in an interactive Textual viewer and wait for approval.
 
     Returns ``True`` if the user approves (or if running in auto mode).
