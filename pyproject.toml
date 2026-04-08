@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentchanti"
+version = "0.1.0"
+description = "A multi-agent AI coding system with built-in RAG — local or cloud, CLI or API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Uday Kanth" },
+]
+keywords = [
+    "ai", "agent", "llm", "coding-assistant", "ollama", "lm-studio",
+    "openai", "anthropic", "gemini", "rag", "code-generation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "requests",
+    "pyyaml",
+    "rich>=13.0",
+    "textual",
+    # Phase 1 — Code Graph (Local KB)
+    "networkx>=3.0",
+    "syntax_checker",
+    "tree-sitter>=0.22",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-java",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-go",
+    "tree-sitter-rust",
+    "tree-sitter-ruby",
+    "tree-sitter-php",
+    "tree-sitter-c-sharp",
+    "watchdog>=3.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/udaykanth/agentchanti"
+Repository = "https://github.com/udaykanth/agentchanti"
+Issues = "https://github.com/udaykanth/agentchanti/issues"
+
+[project.scripts]
+agentchanti = "multi_agent_coder.orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["multi_agent_coder*"]
+exclude = ["tests*", "responsive-web-app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# CI currently enforces only the "code is actually broken" subset.
+# Local devs and editors can opt into the wider set below by running
+# `ruff check` without --select.
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line too long — handled by formatter, noisy without it
+    "E741",  # ambiguous variable name (l, I, O) — too many false positives in legacy code
+]
