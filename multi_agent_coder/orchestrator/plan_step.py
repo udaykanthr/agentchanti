@@ -815,7 +815,10 @@ def _assign_inline_code(step: PlanStep, code_lines: list[str]) -> None:
     2. Fence boundaries (``_FENCE_BOUNDARY`` sentinels inserted at each
        closing `` ``` `` fence) — if the number of non-empty fence blocks
        matches the number of targets, assign block N to target N.
-    3. Fallback: everything goes to ``targets[0]``.
+    3. Fallback: assign all code to the first target that has not yet
+       been populated, so consecutive ``content:`` blocks (one per
+       target file) land on different files instead of overwriting
+       ``targets[0]`` repeatedly.
     """
     targets = step.target_files
 
@@ -865,14 +868,30 @@ def _assign_inline_code(step: PlanStep, code_lines: list[str]) -> None:
                     step.inline_code[target] = content
             return
 
-    # ── Strategy 3: fallback — all code to first target ──
+    # ── Strategy 3: fallback — first UNASSIGNED target ──
+    # Picking the first unassigned target (instead of always
+    # ``targets[0]``) handles the common multi-target pattern where
+    # the planner emits one ``content:`` block per file:
+    #
+    #     target: vite.config.js, vitest.setup.js
+    #     content: ```js ...vite config... ``` ---file-content-end---
+    #     content: ```js ...setup... ```      ---file-content-end---
+    #
+    # Each ``---file-content-end---`` triggers one call here, and
+    # without this rule the second call would silently overwrite
+    # ``vite.config.js`` with the setup-file content.
     clean_lines = [ln for ln in code_lines if ln != _FENCE_BOUNDARY]
     full_code = "\n".join(clean_lines).strip()
     if not full_code:
         return
 
-    if len(targets) >= 1:
-        step.inline_code[targets[0]] = full_code
+    if not targets:
+        return
+    unassigned = [t for t in targets if t not in step.inline_code]
+    if unassigned:
+        step.inline_code[unassigned[0]] = full_code
+    # else: every target already populated — drop the extra block
+    # rather than clobbering an existing assignment.
 
 
 def _match_target(name: str, targets: list[str]) -> Optional[str]:

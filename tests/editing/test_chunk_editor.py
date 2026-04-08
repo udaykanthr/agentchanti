@@ -574,3 +574,141 @@ class TestChunkFileC:
             f"Expected 'main' chunk, got: {chunk_ids}"
         )
 
+
+class TestStripDiffMarkers:
+    """Pin the diff-vs-code classifier in :func:`_strip_diff_markers`.
+
+    The classifier had a real bug: any indented code block was treated
+    as a unified diff because the heuristic counted lines starting with
+    a leading space as "context lines".  It then stripped one leading
+    space from every body line and the chunk-editor's re-indenter
+    compounded the drift across fix-loop attempts, breaking the loop's
+    ability to converge on a fix.  These tests pin the new behaviour:
+
+      * indented code is left untouched (the bug)
+      * real diffs are still recognised and applied
+    """
+
+    def test_indented_jsx_unchanged(self):
+        """The exact failing input from a real run — JSX with 2-space
+        indentation must NOT be classified as a diff."""
+        code = (
+            "describe('HeroBanner', () => {\n"
+            "  it('renders', () => {\n"
+            "    render(<HeroBanner />)\n"
+            "\n"
+            "    expect(\n"
+            "      screen.getByRole('heading', {\n"
+            "        name: /build/i,\n"
+            "      }),\n"
+            "    ).toBeInTheDocument()\n"
+            "  })\n"
+            "})"
+        )
+        assert ChunkEditor._strip_diff_markers(code) == code
+
+    def test_indented_python_class_unchanged(self):
+        """4-space-indented Python is the most common case the bug
+        used to corrupt."""
+        code = (
+            "class Foo:\n"
+            "    def bar(self):\n"
+            "        return 1\n"
+            "    def baz(self):\n"
+            "        return 2"
+        )
+        assert ChunkEditor._strip_diff_markers(code) == code
+
+    def test_tab_indented_code_unchanged(self):
+        """Tab-indented code does not start with a space, so it was
+        always safe — pin it explicitly."""
+        code = (
+            "function foo() {\n"
+            "\tconst x = 1\n"
+            "\treturn x\n"
+            "}"
+        )
+        assert ChunkEditor._strip_diff_markers(code) == code
+
+    def test_unified_diff_with_hunk_header_applied(self):
+        """A real diff with a ``@@`` hunk header is the strongest
+        signal — must be applied."""
+        diff = (
+            "@@ -1,3 +1,4 @@\n"
+            " line1\n"
+            "-line2\n"
+            "+line2_new\n"
+            "+line3\n"
+            " line4"
+        )
+        result = ChunkEditor._strip_diff_markers(diff)
+        assert result == "line1\nline2_new\nline3\nline4"
+
+    def test_unified_diff_with_file_headers_applied(self):
+        """``--- a/`` and ``+++ b/`` file headers also signal a
+        diff."""
+        diff = (
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            " def foo():\n"
+            "-    return 1\n"
+            "+    return 2"
+        )
+        result = ChunkEditor._strip_diff_markers(diff)
+        assert result == "def foo():\n    return 2"
+
+    def test_pure_additions_diff_applied(self):
+        """A diff fragment where every non-blank line is a `+` add
+        (no headers, no context) is still recognised."""
+        diff = (
+            "+import foo\n"
+            "+const x = 1\n"
+            "+function bar() {}"
+        )
+        result = ChunkEditor._strip_diff_markers(diff)
+        assert result == "import foo\nconst x = 1\nfunction bar() {}"
+
+    def test_pure_context_block_unchanged(self):
+        """A block where EVERY line is " context" (no +/- markers
+        and no @@ header) is NOT a diff — without the change markers
+        it has no semantic meaning, and pure-context fragments were
+        the source of the original bug."""
+        code = (
+            " line1\n"
+            " line2\n"
+            " line3"
+        )
+        assert ChunkEditor._strip_diff_markers(code) == code
+
+    def test_empty_input(self):
+        assert ChunkEditor._strip_diff_markers("") == ""
+
+    def test_blank_only_input(self):
+        assert ChunkEditor._strip_diff_markers("\n\n") == "\n\n"
+
+    def test_single_line_code_unchanged(self):
+        """A one-line code snippet is not enough signal for diff
+        detection."""
+        code = "    return None"
+        assert ChunkEditor._strip_diff_markers(code) == code
+
+    def test_diff_with_mixed_context_and_changes_applied(self):
+        """The realistic case — a hunk header, context lines, and
+        +/- changes — applies cleanly."""
+        diff = (
+            "@@ -10,5 +10,5 @@\n"
+            " def foo():\n"
+            '     """docstring"""\n'
+            "-    return None\n"
+            "+    return 42\n"
+            "     # trailing"
+        )
+        result = ChunkEditor._strip_diff_markers(diff)
+        expected = (
+            "def foo():\n"
+            '    """docstring"""\n'
+            "    return 42\n"
+            "    # trailing"
+        )
+        assert result == expected
+

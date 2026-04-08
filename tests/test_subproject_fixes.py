@@ -149,6 +149,135 @@ class TestPrefixSubprojectPaths:
         assert "my-app/src/NewFile.js" in result
 
 
+class TestPlannerLeaderRename:
+    """Pin the planner-leader rename branch.
+
+    Background: a CMD-step diagnosis fix can rename the scaffold
+    directory (e.g. the planner says ``cd myapp && npm create
+    vite@latest .`` but the diagnosis fix runs ``npm create vite@latest
+    my-app``).  Subsequent inline-code paths still carry the planner's
+    name (``myapp/src/...``) but the actual subproject is ``my-app/``.
+    Without this branch the prefixer would blindly produce
+    ``my-app/myapp/src/...``, double-nesting the entire homepage and
+    leaving Vite serving the default scaffold while tests pass against
+    the orphaned tree.
+    """
+
+    def test_renames_hyphen_variant(self):
+        """The exact failing case from a real run: planner emitted
+        ``myapp/src/...`` but the actual scaffold is ``my-app/``."""
+        memory = _make_memory({})
+        files = {"myapp/src/components/Header.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/src/components/Header.jsx" in result
+        assert "my-app/myapp/src/components/Header.jsx" not in result
+
+    def test_renames_camelcase_variant(self):
+        """``myApp`` is the same project as ``my-app`` after
+        normalisation."""
+        memory = _make_memory({})
+        files = {"myApp/src/main.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/src/main.jsx" in result
+
+    def test_renames_snake_case_variant(self):
+        """``my_app/src/...`` ↔ ``my-app/`` after normalisation."""
+        memory = _make_memory({})
+        files = {"my_app/src/index.css": "body {}"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/src/index.css" in result
+
+    def test_renames_pascalcase_variant(self):
+        """``MyApp`` matches ``my-app``."""
+        memory = _make_memory({})
+        files = {"MyApp/vite.config.js": "config"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/vite.config.js" in result
+
+    def test_does_not_strip_src_leading_dir(self):
+        """``src/`` is a standard project top dir — must NOT be
+        stripped, even though ``src`` could in principle be a
+        project name in some other setting.  This pins that
+        legitimate ``src/Foo.jsx`` paths still get the prefix
+        prepended (becoming ``my-app/src/Foo.jsx``), not stripped to
+        the bare ``Foo.jsx``."""
+        memory = _make_memory({})
+        files = {"src/components/Header.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/src/components/Header.jsx" in result
+
+    def test_does_not_strip_lib_leading_dir(self):
+        memory = _make_memory({})
+        files = {"lib/utils.js": "export"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/lib/utils.js" in result
+
+    def test_does_not_strip_components_leading_dir(self):
+        """``components/`` is in the common-top-dirs list to avoid
+        false positives on project names that happen to be
+        ``components`` (rare but allowed)."""
+        memory = _make_memory({})
+        files = {"components/Header.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/components/Header.jsx" in result
+
+    def test_does_not_strip_unrelated_project_leader(self):
+        """An unrelated project name (e.g. ``other-project/``) is NOT
+        a normalisation match for ``my-app/``, so it gets prefixed
+        normally rather than stripped.  This is a false-negative-safe
+        rule — we'd rather double-prefix than silently rewrite to
+        the wrong directory."""
+        memory = _make_memory({})
+        files = {"other-project/src/Header.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/other-project/src/Header.jsx" in result
+
+    def test_already_prefixed_path_left_alone(self):
+        """Sanity: when the path already starts with the actual
+        prefix, the planner-leader branch must not fire."""
+        memory = _make_memory({})
+        files = {"my-app/src/components/Header.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        assert "my-app/src/components/Header.jsx" in result
+        # Must NOT have produced a doubly-prefixed copy.
+        assert "my-app/my-app/src/components/Header.jsx" not in result
+
+    def test_rename_works_with_trailing_slash_subproject(self):
+        """Subproject argument may include a trailing slash —
+        normalisation must still work."""
+        memory = _make_memory({})
+        files = {"myapp/src/App.jsx": "<jsx>"}
+        result = _prefix_subproject_paths(files, "my-app/", memory)
+        assert "my-app/src/App.jsx" in result
+
+    def test_rename_handles_multiple_files_in_one_call(self):
+        """All files in a single batch are independently rewritten."""
+        memory = _make_memory({})
+        files = {
+            "myapp/src/components/Header.jsx": "h",
+            "myapp/src/components/HeroBanner.jsx": "b",
+            "myapp/src/App.jsx": "a",
+            "myapp/vite.config.js": "c",
+            "myapp/vitest.setup.js": "s",
+        }
+        result = _prefix_subproject_paths(files, "my-app", memory)
+        for src in (
+            "my-app/src/components/Header.jsx",
+            "my-app/src/components/HeroBanner.jsx",
+            "my-app/src/App.jsx",
+            "my-app/vite.config.js",
+            "my-app/vitest.setup.js",
+        ):
+            assert src in result, f"missing {src}"
+        # Confirm none of the doubly-nested forms made it through.
+        for bad in (
+            "my-app/myapp/src/components/Header.jsx",
+            "my-app/myapp/src/App.jsx",
+            "my-app/myapp/vite.config.js",
+        ):
+            assert bad not in result, f"unexpected {bad}"
+
+
 # ─── CMD-output-based sub-project detection ─────────────────────────
 
 

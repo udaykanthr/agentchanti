@@ -99,6 +99,66 @@ export function Footer() {
         self.assertIn("export function Header", step.inline_code["src/Header.jsx"])
         self.assertIn("export function Footer", step.inline_code["src/Footer.jsx"])
 
+    def test_multi_target_with_separate_content_blocks(self):
+        """Multi-target step where each target has its OWN ``content:``
+        block (one per file).  Real-world planner output for a step that
+        creates both ``vite.config.js`` and ``vitest.setup.js`` in one
+        go.
+
+        Regression: Strategy 3 fallback used to always assign to
+        ``targets[0]``, so the second ``content:`` block silently
+        overwrote the first.  vite.config.js ended up holding the
+        setup-file content (a single import statement) and the actual
+        Vite config was lost — breaking ``vite build`` / ``vite dev``
+        even though the test runner's auto-create later masked the
+        symptom from the pipeline's success report.
+        """
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:1.2
+Create the Vite + Vitest config and the testing-library setup file.
+target: myapp/vite.config.js, myapp/vitest.setup.js
+exports: default
+imports: none
+content:
+```js
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: './vitest.setup.js',
+  },
+})
+```
+---file-content-end---
+content:
+```js
+import '@testing-library/jest-dom/vitest'
+```
+---file-content-end---
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(len(steps), 1)
+        step = steps[0]
+        # Both targets must be populated independently.
+        self.assertIn("myapp/vite.config.js", step.inline_code)
+        self.assertIn("myapp/vitest.setup.js", step.inline_code)
+        # vite.config.js must hold the actual Vite config, not the
+        # setup-file content.
+        vite_cfg = step.inline_code["myapp/vite.config.js"]
+        self.assertIn("defineConfig", vite_cfg)
+        self.assertIn("plugins: [react()]", vite_cfg)
+        # vitest.setup.js must hold the testing-library import, not
+        # the Vite config.
+        setup = step.inline_code["myapp/vitest.setup.js"]
+        self.assertIn("@testing-library/jest-dom/vitest", setup)
+        self.assertNotIn("defineConfig", setup)
+
     def test_content_marker_with_markdown_fence(self):
         """LLMs often use --- content --- with ```js fences instead of
         ---file-content-start--- / ---file-content-end---."""
