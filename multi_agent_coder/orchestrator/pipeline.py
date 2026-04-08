@@ -106,6 +106,114 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+# ── Router-mount mismatch detection ───────────────────────────────────────
+# Production source files that use react-router primitives (Link,
+# NavLink, useNavigate, …) require a Router (BrowserRouter, HashRouter,
+# RouterProvider, …) mounted somewhere in the tree.  When the source
+# uses primitives but no source file mounts a Router, the app crashes
+# at runtime with:
+#
+#   TypeError: Cannot destructure property 'basename' of
+#              'React.useContext(...)' as it is null.
+#
+# Tests can pass anyway because the BulkTest fix loop's test-only
+# retry frequently wraps the failing render in <MemoryRouter> as a
+# workaround — green tests then mask a broken production binary.
+# This deterministic check is the canary that re-enables wiring
+# verification when the workaround pattern is detected.
+
+_ROUTER_PRIMITIVE_NAMES = (
+    "Link", "NavLink", "Outlet", "Routes", "Route",
+    "useNavigate", "useLocation", "useParams", "useMatch",
+    "useRoutes", "useSearchParams", "useNavigationType",
+)
+_ROUTER_MOUNT_NAMES = (
+    "BrowserRouter", "HashRouter", "MemoryRouter",
+    "Router", "RouterProvider", "StaticRouter",
+)
+_ROUTER_PRIMITIVE_RE = re.compile(
+    r"\b(?:" + "|".join(_ROUTER_PRIMITIVE_NAMES) + r")\b"
+)
+_ROUTER_MOUNT_JSX_RE = re.compile(
+    r"<\s*(?:" + "|".join(_ROUTER_MOUNT_NAMES) + r")\b"
+)
+_REACT_ROUTER_IMPORT_RE = re.compile(
+    r"""(?:from|require\s*\()\s*['"]react-router(?:-dom)?['"]"""
+)
+# Filenames that are typical app entry points; flagged so a downstream
+# fixer can prefer mounting <BrowserRouter> here over editing leaf
+# components.
+_ENTRY_POINT_BASENAMES = frozenset({
+    "main.jsx", "main.tsx", "main.js", "main.ts",
+    "index.jsx", "index.tsx", "index.js", "index.ts",
+    "App.jsx", "App.tsx",
+})
+
+
+def _detect_router_mount_missing(memory: "FileMemory") -> dict | None:
+    """Return a description of the mismatch when production source
+    uses react-router primitives but no source file mounts a Router,
+    otherwise ``None``.
+
+    The detector is **source-side only** — test files are intentionally
+    ignored because the failure mode is "tests use ``<MemoryRouter>``
+    to mask a missing production mount."  Including tests in the scan
+    would let that workaround pretend the app is wired.
+
+    Detection rules (all must hold):
+      1. At least one production (non-test) source file imports
+         from ``react-router`` or ``react-router-dom``.
+      2. That same import surface is actually used (a router primitive
+         like ``Link`` / ``useNavigate`` appears in source).
+      3. No production source file mounts a Router via JSX
+         (``<BrowserRouter>``, ``<RouterProvider>``, etc.).
+
+    Returns a dict with the data the LLM-based wiring verification
+    needs to fix the issue, or ``None``.
+    """
+    import os as _os_rm
+
+    files_using_primitives: list[str] = []
+    entry_candidates: list[str] = []
+    any_source_imports_router = False
+    any_source_mounts_router = False
+
+    for fp, content in memory.all_files().items():
+        if not content:
+            continue
+        if _is_test_file(fp):
+            continue
+
+        # Entry-point candidates are tracked unconditionally — main.jsx
+        # typically does NOT import react-router (that's the bug we're
+        # detecting), so it would be missed if we only looked inside
+        # the react-router import block.
+        base = _os_rm.path.basename(fp.replace("\\", "/"))
+        if base in _ENTRY_POINT_BASENAMES:
+            entry_candidates.append(fp)
+
+        if not _REACT_ROUTER_IMPORT_RE.search(content):
+            continue
+        any_source_imports_router = True
+        if _ROUTER_PRIMITIVE_RE.search(content):
+            files_using_primitives.append(fp)
+        if _ROUTER_MOUNT_JSX_RE.search(content):
+            any_source_mounts_router = True
+
+    if not any_source_imports_router:
+        return None
+    if not files_using_primitives:
+        return None
+    if any_source_mounts_router:
+        return None
+
+    return {
+        "kind": "router_mount_missing",
+        "files_using_primitives": sorted(files_using_primitives),
+        "entry_candidates": sorted(entry_candidates),
+    }
+
+
 def should_run_wiring_verification(
     memory: "FileMemory",
     *,
@@ -124,15 +232,30 @@ def should_run_wiring_verification(
     mode it looks for would have crashed the test runner.  A green bulk
     test run is therefore implicit proof of correct wiring.
 
-    Returns True only when ALL of the following hold:
+    EXCEPTION: when :func:`_detect_router_mount_missing` finds that
+    production source uses react-router primitives without mounting a
+    Router, bulk-test green is **not** a wiring proof — the BulkTest
+    fix loop's test-only retry routinely wraps tests in
+    ``<MemoryRouter>`` as a workaround, masking the missing mount.
+    Force verification to run in that case so the LLM-based fixer can
+    either remove the primitives from source or mount
+    ``<BrowserRouter>`` in the entry point.
+
+    Returns True when ALL of:
       • The pipeline as a whole succeeded.
       • Wiring verification is enabled in config.
-      • Either no test files exist (bulk test was skipped — so wiring is
-        the only integration check we have), OR the bulk test run did not
-        succeed (so we cannot trust it as a wiring proof).
+    AND any of:
+      • No test files exist (bulk test was skipped — so wiring is the
+        only integration check we have).
+      • The bulk test run did not succeed (so we cannot trust it as a
+        wiring proof).
+      • A router-mount mismatch was detected.
     """
     if not (pipeline_success and wiring_enabled):
         return False
+
+    if _detect_router_mount_missing(memory) is not None:
+        return True
 
     bulk_tests_existed = any(
         _is_test_file(f) and not f.startswith("_")
@@ -4994,6 +5117,13 @@ def run_wiring_verification(
         "issue that would cause a blank screen, runtime crash, or silent "
         "failure at startup. Common issues to check:\n"
         "  • Missing ReactDOM.createRoot / wrong entry-point mounting\n"
+        "  • Missing context provider mount — e.g. a component imports "
+        "`Link` / `useNavigate` from react-router-dom but no source file "
+        "wraps the tree in `<BrowserRouter>` / `<RouterProvider>`. Tests "
+        "may pass via `<MemoryRouter>` wrappers while the browser crashes "
+        "with `Cannot destructure 'basename' of useContext(...)`. Either "
+        "mount `<BrowserRouter>` in the entry point, or strip the router "
+        "primitives from the source if the page uses in-page anchor links.\n"
         "  • Default-export / named-export mismatch between files\n"
         "  • Import path typo or missing file extension\n"
         "  • Component receives wrong prop shape (undefined, wrong type)\n"
