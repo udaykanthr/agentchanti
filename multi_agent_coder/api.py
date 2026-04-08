@@ -606,6 +606,7 @@ def _run_task_impl(
 
     # ── Bulk test execution + per-file fix ──
     # All inline TEST steps deferred their runs — execute once here.
+    verif_ok = False
     if pipeline_success:
         from .orchestrator.pipeline import run_bulk_test_execution_and_fix
         verif_ok, verif_err = run_bulk_test_execution_and_fix(
@@ -627,8 +628,21 @@ def _run_task_impl(
     # ── Wiring verification ──
     # One LLM call that checks all fix-scope files together for cross-file
     # integration issues (entry-point mounts, import/export mismatches, etc.).
-    # Resolves files not in memory via disk read → glob → KB semantic search.
-    if pipeline_success and cfg.WIRING_VERIFICATION_ENABLED:
+    # Skipped when the bulk test run just executed real tests and they all
+    # passed — see should_run_wiring_verification() for the full rationale.
+    from .orchestrator.pipeline import should_run_wiring_verification
+    _run_wiring = should_run_wiring_verification(
+        memory,
+        pipeline_success=pipeline_success,
+        bulk_test_verif_ok=verif_ok,
+        wiring_enabled=cfg.WIRING_VERIFICATION_ENABLED,
+    )
+    if not _run_wiring and pipeline_success and cfg.WIRING_VERIFICATION_ENABLED:
+        log.info(
+            "[WiringVerification] Skipped — bulk tests just ran and "
+            "passed; wiring is implicitly verified."
+        )
+    if _run_wiring:
         wv_ok, wv_err = run_wiring_verification(
             memory=memory,
             executor=executor,

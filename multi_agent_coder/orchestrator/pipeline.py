@@ -106,6 +106,42 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+def should_run_wiring_verification(
+    memory: "FileMemory",
+    *,
+    pipeline_success: bool,
+    bulk_test_verif_ok: bool,
+    wiring_enabled: bool,
+) -> bool:
+    """Decide whether the post-pipeline wiring verification should run.
+
+    Wiring verification is an expensive LLM call (60–90s with cloud models)
+    that checks all fix-scope files for cross-file integration issues like
+    missing entry-point mounts, broken imports, default-vs-named export
+    mismatches, and wrong prop shapes.
+
+    It is REDUNDANT after a successful bulk test run because every failure
+    mode it looks for would have crashed the test runner.  A green bulk
+    test run is therefore implicit proof of correct wiring.
+
+    Returns True only when ALL of the following hold:
+      • The pipeline as a whole succeeded.
+      • Wiring verification is enabled in config.
+      • Either no test files exist (bulk test was skipped — so wiring is
+        the only integration check we have), OR the bulk test run did not
+        succeed (so we cannot trust it as a wiring proof).
+    """
+    if not (pipeline_success and wiring_enabled):
+        return False
+
+    bulk_tests_existed = any(
+        _is_test_file(f) and not f.startswith("_")
+        for f in memory.all_files()
+    )
+    bulk_tests_passed = bulk_tests_existed and bulk_test_verif_ok
+    return not bulk_tests_passed
+
+
 def _is_additive_source_fix(file_path: str, new_content: str,
                             memory) -> bool:
     """Return True if the proposed source change is small and additive.
@@ -4450,51 +4486,61 @@ def run_wiring_verification(
 
     display.show_status("Verifying cross-file wiring...")
 
-    # ── 4. LLM call ───────────────────────────────────────────────────────
+    # The status footer keeps the spinner alive during the LLM call.
+    # Clear it on every exit path (try/finally) so the next post-step
+    # phase does not display a stale "Verifying cross-file wiring..."
+    # message after this function returns.
     try:
-        response = coder.llm_client.generate_response(prompt)
-    except Exception as exc:
-        _logger.warning("[WiringVerification] LLM call failed (non-fatal): %s", exc)
-        return True, ""
-
-    if "NO_ISSUES_FOUND" in response:
-        _logger.info("[WiringVerification] No wiring issues found")
-        print("  [WiringVerify] No cross-file wiring issues found.")
-        return True, ""
-
-    # ── 5. Parse and apply fixes ──────────────────────────────────────────
-    fix_files: dict[str, str] = {}
-    try:
-        fix_files = executor.parse_code_blocks(response)
-    except Exception:
-        pass
-    if not fix_files:
+        # ── 4. LLM call ───────────────────────────────────────────────
         try:
-            fix_files = executor.parse_code_blocks_fuzzy(response)
+            response = coder.llm_client.generate_response(prompt)
+        except Exception as exc:
+            _logger.warning(
+                "[WiringVerification] LLM call failed (non-fatal): %s", exc)
+            return True, ""
+
+        if "NO_ISSUES_FOUND" in response:
+            _logger.info("[WiringVerification] No wiring issues found")
+            print("  [WiringVerify] No cross-file wiring issues found.")
+            return True, ""
+
+        # ── 5. Parse and apply fixes ──────────────────────────────────
+        fix_files: dict[str, str] = {}
+        try:
+            fix_files = executor.parse_code_blocks(response)
         except Exception:
             pass
+        if not fix_files:
+            try:
+                fix_files = executor.parse_code_blocks_fuzzy(response)
+            except Exception:
+                pass
 
-    if not fix_files:
-        # LLM described an issue in prose but produced no code — log and
-        # treat as informational (don't block the pipeline).
-        _logger.warning(
-            "[WiringVerification] LLM reported issues but no code blocks found; "
-            "review manually:\n%s", response[:400],
+        if not fix_files:
+            # LLM described an issue in prose but produced no code — log
+            # and treat as informational (don't block the pipeline).
+            _logger.warning(
+                "[WiringVerification] LLM reported issues but no code "
+                "blocks found; review manually:\n%s", response[:400],
+            )
+            return True, ""
+
+        _logger.info(
+            "[WiringVerification] Applying fixes for: %s",
+            list(fix_files.keys()),
         )
+        print(
+            f"  [WiringVerify] Wiring issues found — fixing: "
+            f"{', '.join(fix_files.keys())}"
+        )
+        try:
+            executor.write_files(fix_files)
+            memory.update(fix_files)
+        except Exception as exc:
+            _logger.warning(
+                "[WiringVerification] Failed to write fixes: %s", exc)
+            return False, f"[WiringVerification] Fix write failed: {exc}"
+
         return True, ""
-
-    _logger.info(
-        "[WiringVerification] Applying fixes for: %s", list(fix_files.keys())
-    )
-    print(
-        f"  [WiringVerify] Wiring issues found — fixing: "
-        f"{', '.join(fix_files.keys())}"
-    )
-    try:
-        executor.write_files(fix_files)
-        memory.update(fix_files)
-    except Exception as exc:
-        _logger.warning("[WiringVerification] Failed to write fixes: %s", exc)
-        return False, f"[WiringVerification] Fix write failed: {exc}"
-
-    return True, ""
+    finally:
+        display.show_status("")
