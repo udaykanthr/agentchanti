@@ -1,9 +1,9 @@
 """
-multi_agent_coder — Multi-Agent Local Coder (AgentChanti).
+agentchanti — Multi-Agent Local Coder (AgentChanti).
 
 Public API for library usage::
 
-    from multi_agent_coder import run_task, TaskResult
+    from agentchanti import run_task, TaskResult
 
     result = run_task(task="Add logging to all endpoints", auto=True)
 """

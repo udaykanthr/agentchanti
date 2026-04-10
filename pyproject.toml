@@ -66,10 +66,10 @@ Repository = "https://github.com/udaykanth/agentchanti"
 Issues = "https://github.com/udaykanth/agentchanti/issues"
 
 [project.scripts]
-agentchanti = "multi_agent_coder.orchestrator.cli:main"
+agentchanti = "agentchanti.orchestrator.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["multi_agent_coder*"]
+include = ["agentchanti*"]
 exclude = ["tests*", "responsive-web-app*"]
 
 [tool.ruff]

@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from multi_agent_coder.editing.metrics import log_edit_metric, read_edit_stats
+from agentchanti.editing.metrics import log_edit_metric, read_edit_stats
 
 
 @pytest.fixture

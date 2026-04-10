@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import unittest
 
-from multi_agent_coder.kb.global_kb.error_dict import ContentFix
-from multi_agent_coder.orchestrator.step_handlers import _apply_content_fixes
+from agentchanti.kb.global_kb.error_dict import ContentFix
+from agentchanti.orchestrator.step_handlers import _apply_content_fixes
 
 
 # The Tailwind rule exactly as seeded — used as a realistic test fixture.

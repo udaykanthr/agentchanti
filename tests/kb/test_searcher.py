@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.local.searcher
+Unit tests for agentchanti.kb.local.searcher
 
 Tests SearchResult dataclass, keyword fallback search, and the
 semantic search path — Qdrant and OpenAI are mocked throughout.
@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, patch
 
 def _make_graph():
     """Build a synthetic CodeGraph with authentication-related symbols."""
-    from multi_agent_coder.kb.local.graph import CodeGraph
-    from multi_agent_coder.kb.local.parser import (
+    from agentchanti.kb.local.graph import CodeGraph
+    from agentchanti.kb.local.parser import (
         ParsedFile, ParsedFunction, ParsedClass,
     )
 
@@ -63,7 +63,7 @@ def _make_graph():
 
 
 def _make_manifest(tmp_path):
-    from multi_agent_coder.kb.local.manifest import Manifest
+    from agentchanti.kb.local.manifest import Manifest
 
     m = Manifest(str(tmp_path / "index.db"))
     m.upsert_file("src/auth.py", "aabbcc", "python", time.time(), [])
@@ -76,7 +76,7 @@ def _make_manifest(tmp_path):
 
 class TestSearchResult:
     def test_dataclass_fields(self):
-        from multi_agent_coder.kb.local.searcher import SearchResult
+        from agentchanti.kb.local.searcher import SearchResult
 
         r = SearchResult(
             symbol_name="login",
@@ -93,7 +93,7 @@ class TestSearchResult:
         assert len(r.related_symbols) == 1
 
     def test_related_symbols_default_empty(self):
-        from multi_agent_coder.kb.local.searcher import SearchResult
+        from agentchanti.kb.local.searcher import SearchResult
 
         r = SearchResult(
             symbol_name="x", symbol_type="function", file="a.py",
@@ -108,7 +108,7 @@ class TestSearchResult:
 
 class TestReadSnippet:
     def test_reads_lines(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _read_snippet
+        from agentchanti.kb.local.searcher import _read_snippet
 
         src = tmp_path / "auth.py"
         src.write_text("line1\nline2\nline3\nline4\n")
@@ -119,7 +119,7 @@ class TestReadSnippet:
         assert "line1" not in snippet
 
     def test_missing_file_returns_empty(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _read_snippet
+        from agentchanti.kb.local.searcher import _read_snippet
 
         result = _read_snippet(str(tmp_path), "nonexistent.py", 1, 5)
         assert result == ""
@@ -131,7 +131,7 @@ class TestReadSnippet:
 
 class TestGraphKeywordSearch:
     def test_finds_matching_symbols(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _graph_keyword_search
+        from agentchanti.kb.local.searcher import _graph_keyword_search
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -143,7 +143,7 @@ class TestGraphKeywordSearch:
         assert "login" in names
 
     def test_no_results_for_unrelated_query(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _graph_keyword_search
+        from agentchanti.kb.local.searcher import _graph_keyword_search
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -155,7 +155,7 @@ class TestGraphKeywordSearch:
         assert results == []
 
     def test_returns_at_most_top_k(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _graph_keyword_search
+        from agentchanti.kb.local.searcher import _graph_keyword_search
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -166,7 +166,7 @@ class TestGraphKeywordSearch:
         assert len(results) <= 1
 
     def test_sorted_by_score_descending(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import _graph_keyword_search
+        from agentchanti.kb.local.searcher import _graph_keyword_search
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -184,8 +184,8 @@ class TestGraphKeywordSearch:
 
 class TestSearcher:
     def _make_searcher(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
-        from multi_agent_coder.kb.local.sqlite_vector_store import SQLiteVectorStore
+        from agentchanti.kb.local.searcher import Searcher
+        from agentchanti.kb.local.sqlite_vector_store import SQLiteVectorStore
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -213,12 +213,12 @@ class TestSearcher:
         ), vs
 
     def test_search_returns_results(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
+        from agentchanti.kb.local.searcher import Searcher
 
         searcher, vs = self._make_searcher(tmp_path)
 
         with patch(
-            "multi_agent_coder.kb.local.searcher._embed_query",
+            "agentchanti.kb.local.searcher._embed_query",
             return_value=[0.1] * 1536,
         ):
             results = searcher.search("find authentication functions", top_k=5)
@@ -228,14 +228,14 @@ class TestSearcher:
         assert results[0].score == pytest.approx(0.93)
 
     def test_search_falls_back_when_store_empty(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
+        from agentchanti.kb.local.searcher import Searcher
 
         searcher, vs = self._make_searcher(tmp_path)
 
         vs.collection_info.return_value = {"points_count": 0}
 
         # No embedding mock needed, it will fall back earlier
-        with patch("multi_agent_coder.kb.local.searcher._embed_query") as mock_embed:
+        with patch("agentchanti.kb.local.searcher._embed_query") as mock_embed:
             results = searcher.search("authentication login", top_k=10)
 
         # Fallback returns graph keyword results
@@ -244,8 +244,8 @@ class TestSearcher:
         vs.search.assert_not_called()
 
     def test_search_deduplicates_results(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
-        from multi_agent_coder.kb.local.sqlite_vector_store import SQLiteVectorStore
+        from agentchanti.kb.local.searcher import Searcher
+        from agentchanti.kb.local.sqlite_vector_store import SQLiteVectorStore
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -269,7 +269,7 @@ class TestSearcher:
         searcher = Searcher(g, m, vs, str(tmp_path))
 
         with patch(
-            "multi_agent_coder.kb.local.searcher._embed_query",
+            "agentchanti.kb.local.searcher._embed_query",
             return_value=[0.1] * 1536,
         ):
             results = searcher.search("login", top_k=10)
@@ -278,8 +278,8 @@ class TestSearcher:
         assert len(results) == 1
 
     def test_search_applies_file_filter(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
-        from multi_agent_coder.kb.local.sqlite_vector_store import SQLiteVectorStore
+        from agentchanti.kb.local.searcher import Searcher
+        from agentchanti.kb.local.sqlite_vector_store import SQLiteVectorStore
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -304,7 +304,7 @@ class TestSearcher:
         searcher = Searcher(g, m, vs, str(tmp_path))
 
         with patch(
-            "multi_agent_coder.kb.local.searcher._embed_query",
+            "agentchanti.kb.local.searcher._embed_query",
             return_value=[0.1] * 1536,
         ):
             results = searcher.search(
@@ -315,8 +315,8 @@ class TestSearcher:
         assert all("auth" in r.file for r in results)
 
     def test_search_related_symbols_populated(self, tmp_path):
-        from multi_agent_coder.kb.local.searcher import Searcher
-        from multi_agent_coder.kb.local.sqlite_vector_store import SQLiteVectorStore
+        from agentchanti.kb.local.searcher import Searcher
+        from agentchanti.kb.local.sqlite_vector_store import SQLiteVectorStore
 
         g = _make_graph()
         m = _make_manifest(tmp_path)
@@ -339,7 +339,7 @@ class TestSearcher:
         searcher = Searcher(g, m, vs, str(tmp_path))
 
         with patch(
-            "multi_agent_coder.kb.local.searcher._embed_query",
+            "agentchanti.kb.local.searcher._embed_query",
             return_value=[0.1] * 1536,
         ):
             results = searcher.search("AuthService", top_k=5)

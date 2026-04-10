@@ -4,11 +4,11 @@ These cover the helpers added to defend against reasoning models (glm-5,
 deepseek-r1, qwq, o1, Claude extended thinking) that leak <think> blocks
 or hallucinate fake system banners into directive arguments.
 """
-from multi_agent_coder.agents.intent import (
+from agentchanti.agents.intent import (
     _normalize_dedup_key,
     _sanitize_directive_arg,
 )
-from multi_agent_coder.llm.base import _strip_reasoning
+from agentchanti.llm.base import _strip_reasoning
 
 
 # ── _strip_reasoning ────────────────────────────────────────────────────────

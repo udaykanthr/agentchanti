@@ -14,13 +14,13 @@ from unittest.mock import patch
 
 # Force headless mode so the Live screen never actually takes over the
 # terminal during the test run.
-with patch("multi_agent_coder.cli_display._RICH_AVAILABLE", False):
-    from multi_agent_coder.cli_display import CLIDisplay
+with patch("agentchanti.cli_display._RICH_AVAILABLE", False):
+    from agentchanti.cli_display import CLIDisplay
 
 
 def _make_headless_display() -> CLIDisplay:
     """Build a CLIDisplay that does not own the terminal."""
-    with patch("multi_agent_coder.cli_display._RICH_AVAILABLE", False):
+    with patch("agentchanti.cli_display._RICH_AVAILABLE", False):
         d = CLIDisplay("test task")
     # Belt-and-braces: ensure no Live handle exists.
     d._live = None

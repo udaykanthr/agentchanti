@@ -2,7 +2,7 @@
 Orchestrator package — multi-agent pipeline for code generation.
 
 Backward-compatible re-exports so that existing code like
-``from multi_agent_coder.orchestrator import FileMemory`` continues to work.
+``from agentchanti.orchestrator import FileMemory`` continues to work.
 """
 
 from .memory import FileMemory

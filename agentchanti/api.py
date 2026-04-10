@@ -3,7 +3,7 @@ Programmatic API for AgentChanti — use as a library from Python code.
 
 Example usage::
 
-    from multi_agent_coder import run_task
+    from agentchanti import run_task
 
     result = run_task(
         task="Add input validation to all endpoints",

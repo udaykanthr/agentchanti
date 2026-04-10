@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.health
+Unit tests for agentchanti.kb.health
 
 Tests the health check utility: check(), format_health(), to_json().
 All external dependencies are mocked.
@@ -11,7 +11,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
-from multi_agent_coder.kb.health import (
+from agentchanti.kb.health import (
     KBHealth, check, format_health, to_json,
 )
 
@@ -39,7 +39,7 @@ class TestKBHealth:
 
 class TestCheck:
 
-    @patch("multi_agent_coder.kb.health.check")
+    @patch("agentchanti.kb.health.check")
     def test_check_returns_health(self, mock_check, tmp_path):
         """check() returns a KBHealth instance."""
         mock_check.return_value = KBHealth(

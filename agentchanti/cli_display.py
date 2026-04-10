@@ -114,7 +114,7 @@ def setup_logger(log_dir: str = ".agentchanti/logs") -> logging.Logger:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"agent_{timestamp}.log")
 
-    logger = logging.getLogger("multi_agent_coder")
+    logger = logging.getLogger("agentchanti")
     logger.setLevel(logging.DEBUG)
 
     fh = logging.FileHandler(log_file, encoding="utf-8")

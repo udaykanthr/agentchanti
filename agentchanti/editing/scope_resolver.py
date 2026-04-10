@@ -62,7 +62,7 @@ class ScopeResolver:
         Parameters
         ----------
         graph:
-            A ``CodeGraph`` instance (from ``multi_agent_coder.kb.local.graph``).
+            A ``CodeGraph`` instance (from ``agentchanti.kb.local.graph``).
         """
         self._graph = graph
 

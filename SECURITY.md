@@ -33,7 +33,7 @@ section will list the supported version range.
 
 In-scope:
 
-- The `agentchanti` CLI and `multi_agent_coder` Python package
+- The `agentchanti` CLI and `agentchanti` Python package
 - Default configuration files shipped in this repository
 - The KB ingestion / code-graph subsystem
 

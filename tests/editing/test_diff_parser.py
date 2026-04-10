@@ -2,7 +2,7 @@
 
 import pytest
 
-from multi_agent_coder.editing.diff_parser import (
+from agentchanti.editing.diff_parser import (
     DiffParser, ParsedDiff, FilePatch, DiffHunk,
 )
 

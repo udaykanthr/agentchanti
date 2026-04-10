@@ -24,7 +24,7 @@ HAZARD_BLOCK = "BLOCK"
 HAZARD_WARN = "WARN"
 
 # Get a logger instance consistent with the rest of the package
-log = logging.getLogger("multi_agent_coder")
+log = logging.getLogger("agentchanti")
 
 
 def compute_diff(filepath: str, new_content: str, base_dir: str = ".") -> str | None:

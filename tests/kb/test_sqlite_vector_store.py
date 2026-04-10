@@ -18,7 +18,7 @@ class TestSQLiteVectorStore(unittest.TestCase):
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
-        from multi_agent_coder.kb.local.sqlite_vector_store import SQLiteVectorStore
+        from agentchanti.kb.local.sqlite_vector_store import SQLiteVectorStore
         self.store = SQLiteVectorStore(
             project_root=self._tmpdir,
             db_path=os.path.join(self._tmpdir, "test_vectors.db"),
@@ -109,7 +109,7 @@ class TestCreateVectorStore(unittest.TestCase):
     """Tests for the factory function."""
 
     def test_creates_sqlite_by_default(self):
-        from multi_agent_coder.kb.local.sqlite_vector_store import (
+        from agentchanti.kb.local.sqlite_vector_store import (
             create_vector_store,
             SQLiteVectorStore,
         )
@@ -126,11 +126,11 @@ class TestGetRelevantFiles(unittest.TestCase):
     """Tests for the KB-guided file selection."""
 
     def _make_builder(self):
-        from multi_agent_coder.kb.context_builder import ContextBuilder
+        from agentchanti.kb.context_builder import ContextBuilder
         builder = ContextBuilder(project_root="/tmp/fake_project")
         return builder
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
     def test_returns_files_from_search(self, mock_ensure):
         """get_relevant_files should return file paths from search results."""
         mock_ensure.return_value = True
@@ -183,7 +183,7 @@ class TestScopedContext(unittest.TestCase):
     """Tests for KB-guided file memory scoping."""
 
     def _make_memory(self):
-        from multi_agent_coder.orchestrator.memory import FileMemory
+        from agentchanti.orchestrator.memory import FileMemory
         mem = FileMemory()
         mem.update({
             "src/main.py": "def main(): pass",

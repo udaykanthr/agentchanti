@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import MagicMock
 
-from multi_agent_coder.editing.scope_resolver import (
+from agentchanti.editing.scope_resolver import (
     ScopeResolver, EditScope, SymbolRange,
 )
 

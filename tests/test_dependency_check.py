@@ -2,7 +2,7 @@
 
 import pytest
 
-from multi_agent_coder.orchestrator.dependency_check import (
+from agentchanti.orchestrator.dependency_check import (
     FileDeps,
     IntegrationGap,
     DependencySnapshot,

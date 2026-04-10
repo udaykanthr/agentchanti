@@ -6,8 +6,8 @@ parsed by parse_step_dependencies.
 
 import unittest
 
-from multi_agent_coder.executor import Executor
-from multi_agent_coder.orchestrator.pipeline import build_step_waves
+from agentchanti.executor import Executor
+from agentchanti.orchestrator.pipeline import build_step_waves
 
 
 class TestBuildStepWaves(unittest.TestCase):

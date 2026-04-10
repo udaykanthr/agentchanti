@@ -1,7 +1,7 @@
 """Tests for slim context and file skeleton extraction."""
 
 import pytest
-from multi_agent_coder.orchestrator.memory import (
+from agentchanti.orchestrator.memory import (
     FileMemory, _extract_file_skeleton, _estimate_tokens,
 )
 

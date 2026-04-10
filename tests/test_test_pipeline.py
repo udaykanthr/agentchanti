@@ -7,8 +7,8 @@ Tests for the test pipeline safety improvements:
 import pytest
 from unittest.mock import MagicMock
 
-from multi_agent_coder.executor import Executor
-from multi_agent_coder.orchestrator.step_handlers import (
+from agentchanti.executor import Executor
+from agentchanti.orchestrator.step_handlers import (
     _normalize_fix_paths,
     _filter_test_only_files,
 )
@@ -255,7 +255,7 @@ def test_detect_missing_packages_vite_resolve_skip_relative():
 
 # ── JS project environment detection tests ───────────────────
 
-from multi_agent_coder.orchestrator.step_handlers import _read_js_project_env
+from agentchanti.orchestrator.step_handlers import _read_js_project_env
 import json
 
 
@@ -326,8 +326,8 @@ def test_js_env_detection_no_package_json(tmp_path, monkeypatch):
 
 # ── ESM-aware JS test rules tests ────────────────────────────
 
-from multi_agent_coder.agents.tester import TesterAgent as AppTesterAgent
-from multi_agent_coder.language import get_test_framework
+from agentchanti.agents.tester import TesterAgent as AppTesterAgent
+from agentchanti.language import get_test_framework
 
 
 def test_js_test_rules_esm_includes_jest_globals_import():
@@ -358,8 +358,8 @@ def test_js_test_rules_no_env_defaults_to_cjs():
 
 # ── Protected file stripping tests ───────────────────────────
 
-from multi_agent_coder.orchestrator.step_handlers import _strip_protected_files
-from multi_agent_coder.orchestrator.memory import FileMemory
+from agentchanti.orchestrator.step_handlers import _strip_protected_files
+from agentchanti.orchestrator.memory import FileMemory
 
 
 def test_strip_protected_files_blocks_existing_package_json_no_additions(tmp_path, monkeypatch):
@@ -415,7 +415,7 @@ def test_strip_protected_files_empty_input():
 
 # ── Smart merge: package.json tests ──────────────────────────
 
-from multi_agent_coder.orchestrator.step_handlers import (
+from agentchanti.orchestrator.step_handlers import (
     _smart_merge_json_manifest,
     _smart_merge_requirements_txt,
 )

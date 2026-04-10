@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.context_builder
+Unit tests for agentchanti.kb.context_builder
 
 Tests the ContextBuilder class: intent detection, build_context(),
 format_context_for_prompt(), and token budget management.
@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 # Import under test
 # ---------------------------------------------------------------------------
 
-from multi_agent_coder.kb.context_builder import (
+from agentchanti.kb.context_builder import (
     ContextBuilder, KBContext,
     _ERROR_KEYWORDS, _REVIEW_KEYWORDS,
 )
@@ -110,8 +110,8 @@ class TestBuildContext:
         assert ctx.kb_available is False
         assert ctx.local_symbols == []
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_build_context_with_mocked_local(self, mock_global, mock_local, builder):
         """Test build_context when local KB is available."""
         # Mock local to return True and set up searcher
@@ -139,8 +139,8 @@ class TestBuildContext:
         assert len(ctx.local_symbols) == 1
         assert ctx.local_symbols[0].symbol_name == "login"
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_error_intent_triggers_error_lookup(self, mock_global, mock_local, builder):
         """Error-related tasks should trigger error_dict lookup."""
         mock_local.return_value = False
@@ -162,8 +162,8 @@ class TestBuildContext:
         assert len(ctx.error_fixes) == 1
         assert ctx.error_fixes[0].error_type == "AttributeError"
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_error_output_used_for_lookup(self, mock_global, mock_local, builder):
         """When error_output is provided, it should be used for error matching."""
         mock_local.return_value = False
@@ -191,8 +191,8 @@ class TestBuildContext:
         assert "NullPointerException" in call_args[0][0]
         assert len(ctx.error_fixes) == 1
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_review_intent_triggers_pattern_search(self, mock_global, mock_local, builder):
         """Review-related tasks should trigger global pattern search."""
         mock_local.return_value = False
@@ -215,8 +215,8 @@ class TestBuildContext:
         assert len(ctx.global_patterns) >= 1
         assert ctx.global_patterns[0].title == "SOLID Principles"
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_behavioral_always_included(self, mock_global, mock_local, builder):
         """Behavioral instructions should always be fetched via batch_search."""
         mock_local.return_value = False
@@ -235,8 +235,8 @@ class TestBuildContext:
         builder._global_store.batch_search.assert_called_once()
         assert len(ctx.behavioral_instructions) == 1
 
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_local")
-    @patch("multi_agent_coder.kb.context_builder.ContextBuilder._ensure_global")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_local")
+    @patch("agentchanti.kb.context_builder.ContextBuilder._ensure_global")
     def test_exception_does_not_crash(self, mock_global, mock_local, builder):
         """KB exceptions should be caught, not crash the build."""
         mock_local.side_effect = Exception("boom")

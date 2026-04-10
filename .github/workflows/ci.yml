@@ -60,4 +60,4 @@ jobs:
       # Ratchet up to a wider ruleset (and add `ruff format --check`)
       # in a follow-up once the codebase has been cleaned.
       - name: Ruff check (errors only)
-        run: ruff check --select=E9,F63,F7,F82 multi_agent_coder/ tests/
+        run: ruff check --select=E9,F63,F7,F82 agentchanti/ tests/

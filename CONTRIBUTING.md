@@ -47,7 +47,7 @@ To match the CI lint check:
 
 ```bash
 pip install ruff
-ruff check --select=E9,F63,F7,F82 multi_agent_coder/ tests/
+ruff check --select=E9,F63,F7,F82 agentchanti/ tests/
 ```
 
 ## Commit Message Style

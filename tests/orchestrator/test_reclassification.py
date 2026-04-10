@@ -3,9 +3,9 @@ from unittest.mock import MagicMock, patch
 import re
 
 # We need to mock some imports before importing pipeline to avoid side effects
-with patch('multi_agent_coder.orchestrator.pipeline.log'), \
-     patch('multi_agent_coder.orchestrator.pipeline._logger'):
-    from multi_agent_coder.orchestrator.pipeline import _execute_step
+with patch('agentchanti.orchestrator.pipeline.log'), \
+     patch('agentchanti.orchestrator.pipeline._logger'):
+    from agentchanti.orchestrator.pipeline import _execute_step
 
 class TestReclassification(unittest.TestCase):
     def setUp(self):
@@ -25,10 +25,10 @@ class TestReclassification(unittest.TestCase):
         # Mock memory.all_files to return empty dict
         self.memory.all_files.return_value = {}
 
-    @patch('multi_agent_coder.orchestrator.pipeline._handle_cmd_step')
-    @patch('multi_agent_coder.orchestrator.pipeline._handle_code_step')
+    @patch('agentchanti.orchestrator.pipeline._handle_cmd_step')
+    @patch('agentchanti.orchestrator.pipeline._handle_code_step')
     def test_reclassify_code_to_cmd(self, mock_handle_code, mock_handle_cmd):
-        from multi_agent_coder.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.plan_step import PlanStep
         
         # 1. Setup: A CODE step that looks like a CMD step (has markers, no target:, no inline)
         plan_step = PlanStep(id="1.1", step_type="CODE", description="Step 1: Install deps\n> npm install")

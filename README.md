@@ -43,7 +43,7 @@ AgentChanti ships as both a CLI and a **Python library**, so it can be embedded 
 
 ```python
 # Inside a Flask endpoint — trigger the full agent pipeline on a PR event
-from multi_agent_coder import run_task
+from agentchanti import run_task
 
 @app.route("/pr-review", methods=["POST"])
 def on_pull_request():

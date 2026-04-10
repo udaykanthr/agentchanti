@@ -4,12 +4,12 @@ import math
 import unittest
 from unittest.mock import MagicMock, patch, call
 
-from multi_agent_coder.embedding_store import (
+from agentchanti.embedding_store import (
     EmbeddingStore,
     _cosine_similarity,
     _chunk_text,
 )
-from multi_agent_coder.llm.base import LLMClient
+from agentchanti.llm.base import LLMClient
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ class TestFileMemorySemantic(unittest.TestCase):
             _vec(0.9, 0.1),  # query embed
         ]
 
-        from multi_agent_coder.orchestrator import FileMemory
+        from agentchanti.orchestrator import FileMemory
         mem = FileMemory(embedding_store=store, top_k=2)
         mem.update({"src/utils.py": "def helper(): pass", "src/main.py": "import utils"})
 
@@ -167,7 +167,7 @@ class TestFileMemorySemantic(unittest.TestCase):
         self.assertIn("utils.py", context)
 
     def test_fallback_without_store(self):
-        from multi_agent_coder.orchestrator import FileMemory
+        from agentchanti.orchestrator import FileMemory
         mem = FileMemory()  # no store
         mem.update({"src/utils.py": "def helper(): pass", "src/main.py": "# app"})
 

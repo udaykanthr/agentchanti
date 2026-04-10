@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AgentChanti is a multi-agent AI coding CLI tool (`agentchanti` command) and Python library (`multi_agent_coder` package). It takes a plain English task description and autonomously plans, codes, reviews, and tests the solution using a pipeline of specialized LLM-powered agents. Supports local LLMs (Ollama, LM Studio) and cloud providers (OpenAI, Gemini, Anthropic).
+AgentChanti is a multi-agent AI coding CLI tool (`agentchanti` command) and Python library (`agentchanti` package). It takes a plain English task description and autonomously plans, codes, reviews, and tests the solution using a pipeline of specialized LLM-powered agents. Supports local LLMs (Ollama, LM Studio) and cloud providers (OpenAI, Gemini, Anthropic).
 
 ## Common Commands
 
@@ -22,14 +22,14 @@ python -m pytest tests/test_flow.py -v
 agentchanti "your task" --provider ollama --model deepseek-coder-v2:16b
 
 # Run via library API
-python -c "from multi_agent_coder import run_task; run_task(task='...', auto=True)"
+python -c "from agentchanti import run_task; run_task(task='...', auto=True)"
 ```
 
 ## Architecture
 
 ### Agent Pipeline
 
-The system runs a sequential pipeline: **Planner -> Coder -> Reviewer -> Tester**. Each agent (`multi_agent_coder/agents/`) extends `Agent` base class and calls `self.llm_client.generate_response(prompt)`. The pipeline is orchestrated in two places:
+The system runs a sequential pipeline: **Planner -> Coder -> Reviewer -> Tester**. Each agent (`agentchanti/agents/`) extends `Agent` base class and calls `self.llm_client.generate_response(prompt)`. The pipeline is orchestrated in two places:
 - **CLI path**: `orchestrator/cli.py:main()` — parses args, builds agents, runs the pipeline
 - **Library path**: `api.py:run_task()` — programmatic entry point returning `TaskResult`
 
@@ -46,11 +46,11 @@ Both paths share the same execution engine in `orchestrator/pipeline.py`.
    - **TEST**: TesterAgent generates tests -> runs them -> Coder fixes failures
 5. `orchestrator/diagnosis.py` handles failure analysis and auto-fix
 
-### Language Detection (multi_agent_coder/language.py)
+### Language Detection (agentchanti/language.py)
 
 Auto-detects project language by scanning file extensions (`detect_language()`) or parsing task keywords (`detect_language_from_task()`). Maps languages to test frameworks via `TEST_FRAMEWORKS` dict. **Known issue**: defaults to Python/pytest when language is `None`, which causes incorrect test generation for non-Python projects (e.g., TypeScript projects get Python tests). The TesterAgent at lines 10-12 and 41-44 hard-defaults to Python when `language` is None.
 
-### LLM Client Layer (multi_agent_coder/llm/)
+### LLM Client Layer (agentchanti/llm/)
 
 `LLMClient` base class with provider implementations: `OllamaClient`, `LMStudioClient`, `OpenAIClient`, `GeminiClient`, `AnthropicClient`. All expose `generate_response(prompt) -> str` with retry and streaming support.
 
@@ -80,6 +80,6 @@ Settings file: `.agentchanti.yaml` (project root or home directory). Key section
 
 ## Entry Points
 
-- CLI: `agentchanti` -> `multi_agent_coder.orchestrator.cli:main` (defined in `setup.py`)
-- Library: `from multi_agent_coder import run_task, TaskResult`
-- KB subcommand: `agentchanti kb ...` -> `multi_agent_coder.kb.cli:kb_main`
+- CLI: `agentchanti` -> `agentchanti.orchestrator.cli:main` (defined in `setup.py`)
+- Library: `from agentchanti import run_task, TaskResult`
+- KB subcommand: `agentchanti kb ...` -> `agentchanti.kb.cli:kb_main`

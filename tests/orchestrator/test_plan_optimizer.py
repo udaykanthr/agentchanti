@@ -11,13 +11,13 @@ class TestOptimizePlan(unittest.TestCase):
     """Tests for the main optimize_plan function."""
 
     def test_empty_plan(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps, deps = optimize_plan([])
         self.assertEqual(steps, [])
         self.assertEqual(deps, {})
 
     def test_removes_noop_steps(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Analyze the project structure",
             "Create `src/app.js` with Express server setup",
@@ -28,7 +28,7 @@ class TestOptimizePlan(unittest.TestCase):
         self.assertIn("src/app.js", result[0])
 
     def test_merges_install_steps(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Install express with `npm install express`",
             "Install cors with `npm install cors`",
@@ -42,7 +42,7 @@ class TestOptimizePlan(unittest.TestCase):
         self.assertIn("cors", install_steps[0])
 
     def test_preserves_dependencies(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Install express with `npm install express`",
             "Create `src/server.js` with Express setup",
@@ -57,7 +57,7 @@ class TestReorderTestInfra(unittest.TestCase):
 
     def test_moves_late_infra_before_test_writing(self):
         """Setup file and config steps after test-writing should be moved before it."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Create React components in `src/components/`",
             "Create unit and integration tests in `__tests__/` using vitest",
@@ -97,7 +97,7 @@ class TestReorderTestInfra(unittest.TestCase):
 
     def test_no_reorder_when_infra_already_first(self):
         """No reordering needed when infra is already before test writing."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Create `vitest.config.js` with jsdom environment and globals",
             "Add test setup file `vitest.setup.js`",
@@ -112,7 +112,7 @@ class TestReorderTestInfra(unittest.TestCase):
 
     def test_no_reorder_when_no_test_steps(self):
         """No reordering when there are no test steps."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_plan
         steps = [
             "Create `src/App.jsx` with routing",
             "Create `src/components/Header.jsx`",
@@ -125,7 +125,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
     """Tests for the structured PlanStep optimizer."""
 
     def _make_step(self, **kwargs):
-        from multi_agent_coder.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.plan_step import PlanStep
         defaults = {
             "id": "1.1", "step_type": "CODE", "description": "",
             "depends_on": [], "index": 0,
@@ -134,13 +134,13 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
         return PlanStep(**defaults)
 
     def test_empty_plan(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         result = optimize_structured_plan([])
         self.assertEqual(result, [])
 
     def test_preserves_step_type(self):
         """Step types must survive optimization (unlike legacy path)."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CMD", description="Install deps",
                             command="npm install express"),
@@ -154,7 +154,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_preserves_exports_imports(self):
         """Exports and imports_from must survive optimization."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CODE",
                             description="Create utils",
@@ -172,7 +172,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_merges_install_cmd_steps(self):
         """Multiple npm install CMD steps should merge into one."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CMD",
                             description="Install express",
@@ -194,7 +194,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_merge_rewires_dependencies(self):
         """After merging installs, dependents point to the merged step."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CMD",
                             description="Install A",
@@ -213,7 +213,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_merges_same_file_code_steps(self):
         """CODE steps targeting the same file should merge."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="2.1", step_type="CODE",
                             description="Add Header component",
@@ -237,7 +237,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
         Unlike legacy optimizer, structured plans have explicit types.
         IGNORE steps are already typed by the LLM.
         """
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CODE",
                             description="Analyze the project and create config",
@@ -249,7 +249,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_reindex_fixes_indices(self):
         """After optimization, indices should be 0..N-1."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
         steps = [
             self._make_step(id="1.1", step_type="CMD",
                             description="Install", command="npm install express",
@@ -268,7 +268,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_skip_redundant_installs_with_kb(self):
         """Packages already in KB should be removed from install commands."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
 
         class MockKB:
             def is_package_installed(self, name):
@@ -289,7 +289,7 @@ class TestOptimizeStructuredPlan(unittest.TestCase):
 
     def test_skip_all_installed_removes_step(self):
         """If all packages in a CMD step are installed, remove the step entirely."""
-        from multi_agent_coder.orchestrator.plan_optimizer import optimize_structured_plan
+        from agentchanti.orchestrator.plan_optimizer import optimize_structured_plan
 
         class MockKB:
             def is_package_installed(self, name):
@@ -316,15 +316,15 @@ class TestHasFrameworkConflict(unittest.TestCase):
     """Tests for framework conflict detection."""
 
     def test_no_conflict_same_framework(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import has_framework_conflict
+        from agentchanti.orchestrator.plan_optimizer import has_framework_conflict
         self.assertFalse(has_framework_conflict({"react"}, {"react"}))
 
     def test_conflict_different_frameworks(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import has_framework_conflict
+        from agentchanti.orchestrator.plan_optimizer import has_framework_conflict
         self.assertTrue(has_framework_conflict({"react"}, {"angular"}))
 
     def test_no_conflict_unrelated(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import has_framework_conflict
+        from agentchanti.orchestrator.plan_optimizer import has_framework_conflict
         self.assertFalse(has_framework_conflict({"react"}, {"django"}))
 
 
@@ -332,25 +332,25 @@ class TestNormalizeTechKeywords(unittest.TestCase):
     """Tests for normalize_tech_keywords alias resolution."""
 
     def test_tailwindcss_normalizes(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import normalize_tech_keywords
+        from agentchanti.orchestrator.plan_optimizer import normalize_tech_keywords
         self.assertEqual(normalize_tech_keywords({"tailwindcss"}), {"tailwind"})
 
     def test_reactjs_normalizes(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import normalize_tech_keywords
+        from agentchanti.orchestrator.plan_optimizer import normalize_tech_keywords
         self.assertEqual(normalize_tech_keywords({"reactjs"}), {"react"})
 
     def test_mixed_normalization(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import normalize_tech_keywords
+        from agentchanti.orchestrator.plan_optimizer import normalize_tech_keywords
         result = normalize_tech_keywords({"tailwindcss", "react", "vitejs"})
         self.assertEqual(result, {"tailwind", "react", "vite"})
 
     def test_no_alias_passthrough(self):
-        from multi_agent_coder.orchestrator.plan_optimizer import normalize_tech_keywords
+        from agentchanti.orchestrator.plan_optimizer import normalize_tech_keywords
         self.assertEqual(normalize_tech_keywords({"django", "flask"}), {"django", "flask"})
 
     def test_tailwindcss_matches_tailwind_doc(self):
         """Task with 'tailwindcss' should overlap with doc tagged 'tailwind'."""
-        from multi_agent_coder.orchestrator.plan_optimizer import (
+        from agentchanti.orchestrator.plan_optimizer import (
             _TECH_KEYWORDS, normalize_tech_keywords,
         )
         task_techs = normalize_tech_keywords(set(
