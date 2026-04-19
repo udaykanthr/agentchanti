@@ -16,11 +16,20 @@
 </p>
 
 <p align="center">
+  <a href="https://pypi.org/project/agentchanti/"><img src="https://img.shields.io/pypi/v/agentchanti" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/agentchanti/"><img src="https://img.shields.io/pypi/dm/agentchanti" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/LLM-Local%20%2B%20Cloud-orange" alt="Local + Cloud">
   <img src="https://img.shields.io/badge/providers-Ollama%20%7C%20LM%20Studio%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20Claude-blueviolet" alt="Multiple Providers">
 </p>
+
+```bash
+pipx install agentchanti   # or: pip install agentchanti
+agentchanti --help
+```
+
+Full installation options (venv, editable, convenience scripts) are [further down](#installation).
 
 ## What is AgentChanti?
 
