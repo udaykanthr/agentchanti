@@ -5,7 +5,7 @@ broken relative imports and detects package imports for auto-install.
 import pytest
 from unittest.mock import MagicMock
 
-from multi_agent_coder.orchestrator.step_handlers import (
+from agentchanti.orchestrator.step_handlers import (
     _validate_import_paths,
     _extract_npm_package_name,
 )

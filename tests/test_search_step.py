@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 class TestClassifySearchStep:
     """Verify _classify_step recognizes SEARCH."""
 
-    @patch("multi_agent_coder.orchestrator.classification.token_tracker")
+    @patch("agentchanti.orchestrator.classification.token_tracker")
     def test_classify_returns_search(self, mock_tracker):
         """When the LLM responds with SEARCH, _classify_step should return it."""
         mock_tracker.snapshot.return_value = (0, 0)
@@ -25,14 +25,14 @@ class TestClassifySearchStep:
 
         mock_display = MagicMock()
 
-        from multi_agent_coder.orchestrator.classification import _classify_step
+        from agentchanti.orchestrator.classification import _classify_step
         result = _classify_step(
             "Search for the latest Next.js 15 migration guide",
             mock_llm, mock_display, 0,
         )
         assert result == "SEARCH"
 
-    @patch("multi_agent_coder.orchestrator.classification.token_tracker")
+    @patch("agentchanti.orchestrator.classification.token_tracker")
     def test_classify_prompt_mentions_search(self, mock_tracker):
         """The classification prompt should mention SEARCH as a valid option."""
         mock_tracker.snapshot.return_value = (0, 0)
@@ -42,7 +42,7 @@ class TestClassifySearchStep:
 
         mock_display = MagicMock()
 
-        from multi_agent_coder.orchestrator.classification import _classify_step
+        from agentchanti.orchestrator.classification import _classify_step
         _classify_step("dummy", mock_llm, mock_display, 0)
 
         # Inspect the prompt sent to the LLM
@@ -59,7 +59,7 @@ class TestHandleSearchStep:
 
     def test_calls_search_agent(self):
         """Should call search_for_task and store results in memory."""
-        from multi_agent_coder.orchestrator.step_handlers import _handle_search_step
+        from agentchanti.orchestrator.step_handlers import _handle_search_step
 
         mock_search = MagicMock()
         mock_search.search_for_task.return_value = (
@@ -91,7 +91,7 @@ class TestHandleSearchStep:
 
     def test_no_search_agent_skips(self):
         """When search_agent is None, should skip gracefully."""
-        from multi_agent_coder.orchestrator.step_handlers import _handle_search_step
+        from agentchanti.orchestrator.step_handlers import _handle_search_step
 
         mock_memory = MagicMock()
         mock_display = MagicMock()
@@ -107,7 +107,7 @@ class TestHandleSearchStep:
 
     def test_search_exception_handled(self):
         """If search_for_task raises, should return success (best-effort)."""
-        from multi_agent_coder.orchestrator.step_handlers import _handle_search_step
+        from agentchanti.orchestrator.step_handlers import _handle_search_step
 
         mock_search = MagicMock()
         mock_search.search_for_task.side_effect = Exception("Network down")
@@ -126,7 +126,7 @@ class TestHandleSearchStep:
 
     def test_empty_results(self):
         """When search returns empty string, should still succeed."""
-        from multi_agent_coder.orchestrator.step_handlers import _handle_search_step
+        from agentchanti.orchestrator.step_handlers import _handle_search_step
 
         mock_search = MagicMock()
         mock_search.search_for_task.return_value = ""

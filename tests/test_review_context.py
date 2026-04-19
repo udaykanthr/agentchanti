@@ -1,7 +1,7 @@
 """Tests for review context building."""
 
 import pytest
-from multi_agent_coder.orchestrator.memory import FileMemory
+from agentchanti.orchestrator.memory import FileMemory
 
 
 # Import the function under test - it's in step_handlers but we can

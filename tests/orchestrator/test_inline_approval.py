@@ -12,11 +12,11 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 # Mock noisy module-level loggers before importing pipeline.
-with patch('multi_agent_coder.orchestrator.pipeline.log'), \
-     patch('multi_agent_coder.orchestrator.pipeline._logger'):
-    from multi_agent_coder.orchestrator.pipeline import _execute_step
+with patch('agentchanti.orchestrator.pipeline.log'), \
+     patch('agentchanti.orchestrator.pipeline._logger'):
+    from agentchanti.orchestrator.pipeline import _execute_step
 
-from multi_agent_coder.orchestrator.plan_step import PlanStep
+from agentchanti.orchestrator.plan_step import PlanStep
 
 
 class TestInlineApprovalGate(unittest.TestCase):
@@ -59,8 +59,8 @@ class TestInlineApprovalGate(unittest.TestCase):
         step.index = 0
         return step
 
-    @patch('multi_agent_coder.orchestrator.pipeline._handle_code_step')
-    @patch('multi_agent_coder.diff_display.prompt_diff_approval')
+    @patch('agentchanti.orchestrator.pipeline._handle_code_step')
+    @patch('agentchanti.diff_display.prompt_diff_approval')
     def test_inline_rejection_falls_back_to_coder(
             self, mock_approval, mock_handle_code):
         """Reject in the diff editor → no write, Coder runs instead."""
@@ -104,8 +104,8 @@ class TestInlineApprovalGate(unittest.TestCase):
         # Coder was invoked as the fall-back.
         mock_handle_code.assert_called_once()
 
-    @patch('multi_agent_coder.orchestrator.pipeline._handle_code_step')
-    @patch('multi_agent_coder.diff_display.prompt_diff_approval')
+    @patch('agentchanti.orchestrator.pipeline._handle_code_step')
+    @patch('agentchanti.diff_display.prompt_diff_approval')
     def test_inline_approval_writes_files(
             self, mock_approval, mock_handle_code):
         """Approve in the diff editor → file is written, Coder is skipped."""
@@ -142,8 +142,8 @@ class TestInlineApprovalGate(unittest.TestCase):
         # Coder fall-back was NOT invoked — the inline fast path handled it.
         mock_handle_code.assert_not_called()
 
-    @patch('multi_agent_coder.orchestrator.pipeline._handle_code_step')
-    @patch('multi_agent_coder.diff_display.prompt_diff_approval')
+    @patch('agentchanti.orchestrator.pipeline._handle_code_step')
+    @patch('agentchanti.diff_display.prompt_diff_approval')
     def test_auto_mode_skips_approval_prompt(
             self, mock_approval, mock_handle_code):
         """--auto skips the gate entirely (no interactive prompt)."""

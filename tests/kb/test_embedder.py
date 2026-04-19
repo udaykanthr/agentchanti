@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.local.embedder
+Unit tests for agentchanti.kb.local.embedder
 
 Tests chunking logic, UUID generation, text formatting, and
 incremental skip logic — without calling the OpenAI API.
@@ -20,8 +20,8 @@ import pytest
 
 def _make_graph_with_symbols():
     """Build a small synthetic CodeGraph with one function and one class."""
-    from multi_agent_coder.kb.local.graph import CodeGraph
-    from multi_agent_coder.kb.local.parser import (
+    from agentchanti.kb.local.graph import CodeGraph
+    from agentchanti.kb.local.parser import (
         ParsedFile, ParsedFunction, ParsedClass,
     )
 
@@ -69,14 +69,14 @@ def _make_graph_with_symbols():
 
 class TestMakePointId:
     def test_deterministic(self):
-        from multi_agent_coder.kb.local.embedder import make_point_id
+        from agentchanti.kb.local.embedder import make_point_id
 
         id1 = make_point_id("src/auth.py", "login", 10)
         id2 = make_point_id("src/auth.py", "login", 10)
         assert id1 == id2
 
     def test_different_inputs_produce_different_ids(self):
-        from multi_agent_coder.kb.local.embedder import make_point_id
+        from agentchanti.kb.local.embedder import make_point_id
 
         id1 = make_point_id("src/auth.py", "login", 10)
         id2 = make_point_id("src/auth.py", "login", 11)
@@ -85,7 +85,7 @@ class TestMakePointId:
         assert id1 != id3
 
     def test_valid_uuid_format(self):
-        from multi_agent_coder.kb.local.embedder import make_point_id
+        from agentchanti.kb.local.embedder import make_point_id
 
         result = make_point_id("src/auth.py", "login", 10)
         # Should be parseable as UUID
@@ -99,7 +99,7 @@ class TestMakePointId:
 
 class TestTextFormatters:
     def test_function_text_includes_fields(self):
-        from multi_agent_coder.kb.local.embedder import _function_text
+        from agentchanti.kb.local.embedder import _function_text
 
         text = _function_text(
             language="python",
@@ -118,14 +118,14 @@ class TestTextFormatters:
         assert "return True" in text
 
     def test_function_text_empty_params(self):
-        from multi_agent_coder.kb.local.embedder import _function_text
+        from agentchanti.kb.local.embedder import _function_text
 
         text = _function_text("go", "main.go", "main", [], "", "", [])
         assert "Parameters: none" in text
         assert "Returns: none" in text
 
     def test_class_text_includes_fields(self):
-        from multi_agent_coder.kb.local.embedder import _class_text
+        from agentchanti.kb.local.embedder import _class_text
 
         text = _class_text(
             language="python",
@@ -142,7 +142,7 @@ class TestTextFormatters:
         assert "login, logout" in text
 
     def test_class_text_no_bases(self):
-        from multi_agent_coder.kb.local.embedder import _class_text
+        from agentchanti.kb.local.embedder import _class_text
 
         text = _class_text("python", "a.py", "Foo", [], "", [])
         assert "Inherits: none" in text
@@ -155,7 +155,7 @@ class TestTextFormatters:
 
 class TestExtractSymbolChunks:
     def test_returns_chunks_for_function_and_class(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -167,7 +167,7 @@ class TestExtractSymbolChunks:
         assert "AuthService" in names
 
     def test_function_chunk_type(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -178,7 +178,7 @@ class TestExtractSymbolChunks:
         assert login_chunks[0].file_path == "src/auth.py"
 
     def test_method_chunk_type(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -189,7 +189,7 @@ class TestExtractSymbolChunks:
         assert method_chunks[0].parent_class == "AuthService"
 
     def test_class_chunk_type(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -199,7 +199,7 @@ class TestExtractSymbolChunks:
         assert class_chunks[0].symbol_type == "class"
 
     def test_class_text_contains_method_names(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -210,7 +210,7 @@ class TestExtractSymbolChunks:
         assert "get_token" in class_chunks[0].text
 
     def test_point_ids_are_unique(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
 
         g = _make_graph_with_symbols()
         chunks = extract_symbol_chunks(g, str(tmp_path))
@@ -219,9 +219,9 @@ class TestExtractSymbolChunks:
         assert len(ids) == len(set(ids)), "Point IDs must be unique"
 
     def test_no_variable_chunks(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import extract_symbol_chunks
-        from multi_agent_coder.kb.local.graph import CodeGraph
-        from multi_agent_coder.kb.local.parser import ParsedFile, ParsedVariable
+        from agentchanti.kb.local.embedder import extract_symbol_chunks
+        from agentchanti.kb.local.graph import CodeGraph
+        from agentchanti.kb.local.parser import ParsedFile, ParsedVariable
 
         g = CodeGraph()
         pf = ParsedFile(
@@ -242,7 +242,7 @@ class TestExtractSymbolChunks:
 
 class TestReadLines:
     def test_reads_specified_range(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import _read_lines
+        from agentchanti.kb.local.embedder import _read_lines
 
         src = tmp_path / "test.py"
         src.write_text("line1\nline2\nline3\nline4\nline5\n")
@@ -251,7 +251,7 @@ class TestReadLines:
         assert lines == ["line2", "line3", "line4"]
 
     def test_missing_file_returns_empty(self, tmp_path):
-        from multi_agent_coder.kb.local.embedder import _read_lines
+        from agentchanti.kb.local.embedder import _read_lines
 
         lines = _read_lines(str(tmp_path / "nonexistent.py"), 1, 5)
         assert lines == []
@@ -263,14 +263,14 @@ class TestReadLines:
 
 class TestManifestEmbeddedHash:
     def test_get_embedded_hash_initially_none(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
 
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/auth.py", "hash1", "python", time.time(), [])
         assert m.get_embedded_hash("src/auth.py") is None
 
     def test_set_and_get_embedded_hash(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
 
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/auth.py", "hash1", "python", time.time(), [])
@@ -278,7 +278,7 @@ class TestManifestEmbeddedHash:
         assert m.get_embedded_hash("src/auth.py") == "hash1"
 
     def test_get_files_needing_embed_new_file(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
 
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/auth.py", "hash1", "python", time.time(), [])
@@ -287,7 +287,7 @@ class TestManifestEmbeddedHash:
         assert ("src/auth.py", "hash1") in needing
 
     def test_get_files_needing_embed_up_to_date(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
 
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/auth.py", "hash1", "python", time.time(), [])
@@ -297,7 +297,7 @@ class TestManifestEmbeddedHash:
         assert all(p != "src/auth.py" for p, _ in needing)
 
     def test_get_files_needing_embed_changed_hash(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
 
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/auth.py", "hash1", "python", time.time(), [])
@@ -347,7 +347,7 @@ class TestManifestMigration:
         conn.close()
 
         # Now open via Manifest (should apply migration)
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(db_path)
 
         # Should be able to access the new column without error

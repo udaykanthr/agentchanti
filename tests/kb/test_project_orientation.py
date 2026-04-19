@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.project_orientation
+Unit tests for agentchanti.kb.project_orientation
 
 Tests ProjectProfile formatting and ProjectOrientation detection logic
 across different project types (React/JS, Python, Java, Go, Rust).
@@ -12,7 +12,7 @@ import os
 import tempfile
 import pytest
 
-from multi_agent_coder.kb.project_orientation import (
+from agentchanti.kb.project_orientation import (
     ProjectOrientation,
     ProjectProfile,
 )
@@ -360,8 +360,8 @@ class TestOrientationWithGraph:
 
     def test_uses_graph_file_nodes(self, tmp_path):
         """Source layout detection uses graph FILE nodes."""
-        from multi_agent_coder.kb.local.graph import CodeGraph, NodeType
-        from multi_agent_coder.kb.local.parser import ParsedFile
+        from agentchanti.kb.local.graph import CodeGraph, NodeType
+        from agentchanti.kb.local.parser import ParsedFile
 
         g = CodeGraph()
         # Simulate files under my-app/src/
@@ -392,8 +392,8 @@ class TestOrientationWithGraph:
 
     def test_get_all_file_nodes_works(self):
         """Verify the new get_all_file_nodes method on CodeGraph."""
-        from multi_agent_coder.kb.local.graph import CodeGraph, NodeType
-        from multi_agent_coder.kb.local.parser import ParsedFile, ParsedFunction
+        from agentchanti.kb.local.graph import CodeGraph, NodeType
+        from agentchanti.kb.local.parser import ParsedFile, ParsedFunction
 
         g = CodeGraph()
         g.add_parsed_file(ParsedFile(
@@ -449,7 +449,7 @@ class TestPipelineSignatureCompat:
     def test_execute_step_accepts_project_profile(self):
         """_execute_step should accept project_profile kwarg."""
         import inspect
-        from multi_agent_coder.orchestrator.pipeline import _execute_step
+        from agentchanti.orchestrator.pipeline import _execute_step
 
         sig = inspect.signature(_execute_step)
         assert "project_profile" in sig.parameters
@@ -457,7 +457,7 @@ class TestPipelineSignatureCompat:
     def test_run_diagnosis_loop_accepts_project_profile(self):
         """_run_diagnosis_loop should accept project_profile kwarg."""
         import inspect
-        from multi_agent_coder.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
 
         sig = inspect.signature(_run_diagnosis_loop)
         assert "project_profile" in sig.parameters

@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.runtime_watcher
+Unit tests for agentchanti.kb.runtime_watcher
 
 Tests the RuntimeWatcher class: start/stop lifecycle, index detection,
 and the first-file handler. watchdog is mocked throughout.
@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 # Import under test
 # ---------------------------------------------------------------------------
 
-from multi_agent_coder.kb.runtime_watcher import (
+from agentchanti.kb.runtime_watcher import (
     RuntimeWatcher, _FirstFileHandler,
 )
 
@@ -40,8 +40,8 @@ class TestRuntimeWatcher:
         watcher.stop()  # should not raise
         assert not watcher.is_running
 
-    @patch("multi_agent_coder.kb.runtime_watcher.RuntimeWatcher._has_local_index")
-    @patch("multi_agent_coder.kb.runtime_watcher.RuntimeWatcher._start_incremental_watcher")
+    @patch("agentchanti.kb.runtime_watcher.RuntimeWatcher._has_local_index")
+    @patch("agentchanti.kb.runtime_watcher.RuntimeWatcher._start_incremental_watcher")
     def test_start_with_existing_index(self, mock_incremental, mock_has_index, tmp_path):
         """When index exists, start() should use incremental mode."""
         mock_has_index.return_value = True
@@ -49,8 +49,8 @@ class TestRuntimeWatcher:
         watcher.start(str(tmp_path))
         mock_incremental.assert_called_once()
 
-    @patch("multi_agent_coder.kb.runtime_watcher.RuntimeWatcher._has_local_index")
-    @patch("multi_agent_coder.kb.runtime_watcher.RuntimeWatcher._start_creation_watcher")
+    @patch("agentchanti.kb.runtime_watcher.RuntimeWatcher._has_local_index")
+    @patch("agentchanti.kb.runtime_watcher.RuntimeWatcher._start_creation_watcher")
     def test_start_without_index(self, mock_creation, mock_has_index, tmp_path):
         """When no index exists, start() should use creation mode."""
         mock_has_index.return_value = False

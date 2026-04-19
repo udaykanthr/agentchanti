@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.local.graph
+Unit tests for agentchanti.kb.local.graph
 
 Tests all public query methods with a deterministic in-memory graph.
 """
@@ -33,11 +33,11 @@ def _make_graph():
 
         files/c.py  imports a.py
     """
-    from multi_agent_coder.kb.local.graph import (
+    from agentchanti.kb.local.graph import (
         CodeGraph, NodeType, EdgeType,
         _file_id, _func_id, _class_id,
     )
-    from multi_agent_coder.kb.local.parser import (
+    from agentchanti.kb.local.parser import (
         ParsedFile, ParsedFunction, ParsedClass,
         ParsedImport, ParsedCall,
     )
@@ -307,13 +307,13 @@ class TestSerialisation:
         g.save(pkl_path)
         assert os.path.exists(pkl_path)
 
-        from multi_agent_coder.kb.local.graph import CodeGraph
+        from agentchanti.kb.local.graph import CodeGraph
         g2 = CodeGraph.load(pkl_path)
         assert g2.stats()["node_count"] == g.stats()["node_count"]
         assert g2.stats()["edge_count"] == g.stats()["edge_count"]
 
     def test_load_missing_file(self, tmp_path):
-        from multi_agent_coder.kb.local.graph import CodeGraph
+        from agentchanti.kb.local.graph import CodeGraph
         with pytest.raises(FileNotFoundError):
             CodeGraph.load(str(tmp_path / "missing.pkl"))
 

@@ -43,7 +43,7 @@ AgentChanti ships as both a CLI and a **Python library**, so it can be embedded 
 
 ```python
 # Inside a Flask endpoint — trigger the full agent pipeline on a PR event
-from multi_agent_coder import run_task
+from agentchanti import run_task
 
 @app.route("/pr-review", methods=["POST"])
 def on_pull_request():
@@ -134,10 +134,45 @@ All storage is local SQLite -- no external vector database required. See [docume
 
 ### Installation
 
-**Option 1: Automatic Installer (recommended)**
+**Option 1: pipx (recommended for end users)**
+
+`pipx` installs CLI tools into isolated environments and puts them on
+your `PATH` — no virtualenv to activate, no `pip install` polluting
+your global site-packages.
 
 ```bash
-git clone https://github.com/udaykanthr/agentchanti.git
+pipx install agentchanti
+agentchanti --help
+```
+
+To upgrade later: `pipx upgrade agentchanti`. To install pre-release
+builds straight from `main`: `pipx install
+git+https://github.com/udaykanth/agentchanti.git`.
+
+> **Note:** The package will be on PyPI once the first tagged release
+> is cut. Until then, use Option 2 or 3 below.
+
+**Option 2: Clone and install (for contributors / latest code)**
+
+```bash
+git clone https://github.com/udaykanth/agentchanti.git
+cd agentchanti
+
+python3 -m venv .venv
+source .venv/bin/activate        # Linux/macOS
+.venv\Scripts\activate           # Windows
+
+python -m pip install -e ".[dev]"   # includes pytest + ruff for tests
+agentchanti --help
+```
+
+**Option 3: Convenience scripts**
+
+If you'd rather not type the venv steps yourself, the repo ships
+helper scripts that do the same thing:
+
+```bash
+git clone https://github.com/udaykanth/agentchanti.git
 cd agentchanti
 
 # Linux / macOS
@@ -145,33 +180,16 @@ chmod +x install.sh && ./install.sh
 
 # Windows
 ./install.bat
-```
 
-This creates a `.venv` virtual environment and installs into it. Activate before use:
-
-```bash
 source .venv/bin/activate        # Linux/macOS
 .venv\Scripts\activate           # Windows
 ```
 
-**Option 2: Manual Install**
-
-```bash
-git clone https://github.com/udaykanthr/agentchanti.git
-cd agentchanti
-
-python3 -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-.venv\Scripts\activate           # Windows
-
-python -m pip install -e .
-```
-
-**Verify:**
-
-```bash
-agentchanti --help
-```
+> **Why no `curl | bash` installer?** AgentChanti is a Python package,
+> not a single static binary. The standard Python tooling (`pipx`,
+> `pip`) already handles isolated installs, version pinning, and
+> upgrades — wrapping that in a shell script downloaded over HTTPS
+> would add an attack surface without adding any value.
 
 ---
 

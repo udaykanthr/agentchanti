@@ -9,11 +9,11 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from multi_agent_coder.orchestrator.step_handlers import (
+from agentchanti.orchestrator.step_handlers import (
     _normalize_fix_paths,
     _detect_subproject_root,
 )
-from multi_agent_coder.orchestrator.memory import FileMemory
+from agentchanti.orchestrator.memory import FileMemory
 
 
 # ─── _normalize_fix_paths ───────────────────────────────────────────

@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 
-from multi_agent_coder.checkpoint import save_checkpoint, load_checkpoint, clear_checkpoint
+from agentchanti.checkpoint import save_checkpoint, load_checkpoint, clear_checkpoint
 
 
 class TestCheckpointBasic(unittest.TestCase):
@@ -65,7 +65,7 @@ class TestCheckpointPlanSteps(unittest.TestCase):
             os.remove(self.filepath)
 
     def _make_step(self, **kwargs):
-        from multi_agent_coder.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.plan_step import PlanStep
         defaults = {
             "id": "1.1", "step_type": "CODE", "description": "",
             "depends_on": [], "index": 0,
@@ -101,7 +101,7 @@ class TestCheckpointPlanSteps(unittest.TestCase):
 
     def test_plan_steps_round_trip(self):
         """Save PlanStep → load → from_dict should preserve all fields."""
-        from multi_agent_coder.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.plan_step import PlanStep
 
         original = self._make_step(
             id="2.1", step_type="CODE", description="Create utils",
@@ -143,7 +143,7 @@ class TestCheckpointPlanSteps(unittest.TestCase):
 
     def test_status_preserved_on_resume(self):
         """Step status (completed/pending) should survive checkpoint round-trip."""
-        from multi_agent_coder.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.plan_step import PlanStep
 
         steps = [
             self._make_step(id="1.1", step_type="CMD", status="completed", index=0),

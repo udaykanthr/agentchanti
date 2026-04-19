@@ -999,7 +999,7 @@ agentchanti kb embed
 
 # Query the code graph
 agentchanti kb query find-callers "run_task"
-agentchanti kb query impact "multi_agent_coder/api.py"
+agentchanti kb query impact "agentchanti/api.py"
 
 # Semantic search
 agentchanti kb search "how does step classification work" --top-k 5
@@ -1109,7 +1109,7 @@ AgentChanti protects certain files from being overwritten:
 Use AgentChanti programmatically for backend integration, CI pipelines, or custom tooling.
 
 ```python
-from multi_agent_coder import run_task, TaskResult
+from agentchanti import run_task, TaskResult
 
 result: TaskResult = run_task(
     task="Create a Python CLI calculator",
@@ -1166,7 +1166,7 @@ Extend AgentChanti with custom step type handlers.
 ### Creating a Plugin
 
 ```python
-from multi_agent_coder.plugins import StepPlugin, PluginContext
+from agentchanti.plugins import StepPlugin, PluginContext
 
 class LintPlugin(StepPlugin):
     name = "LINT"
@@ -1288,7 +1288,7 @@ agentchanti "task" --no-cache          # disable caching entirely
 
 ```
 agentchanti/
-  multi_agent_coder/
+  agentchanti/
     agents/
       base.py                  # Agent base class with custom prompt suffix support
       planner.py               # PlannerAgent — creates step-by-step plans

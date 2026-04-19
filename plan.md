@@ -93,14 +93,14 @@ for run_attempt in range(1, MAX_STEP_RETRIES + 1):
 
 ## Files to Modify
 
-1. **`multi_agent_coder/orchestrator/step_handlers.py`**
+1. **`agentchanti/orchestrator/step_handlers.py`**
    - Add `_build_batch_error_summary()` function (~80 lines)
    - Add `_count_test_failures()` helper (~20 lines)
    - Update `_handle_test_step()` fix context to use batch summary
    - Add early-exit on no-progress detection
    - Reduce `MAX_STEP_RETRIES` from 3 to 2
 
-2. **`multi_agent_coder/orchestrator/pipeline.py`**
+2. **`agentchanti/orchestrator/pipeline.py`**
    - Reduce `MAX_DIAGNOSIS_RETRIES` from 2 to 1
 
 ## Expected Impact

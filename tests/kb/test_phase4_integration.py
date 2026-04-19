@@ -21,7 +21,7 @@ class TestConfigKBSettings:
 
     def test_default_kb_settings(self):
         """Default config should have KB settings enabled."""
-        from multi_agent_coder.config import Config
+        from agentchanti.config import Config
 
         cfg = Config.load(None)
         assert cfg.KB_ENABLED is True
@@ -32,7 +32,7 @@ class TestConfigKBSettings:
 
     def test_kb_settings_in_yaml(self, tmp_path):
         """KB settings from YAML should be loaded correctly."""
-        from multi_agent_coder.config import Config
+        from agentchanti.config import Config
 
         yaml_content = """\
 kb:
@@ -54,7 +54,7 @@ kb:
 
     def test_kb_settings_in_to_dict(self):
         """KB settings should be present in to_dict() output."""
-        from multi_agent_coder.config import Config
+        from agentchanti.config import Config
 
         cfg = Config.load(None)
         d = cfg.to_dict()
@@ -71,7 +71,7 @@ class TestPipelineKBIntegration:
 
     def test_execute_step_accepts_kb_context_builder(self):
         """_execute_step should accept kb_context_builder kwarg without error."""
-        from multi_agent_coder.orchestrator.pipeline import _execute_step
+        from agentchanti.orchestrator.pipeline import _execute_step
 
         # We need to mock everything — just verify the function accepts the param
         import inspect
@@ -80,7 +80,7 @@ class TestPipelineKBIntegration:
 
     def test_run_diagnosis_loop_accepts_kb_context_builder(self):
         """_run_diagnosis_loop should accept kb_context_builder kwarg."""
-        from multi_agent_coder.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
 
         import inspect
         sig = inspect.signature(_run_diagnosis_loop)
@@ -95,7 +95,7 @@ class TestAPIKBIntegration:
 
     def test_run_task_accepts_no_kb(self):
         """run_task should accept no_kb parameter."""
-        from multi_agent_coder.api import run_task
+        from agentchanti.api import run_task
 
         import inspect
         sig = inspect.signature(run_task)
@@ -103,7 +103,7 @@ class TestAPIKBIntegration:
 
     def test_run_task_impl_accepts_no_kb(self):
         """_run_task_impl should accept no_kb parameter."""
-        from multi_agent_coder.api import _run_task_impl
+        from agentchanti.api import _run_task_impl
 
         import inspect
         sig = inspect.signature(_run_task_impl)
@@ -118,7 +118,7 @@ class TestKBCLIHealth:
 
     def test_health_command_registered(self):
         """The 'health' subcommand should be registered in the KB CLI parser."""
-        from multi_agent_coder.kb.cli import _build_parser
+        from agentchanti.kb.cli import _build_parser
 
         parser = _build_parser()
         # Parse a minimal health command
@@ -128,7 +128,7 @@ class TestKBCLIHealth:
 
     def test_health_json_flag(self):
         """The --json flag should be available on health command."""
-        from multi_agent_coder.kb.cli import _build_parser
+        from agentchanti.kb.cli import _build_parser
 
         parser = _build_parser()
         args = parser.parse_args(["health", "--json"])

@@ -1,6 +1,6 @@
 import pytest
-from multi_agent_coder.diff_display import _detect_hazards, HAZARD_WARN
-from multi_agent_coder.config import Config
+from agentchanti.diff_display import _detect_hazards, HAZARD_WARN
+from agentchanti.config import Config
 
 # def test_detect_hazards_shrinkage():
 #     # File shrinkage > 50%

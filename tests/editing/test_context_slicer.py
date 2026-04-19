@@ -4,8 +4,8 @@ import os
 import pytest
 import tempfile
 
-from multi_agent_coder.editing.context_slicer import ContextSlicer, FileSlice
-from multi_agent_coder.editing.scope_resolver import EditScope, SymbolRange
+from agentchanti.editing.context_slicer import ContextSlicer, FileSlice
+from agentchanti.editing.scope_resolver import EditScope, SymbolRange
 
 
 def _write_temp_file(content: str, suffix=".py") -> str:

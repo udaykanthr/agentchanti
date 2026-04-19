@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from multi_agent_coder.orchestrator.plan_step import (
+from agentchanti.orchestrator.plan_step import (
     parse_structured_plan, PlanStep, validate_plan,
     fix_import_dependencies,
     is_structured_plan, build_waves,

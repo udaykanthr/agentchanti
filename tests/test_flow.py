@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import MagicMock
-from multi_agent_coder.llm.base import LLMClient
-from multi_agent_coder.agents.planner import PlannerAgent
-from multi_agent_coder.agents.coder import CoderAgent
-from multi_agent_coder.agents.reviewer import ReviewerAgent
+from agentchanti.llm.base import LLMClient
+from agentchanti.agents.planner import PlannerAgent
+from agentchanti.agents.coder import CoderAgent
+from agentchanti.agents.reviewer import ReviewerAgent
 
 class TestAgents(unittest.TestCase):
     def setUp(self):

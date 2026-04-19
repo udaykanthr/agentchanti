@@ -11,12 +11,12 @@ import os
 import re
 from unittest.mock import patch
 
-from multi_agent_coder.orchestrator.step_handlers import (
+from agentchanti.orchestrator.step_handlers import (
     _prefix_subproject_paths,
     _detect_subproject_root,
 )
-from multi_agent_coder.orchestrator.memory import FileMemory
-from multi_agent_coder.agents.coder import _LANG_TO_EXT
+from agentchanti.orchestrator.memory import FileMemory
+from agentchanti.agents.coder import _LANG_TO_EXT
 
 
 # ─── Helpers ────────────────────────────────────────────────────────

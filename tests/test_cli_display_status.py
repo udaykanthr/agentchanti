@@ -14,13 +14,13 @@ from unittest.mock import patch
 
 # Force headless mode so the Live screen never actually takes over the
 # terminal during the test run.
-with patch("multi_agent_coder.cli_display._RICH_AVAILABLE", False):
-    from multi_agent_coder.cli_display import CLIDisplay
+with patch("agentchanti.cli_display._RICH_AVAILABLE", False):
+    from agentchanti.cli_display import CLIDisplay
 
 
 def _make_headless_display() -> CLIDisplay:
     """Build a CLIDisplay that does not own the terminal."""
-    with patch("multi_agent_coder.cli_display._RICH_AVAILABLE", False):
+    with patch("agentchanti.cli_display._RICH_AVAILABLE", False):
         d = CLIDisplay("test task")
     # Belt-and-braces: ensure no Live handle exists.
     d._live = None
@@ -117,7 +117,7 @@ class TestExecutionClearsPlannerStatus(unittest.TestCase):
         return (root / relpath).read_text(encoding="utf-8")
 
     def test_cli_clears_status_before_wave_loop(self):
-        src = self._read("multi_agent_coder/orchestrator/cli.py")
+        src = self._read("agentchanti/orchestrator/cli.py")
         # Find the wave loop and walk backwards a few lines.
         marker = "for wave_idx, wave in enumerate(waves):"
         idx = src.find(marker)
@@ -130,7 +130,7 @@ class TestExecutionClearsPlannerStatus(unittest.TestCase):
         )
 
     def test_api_clears_status_before_wave_loop(self):
-        src = self._read("multi_agent_coder/api.py")
+        src = self._read("agentchanti/api.py")
         marker = "for wave_idx, wave in enumerate(waves):"
         idx = src.find(marker)
         self.assertGreater(idx, 0, "wave loop not found in api.py")

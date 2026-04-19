@@ -1,5 +1,5 @@
 import unittest
-from multi_agent_coder.orchestrator.classification import _extract_commands_from_text
+from agentchanti.orchestrator.classification import _extract_commands_from_text
 
 class TestCommandExtraction(unittest.TestCase):
     def test_multiline_merge_and_cleanup(self):

@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.startup
+Unit tests for agentchanti.kb.startup
 
 Tests the KBStartupManager decision logic: each branch in the decision
 table gets its own test.  All external dependencies (Qdrant, indexer,
@@ -14,7 +14,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch, call
 
-from multi_agent_coder.kb.startup import KBStartupManager, KBStartupReport
+from agentchanti.kb.startup import KBStartupManager, KBStartupReport
 
 
 # ---------------------------------------------------------------------------

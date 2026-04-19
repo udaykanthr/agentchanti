@@ -1,7 +1,7 @@
 """Tests for the chunk editor module."""
 
 import pytest
-from multi_agent_coder.editing.chunk_editor import (
+from agentchanti.editing.chunk_editor import (
     ChunkEditor, FileChunk, ChunkEditResponse,
 )
 
@@ -309,23 +309,23 @@ class TestChunkIdMatches:
     """Tests for the _chunk_id_matches helper."""
 
     def test_exact_match(self):
-        from multi_agent_coder.editing.chunk_editor import _chunk_id_matches
+        from agentchanti.editing.chunk_editor import _chunk_id_matches
         assert _chunk_id_matches("function:setup", "function:setup")
 
     def test_name_only_match(self):
-        from multi_agent_coder.editing.chunk_editor import _chunk_id_matches
+        from agentchanti.editing.chunk_editor import _chunk_id_matches
         assert _chunk_id_matches("function:setup", "setup")
 
     def test_dotted_name_match(self):
-        from multi_agent_coder.editing.chunk_editor import _chunk_id_matches
+        from agentchanti.editing.chunk_editor import _chunk_id_matches
         assert _chunk_id_matches("method:UserService.authenticate", "authenticate")
 
     def test_no_match(self):
-        from multi_agent_coder.editing.chunk_editor import _chunk_id_matches
+        from agentchanti.editing.chunk_editor import _chunk_id_matches
         assert not _chunk_id_matches("function:setup", "teardown")
 
     def test_empty_edit_id(self):
-        from multi_agent_coder.editing.chunk_editor import _chunk_id_matches
+        from agentchanti.editing.chunk_editor import _chunk_id_matches
         assert not _chunk_id_matches("function:setup", "")
 
 

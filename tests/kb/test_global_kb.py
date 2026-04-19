@@ -28,7 +28,7 @@ class TestErrorDict(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test_errors.db")
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorDict
+        from agentchanti.kb.global_kb.error_dict import ErrorDict
         self.edict = ErrorDict(self.db_path)
 
     def tearDown(self):
@@ -36,7 +36,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_add_and_count(self):
         """add() inserts a record; count() reflects it."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(
             error_type="TestError",
             language="python",
@@ -53,7 +53,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_bulk_insert(self):
         """bulk_insert() inserts multiple records."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         errors = [
             ErrorFix(error_type=f"Err{i}", language="python",
                      fix_template=f"fix {i}")
@@ -64,7 +64,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_lookup_exact(self):
         """lookup() matches by error_type substring."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(
             error_type="NullPointerException",
             language="java",
@@ -79,7 +79,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_lookup_regex(self):
         """lookup() falls back to regex pattern matching."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(
             error_type="ImportError",
             language="python",
@@ -94,7 +94,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_lookup_fuzzy_tags(self):
         """lookup() falls back to tag-based fuzzy matching."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(
             error_type="MemoryLeak",
             language="all",
@@ -110,7 +110,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_lookup_language_filter(self):
         """lookup() respects language filter, includes 'all'."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         self.edict.bulk_insert([
             ErrorFix(error_type="Err1", language="python", fix_template="fix1"),
             ErrorFix(error_type="Err2", language="java", fix_template="fix2"),
@@ -125,7 +125,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_clear(self):
         """clear() removes all records."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         self.edict.bulk_insert([
             ErrorFix(error_type=f"E{i}", language="go", fix_template="f")
             for i in range(5)
@@ -136,7 +136,7 @@ class TestErrorDict(unittest.TestCase):
 
     def test_count_by_language(self):
         """count_by_language() groups correctly."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         self.edict.bulk_insert([
             ErrorFix(error_type="E1", language="python", fix_template="f"),
             ErrorFix(error_type="E2", language="python", fix_template="f"),
@@ -148,14 +148,14 @@ class TestErrorDict(unittest.TestCase):
 
     def test_errorfix_tag_list(self):
         """ErrorFix.tag_list() splits comma-separated tags."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(error_type="E", language="py", fix_template="f",
                       tags="a, b, c")
         self.assertEqual(ef.tag_list(), ["a", "b", "c"])
 
     def test_errorfix_empty_tags(self):
         """ErrorFix.tag_list() returns empty list for no tags."""
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorFix
+        from agentchanti.kb.global_kb.error_dict import ErrorFix
         ef = ErrorFix(error_type="E", language="py", fix_template="f", tags="")
         self.assertEqual(ef.tag_list(), [])
 
@@ -171,7 +171,7 @@ class TestContentFix(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test_errors.db")
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorDict
+        from agentchanti.kb.global_kb.error_dict import ErrorDict
         self.edict = ErrorDict(self.db_path)
 
     def tearDown(self):
@@ -179,7 +179,7 @@ class TestContentFix(unittest.TestCase):
 
     def test_add_and_get(self):
         """bulk_insert + get round-trips correctly."""
-        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        from agentchanti.kb.global_kb.error_dict import ContentFix
         fix = ContentFix(
             name="test-fix",
             file_glob="*.css",
@@ -196,7 +196,7 @@ class TestContentFix(unittest.TestCase):
         self.assertEqual(fixes[0].replacement, "@new-directive")
 
     def test_count_and_clear(self):
-        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        from agentchanti.kb.global_kb.error_dict import ContentFix
         fixes = [
             ContentFix(name=f"fix-{i}", file_glob="*.css",
                        content_pattern=f"pat{i}", replacement=f"rep{i}")
@@ -208,7 +208,7 @@ class TestContentFix(unittest.TestCase):
         self.assertEqual(self.edict.count_content_fixes(), 0)
 
     def test_language_filter(self):
-        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        from agentchanti.kb.global_kb.error_dict import ContentFix
         self.edict.bulk_insert_content_fixes([
             ContentFix(name="all-fix", file_glob="*.css",
                        content_pattern="a", replacement="b", language="all"),
@@ -227,7 +227,7 @@ class TestContentFix(unittest.TestCase):
 
     def test_compiled_flags(self):
         import re
-        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        from agentchanti.kb.global_kb.error_dict import ContentFix
         fix = ContentFix(
             name="t", file_glob="*", content_pattern="x",
             flags="MULTILINE, IGNORECASE",
@@ -236,7 +236,7 @@ class TestContentFix(unittest.TestCase):
 
     def test_upsert_on_duplicate_name(self):
         """INSERT OR REPLACE updates existing rule by name."""
-        from multi_agent_coder.kb.global_kb.error_dict import ContentFix
+        from agentchanti.kb.global_kb.error_dict import ContentFix
         self.edict.bulk_insert_content_fixes([
             ContentFix(name="rule-1", file_glob="*.css",
                        content_pattern="old", replacement="v1"),
@@ -266,8 +266,8 @@ class TestSeeder(unittest.TestCase):
 
     def test_seed_no_embed(self):
         """seed(embed=False) populates errors.db and writes .md files."""
-        from multi_agent_coder.kb.global_kb.seeder import seed
-        from multi_agent_coder.kb.global_kb.error_dict import ErrorDict
+        from agentchanti.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.error_dict import ErrorDict
 
         summary = seed(embed=False, base_dir=self.tmpdir)
 
@@ -292,7 +292,7 @@ class TestSeeder(unittest.TestCase):
 
     def test_md_files_have_frontmatter(self):
         """All seeded .md files contain valid frontmatter."""
-        from multi_agent_coder.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.seeder import seed
 
         seed(embed=False, base_dir=self.tmpdir)
         registry_dir = os.path.join(self.tmpdir, "registry")
@@ -319,7 +319,7 @@ class TestSeeder(unittest.TestCase):
 
     def test_chunk_markdown(self):
         """_chunk_markdown splits correctly."""
-        from multi_agent_coder.kb.global_kb.seeder import _chunk_markdown
+        from agentchanti.kb.global_kb.seeder import _chunk_markdown
 
         text = "## Section 1\nShort.\n\n## Section 2\nAlso short."
         # Both sections are < 100 chars each, so they get merged
@@ -331,7 +331,7 @@ class TestSeeder(unittest.TestCase):
 
     def test_chunk_markdown_splits_large(self):
         """_chunk_markdown splits sections exceeding max_size."""
-        from multi_agent_coder.kb.global_kb.seeder import _chunk_markdown
+        from agentchanti.kb.global_kb.seeder import _chunk_markdown
 
         # Create a large section with paragraph breaks so it can be split
         paragraphs = "\n\n".join(["word " * 30 for _ in range(10)])
@@ -352,7 +352,7 @@ class TestGlobalKBStore(unittest.TestCase):
     def setUpClass(cls):
         """Seed the DB once for all store tests in a temp dir."""
         cls._tmpdir = tempfile.mkdtemp()
-        from multi_agent_coder.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.seeder import seed
         seed(embed=False, base_dir=cls._tmpdir)
 
     @classmethod
@@ -360,7 +360,7 @@ class TestGlobalKBStore(unittest.TestCase):
         shutil.rmtree(cls._tmpdir, ignore_errors=True)
 
     def _store(self):
-        from multi_agent_coder.kb.global_kb.store import GlobalKBStore
+        from agentchanti.kb.global_kb.store import GlobalKBStore
         return GlobalKBStore(base_dir=self._tmpdir)
 
     def test_search_errors_exact(self):
@@ -428,28 +428,28 @@ class TestUpdater(unittest.TestCase):
 
     def test_parse_semver(self):
         """_parse_semver parses correctly."""
-        from multi_agent_coder.kb.global_kb.updater import _parse_semver
+        from agentchanti.kb.global_kb.updater import _parse_semver
         self.assertEqual(_parse_semver("1.2.3"), (1, 2, 3))
         self.assertEqual(_parse_semver("v2.0.0"), (2, 0, 0))
         self.assertGreater(_parse_semver("1.1.0"), _parse_semver("1.0.9"))
 
     def test_load_local_manifest(self):
         """_load_local_manifest reads the core manifest."""
-        from multi_agent_coder.kb.global_kb.updater import _load_local_manifest
+        from agentchanti.kb.global_kb.updater import _load_local_manifest
         manifest = _load_local_manifest()
         self.assertIn("version", manifest)
         self.assertIn("categories", manifest)
 
     def test_get_version(self):
         """get_version returns a version string."""
-        from multi_agent_coder.kb.global_kb.updater import get_version
+        from agentchanti.kb.global_kb.updater import get_version
         version = get_version()
         self.assertIsInstance(version, str)
         self.assertRegex(version, r"\d+\.\d+\.\d+")
 
     def test_get_manifest_info(self):
         """get_manifest_info returns full manifest dict."""
-        from multi_agent_coder.kb.global_kb.updater import get_manifest_info
+        from agentchanti.kb.global_kb.updater import get_manifest_info
         info = get_manifest_info()
         self.assertIn("version", info)
         self.assertIn("categories", info)
@@ -457,7 +457,7 @@ class TestUpdater(unittest.TestCase):
 
     def test_check_for_updates_no_owner(self):
         """check_for_updates gracefully handles nonexistent repo."""
-        from multi_agent_coder.kb.global_kb.updater import check_for_updates
+        from agentchanti.kb.global_kb.updater import check_for_updates
         status = check_for_updates("nonexistent-owner-xyz", "nonexistent-repo-xyz")
         # Should not crash; update_available should be False
         self.assertFalse(status.update_available)
@@ -473,7 +473,7 @@ class TestCLIParsing(unittest.TestCase):
     """Tests that Phase 3 CLI subcommands parse correctly."""
 
     def _parse(self, argv: list[str]):
-        from multi_agent_coder.kb.cli import _build_parser
+        from agentchanti.kb.cli import _build_parser
         parser = _build_parser()
         return parser.parse_args(argv)
 
@@ -545,8 +545,8 @@ class TestUpdaterClean(unittest.TestCase):
 
     def test_clean_removes_files(self):
         """clean() removes errors.db, global_kb.db, manifest, and registry."""
-        from multi_agent_coder.kb.global_kb.seeder import seed
-        from multi_agent_coder.kb.global_kb.updater import clean
+        from agentchanti.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.updater import clean
 
         core_dir = os.path.join(self.tmpdir, "core")
         registry_dir = os.path.join(self.tmpdir, "registry")
@@ -569,7 +569,7 @@ class TestUpdaterClean(unittest.TestCase):
 
     def test_clean_idempotent(self):
         """clean() on already-clean state does not crash."""
-        from multi_agent_coder.kb.global_kb.updater import clean
+        from agentchanti.kb.global_kb.updater import clean
 
         # Clean twice — second call should succeed silently
         clean(base_dir=self.tmpdir)
@@ -579,8 +579,8 @@ class TestUpdaterClean(unittest.TestCase):
 
     def test_seed_after_clean(self):
         """seed() works correctly after clean() — full round trip."""
-        from multi_agent_coder.kb.global_kb.seeder import seed
-        from multi_agent_coder.kb.global_kb.updater import clean
+        from agentchanti.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.updater import clean
 
         clean(base_dir=self.tmpdir)
         summary = seed(embed=False, base_dir=self.tmpdir)
@@ -606,7 +606,7 @@ class TestApplyUpdateReturnsMdFiles(unittest.TestCase):
 
     def test_apply_update_returns_md_files(self):
         """_apply_update returns (count, md_files) with correct metadata."""
-        from multi_agent_coder.kb.global_kb.updater import _apply_update
+        from agentchanti.kb.global_kb.updater import _apply_update
 
         # Create a fake update directory with a docs/guide.md
         docs_dir = os.path.join(self.tmpdir, "docs")
@@ -667,7 +667,7 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
 
     def test_seed_preserves_update_file(self):
         """seed(embed=False) does not delete files from kb update."""
-        from multi_agent_coder.kb.global_kb.seeder import seed
+        from agentchanti.kb.global_kb.seeder import seed
 
         seed(embed=False, base_dir=self.tmpdir)
         self.assertTrue(
@@ -677,7 +677,7 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
 
     def test_seed_includes_update_file_in_all_md_files(self):
         """collect_all_registry_md_files() discovers kb update files."""
-        from multi_agent_coder.kb.global_kb.seeder import (
+        from agentchanti.kb.global_kb.seeder import (
             seed, collect_all_registry_md_files,
         )
 
@@ -694,7 +694,7 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
 
     def test_collect_excludes_given_paths(self):
         """collect_all_registry_md_files() respects exclude_paths."""
-        from multi_agent_coder.kb.global_kb.seeder import (
+        from agentchanti.kb.global_kb.seeder import (
             seed, collect_all_registry_md_files,
         )
 

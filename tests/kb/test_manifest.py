@@ -1,5 +1,5 @@
 """
-Unit tests for multi_agent_coder.kb.local.manifest
+Unit tests for agentchanti.kb.local.manifest
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ class TestManifest:
         pass
 
     def test_upsert_and_get_file(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file(
             path="src/foo.py",
@@ -28,36 +28,36 @@ class TestManifest:
         assert rec.language == "python"
 
     def test_is_file_changed_new_file(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(str(tmp_path / "index.db"))
         assert m.is_file_changed("src/new.py", "hash1") is True
 
     def test_is_file_changed_same_hash(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/foo.py", "hash1", "python", 0.0, [])
         assert m.is_file_changed("src/foo.py", "hash1") is False
 
     def test_is_file_changed_different_hash(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/foo.py", "hash1", "python", 0.0, [])
         assert m.is_file_changed("src/foo.py", "hash2") is True
 
     def test_remove_file(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("src/foo.py", "h1", "python", 0.0, [])
         m.remove_file("src/foo.py")
         assert m.get_file("src/foo.py") is None
 
     def test_remove_nonexistent_file_is_safe(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(str(tmp_path / "index.db"))
         m.remove_file("nonexistent.py")  # should not raise
 
     def test_get_all_indexed_paths(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [])
         m.upsert_file("b.py", "h2", "python", 0.0, [])
@@ -65,7 +65,7 @@ class TestManifest:
         assert set(paths) == {"a.py", "b.py"}
 
     def test_get_symbols_for_file(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         symbols = [
             SymbolRecord("Foo", "class", 1, 20),
@@ -76,7 +76,7 @@ class TestManifest:
         assert {s.name for s in stored} == {"Foo", "bar"}
 
     def test_stats(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [SymbolRecord("f", "function", 1, 5)])
         m.upsert_file("b.js", "h2", "javascript", 0.0, [])
@@ -86,14 +86,14 @@ class TestManifest:
         assert "python" in stats["languages"]
 
     def test_clear(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest
+        from agentchanti.kb.local.manifest import Manifest
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [])
         m.clear()
         assert m.get_all_indexed_paths() == []
 
     def test_find_symbol(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [
             SymbolRecord("MyClass", "class", 1, 30),
@@ -104,7 +104,7 @@ class TestManifest:
         assert results[0]["symbol_type"] == "class"
 
     def test_find_symbol_with_type_filter(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [
             SymbolRecord("run", "function", 1, 5),
@@ -116,7 +116,7 @@ class TestManifest:
         assert all(r["symbol_type"] == "function" for r in results)
 
     def test_upsert_replaces_symbols(self, tmp_path):
-        from multi_agent_coder.kb.local.manifest import Manifest, SymbolRecord
+        from agentchanti.kb.local.manifest import Manifest, SymbolRecord
         m = Manifest(str(tmp_path / "index.db"))
         m.upsert_file("a.py", "h1", "python", 0.0, [
             SymbolRecord("old_func", "function", 1, 5),

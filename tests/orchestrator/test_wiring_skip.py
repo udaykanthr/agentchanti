@@ -21,7 +21,7 @@ See: bugfix branch — pipeline.py:should_run_wiring_verification
 import unittest
 from unittest.mock import MagicMock
 
-from multi_agent_coder.orchestrator.pipeline import (
+from agentchanti.orchestrator.pipeline import (
     _detect_router_mount_missing,
     should_run_wiring_verification,
 )

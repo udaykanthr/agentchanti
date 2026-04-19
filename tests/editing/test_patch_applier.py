@@ -5,8 +5,8 @@ import tempfile
 
 import pytest
 
-from multi_agent_coder.editing.diff_parser import DiffHunk, FilePatch, ParsedDiff
-from multi_agent_coder.editing.patch_applier import PatchApplier, ApplyResult
+from agentchanti.editing.diff_parser import DiffHunk, FilePatch, ParsedDiff
+from agentchanti.editing.patch_applier import PatchApplier, ApplyResult
 
 
 def _write_temp(content: str, suffix=".py") -> str:

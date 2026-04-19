@@ -4,7 +4,7 @@ specifically heredoc handling in _extract_commands_from_text.
 """
 import pytest
 
-from multi_agent_coder.orchestrator.classification import (
+from agentchanti.orchestrator.classification import (
     _extract_commands_from_text,
     _looks_like_command,
 )

@@ -1,6 +1,6 @@
 """Tests for the uniquify_context utility in agents.base."""
 
-from multi_agent_coder.agents.base import uniquify_context
+from agentchanti.agents.base import uniquify_context
 
 
 class TestUniquifyContext:

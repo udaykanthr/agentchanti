@@ -15,7 +15,7 @@ See: bugfix branch — pipeline.py:_attempt_targeted_source_fix.
 import unittest
 from unittest.mock import MagicMock
 
-from multi_agent_coder.orchestrator.pipeline import (
+from agentchanti.orchestrator.pipeline import (
     _attempt_targeted_source_fix,
     _diff_stats,
     _error_signature,
