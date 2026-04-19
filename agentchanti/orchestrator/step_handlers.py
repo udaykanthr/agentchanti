@@ -1324,6 +1324,30 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
     return None
 
 
+# Standard top-level directories inside a project root.  Used by the
+# planner-leader detector below to avoid stripping legitimate paths
+# like ``src/components/Header.jsx`` that share a leading dir name
+# with no project at all.
+_COMMON_PROJECT_TOP_DIRS = frozenset({
+    "src", "lib", "app", "apps", "packages", "tests", "test",
+    "public", "static", "assets", "dist", "build", "node_modules",
+    "__tests__", "__mocks__", "bin", "scripts", "docs",
+    "components", "pages", "styles", "utils", "hooks", "config",
+})
+
+
+def _normalize_proj_name(name: str) -> str:
+    """Lower-case and strip non-alphanumerics so naming variants
+    collapse to a single key.
+
+    ``my-app``, ``my_app``, ``myApp``, ``MyApp``, and ``myapp`` all
+    normalize to ``"myapp"``.  Used to detect when an inline-code path
+    leader is the planner's name for a subproject that the actual
+    scaffold created under a different (but equivalent) directory.
+    """
+    return "".join(c for c in name if c.isalnum()).lower()
+
+
 def _prefix_subproject_paths(files: dict[str, str],
                              subproject: str,
                              memory: FileMemory) -> dict[str, str]:
@@ -1337,6 +1361,17 @@ def _prefix_subproject_paths(files: dict[str, str],
     of the path (e.g. ``src/my-app/src/Header.jsx``) and reconstructs
     the correct path (``my-app/src/Header.jsx``).
 
+    **Planner-leader rename**: when the planner emits a path like
+    ``myapp/src/Header.jsx`` but the actual scaffold landed under a
+    naming variant like ``my-app/`` (because the CMD-step diagnosis
+    swapped the folder name), the leading ``myapp/`` is recognised as
+    the planner's name for the same subproject and stripped before
+    the real prefix is applied.  Without this rule the path would be
+    blindly prepended to ``my-app/myapp/src/Header.jsx`` — a
+    double-nested location that Vite never serves, leaving the user
+    with the default scaffold in the browser while the test runner
+    happily passes against the orphaned tree.
+
     Files that are already prefixed, already known in memory, or are
     internal tracking paths (``_cmd_output/`` etc.) are left unchanged.
     """
@@ -1345,6 +1380,7 @@ def _prefix_subproject_paths(files: dict[str, str],
 
     prefix = subproject.rstrip('/') + '/'
     proj_name = subproject.rstrip('/')
+    proj_name_norm = _normalize_proj_name(proj_name)
     known_paths = set(memory.all_files().keys())
     corrected: dict[str, str] = {}
 
@@ -1398,6 +1434,30 @@ def _prefix_subproject_paths(files: dict[str, str],
                 log.warning(f"[SubProject] Fixed embedded subproject: "
                             f"'{fpath}' → '{candidate}'")
                 corrected[candidate] = content
+                continue
+
+        # Planner-leader rename detection.  The planner may have used
+        # one project-name spelling (e.g. ``myapp/...``) while the
+        # actual scaffold landed under a normalisation-equivalent
+        # variant (``my-app/``) — typically because a CMD-step
+        # diagnosis fix renamed the directory.  When the inline path's
+        # leading directory is a naming variant of the real subproject
+        # AND the leading dir is not a standard top-level project
+        # folder (``src/``, ``lib/``, etc.), strip it before applying
+        # the real prefix.  Without this rule the result would be
+        # double-nested at ``my-app/myapp/src/...`` and Vite would
+        # serve the default scaffold instead of the user's homepage.
+        if '/' in norm:
+            leader, _, rest = norm.partition('/')
+            if (leader.lower() not in _COMMON_PROJECT_TOP_DIRS
+                    and rest
+                    and _normalize_proj_name(leader) == proj_name_norm):
+                new_path = prefix + rest
+                log.warning(
+                    f"[SubProject] Renamed planner-leader '{leader}/' → "
+                    f"'{prefix}': '{fpath}' → '{new_path}' "
+                    f"(prevents double-nesting)")
+                corrected[new_path] = content
                 continue
 
         # Bare filename (no directory component): the fuzzy parser may

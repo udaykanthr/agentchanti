@@ -240,16 +240,21 @@ _JS_DEFAULT_IMPORT_PATTERN = re.compile(
 
 # ── Function / callable signature patterns (per language) ─────────
 
-# JS/TS: components with destructured-object props
-#   function ComponentName({ propA, propB })
-#   const ComponentName = ({ propA }) =>
-_JSX_COMP_DEF_RE = re.compile(
+# JS/TS: components with destructured-object props.
+# This regex matches only the *head* of a component definition:
+#   function ComponentName
+#   const ComponentName =
+#   const ComponentName = function
+# The destructure body is parsed separately by `_scan_balanced_destructure`
+# so that nested object defaults and string literals containing braces or
+# commas are handled correctly (a naive `[^}]*` capture truncates inside
+# default object literals and exposes their contents as fake top-level props).
+_JSX_COMP_HEAD_RE = re.compile(
     r'(?:export\s+(?:default\s+)?)?'
     r'(?:'
     r'function\s+([A-Z]\w*)'
     r'|(?:const|let|var)\s+([A-Z]\w*)\s*=\s*(?:function\s*)?'
-    r')'
-    r'\s*\(\s*\{([^}]*)\}',
+    r')',
     re.MULTILINE,
 )
 
@@ -394,16 +399,152 @@ def extract_file_deps(
 
 # ── Function signature contract helpers ──────────────────────────
 
+def _scan_balanced_destructure(
+    content: str, start_idx: int,
+) -> tuple[str, int] | None:
+    """Find the matching ``}`` for the ``{`` at *start_idx*.
+
+    Walks the source character by character, counting only ``{``/``}`` braces
+    while skipping over string literals (``'…'``, ``"…"``, ``\u0060…\u0060``)
+    and ``//``/``/* … */`` comments so that braces inside them do not affect
+    nesting depth. Returns ``(inner_text, index_after_closing_brace)`` or
+    ``None`` if no matching brace is found.
+    """
+    n = len(content)
+    if start_idx >= n or content[start_idx] != "{":
+        return None
+
+    depth = 1
+    i = start_idx + 1
+    while i < n:
+        ch = content[i]
+        # Line comment
+        if ch == "/" and i + 1 < n and content[i + 1] == "/":
+            nl = content.find("\n", i + 2)
+            i = n if nl == -1 else nl + 1
+            continue
+        # Block comment
+        if ch == "/" and i + 1 < n and content[i + 1] == "*":
+            end = content.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        # String / template literal
+        if ch in ("'", '"', "`"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                cj = content[j]
+                if cj == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cj == quote:
+                    j += 1
+                    break
+                j += 1
+            i = j
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start_idx + 1:i], i + 1
+        i += 1
+
+    return None
+
+
+def _split_top_level_params(s: str) -> list[str]:
+    """Split *s* on commas that are not inside strings or balanced brackets.
+
+    Used to break a destructure body into individual parameter declarations
+    while preserving object/array defaults and string literals (which may
+    contain commas) as a single token. Mirrors the lexer behaviour of
+    ``_scan_balanced_destructure`` for the inner contents.
+    """
+    parts: list[str] = []
+    n = len(s)
+    i = 0
+    start = 0
+    depth = 0  # combined {}/[]/() depth — well-formed JS keeps these balanced
+
+    while i < n:
+        ch = s[i]
+        # Line comment
+        if ch == "/" and i + 1 < n and s[i + 1] == "/":
+            nl = s.find("\n", i + 2)
+            i = n if nl == -1 else nl + 1
+            continue
+        # Block comment
+        if ch == "/" and i + 1 < n and s[i + 1] == "*":
+            end = s.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        # String / template literal
+        if ch in ("'", '"', "`"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                cj = s[j]
+                if cj == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cj == quote:
+                    j += 1
+                    break
+                j += 1
+            i = j
+            continue
+        if ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+        i += 1
+
+    if start < n:
+        parts.append(s[start:n])
+    return parts
+
+
 def _extract_component_props(content: str) -> dict[str, set[str]]:
-    """JS/TS only: return {ComponentName: required_props} for destructured-prop components."""
+    """JS/TS only: return {ComponentName: required_props} for destructured-prop components.
+
+    Only props *without* a default value are considered required. Default
+    values may contain commas and braces (e.g. ``foo = { a: 1, b: 2 }`` or
+    ``foo = 'a, b, c'``); both are handled by the brace-/string-aware
+    scanners ``_scan_balanced_destructure`` and ``_split_top_level_params``.
+    """
     result: dict[str, set[str]] = {}
-    for m in _JSX_COMP_DEF_RE.finditer(content):
+    n = len(content)
+
+    for m in _JSX_COMP_HEAD_RE.finditer(content):
         name = m.group(1) or m.group(2)
         if not name:
             continue
-        props_str = m.group(3)
+
+        # Locate the opening `(` of the parameter list, then the destructure `{`.
+        i = m.end()
+        while i < n and content[i].isspace():
+            i += 1
+        if i >= n or content[i] != "(":
+            continue
+        i += 1
+        while i < n and content[i].isspace():
+            i += 1
+        if i >= n or content[i] != "{":
+            continue
+
+        scan = _scan_balanced_destructure(content, i)
+        if scan is None:
+            continue
+        props_str, _end = scan
+
         required: set[str] = set()
-        for raw in props_str.split(","):
+        for raw in _split_top_level_params(props_str):
             raw = raw.strip()
             if not raw or raw.startswith("..."):
                 continue

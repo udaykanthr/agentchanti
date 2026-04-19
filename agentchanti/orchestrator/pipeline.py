@@ -106,6 +106,114 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+# ── Router-mount mismatch detection ───────────────────────────────────────
+# Production source files that use react-router primitives (Link,
+# NavLink, useNavigate, …) require a Router (BrowserRouter, HashRouter,
+# RouterProvider, …) mounted somewhere in the tree.  When the source
+# uses primitives but no source file mounts a Router, the app crashes
+# at runtime with:
+#
+#   TypeError: Cannot destructure property 'basename' of
+#              'React.useContext(...)' as it is null.
+#
+# Tests can pass anyway because the BulkTest fix loop's test-only
+# retry frequently wraps the failing render in <MemoryRouter> as a
+# workaround — green tests then mask a broken production binary.
+# This deterministic check is the canary that re-enables wiring
+# verification when the workaround pattern is detected.
+
+_ROUTER_PRIMITIVE_NAMES = (
+    "Link", "NavLink", "Outlet", "Routes", "Route",
+    "useNavigate", "useLocation", "useParams", "useMatch",
+    "useRoutes", "useSearchParams", "useNavigationType",
+)
+_ROUTER_MOUNT_NAMES = (
+    "BrowserRouter", "HashRouter", "MemoryRouter",
+    "Router", "RouterProvider", "StaticRouter",
+)
+_ROUTER_PRIMITIVE_RE = re.compile(
+    r"\b(?:" + "|".join(_ROUTER_PRIMITIVE_NAMES) + r")\b"
+)
+_ROUTER_MOUNT_JSX_RE = re.compile(
+    r"<\s*(?:" + "|".join(_ROUTER_MOUNT_NAMES) + r")\b"
+)
+_REACT_ROUTER_IMPORT_RE = re.compile(
+    r"""(?:from|require\s*\()\s*['"]react-router(?:-dom)?['"]"""
+)
+# Filenames that are typical app entry points; flagged so a downstream
+# fixer can prefer mounting <BrowserRouter> here over editing leaf
+# components.
+_ENTRY_POINT_BASENAMES = frozenset({
+    "main.jsx", "main.tsx", "main.js", "main.ts",
+    "index.jsx", "index.tsx", "index.js", "index.ts",
+    "App.jsx", "App.tsx",
+})
+
+
+def _detect_router_mount_missing(memory: "FileMemory") -> dict | None:
+    """Return a description of the mismatch when production source
+    uses react-router primitives but no source file mounts a Router,
+    otherwise ``None``.
+
+    The detector is **source-side only** — test files are intentionally
+    ignored because the failure mode is "tests use ``<MemoryRouter>``
+    to mask a missing production mount."  Including tests in the scan
+    would let that workaround pretend the app is wired.
+
+    Detection rules (all must hold):
+      1. At least one production (non-test) source file imports
+         from ``react-router`` or ``react-router-dom``.
+      2. That same import surface is actually used (a router primitive
+         like ``Link`` / ``useNavigate`` appears in source).
+      3. No production source file mounts a Router via JSX
+         (``<BrowserRouter>``, ``<RouterProvider>``, etc.).
+
+    Returns a dict with the data the LLM-based wiring verification
+    needs to fix the issue, or ``None``.
+    """
+    import os as _os_rm
+
+    files_using_primitives: list[str] = []
+    entry_candidates: list[str] = []
+    any_source_imports_router = False
+    any_source_mounts_router = False
+
+    for fp, content in memory.all_files().items():
+        if not content:
+            continue
+        if _is_test_file(fp):
+            continue
+
+        # Entry-point candidates are tracked unconditionally — main.jsx
+        # typically does NOT import react-router (that's the bug we're
+        # detecting), so it would be missed if we only looked inside
+        # the react-router import block.
+        base = _os_rm.path.basename(fp.replace("\\", "/"))
+        if base in _ENTRY_POINT_BASENAMES:
+            entry_candidates.append(fp)
+
+        if not _REACT_ROUTER_IMPORT_RE.search(content):
+            continue
+        any_source_imports_router = True
+        if _ROUTER_PRIMITIVE_RE.search(content):
+            files_using_primitives.append(fp)
+        if _ROUTER_MOUNT_JSX_RE.search(content):
+            any_source_mounts_router = True
+
+    if not any_source_imports_router:
+        return None
+    if not files_using_primitives:
+        return None
+    if any_source_mounts_router:
+        return None
+
+    return {
+        "kind": "router_mount_missing",
+        "files_using_primitives": sorted(files_using_primitives),
+        "entry_candidates": sorted(entry_candidates),
+    }
+
+
 def should_run_wiring_verification(
     memory: "FileMemory",
     *,
@@ -124,15 +232,30 @@ def should_run_wiring_verification(
     mode it looks for would have crashed the test runner.  A green bulk
     test run is therefore implicit proof of correct wiring.
 
-    Returns True only when ALL of the following hold:
+    EXCEPTION: when :func:`_detect_router_mount_missing` finds that
+    production source uses react-router primitives without mounting a
+    Router, bulk-test green is **not** a wiring proof — the BulkTest
+    fix loop's test-only retry routinely wraps tests in
+    ``<MemoryRouter>`` as a workaround, masking the missing mount.
+    Force verification to run in that case so the LLM-based fixer can
+    either remove the primitives from source or mount
+    ``<BrowserRouter>`` in the entry point.
+
+    Returns True when ALL of:
       • The pipeline as a whole succeeded.
       • Wiring verification is enabled in config.
-      • Either no test files exist (bulk test was skipped — so wiring is
-        the only integration check we have), OR the bulk test run did not
-        succeed (so we cannot trust it as a wiring proof).
+    AND any of:
+      • No test files exist (bulk test was skipped — so wiring is the
+        only integration check we have).
+      • The bulk test run did not succeed (so we cannot trust it as a
+        wiring proof).
+      • A router-mount mismatch was detected.
     """
     if not (pipeline_success and wiring_enabled):
         return False
+
+    if _detect_router_mount_missing(memory) is not None:
+        return True
 
     bulk_tests_existed = any(
         _is_test_file(f) and not f.startswith("_")
@@ -140,6 +263,46 @@ def should_run_wiring_verification(
     )
     bulk_tests_passed = bulk_tests_existed and bulk_test_verif_ok
     return not bulk_tests_passed
+
+
+def _diff_stats(orig: str, new_content: str) -> dict:
+    """Return per-opcode line-level diff stats between two file contents.
+
+    Shared by :func:`_is_additive_source_fix` (strict 10% additive check)
+    and :func:`_attempt_targeted_source_fix` (relaxed 30% cap for the
+    escape hatch) so both use identical diff arithmetic.
+
+    Returned keys:
+        ``added``     — line count for insert-only opcodes
+        ``removed``   — line count for delete-only opcodes
+        ``changed``   — max side of replace opcodes
+        ``total_delta`` — ``added + changed``
+        ``ratio``     — ``total_delta / max(orig_len, 1)``
+    """
+    import difflib
+    orig_lines = orig.splitlines()
+    new_lines = new_content.splitlines()
+    orig_len = max(len(orig_lines), 1)
+    sm = difflib.SequenceMatcher(None, orig_lines, new_lines, autojunk=False)
+    added = 0
+    removed = 0
+    changed = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'insert':
+            added += j2 - j1
+        elif tag == 'delete':
+            removed += i2 - i1
+        elif tag == 'replace':
+            changed += max(i2 - i1, j2 - j1)
+            removed += max(0, (i2 - i1) - (j2 - j1))
+    total_delta = added + changed
+    return {
+        'added': added,
+        'removed': removed,
+        'changed': changed,
+        'total_delta': total_delta,
+        'ratio': total_delta / orig_len,
+    }
 
 
 def _is_additive_source_fix(file_path: str, new_content: str,
@@ -155,42 +318,375 @@ def _is_additive_source_fix(file_path: str, new_content: str,
       3. Total change is ≤10% of original line count
       4. Changed lines only add attributes / props, not logic
     """
-    import difflib
-
     orig = memory.get(file_path)
     if orig is None:
         return False
 
     orig_lines = orig.splitlines()
-    new_lines = new_content.splitlines()
     orig_len = len(orig_lines)
-
     if orig_len < 3:
         return False
 
-    sm = difflib.SequenceMatcher(None, orig_lines, new_lines, autojunk=False)
-    added = 0
-    removed = 0
-    changed = 0
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'insert':
-            added += j2 - j1
-        elif tag == 'delete':
-            removed += i2 - i1
-        elif tag == 'replace':
-            changed += max(i2 - i1, j2 - j1)
-            removed += max(0, (i2 - i1) - (j2 - j1))
+    stats = _diff_stats(orig, new_content)
 
     # No lines may be removed — only additions or in-place edits
-    if removed > 0:
+    if stats['removed'] > 0:
         return False
 
     # Total change must be ≤10% of original
-    total_delta = added + changed
-    if total_delta > max(orig_len * 0.10, 3):
+    if stats['total_delta'] > max(orig_len * 0.10, 3):
         return False
 
     return True
+
+
+# ── Escape hatch: targeted source-file fix helpers ────────────────────────
+# When test-only retries can't resolve a BulkTest failure (same error
+# signature across consecutive attempts), the escape hatch allows ONE
+# narrowly-scoped source-file fix.  Safety is enforced by:
+#   1. Stack-trace scope  (cannot touch files the error doesn't reference)
+#   2. Single-file scope  (multi-file fixes are rejected)
+#   3. Export preservation (all top-level public names must survive)
+#   4. Diff size cap      (≤30% of original lines changed)
+#   5. Snapshot & revert  (caller reverts if the target test still fails)
+
+# Normalisation regexes used to compute a stable error "shape" hash —
+# stripping line/column numbers, timings, absolute paths and hex pointers
+# so cosmetic churn across attempts doesn't hide a repeating error.
+_ERROR_SIG_STRIP_RE = re.compile(
+    r'(?:'
+    r':\d+(?::\d+)?'              # :line or :line:col
+    r'|\b\d+\s*ms\b'              # test timings
+    r'|[A-Z]:\\[\w\-./\\]+'       # Windows absolute paths
+    r'|(?<=[\s\'"(])/[\w\-./]+'   # POSIX absolute paths
+    r'|0x[0-9a-fA-F]+'            # hex addresses
+    r')'
+)
+
+
+def _error_signature(err: str) -> str:
+    """Compute a stable short hash of the *shape* of an error string.
+
+    Used to detect "the fix loop is making no progress": if two
+    consecutive attempts produce the same signature, the test-only
+    rewrites are not addressing the root cause and the escape hatch
+    may fire.
+    """
+    import hashlib
+    if not err:
+        return ""
+    norm = _ERROR_SIG_STRIP_RE.sub('', err)
+    norm = re.sub(r'\s+', ' ', norm).strip()
+    return hashlib.sha1(
+        norm[:600].encode('utf-8', errors='replace')).hexdigest()[:12]
+
+
+# Stack-trace patterns.  Catch both parenthesised JS frames
+# (`at Fn (src/Foo.jsx:12:3)`), bare JS frames (`src/Foo.jsx:12`),
+# and Python `File "src/foo.py"` frames.
+_STACK_JS_RE = re.compile(
+    r'(?:at\s[^()]*\(|[\s(])'
+    r'((?:[A-Za-z]:[\\/])?[\w\-./\\]+\.(?:jsx?|tsx?|mjs|cjs|vue|svelte))'
+    r':\d+(?::\d+)?'
+)
+_STACK_JS_BARE_RE = re.compile(
+    r'(?:^|[\s"\'(<>])'
+    r'((?:[A-Za-z]:[\\/])?[\w\-./\\]+\.(?:jsx?|tsx?|mjs|cjs|vue|svelte))'
+    r':\d+(?::\d+)?'
+)
+_STACK_PY_RE = re.compile(
+    r'File\s+"((?:[A-Za-z]:[\\/])?[\w\-./\\]+\.py)"'
+)
+
+
+def _extract_stack_trace_files(err: str) -> set[str]:
+    """Extract source file paths referenced in a test-runner error output.
+
+    Normalises backslashes to forward slashes so comparisons with memory
+    keys work on Windows.  Filters out library files (``node_modules``,
+    ``site-packages``, ``dist/``) — the agent cannot fix those.
+    """
+    if not err:
+        return set()
+    paths: set[str] = set()
+    for m in _STACK_JS_RE.finditer(err):
+        paths.add(m.group(1).replace('\\', '/'))
+    for m in _STACK_JS_BARE_RE.finditer(err):
+        paths.add(m.group(1).replace('\\', '/'))
+    for m in _STACK_PY_RE.finditer(err):
+        paths.add(m.group(1).replace('\\', '/'))
+    return {
+        p for p in paths
+        if 'node_modules' not in p
+        and 'site-packages' not in p
+        and '/dist/' not in p
+        and not p.startswith('dist/')
+    }
+
+
+# Top-level export / definition patterns used to check that a targeted
+# source fix preserves the file's public API.  Best-effort — recognises
+# common JS/TS/CJS/Python patterns without a full parser.
+_EXPORT_PATTERNS: list[re.Pattern] = [
+    # "export default function Foo" / "export default class Foo"
+    re.compile(
+        r'^export\s+default\s+(?:async\s+)?(?:function|class)\s+(\w+)',
+        re.MULTILINE),
+    # "export function Foo" / "export class Foo"
+    re.compile(
+        r'^export\s+(?:async\s+)?(?:function|class)\s+(\w+)',
+        re.MULTILINE),
+    # "export const/let/var Foo"
+    re.compile(r'^export\s+(?:const|let|var)\s+(\w+)', re.MULTILINE),
+    # CJS "module.exports.Foo ="
+    re.compile(r'^module\.exports\.(\w+)\s*=', re.MULTILINE),
+    # Python top-level "def Foo(" / "async def Foo(" / "class Foo"
+    re.compile(r'^(?:async\s+)?def\s+(\w+)\s*\(', re.MULTILINE),
+    re.compile(r'^class\s+(\w+)\s*[:\(]', re.MULTILINE),
+]
+# "export { A, B as C }" — body captured then split
+_EXPORT_NAMED_BLOCK_RE = re.compile(r'^export\s*\{([^}]+)\}', re.MULTILINE)
+_EXPORT_NAMED_ITEM_RE = re.compile(r'(\w+)(?:\s+as\s+\w+)?')
+# "export default Foo;" — identifier-only default export
+_EXPORT_DEFAULT_IDENT_RE = re.compile(
+    r'^export\s+default\s+(\w+)\s*;?\s*$', re.MULTILINE)
+
+
+def _extract_top_level_exports(content: str) -> set[str]:
+    """Return the set of top-level export / definition names in *content*.
+
+    Used to verify that a targeted source fix doesn't silently drop the
+    file's public API (which would break every importer).  Recognises
+    common JS/TS/CJS/Python forms — intentionally best-effort, not a
+    full AST walk.
+    """
+    names: set[str] = set()
+    if not content:
+        return names
+    for pat in _EXPORT_PATTERNS:
+        for m in pat.finditer(content):
+            names.add(m.group(1))
+    for m in _EXPORT_NAMED_BLOCK_RE.finditer(content):
+        body = m.group(1)
+        for nm in _EXPORT_NAMED_ITEM_RE.finditer(body):
+            names.add(nm.group(1))
+    for m in _EXPORT_DEFAULT_IDENT_RE.finditer(content):
+        names.add(m.group(1))
+    return names
+
+
+# Relaxed diff cap for escape-hatch source fixes — loose enough to allow
+# real bug fixes (remove an import + swap a JSX element) but strict
+# enough to block "LLM rewrote the whole file" regressions.
+_ESCAPE_HATCH_DIFF_RATIO = 0.30
+
+
+def _should_trigger_escape_hatch(
+    *,
+    used_escape_hatch: bool,
+    did_test_only_retry: bool,
+    error_sig_history: list[str],
+    route,
+) -> bool:
+    """Decide whether the BulkTest escape hatch may fire this attempt.
+
+    Pure-function form so it can be unit-tested without standing up a
+    whole loop, and called from both Loop 1 and Loop 2 to keep the
+    trigger logic identical.
+
+    All conditions MUST hold:
+
+    1. The hatch hasn't already been used for this test file (one
+       shot only — see commit message for the rationale).
+    2. The test-only retry has been tried; this rules out attempt 1
+       and forces the cheaper rewrite path to run first.
+    3. We've recorded at least 2 error signatures and the most
+       recent two are identical and non-empty — i.e. the test-only
+       retries are demonstrably not converging on a fix.
+    4. ErrorRouter classified the failure as ``source_type='code'``.
+       Environment / data / network errors get a different remedy
+       and the hatch is not designed to handle them.
+
+    Note: there is intentionally no ``fix_attempt < MAX`` guard.
+    Verification of the hatch fix happens via the immediate re-run
+    inside the same loop iteration, and the snapshot revert handles
+    failure on any attempt — including the last one.  An earlier
+    version of this guard prevented the hatch from ever firing on
+    the final attempt, which is exactly when test-only retries
+    have most clearly failed.
+    """
+    if used_escape_hatch:
+        return False
+    if not did_test_only_retry:
+        return False
+    if len(error_sig_history) < 2:
+        return False
+    if not error_sig_history[-1]:
+        return False
+    if error_sig_history[-1] != error_sig_history[-2]:
+        return False
+    if route is None or getattr(route, 'source_type', None) != 'code':
+        return False
+    return True
+
+
+def _attempt_targeted_source_fix(
+    *,
+    test_path: str,
+    file_error: str,
+    source_ctx: str,
+    coder,
+    executor,
+    memory,
+    subproject_cwd,
+    lang_tag: str,
+    task: str,
+) -> dict[str, str] | None:
+    """Last-resort source-file fix when test-only retries cannot help.
+
+    Prompts the LLM to make the SMALLEST possible change to exactly ONE
+    source file referenced in the test's error stack trace, then applies
+    these post-LLM safety rails before returning:
+
+      * Only files in the stack trace are accepted.
+      * Single-file scope — multi-file responses are rejected.
+      * Every top-level export in the original file must still be
+        present in the new content.
+      * Diff size ≤ ``_ESCAPE_HATCH_DIFF_RATIO`` (30%) of original lines.
+
+    Returns a ``{path: content}`` dict ready to write, or ``None`` if
+    the LLM response was empty, unparseable, or failed any safety
+    check.  The caller is responsible for snapshotting the file(s)
+    before write and restoring on regression.
+    """
+    # 1. Derive the in-scope source files from the stack trace.
+    trace_files = _extract_stack_trace_files(file_error)
+    _test_path_norm = test_path.replace('\\', '/')
+    trace_files = {
+        p for p in trace_files
+        if not _is_test_file(p) and p != _test_path_norm
+    }
+    if not trace_files:
+        _logger.info(
+            "[BulkTest/Hatch] No source files referenced in stack trace "
+            "for %s — cannot target a fix", test_path)
+        return None
+
+    _logger.info(
+        "[BulkTest/Hatch] Candidate source files from stack: %s",
+        sorted(trace_files))
+
+    # 2. Build a tightly constrained prompt.
+    trace_list = ", ".join(f"`{p}`" for p in sorted(trace_files))
+    prompt = (
+        f"Task: {task}\n\n"
+        f"Test file `{test_path}` has failed repeatedly and the test "
+        f"itself cannot be rewritten to work around the problem — the "
+        f"ROOT CAUSE is in the SOURCE code.\n\n"
+        f"Error output:\n{file_error}\n\n"
+        f"Source files in scope:\n{source_ctx}\n\n"
+        f"CRITICAL RULES:\n"
+        f"1. Modify EXACTLY ONE source file — one of: {trace_list}\n"
+        f"2. Make the SMALLEST possible change to fix the root cause.\n"
+        f"3. DO NOT rewrite the file from scratch. DO NOT drop, rename, "
+        f"or re-order existing top-level exports/functions/classes.\n"
+        f"4. DO NOT modify the test file — the test encodes the "
+        f"intended behaviour.\n"
+        f"5. Output the COMPLETE updated source file using:\n"
+        f"   #### [FILE]: <path>\n"
+        f"   ```{lang_tag}\n   ...full file content...\n   ```\n"
+    )
+
+    try:
+        response = coder.llm_client.generate_response(prompt)
+    except Exception as exc:
+        _logger.warning("[BulkTest/Hatch] LLM call failed: %s", exc)
+        return None
+
+    fix_files = executor.parse_code_blocks(response)
+    if not fix_files:
+        fix_files = executor.parse_code_blocks_fuzzy(response)
+    if not fix_files:
+        _logger.info(
+            "[BulkTest/Hatch] LLM response had no parseable code blocks")
+        return None
+
+    if subproject_cwd:
+        fix_files = _prefix_subproject_paths(
+            fix_files, subproject_cwd, memory)
+
+    # 3a. Single-file scope
+    if len(fix_files) != 1:
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — LLM proposed %d files, "
+            "expected 1: %s", len(fix_files), list(fix_files.keys()))
+        return None
+
+    fp, new_content = next(iter(fix_files.items()))
+    fp_norm = fp.replace('\\', '/')
+
+    # 3b. Must be a source file, not a test
+    if _is_test_file(fp):
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — LLM returned a test file "
+            "(%s); hatch is source-only", fp)
+        return None
+
+    # 3c. Must be in the stack-trace scope (suffix-match tolerates
+    #     subproject-prefixed vs. relative paths).
+    in_scope = any(
+        fp_norm == tp
+        or fp_norm.endswith('/' + tp)
+        or tp.endswith('/' + fp_norm)
+        for tp in trace_files
+    )
+    if not in_scope:
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — %s not in stack-trace scope "
+            "(%s)", fp_norm, sorted(trace_files))
+        return None
+
+    # 3d. Load original content for diff + export checks.
+    orig_content = memory.get(fp)
+    if orig_content is None:
+        try:
+            with open(fp, 'r', encoding='utf-8', errors='replace') as _f:
+                orig_content = _f.read()
+        except OSError:
+            orig_content = ""
+    if not orig_content:
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — cannot read original %s for "
+            "safety checks", fp)
+        return None
+
+    # 3e. Top-level exports must all be preserved.
+    orig_exports = _extract_top_level_exports(orig_content)
+    new_exports = _extract_top_level_exports(new_content)
+    dropped = orig_exports - new_exports
+    if dropped:
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — dropped top-level exports "
+            "%s in %s", sorted(dropped), fp)
+        return None
+
+    # 3f. Diff size within relaxed cap.
+    stats = _diff_stats(orig_content, new_content)
+    if stats['ratio'] > _ESCAPE_HATCH_DIFF_RATIO:
+        _logger.warning(
+            "[BulkTest/Hatch] Rejected — diff ratio %.0f%% exceeds "
+            "%.0f%% cap for %s (added=%d removed=%d changed=%d)",
+            stats['ratio'] * 100,
+            _ESCAPE_HATCH_DIFF_RATIO * 100, fp,
+            stats['added'], stats['removed'], stats['changed'])
+        return None
+
+    _logger.info(
+        "[BulkTest/Hatch] Validated source fix for %s "
+        "(added=%d removed=%d changed=%d ratio=%.0f%%)",
+        fp, stats['added'], stats['removed'], stats['changed'],
+        stats['ratio'] * 100)
+    return {fp: new_content}
 
 
 def _find_tests_impacted_by_sources(
@@ -3416,6 +3912,13 @@ def run_bulk_test_execution_and_fix(
         _no_code_last_attempt = False   # True when LLM returned prose but no code
         _test_rewrite_done = False      # True after a test-rewrite pivot was attempted
 
+        # Escape-hatch state — see _attempt_targeted_source_fix.
+        # _did_test_only_retry replaces the broken `getattr(int, ...)` flag.
+        _did_test_only_retry = False
+        _used_escape_hatch = False
+        _hatch_snap: dict[str, str] | None = None
+        _error_sig_history: list[str] = []
+
         # ── ErrorRouter: classify this test failure once per file ────────────
         # Determines whether web search is worth calling before fixing.
         # Computed from the initial error output (before any fix is applied).
@@ -3460,6 +3963,11 @@ def run_bulk_test_execution_and_fix(
                 # Take the tail (where tracebacks and ImportErrors appear)
                 # rather than the head (which is often setup noise).
                 file_error = current_output[-3000:]
+
+            # Track normalised error shape for the escape-hatch trigger:
+            # if the same signature appears on consecutive attempts the
+            # test-only retries are not converging.
+            _error_sig_history.append(_error_signature(file_error))
 
             # Build source context for this test file
             current_content = memory.all_files().get(test_path, "")
@@ -3802,7 +4310,8 @@ def run_bulk_test_execution_and_fix(
                     # case: Header uses <Link> but test doesn't wrap in
                     # MemoryRouter.  LLM tries to remove Link from Header
                     # instead of wrapping the test render.
-                    if not getattr(fix_attempt, '_retried_test_only', False):
+                    if not _did_test_only_retry:
+                        _did_test_only_retry = True
                         _logger.info(
                             "[BulkTest] All fixes were source files for %s "
                             "— retrying with test-only constraint", basename)
@@ -3876,6 +4385,52 @@ def run_bulk_test_execution_and_fix(
                                 "[BulkTest] Test-only retry failed: %s",
                                 _to_exc)
                     if not fix_files:
+                        # ── Escape hatch: targeted source-file fix ──
+                        # See _should_trigger_escape_hatch for the
+                        # full set of preconditions.
+                        if _should_trigger_escape_hatch(
+                            used_escape_hatch=_used_escape_hatch,
+                            did_test_only_retry=_did_test_only_retry,
+                            error_sig_history=_error_sig_history,
+                            route=_route,
+                        ):
+                            _logger.info(
+                                "[BulkTest] Escape hatch triggered for %s "
+                                "— error signature stable (%s), attempting "
+                                "targeted source fix",
+                                basename, _error_sig_history[-1])
+                            _used_escape_hatch = True  # one shot only
+                            _hatch_files = _attempt_targeted_source_fix(
+                                test_path=test_path,
+                                file_error=file_error,
+                                source_ctx=source_ctx,
+                                coder=coder,
+                                executor=executor,
+                                memory=memory,
+                                subproject_cwd=subproject_cwd,
+                                lang_tag=lang_tag,
+                                task=task,
+                            )
+                            if _hatch_files:
+                                # Snapshot the files we're about to
+                                # overwrite so we can revert on regression.
+                                _hatch_snap = memory.snapshot(
+                                    list(_hatch_files.keys()))
+                                for _hfp in _hatch_files:
+                                    if _hfp not in _hatch_snap:
+                                        try:
+                                            with open(_hfp, 'r',
+                                                      encoding='utf-8',
+                                                      errors='replace') as _f:
+                                                _hatch_snap[_hfp] = _f.read()
+                                        except OSError:
+                                            _hatch_snap[_hfp] = ''
+                                fix_files = _hatch_files
+                                _logger.info(
+                                    "[BulkTest] Escape hatch fix ready for "
+                                    "%s: %s",
+                                    basename, list(fix_files.keys()))
+                    if not fix_files:
                         _logger.warning(
                             "[BulkTest] All fix files were source files — "
                             "skipping write for %s", basename)
@@ -3900,6 +4455,9 @@ def run_bulk_test_execution_and_fix(
                 print(f"  [BulkTest] {basename} fixed ✔")
                 _p, _t, _ = _parse_test_counts(current_output)
                 display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+                # Hatch fix worked — drop the snapshot so it isn't
+                # restored later if a subsequent attempt regresses.
+                _hatch_snap = None
 
                 # Check if any source files were modified and find other test
                 # files that import them — they may have been broken by the fix.
@@ -3938,6 +4496,17 @@ def run_bulk_test_execution_and_fix(
                 "[BulkTest] %s still failing (attempt %d/%d)",
                 basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
             )
+            # If the just-applied fix came from the escape hatch and the
+            # target test still fails, the source change did not help —
+            # roll it back so subsequent attempts (and downstream tests)
+            # operate on the known-good source content.
+            if _hatch_snap is not None:
+                _logger.warning(
+                    "[BulkTest] Escape-hatch source fix for %s did not "
+                    "fix the test — reverting %d file(s)",
+                    basename, len(_hatch_snap))
+                memory.restore(_hatch_snap, executor=executor)
+                _hatch_snap = None
             # Update TEST RESULTS with latest counts on each fix attempt
             _p, _t, _f = _parse_test_counts(current_output)
             display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
@@ -3996,6 +4565,35 @@ def run_bulk_test_execution_and_fix(
             basename = test_path.rsplit('/', 1)[-1]
             print(f"  [BulkTest] Fixing {basename} (from run-all)...")
 
+            # Per-test escape-hatch state — see Loop 1 for details.
+            _did_test_only_retry = False
+            _used_escape_hatch = False
+            _hatch_snap: dict[str, str] | None = None
+            _error_sig_history: list[str] = []
+
+            # Classify the failure once per test so the escape-hatch
+            # trigger can require ErrorRouter source_type == 'code'.
+            _route = None
+            try:
+                from .error_router import classify_error as _classify_error
+                _initial_error = _extract_file_specific_errors(
+                    current_output, test_path, max_chars=2000)
+                if not _initial_error:
+                    _initial_error = current_output[-2000:]
+                _route = _classify_error(
+                    error_info=_initial_error,
+                    step_type="TEST",
+                    project_context=project_context,
+                    kb_matched=False,
+                    llm_client=coder.llm_client if search_agent is not None else None,
+                )
+                log.info(
+                    "[BulkTest] ErrorRouter %s → source=%s skip_web=%s (%s)",
+                    basename, _route.source_type, _route.skip_web, _route.reason,
+                )
+            except Exception as _re_exc:
+                log.debug("[BulkTest] ErrorRouter failed for %s: %s", basename, _re_exc)
+
             for fix_attempt in range(1, _MAX_BULK_TEST_FIX_ATTEMPTS + 1):
                 file_error = _extract_file_specific_errors(
                     current_output, test_path, max_chars=3000)
@@ -4003,6 +4601,9 @@ def run_bulk_test_execution_and_fix(
                     # Take the tail (where tracebacks and ImportErrors appear)
                     # rather than the head (which is often setup noise).
                     file_error = current_output[-3000:]
+
+                # Track normalised error shape (escape-hatch trigger).
+                _error_sig_history.append(_error_signature(file_error))
 
                 current_content = memory.all_files().get(test_path, "")
                 if not current_content:
@@ -4109,9 +4710,10 @@ def run_bulk_test_execution_and_fix(
                                 "[BulkTest] Blocked source file(s): %s",
                                 list(_bt2_blocked))
                         fix_files = _bt2_filtered
-                        if not fix_files:
+                        if not fix_files and not _did_test_only_retry:
                             # Retry with test-only constraint (same
                             # logic as Loop 1 — see detailed comments there)
+                            _did_test_only_retry = True
                             try:
                                 _to2_step_desc = ""
                                 _to2_ps = _step_descs.get(test_path)
@@ -4170,6 +4772,49 @@ def run_bulk_test_execution_and_fix(
                             except Exception:
                                 pass
                         if not fix_files:
+                            # Escape hatch — same trigger as Loop 1.
+                            if _should_trigger_escape_hatch(
+                                used_escape_hatch=_used_escape_hatch,
+                                did_test_only_retry=_did_test_only_retry,
+                                error_sig_history=_error_sig_history,
+                                route=_route,
+                            ):
+                                _logger.info(
+                                    "[BulkTest] Escape hatch triggered for "
+                                    "%s (run-all loop) — error signature "
+                                    "stable (%s), attempting targeted "
+                                    "source fix",
+                                    basename, _error_sig_history[-1])
+                                _used_escape_hatch = True
+                                _hatch_files = _attempt_targeted_source_fix(
+                                    test_path=test_path,
+                                    file_error=file_error,
+                                    source_ctx=source_ctx,
+                                    coder=coder,
+                                    executor=executor,
+                                    memory=memory,
+                                    subproject_cwd=subproject_cwd,
+                                    lang_tag=lang_tag,
+                                    task=task,
+                                )
+                                if _hatch_files:
+                                    _hatch_snap = memory.snapshot(
+                                        list(_hatch_files.keys()))
+                                    for _hfp in _hatch_files:
+                                        if _hfp not in _hatch_snap:
+                                            try:
+                                                with open(_hfp, 'r',
+                                                          encoding='utf-8',
+                                                          errors='replace') as _f:
+                                                    _hatch_snap[_hfp] = _f.read()
+                                            except OSError:
+                                                _hatch_snap[_hfp] = ''
+                                    fix_files = _hatch_files
+                                    _logger.info(
+                                        "[BulkTest] Escape hatch fix ready "
+                                        "for %s: %s",
+                                        basename, list(fix_files.keys()))
+                        if not fix_files:
                             break
                         executor.write_files(fix_files)
                         memory.update(fix_files)
@@ -4191,11 +4836,20 @@ def run_bulk_test_execution_and_fix(
                     print(f"  [BulkTest] {basename} fixed ✔")
                     _p, _t, _ = _parse_test_counts(current_output)
                     display.record_test_result(test_path, passed=_p, total=_t, failures=[])
+                    _hatch_snap = None  # commit hatch fix
                     break
                 _logger.warning(
                     "[BulkTest] %s still failing (attempt %d/%d)",
                     basename, fix_attempt, _MAX_BULK_TEST_FIX_ATTEMPTS,
                 )
+                # Revert any escape-hatch source fix that didn't help.
+                if _hatch_snap is not None:
+                    _logger.warning(
+                        "[BulkTest] Escape-hatch source fix for %s did "
+                        "not fix the test — reverting %d file(s)",
+                        basename, len(_hatch_snap))
+                    memory.restore(_hatch_snap, executor=executor)
+                    _hatch_snap = None
                 _p, _t, _f = _parse_test_counts(current_output)
                 display.record_test_result(test_path, passed=_p, total=_t, failures=_f)
             else:
@@ -4463,6 +5117,13 @@ def run_wiring_verification(
         "issue that would cause a blank screen, runtime crash, or silent "
         "failure at startup. Common issues to check:\n"
         "  • Missing ReactDOM.createRoot / wrong entry-point mounting\n"
+        "  • Missing context provider mount — e.g. a component imports "
+        "`Link` / `useNavigate` from react-router-dom but no source file "
+        "wraps the tree in `<BrowserRouter>` / `<RouterProvider>`. Tests "
+        "may pass via `<MemoryRouter>` wrappers while the browser crashes "
+        "with `Cannot destructure 'basename' of useContext(...)`. Either "
+        "mount `<BrowserRouter>` in the entry point, or strip the router "
+        "primitives from the source if the page uses in-page anchor links.\n"
         "  • Default-export / named-export mismatch between files\n"
         "  • Import path typo or missing file extension\n"
         "  • Component receives wrong prop shape (undefined, wrong type)\n"

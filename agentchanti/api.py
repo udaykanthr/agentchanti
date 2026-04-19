@@ -535,6 +535,13 @@ def _run_task_impl(
     step_results: dict[int, str] = {}
     pipeline_success = True
 
+    # Clear any lingering planning/analysis status message before execution
+    # starts. Without this, "Analysing project...", "Requesting steps from
+    # planner...", etc. stay pinned to the STATUS panel for the entire run
+    # because nothing inside _execute_step touches show_status. The wiring
+    # verification phase sets/clears its own status independently.
+    display.show_status("")
+
     for wave_idx, wave in enumerate(waves):
         for idx in wave:
             step_text = steps[idx]

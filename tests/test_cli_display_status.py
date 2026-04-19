@@ -98,5 +98,49 @@ class TestPostStepStatusFooter(unittest.TestCase):
         self.assertNotIn("PLANNING", title_str)
 
 
+class TestExecutionClearsPlannerStatus(unittest.TestCase):
+    """Both entry points must clear the planning status before executing waves.
+
+    Regression: the planner sets ``show_status('Requesting steps from
+    planner...')`` and nothing inside ``_execute_step`` ever touches the
+    status, so the message used to stay pinned to the STATUS panel for the
+    entire pipeline run — even after every step finished and tests passed.
+    The fix clears the status right before the wave execution loop in both
+    ``orchestrator/cli.py`` and ``api.py``. These tests pin that contract by
+    asserting the source files contain a ``show_status("")`` call adjacent
+    to the wave loop.
+    """
+
+    def _read(self, relpath: str) -> str:
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        return (root / relpath).read_text(encoding="utf-8")
+
+    def test_cli_clears_status_before_wave_loop(self):
+        src = self._read("agentchanti/orchestrator/cli.py")
+        # Find the wave loop and walk backwards a few lines.
+        marker = "for wave_idx, wave in enumerate(waves):"
+        idx = src.find(marker)
+        self.assertGreater(idx, 0, "wave loop not found in cli.py")
+        preface = src[max(0, idx - 600):idx]
+        self.assertIn(
+            'display.show_status("")', preface,
+            "cli.py must clear status before wave execution starts "
+            "(see TestExecutionClearsPlannerStatus docstring)",
+        )
+
+    def test_api_clears_status_before_wave_loop(self):
+        src = self._read("agentchanti/api.py")
+        marker = "for wave_idx, wave in enumerate(waves):"
+        idx = src.find(marker)
+        self.assertGreater(idx, 0, "wave loop not found in api.py")
+        preface = src[max(0, idx - 600):idx]
+        self.assertIn(
+            'display.show_status("")', preface,
+            "api.py must clear status before wave execution starts "
+            "(see TestExecutionClearsPlannerStatus docstring)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

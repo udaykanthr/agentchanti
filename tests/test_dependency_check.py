@@ -16,6 +16,10 @@ from agentchanti.orchestrator.dependency_check import (
     _is_external_import,
     _is_test_file,
     _guess_parent_file,
+    _extract_component_props,
+    _find_signature_gaps,
+    _scan_balanced_destructure,
+    _split_top_level_params,
 )
 
 
@@ -749,3 +753,197 @@ class TestRunDependencyCheck:
         )
         assert llm.called
         assert "src/App.tsx" in result
+
+
+# ── _scan_balanced_destructure / _split_top_level_params ─────────
+
+
+class TestBalancedScanner:
+    def test_simple_destructure(self):
+        s = "({a, b})"
+        inner, end = _scan_balanced_destructure(s, 1)
+        assert inner == "a, b"
+        assert s[end - 1] == "}"
+
+    def test_nested_object_default(self):
+        s = "({a = { x: 1, y: 2 }, b})"
+        inner, _ = _scan_balanced_destructure(s, 1)
+        assert inner == "a = { x: 1, y: 2 }, b"
+
+    def test_brace_inside_string_does_not_close(self):
+        s = "({a = 'has } brace', b})"
+        inner, _ = _scan_balanced_destructure(s, 1)
+        assert inner == "a = 'has } brace', b"
+
+    def test_brace_inside_template_literal(self):
+        s = "({a = `tpl } brace`, b})"
+        inner, _ = _scan_balanced_destructure(s, 1)
+        assert inner == "a = `tpl } brace`, b"
+
+    def test_escaped_quote_in_string(self):
+        s = "({a = 'it\\'s fine, really', b})"
+        inner, _ = _scan_balanced_destructure(s, 1)
+        assert inner == "a = 'it\\'s fine, really', b"
+
+    def test_unclosed_destructure_returns_none(self):
+        s = "({a, b"
+        assert _scan_balanced_destructure(s, 1) is None
+
+    def test_split_respects_string_commas(self):
+        parts = _split_top_level_params("a = 'x, y, z', b")
+        assert parts == ["a = 'x, y, z'", " b"]
+
+    def test_split_respects_object_commas(self):
+        parts = _split_top_level_params("a = { p: 1, q: 2 }, b")
+        assert parts == ["a = { p: 1, q: 2 }", " b"]
+
+    def test_split_respects_array_commas(self):
+        parts = _split_top_level_params("a = [1, 2, 3], b")
+        assert parts == ["a = [1, 2, 3]", " b"]
+
+    def test_split_respects_call_commas(self):
+        parts = _split_top_level_params("a = f(1, 2), b")
+        assert parts == ["a = f(1, 2)", " b"]
+
+
+# ── _extract_component_props ─────────────────────────────────────
+
+
+class TestExtractComponentProps:
+    def test_required_props_no_defaults(self):
+        content = "function Foo({ a, b, c }) { return null; }"
+        assert _extract_component_props(content) == {"Foo": {"a", "b", "c"}}
+
+    def test_props_with_defaults_are_optional(self):
+        content = "function Foo({ a = 1, b = 2 }) { return null; }"
+        assert _extract_component_props(content) == {}
+
+    def test_mixed_required_and_optional(self):
+        content = "function Foo({ a, b = 2, c }) { return null; }"
+        assert _extract_component_props(content) == {"Foo": {"a", "c"}}
+
+    def test_string_default_with_commas_does_not_create_fake_props(self):
+        """Regression: prose commas in default strings used to be parsed as params.
+
+        See dependency_check.py: a description like
+        'Build apps with React, Tailwind, and joy' would split into fake
+        required props 'Tailwind' and 'and joy'.
+        """
+        content = (
+            "function Hero({\n"
+            "  title = 'Build apps faster',\n"
+            "  description = 'Modern homepage with header, animated banner, and layout.',\n"
+            "}) { return null; }"
+        )
+        assert _extract_component_props(content) == {}
+
+    def test_object_default_with_commas_does_not_create_fake_props(self):
+        """Regression: nested object defaults used to leak inner keys as fake props."""
+        content = (
+            "function Hero({\n"
+            "  primaryCta = { label: 'Get started', to: '/signup' },\n"
+            "  secondaryCta = { label: 'Learn more', to: '/features' },\n"
+            "}) { return null; }"
+        )
+        assert _extract_component_props(content) == {}
+
+    def test_real_world_hero_banner(self):
+        """Regression: the exact shape from the agentchanti demo bug report."""
+        content = (
+            "function HeroBanner({\n"
+            "  eyebrow = 'New feature',\n"
+            "  title = 'Build responsive apps faster with React and Tailwind CSS',\n"
+            "  description = 'A modern single-page homepage with a responsive header, animated hero banner, and a polished mobile-friendly layout.',\n"
+            "  primaryCta = { label: 'Get started', to: '/signup' },\n"
+            "  secondaryCta = { label: 'Learn more', to: '/features' },\n"
+            "}) {\n"
+            "  return null;\n"
+            "}"
+        )
+        # All five props have defaults → none required → no entry.
+        assert _extract_component_props(content) == {}
+
+    def test_arrow_component(self):
+        content = "const Foo = ({ a, b }) => null;"
+        assert _extract_component_props(content) == {"Foo": {"a", "b"}}
+
+    def test_export_default_arrow(self):
+        content = "export default function Foo({ a, b }) { return null; }"
+        assert _extract_component_props(content) == {"Foo": {"a", "b"}}
+
+    def test_rest_prop_ignored(self):
+        content = "function Foo({ a, ...rest }) { return null; }"
+        assert _extract_component_props(content) == {"Foo": {"a"}}
+
+    def test_lowercase_function_not_a_component(self):
+        content = "function helper({ a, b }) { return null; }"
+        assert _extract_component_props(content) == {}
+
+    def test_zero_arg_function_not_destructured(self):
+        content = "function Foo() { return null; }"
+        assert _extract_component_props(content) == {}
+
+    def test_positional_props_function_not_destructured(self):
+        content = "function Foo(props) { return null; }"
+        assert _extract_component_props(content) == {}
+
+    def test_two_components_in_one_file(self):
+        content = (
+            "function Foo({ a, b }) { return null; }\n"
+            "function Bar({ x = 1, y }) { return null; }"
+        )
+        assert _extract_component_props(content) == {
+            "Foo": {"a", "b"},
+            "Bar": {"y"},
+        }
+
+
+# ── _find_signature_gaps ─────────────────────────────────────────
+
+
+class TestFindSignatureGaps:
+    def test_caller_missing_required_props_triggers_gap(self):
+        """Positive control: real signature mismatch must still be detected."""
+        files = {
+            "src/Foo.jsx": "export default function Foo({ a, b, c }) { return null; }",
+            "src/App.jsx": "import Foo from './Foo';\nfunction App() { return <Foo />; }",
+        }
+        gaps = _find_signature_gaps(["src/Foo.jsx"], files)
+        stale = [g for g in gaps if g.gap_type == "stale_caller"]
+        assert len(stale) == 1
+        assert stale[0].source_file == "src/Foo.jsx"
+        assert stale[0].target_file == "src/App.jsx"
+        assert stale[0].symbol == "Foo"
+
+    def test_caller_with_correct_props_no_gap(self):
+        files = {
+            "src/Foo.jsx": "export default function Foo({ a, b }) { return null; }",
+            "src/App.jsx": "function App() { return <Foo a={1} b={2} />; }",
+        }
+        gaps = _find_signature_gaps(["src/Foo.jsx"], files)
+        assert [g for g in gaps if g.gap_type == "stale_caller"] == []
+
+    def test_no_gap_when_all_props_have_defaults(self):
+        """Regression: the HeroBanner case must not produce a stale_caller gap."""
+        files = {
+            "src/HeroBanner.jsx": (
+                "function HeroBanner({\n"
+                "  title = 'Build apps, fast',\n"
+                "  description = 'Header, banner, and layout.',\n"
+                "  primaryCta = { label: 'Go', to: '/x' },\n"
+                "}) { return null; }\n"
+                "export default HeroBanner;"
+            ),
+            "src/App.jsx": "function App() { return <HeroBanner />; }",
+        }
+        gaps = _find_signature_gaps(["src/HeroBanner.jsx"], files)
+        assert [g for g in gaps if g.gap_type == "stale_caller"] == []
+
+    def test_spread_caller_skipped(self):
+        """Spread props in JSX call site must suppress the gap (caller may pass them)."""
+        files = {
+            "src/Foo.jsx": "export default function Foo({ a, b, c }) { return null; }",
+            "src/App.jsx": "function App({ p }) { return <Foo {...p} />; }",
+        }
+        gaps = _find_signature_gaps(["src/Foo.jsx"], files)
+        assert [g for g in gaps if g.gap_type == "stale_caller"] == []
