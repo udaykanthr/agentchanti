@@ -45,7 +45,8 @@ Thumbs.db
 agentchanti/kb/global_kb/core/errors.db
 agentchanti/kb/global_kb/core/.seeded
 
-.claude/
+.claude/settings.local.json
+.claude/*.local.json
 agentchanti/kb/global_kb/core/global_kb.db
 agentchanti/kb/global_kb/core/manifest.json
 agentchanti/kb/global_kb/registry/
