@@ -16,8 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/agentchanti/"><img src="https://img.shields.io/pypi/v/agentchanti" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/agentchanti/"><img src="https://img.shields.io/pypi/dm/agentchanti" alt="Downloads"></a>
+  <a href="https://pypi.org/project/agentchanti/"><img src="https://img.shields.io/pypi/v/agentchanti?cacheSeconds=300" alt="PyPI version"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/LLM-Local%20%2B%20Cloud-orange" alt="Local + Cloud">
