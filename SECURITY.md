@@ -8,9 +8,8 @@ If you discover a security vulnerability in AgentChanti, please report it
 Use one of these channels:
 
 - **GitHub Security Advisories**: open a draft advisory at
-  <https://github.com/udaykanth/agentchanti/security/advisories/new>
-- **Email**: contact the maintainer listed in `setup.py` /
-  `pyproject.toml`
+  <https://github.com/udaykanthr/agentchanti/security/advisories/new>
+- **Email**: contact the maintainer listed in `pyproject.toml`
 
 Please include:
 
