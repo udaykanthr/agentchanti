@@ -7,6 +7,7 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
 
@@ -92,34 +93,36 @@ class GeminiClient(LLMClient):
         response.raise_for_status()
         # Logging the headers as the body stream can't be read before iter_lines
         log.debug(f"[Gemini] Response Status: {response.status_code}, Headers: {dict(response.headers)}")
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    # log.debug(f"[Gemini] Chunk: {chunk}")
-                    # usageMetadata is present in the final chunk with real counts
-                    usage = chunk.get("usageMetadata", {})
-                    if usage:
-                        prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
-                        completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
-                    candidates = chunk.get("candidates", [])
-                    if not candidates:
-                        continue
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    for part in parts:
-                        token = part.get("text", "")
-                        if token:
-                            content_parts.append(token)
-                            tokens_generated += 1
-                            if self._stream_callback and tokens_generated % 10 == 0:
-                                self._stream_callback(tokens_generated)
-                except (json.JSONDecodeError, KeyError, IndexError):
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
                     continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        # log.debug(f"[Gemini] Chunk: {chunk}")
+                        # usageMetadata is present in the final chunk with real counts
+                        usage = chunk.get("usageMetadata", {})
+                        if usage:
+                            prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
+                            completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
+                        candidates = chunk.get("candidates", [])
+                        if not candidates:
+                            continue
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for part in parts:
+                            token = part.get("text", "")
+                            if token:
+                                content_parts.append(token)
+                                tokens_generated += 1
+                                if self._stream_callback and tokens_generated % 10 == 0:
+                                    self._stream_callback(tokens_generated)
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
         result = "".join(content_parts)
         token_tracker.record(

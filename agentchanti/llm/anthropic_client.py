@@ -7,6 +7,7 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
 
@@ -93,42 +94,44 @@ class AnthropicClient(LLMClient):
                                  stream=True, timeout=(10, 120))
         response.raise_for_status()
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                try:
-                    event = json.loads(data_str)
-                    event_type = event.get("type", "")
-
-                    if event_type == "message_start":
-                        # First event — contains real input_tokens count
-                        usage = event.get("message", {}).get("usage", {})
-                        if usage.get("input_tokens"):
-                            prompt_tokens = usage["input_tokens"]
-
-                    elif event_type == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            token = delta.get("text", "")
-                            if token:
-                                content_parts.append(token)
-                                tokens_generated += 1
-                                if self._stream_callback and tokens_generated % 10 == 0:
-                                    self._stream_callback(tokens_generated)
-
-                    elif event_type == "message_delta":
-                        # Final event — contains real output_tokens count
-                        usage = event.get("usage", {})
-                        if usage.get("output_tokens"):
-                            completion_tokens = usage["output_tokens"]
-
-                    elif event_type == "message_stop":
-                        break
-
-                except (json.JSONDecodeError, KeyError, IndexError):
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
                     continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    try:
+                        event = json.loads(data_str)
+                        event_type = event.get("type", "")
+
+                        if event_type == "message_start":
+                            # First event — contains real input_tokens count
+                            usage = event.get("message", {}).get("usage", {})
+                            if usage.get("input_tokens"):
+                                prompt_tokens = usage["input_tokens"]
+
+                        elif event_type == "content_block_delta":
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                token = delta.get("text", "")
+                                if token:
+                                    content_parts.append(token)
+                                    tokens_generated += 1
+                                    if self._stream_callback and tokens_generated % 10 == 0:
+                                        self._stream_callback(tokens_generated)
+
+                        elif event_type == "message_delta":
+                            # Final event — contains real output_tokens count
+                            usage = event.get("usage", {})
+                            if usage.get("output_tokens"):
+                                completion_tokens = usage["output_tokens"]
+
+                        elif event_type == "message_stop":
+                            break
+
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
         result = "".join(content_parts)
         token_tracker.record(

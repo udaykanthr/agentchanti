@@ -3,8 +3,10 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
+REQUEST_TIMEOUT = (10, 300)
 
 class LMStudioClient(LLMClient):
 
@@ -38,7 +40,7 @@ class LMStudioClient(LLMClient):
         headers = {"Content-Type": "application/json"}
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=headers, json=payload,
-                                 timeout=(10, 300))
+                                 timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
 
@@ -87,36 +89,38 @@ class LMStudioClient(LLMClient):
 
         # timeout: (connect, read-per-chunk); generous read timeout for slow models
         response = requests.post(url, headers=headers, json=payload,
-                                 stream=True, timeout=(10, 120))
+                                 stream=True, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    token = delta.get("content", "")
-                    if token:
-                        content_parts.append(token)
-                        tokens_generated += 1
-                        if self._stream_callback and tokens_generated % 10 == 0:
-                            self._stream_callback(tokens_generated)
-                    # Extract actual usage from the final chunk if available
-                    usage = chunk.get("usage")
-                    if usage:
-                        pt = usage.get("prompt_tokens")
-                        ct = usage.get("completion_tokens")
-                        if isinstance(pt, int):
-                            prompt_tokens = pt
-                        if isinstance(ct, int):
-                            tokens_generated = ct
-                except (json.JSONDecodeError, KeyError, IndexError):
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
                     continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            content_parts.append(token)
+                            tokens_generated += 1
+                            if self._stream_callback and tokens_generated % 10 == 0:
+                                self._stream_callback(tokens_generated)
+                        # Extract actual usage from the final chunk if available
+                        usage = chunk.get("usage")
+                        if usage:
+                            pt = usage.get("prompt_tokens")
+                            ct = usage.get("completion_tokens")
+                            if isinstance(pt, int):
+                                prompt_tokens = pt
+                            if isinstance(ct, int):
+                                tokens_generated = ct
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
         result = "".join(content_parts)
         token_tracker.record(prompt_tokens, tokens_generated,
@@ -138,7 +142,7 @@ class LMStudioClient(LLMClient):
         headers = {"Content-Type": "application/json"}
         try:
             response = requests.post(url, headers=headers, json=payload,
-                                     timeout=(10, 120))
+                                     timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])
@@ -161,7 +165,7 @@ class LMStudioClient(LLMClient):
         payload = {"model": embed_model, "input": texts}
         headers = {"Content-Type": "application/json"}
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             items = data.get("data", [])

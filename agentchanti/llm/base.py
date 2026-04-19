@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
 from ..cli_display import log
+from .cancellation import check_cancelled
 
 
 # Matches well-formed <think>...</think> blocks (including newlines).
@@ -119,6 +120,10 @@ class LLMClient(ABC):
             except LLMError:
                 raise
             except Exception as e:
+                # If Ctrl+C closed the response socket mid-stream the
+                # underlying ConnectionError surfaces here — don't retry,
+                # propagate as KeyboardInterrupt instead.
+                check_cancelled()
                 last_error = e
                 log.warning(
                     f"[LLM] Error on attempt {attempt}/{self.max_retries}: {e}")

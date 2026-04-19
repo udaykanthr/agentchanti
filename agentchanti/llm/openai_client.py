@@ -8,6 +8,7 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
 
@@ -107,29 +108,31 @@ class OpenAIClient(LLMClient):
                                      stream=True, timeout=(10, 120))
         response.raise_for_status()
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    # Final chunk from stream_options.include_usage carries real usage
-                    usage = chunk.get("usage")
-                    if usage:
-                        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
-                        completion_tokens = usage.get("completion_tokens", completion_tokens)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    token = delta.get("content", "")
-                    if token:
-                        content_parts.append(token)
-                        tokens_generated += 1
-                        if self._stream_callback and tokens_generated % 10 == 0:
-                            self._stream_callback(tokens_generated)
-                except (json.JSONDecodeError, KeyError, IndexError):
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
                     continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        # Final chunk from stream_options.include_usage carries real usage
+                        usage = chunk.get("usage")
+                        if usage:
+                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                            completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            content_parts.append(token)
+                            tokens_generated += 1
+                            if self._stream_callback and tokens_generated % 10 == 0:
+                                self._stream_callback(tokens_generated)
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
         result = "".join(content_parts)
         token_tracker.record(

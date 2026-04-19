@@ -3,6 +3,7 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
 
@@ -24,7 +25,7 @@ class OllamaClient(LLMClient):
         est_tokens = int(len(prompt.split()) * 1.3)
         log.debug(f"[Ollama] Sending ~{est_tokens} est. tokens")
         token_tracker.set_context(est_tokens)
-        log.debug(f"[Ollama] Prompt:\n{prompt}")
+        # log.debug(f"[Ollama] Prompt:\n{prompt}")
 
         payload = {
             "model": self.model,
@@ -69,25 +70,27 @@ class OllamaClient(LLMClient):
                                  stream=True, timeout=(10, 120))
         response.raise_for_status()
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            try:
-                chunk = json.loads(line)
-                token = chunk.get("response", "")
-                if token:
-                    content_parts.append(token)
-                    tokens_generated += 1
-                    if self._stream_callback and tokens_generated % 10 == 0:
-                        self._stream_callback(tokens_generated)
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    token = chunk.get("response", "")
+                    if token:
+                        content_parts.append(token)
+                        tokens_generated += 1
+                        if self._stream_callback and tokens_generated % 10 == 0:
+                            self._stream_callback(tokens_generated)
 
-                # Final chunk contains token counts
-                if chunk.get("done", False):
-                    prompt_tokens = chunk.get("prompt_eval_count", est_tokens)
-                    eval_count = chunk.get("eval_count", tokens_generated)
-                    tokens_generated = eval_count if isinstance(eval_count, int) else tokens_generated
-            except (json.JSONDecodeError, KeyError):
-                continue
+                    # Final chunk contains token counts
+                    if chunk.get("done", False):
+                        prompt_tokens = chunk.get("prompt_eval_count", est_tokens)
+                        eval_count = chunk.get("eval_count", tokens_generated)
+                        tokens_generated = eval_count if isinstance(eval_count, int) else tokens_generated
+                except (json.JSONDecodeError, KeyError):
+                    continue
 
         result = "".join(content_parts)
         token_tracker.record(

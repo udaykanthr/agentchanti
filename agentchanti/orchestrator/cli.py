@@ -11,6 +11,7 @@ from ..llm.ollama import OllamaClient
 from ..llm.lm_studio import LMStudioClient
 from ..llm.base import LLMError
 from ..llm import build_embed_client
+from ..llm.cancellation import install_sigint_handler
 from ..agents.planner import PlannerAgent
 from ..agents.coder import CoderAgent
 from ..agents.reviewer import ReviewerAgent
@@ -198,6 +199,15 @@ def _parse_kb_doc_titles(task: str) -> list[str]:
 
 
 def main():
+    install_sigint_handler()
+    try:
+        _main_impl()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(130)
+
+
+def _main_impl():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
     if len(sys.argv) > 1 and sys.argv[1] == "kb":
