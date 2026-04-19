@@ -30,6 +30,12 @@ agentchanti --help
 
 Full installation options (venv, editable, convenience scripts) are [further down](#installation).
 
+## Quick-Start Demo (7 min)
+
+[![AgentChanti 7-minute walkthrough — install, configuration, and first run](https://img.youtube.com/vi/DOUavSTMobI/maxresdefault.jpg)](https://www.youtube.com/watch?v=DOUavSTMobI)
+
+*~7 minutes · installation, configuration step-by-step, main features, and a first end-to-end task run. Recorded against v0.1.1.*
+
 ## What is AgentChanti?
 
 AgentChanti ships with a built-in RAG system. Before any agent writes code, it automatically retrieves the most relevant functions, classes, and docs from your codebase and injects them as context — so even a local 7B model running in Ollama understands your project structure and coding conventions. Teams can add internal docs, architecture decisions, and coding standards to the Global KB, and every agent on every run picks them up automatically.
