@@ -6,7 +6,7 @@ day-to-day workflow for proposing changes.
 ## Development Setup
 
 ```bash
-git clone https://github.com/udaykanth/agentchanti.git
+git clone https://github.com/udaykanthr/agentchanti.git
 cd agentchanti
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate

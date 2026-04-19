@@ -147,15 +147,12 @@ agentchanti --help
 
 To upgrade later: `pipx upgrade agentchanti`. To install pre-release
 builds straight from `main`: `pipx install
-git+https://github.com/udaykanth/agentchanti.git`.
-
-> **Note:** The package will be on PyPI once the first tagged release
-> is cut. Until then, use Option 2 or 3 below.
+git+https://github.com/udaykanthr/agentchanti.git`.
 
 **Option 2: Clone and install (for contributors / latest code)**
 
 ```bash
-git clone https://github.com/udaykanth/agentchanti.git
+git clone https://github.com/udaykanthr/agentchanti.git
 cd agentchanti
 
 python3 -m venv .venv
@@ -172,7 +169,7 @@ If you'd rather not type the venv steps yourself, the repo ships
 helper scripts that do the same thing:
 
 ```bash
-git clone https://github.com/udaykanth/agentchanti.git
+git clone https://github.com/udaykanthr/agentchanti.git
 cd agentchanti
 
 # Linux / macOS

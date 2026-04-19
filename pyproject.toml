@@ -61,9 +61,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/udaykanth/agentchanti"
-Repository = "https://github.com/udaykanth/agentchanti"
-Issues = "https://github.com/udaykanth/agentchanti/issues"
+Homepage = "https://github.com/udaykanthr/agentchanti"
+Repository = "https://github.com/udaykanthr/agentchanti"
+Issues = "https://github.com/udaykanthr/agentchanti/issues"
 
 [project.scripts]
 agentchanti = "agentchanti.orchestrator.cli:main"
