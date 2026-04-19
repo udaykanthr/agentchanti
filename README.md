@@ -30,11 +30,13 @@ agentchanti --help
 
 Full installation options (venv, editable, convenience scripts) are [further down](#installation).
 
-## Quick-Start Demo (7 min)
+## Quick-Start Demo
 
-[![AgentChanti 7-minute walkthrough — install, configuration, and first run](https://img.youtube.com/vi/DOUavSTMobI/maxresdefault.jpg)](https://www.youtube.com/watch?v=DOUavSTMobI)
+![AgentChanti in action — Global KB registry + live agent pipeline](docs/demo.gif)
 
-*~7 minutes · installation, configuration step-by-step, main features, and a first end-to-end task run. Recorded against v0.1.1.*
+Full 7-minute walkthrough on YouTube — installation, configuration step-by-step, main features, and a first end-to-end task run (recorded against v0.1.1):
+
+[![7-minute quick-start walkthrough](https://img.youtube.com/vi/DOUavSTMobI/0.jpg)](https://www.youtube.com/watch?v=DOUavSTMobI)
 
 ## What is AgentChanti?
 
