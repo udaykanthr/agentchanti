@@ -1,0 +1,80 @@
+# Example semantic test spec — the output of `agentchanti test normalize`
+# and the input of `agentchanti test replay`.
+#
+# Scenario: a logged-in user adds a product to their cart, opens checkout,
+# submits payment, and expects a confirmation page whose total matches the
+# sum of line items. Both UI navigation and backend API contracts are
+# checked.
+
+version: "1"
+name: "checkout flow — happy path"
+start_url: "http://localhost:3000/products/42"
+metadata:
+  recorded_by: agentchanti
+  tags: [checkout, regression]
+
+steps:
+  - id: step-1
+    action: click
+    target:
+      label: "Add to cart button"
+      fallbacks:
+        - "button[data-testid=add-to-cart]"
+        - "text=Add to cart"
+    expected_network:
+      - method: POST
+        path: "/api/cart/items"
+        status: 201
+        response_schema:
+          type: object
+          required: [id, product_id, qty]
+          properties:
+            id:         { type: string }
+            product_id: { type: integer }
+            qty:        { type: integer, minimum: 1 }
+
+  - id: step-2
+    action: navigate
+    url: "/checkout"
+
+  - id: step-3
+    action: fill
+    target:
+      label: "Card number input"
+      fallbacks: ["input[name=cardNumber]"]
+    value: "4242424242424242"
+
+  - id: step-4
+    action: click
+    target:
+      label: "Place order button"
+      fallbacks: ["button[type=submit]", "text=Place order"]
+    expected_network:
+      - method: POST
+        path: "/api/orders"
+        status: 201
+        response_schema:
+          type: object
+          required: [order_id, total, items]
+          properties:
+            order_id: { type: string }
+            total:    { type: number }
+            items:
+              type: array
+              items:
+                type: object
+                required: [product_id, qty, line_total]
+
+assertions:
+  - id: assert-1
+    kind: url_equals
+    url: "/orders/confirmation"
+
+  - id: assert-2
+    kind: dom_predicate
+    selector: "[data-testid=order-id]"
+    must_exist: true
+
+  - id: assert-3
+    kind: natural_language
+    text: "The displayed order total equals the sum of line_total across all items shown on the page."

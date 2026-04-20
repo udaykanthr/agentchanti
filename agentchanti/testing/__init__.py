@@ -20,7 +20,12 @@ from __future__ import annotations
 
 __version__ = "0.0.1"
 
-__all__ = ["Recorder", "Normalizer", "Replayer", "Validator", "Reporter"]
+__all__ = [
+    "Recorder", "Normalizer", "Replayer", "Validator", "Reporter",
+    # Recording schema — pure-Python, no heavy deps, safe to import eagerly
+    # via `from agentchanti.testing import Spec, Step, Locator, ...`.
+    "Spec", "Step", "Locator", "NetworkExpectation", "Assertion",
+]
 
 
 def __getattr__(name: str):
@@ -41,4 +46,7 @@ def __getattr__(name: str):
     if name == "Reporter":
         from .reporter import Reporter
         return Reporter
+    if name in {"Spec", "Step", "Locator", "NetworkExpectation", "Assertion"}:
+        from . import spec as _spec
+        return getattr(_spec, name)
     raise AttributeError(f"module 'agentchanti.testing' has no attribute {name!r}")
