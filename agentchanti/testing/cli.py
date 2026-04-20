@@ -19,9 +19,25 @@ import sys
 
 def _cmd_record(args: argparse.Namespace) -> int:
     from .recorder import Recorder
-    rec = Recorder(mcp_server_url=args.mcp_server, output_path=args.out)
-    rec.start(start_url=args.url)
-    rec.stop()
+
+    with Recorder.from_url(args.mcp_server, args.out) as rec:
+        rec.start(start_url=args.url)
+        try:
+            rec.subscribe_to_live_events()
+        except NotImplementedError as e:
+            print(
+                f"\n  [record] live event subscription not yet wired: {e}\n"
+                f"  The session was opened and navigated to {args.url}\n"
+                f"  and the initial navigate event was written to {args.out}.\n"
+                f"  For now, use the scripted Python API:\n"
+                f"    from agentchanti.testing import Recorder\n"
+                f"    with Recorder.from_url(mcp_url, out) as rec:\n"
+                f"        rec.start(url); rec.record_interaction(...); rec.stop()\n",
+                file=sys.stderr,
+            )
+            rec.stop(reason="live_subscription_unavailable")
+            return 2
+        rec.stop()
     return 0
 
 
