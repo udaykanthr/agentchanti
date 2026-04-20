@@ -25,6 +25,8 @@ __all__ = [
     # Recording schema — pure-Python, no heavy deps, safe to import eagerly
     # via `from agentchanti.testing import Spec, Step, Locator, ...`.
     "Spec", "Step", "Locator", "NetworkExpectation", "Assertion",
+    # Browser MCP client + locator cache (self-healing replay support).
+    "BrowserMCPClient", "LocatorCache",
 ]
 
 
@@ -49,4 +51,10 @@ def __getattr__(name: str):
     if name in {"Spec", "Step", "Locator", "NetworkExpectation", "Assertion"}:
         from . import spec as _spec
         return getattr(_spec, name)
+    if name == "BrowserMCPClient":
+        from .mcp_client import BrowserMCPClient
+        return BrowserMCPClient
+    if name == "LocatorCache":
+        from .locator_cache import LocatorCache
+        return LocatorCache
     raise AttributeError(f"module 'agentchanti.testing' has no attribute {name!r}")
