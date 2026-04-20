@@ -60,12 +60,14 @@ dev = [
     "build>=1.0",
 ]
 # Browser + API end-to-end testing (agentchanti test ...).
-# Opt-in because Playwright pulls ~300MB of browser binaries on install.
+# Opt-in so AgentChanti's core install stays small. The browser itself
+# runs on the Node side as a Playwright MCP server — see
+# README of `@playwright/mcp`. We only need the Python MCP client + a
+# JSON Schema validator here.
 #   pip install agentchanti[testing]
-#   playwright install   # download browser binaries after install
+#   npx @playwright/mcp@latest --port 8931   # start server separately
 testing = [
-    "playwright>=1.40",
-    "mcp>=0.9",
+    "mcp>=1.0",
     "jsonschema>=4.0",
 ]
 
@@ -80,6 +82,12 @@ agentchanti = "agentchanti.orchestrator.cli:main"
 [tool.setuptools.packages.find]
 include = ["agentchanti*"]
 exclude = ["tests*", "responsive-web-app*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require an external live service (opt-in with `-m integration`).",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 line-length = 100
