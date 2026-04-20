@@ -27,6 +27,8 @@ __all__ = [
     "Spec", "Step", "Locator", "NetworkExpectation", "Assertion",
     # Browser MCP client + locator cache (self-healing replay support).
     "BrowserMCPClient", "LocatorCache",
+    # Result dataclasses — useful for callers consuming programmatic output.
+    "StepResult", "RunResult", "AssertionResult",
 ]
 
 
@@ -57,4 +59,10 @@ def __getattr__(name: str):
     if name == "LocatorCache":
         from .locator_cache import LocatorCache
         return LocatorCache
+    if name in {"StepResult", "RunResult"}:
+        from . import replayer as _r
+        return getattr(_r, name)
+    if name == "AssertionResult":
+        from .validator import AssertionResult
+        return AssertionResult
     raise AttributeError(f"module 'agentchanti.testing' has no attribute {name!r}")

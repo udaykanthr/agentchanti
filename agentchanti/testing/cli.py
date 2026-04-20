@@ -65,10 +65,61 @@ def _cmd_normalize(args: argparse.Namespace) -> int:
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
+    from ..config import Config
+    from ..llm import MissingAPIKeyError, build_llm_client
+    from .locator_cache import DEFAULT_CACHE_PATH, LocatorCache
+    from .mcp_client import BrowserMCPClient
     from .replayer import Replayer
+    from .reporter import Reporter
+    from .spec import Spec
     from .validator import Validator
-    from .reporter import Reporter  # noqa: F401 — used once replay loop is wired
-    raise NotImplementedError("agentchanti test replay is not wired yet")
+
+    try:
+        spec = Spec.load(args.spec)
+    except (OSError, ValueError) as e:
+        print(f"\n  [ERROR] failed to load spec {args.spec}: {e}\n", file=sys.stderr)
+        return 2
+
+    cfg = Config.load(args.config)
+    llm = None
+    if not args.no_llm:
+        try:
+            llm = build_llm_client(cfg, provider=args.provider, model=args.model)
+        except MissingAPIKeyError as e:
+            print(
+                f"\n  [WARN] {e.provider.title()} provider requires {e.env_var}; "
+                f"self-healing and natural-language assertions will be skipped.\n",
+                file=sys.stderr,
+            )
+
+    cache = LocatorCache(args.cache_path or DEFAULT_CACHE_PATH)
+
+    try:
+        with BrowserMCPClient(args.mcp_server) as mcp:
+            run_result = Replayer(mcp, cache, llm_client=llm).replay(spec)
+            assertion_results = Validator(llm_client=llm).validate(spec, run_result)
+    except NotImplementedError as e:
+        print(
+            f"\n  [ERROR] browser MCP transport is not yet wired: {e}\n"
+            f"  This command needs a live Playwright MCP server + the real\n"
+            f"  BrowserMCPClient transport layer. The rest of the replay\n"
+            f"  pipeline (Spec → Replayer → Validator → Reporter) is fully\n"
+            f"  exercised by the test suite with a FakeMCP client.\n",
+            file=sys.stderr,
+        )
+        return 2
+    except Exception as e:
+        print(f"\n  [ERROR] replay failed: {e}\n", file=sys.stderr)
+        return 2
+
+    reporter = Reporter()
+    print(reporter.render_console(assertion_results))
+    if args.report:
+        out = reporter.render_json(assertion_results, args.report)
+        print(f"wrote JSON report → {out}")
+
+    failed = any(not r.passed and not r.skipped for r in assertion_results)
+    return 1 if failed else 0
 
 
 def test_main(argv: list[str]) -> int:
@@ -99,9 +150,19 @@ def test_main(argv: list[str]) -> int:
 
     p_rep = sub.add_parser("replay", help="Replay a spec against a live browser + validate.")
     p_rep.add_argument("--spec", required=True, help="Semantic spec path.")
-    p_rep.add_argument("--report", required=True, help="Where to write the JSON report.")
+    p_rep.add_argument("--report", default=None,
+                       help="Optional path to write a JSON report for CI.")
     p_rep.add_argument("--mcp-server", default="http://localhost:8931",
                        help="Browser MCP server URL.")
+    p_rep.add_argument("--cache-path", default=None,
+                       help="Locator cache path (default: .agentchanti/testing/locator-cache.json).")
+    p_rep.add_argument("--provider", default=None,
+                       choices=["ollama", "lm_studio", "openai", "gemini", "anthropic"],
+                       help="LLM provider for self-healing + NL assertions.")
+    p_rep.add_argument("--model", default=None, help="LLM model override.")
+    p_rep.add_argument("--config", default=None, help="Path to .agentchanti.yaml.")
+    p_rep.add_argument("--no-llm", action="store_true",
+                       help="Disable self-healing + NL assertions (skip LLM calls).")
     p_rep.set_defaults(func=_cmd_replay)
 
     args = parser.parse_args(argv)
