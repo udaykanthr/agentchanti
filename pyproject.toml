@@ -59,6 +59,15 @@ dev = [
     "ruff>=0.5",
     "build>=1.0",
 ]
+# Browser + API end-to-end testing (agentchanti test ...).
+# Opt-in because Playwright pulls ~300MB of browser binaries on install.
+#   pip install agentchanti[testing]
+#   playwright install   # download browser binaries after install
+testing = [
+    "playwright>=1.40",
+    "mcp>=0.9",
+    "jsonschema>=4.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/udaykanthr/agentchanti"

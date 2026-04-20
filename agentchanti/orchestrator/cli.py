@@ -215,6 +215,13 @@ def _main_impl():
         kb_main(sys.argv[2:])
         return
 
+    # Dispatch `agentchanti test ...` to the testing CLI. Playwright and MCP
+    # client libraries are only imported when the user actually runs a
+    # testing command, so they don't affect normal CLI startup time.
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        from ..testing.cli import test_main
+        sys.exit(test_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="AgentChanti — Multi-Agent Local Coder")
     parser.add_argument("task", nargs="?", help="The coding task to perform")
     parser.add_argument("--prompt-from-file", help="Read prompt from a text file")
