@@ -36,9 +36,18 @@ steps are human-paced, not high-throughput.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from .snapshot import (
+    SelectorKind,
+    classify_selector,
+    parse_snapshot,
+    resolve_selector,
+)
 
 # Default Playwright MCP endpoint. Note the `/mcp` suffix — that's the
 # streamable HTTP transport path. The bare `http://localhost:8931` root
@@ -172,33 +181,162 @@ class BrowserMCPClient:
             return {}
         return {"raw": text or ""}
 
-    # ---- P2 scope: resolve ref then dispatch -----------------------------
-    # These stay NotImplementedError until snapshot->ref resolution is
-    # wired. The fakes in tests still satisfy Replayer's contract; a live
-    # replay against Playwright MCP will exercise the implementations below
-    # when they land.
+    # ---- Interactions (P2) ----------------------------------------------
+    # Two dispatch paths:
+    #   SEMANTIC selector (text=, role=, bare name) -> snapshot + resolve
+    #     to a ref, then call browser_{click,type,hover,select_option}
+    #     with {ref, element}. Best-case path: debuggable, self-healable.
+    #   CSS selector (#id, [data-testid=X], tag[attr]) -> dispatch via
+    #     browser_evaluate using document.querySelector. Escape hatch for
+    #     the many DOM attributes the accessibility tree hides.
 
     def click(self, selector: str) -> ActionResult:
-        raise NotImplementedError("click lands in P2 (snapshot->ref resolution)")
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            return self._dispatch_semantic(selector, "browser_click", extra={})
+        if kind is SelectorKind.CSS:
+            return self._dispatch_css(selector, "click")
+        return _unsupported_selector(selector, kind)
 
     def fill(self, selector: str, value: str) -> ActionResult:
-        raise NotImplementedError("fill lands in P2")
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            return self._dispatch_semantic(
+                selector, "browser_type", extra={"text": value},
+            )
+        if kind is SelectorKind.CSS:
+            return self._dispatch_css(selector, "fill", value=value)
+        return _unsupported_selector(selector, kind)
 
     def press(self, selector: str, key: str) -> ActionResult:
-        raise NotImplementedError("press lands in P2")
+        # Two-step: focus the element, then press the key. browser_press_key
+        # doesn't take a ref — it presses on whatever has focus.
+        focus_result = self._focus(selector)
+        if not focus_result.success:
+            return focus_result
+        try:
+            self._call_tool("browser_press_key", {"key": key})
+        except Exception as e:
+            return ActionResult(success=False, error=f"press failed: {e}")
+        return ActionResult(success=True)
 
     def select(self, selector: str, value: str) -> ActionResult:
-        raise NotImplementedError("select lands in P2")
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            return self._dispatch_semantic(
+                selector, "browser_select_option", extra={"values": [value]},
+            )
+        if kind is SelectorKind.CSS:
+            return self._dispatch_css(selector, "select", value=value)
+        return _unsupported_selector(selector, kind)
 
     def hover(self, selector: str) -> ActionResult:
-        raise NotImplementedError("hover lands in P2")
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            return self._dispatch_semantic(selector, "browser_hover", extra={})
+        if kind is SelectorKind.CSS:
+            return self._dispatch_css(selector, "hover")
+        return _unsupported_selector(selector, kind)
 
     def wait_for(self, selector: str, timeout_ms: int = 5000) -> ActionResult:
-        # Replayer uses this as a "does this selector match right now?"
-        # probe. Playwright MCP's browser_wait_for is text/time-based, so
-        # the real implementation is: take a snapshot and query it in
-        # memory. Lands alongside the ref-resolution work in P2.
-        raise NotImplementedError("wait_for probe lands in P2 (via snapshot)")
+        """Probe whether ``selector`` matches something on the page now.
+
+        Replayer uses this to test locator candidates cheaply. We poll
+        because the element may render just after the action that
+        triggered its appearance — the caller supplies ``timeout_ms``.
+        """
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000.0
+        while True:
+            try:
+                if self._selector_exists(selector):
+                    return ActionResult(success=True)
+            except Exception as e:
+                return ActionResult(success=False, error=str(e))
+            if time.monotonic() >= deadline:
+                return ActionResult(success=False)
+            time.sleep(0.1)
+
+    # ---- Dispatch helpers -----------------------------------------------
+
+    def _dispatch_semantic(
+        self, selector: str, tool: str, *, extra: dict[str, Any],
+    ) -> ActionResult:
+        ref = self._resolve_ref(selector)
+        if ref is None:
+            return ActionResult(
+                success=False,
+                error=f"no element matching {selector!r} in current snapshot",
+            )
+        args = {"ref": ref, "element": selector, **extra}
+        try:
+            self._call_tool(tool, args)
+        except Exception as e:
+            return ActionResult(success=False, error=f"{tool} failed: {e}")
+        return ActionResult(success=True)
+
+    def _dispatch_css(
+        self, selector: str, action: str, *, value: str | None = None,
+    ) -> ActionResult:
+        js = _build_css_action_js(selector, action, value)
+        try:
+            self._call_tool("browser_evaluate", {"function": js})
+        except Exception as e:
+            return ActionResult(success=False, error=f"{action} via evaluate failed: {e}")
+        return ActionResult(success=True)
+
+    def _focus(self, selector: str) -> ActionResult:
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            ref = self._resolve_ref(selector)
+            if ref is None:
+                return ActionResult(
+                    success=False,
+                    error=f"no element matching {selector!r} in current snapshot",
+                )
+            try:
+                # `(element) => element.focus()` runs scoped to the ref —
+                # no side-effect click, no accidental form submit.
+                self._call_tool("browser_evaluate", {
+                    "function": "(element) => element.focus()",
+                    "ref": ref,
+                    "element": selector,
+                })
+            except Exception as e:
+                return ActionResult(success=False, error=f"focus failed: {e}")
+            return ActionResult(success=True)
+        if kind is SelectorKind.CSS:
+            js = (
+                f"() => {{ const el = document.querySelector({json.dumps(selector)}); "
+                f"if (!el) throw new Error('selector not found: ' + {json.dumps(selector)}); "
+                f"el.focus(); }}"
+            )
+            try:
+                self._call_tool("browser_evaluate", {"function": js})
+            except Exception as e:
+                return ActionResult(success=False, error=f"focus failed: {e}")
+            return ActionResult(success=True)
+        return _unsupported_selector(selector, kind)
+
+    def _selector_exists(self, selector: str) -> bool:
+        kind = classify_selector(selector)
+        if kind is SelectorKind.SEMANTIC:
+            return self._resolve_ref(selector) is not None
+        if kind is SelectorKind.CSS:
+            js = f"() => document.querySelector({json.dumps(selector)}) !== null"
+            try:
+                result_text = self._call_tool("browser_evaluate", {"function": js})
+            except Exception:
+                return False
+            # browser_evaluate surfaces the boolean as text; "true" literal
+            # is the success case. The result includes the ### Result
+            # header — simple substring check is robust.
+            return "true" in (result_text or "").lower()
+        return False
+
+    def _resolve_ref(self, selector: str) -> str | None:
+        snap = self.snapshot()
+        elements = parse_snapshot(snap.get("raw", ""))
+        return resolve_selector(elements, selector)
 
     def screenshot(self, path: str) -> str:
         try:
@@ -226,6 +364,59 @@ class BrowserMCPClient:
             return "\n".join(parts)
 
         return self._engine.run(_do(), timeout=_CALL_TIMEOUT_S)
+
+
+# ---------------------------------------------------------------------------
+# CSS-action JS builders
+# ---------------------------------------------------------------------------
+
+def _unsupported_selector(selector: str, kind: SelectorKind) -> ActionResult:
+    return ActionResult(
+        success=False,
+        error=f"cannot dispatch selector {selector!r} of kind {kind.value}",
+    )
+
+
+def _build_css_action_js(selector: str, action: str, value: str | None) -> str:
+    """Return a JS function string that performs ``action`` on the first
+    element matching ``selector``. Values are JSON-escaped to survive
+    arbitrary user input without injection risk.
+    """
+    q = json.dumps(selector)
+    if action == "click":
+        body = "el.click();"
+    elif action == "fill":
+        v = json.dumps(value or "")
+        body = (
+            f"el.focus(); el.value = {v}; "
+            f"el.dispatchEvent(new Event('input', {{bubbles: true}})); "
+            f"el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        )
+    elif action == "select":
+        v = json.dumps(value or "")
+        body = (
+            f"el.value = {v}; "
+            f"el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        )
+    elif action == "hover":
+        # No native `.hover()` — dispatch mouse events. Imperfect (doesn't
+        # trigger CSS :hover the same way a real mouse does) but good
+        # enough for UI effects that listen to pointer events.
+        body = (
+            "const r = el.getBoundingClientRect();"
+            "const opts = {bubbles: true, clientX: r.left + r.width/2, "
+            "clientY: r.top + r.height/2};"
+            "el.dispatchEvent(new MouseEvent('mouseover', opts));"
+            "el.dispatchEvent(new MouseEvent('mouseenter', opts));"
+            "el.dispatchEvent(new MouseEvent('mousemove', opts));"
+        )
+    else:
+        raise ValueError(f"unsupported CSS action {action!r}")
+    return (
+        f"() => {{ const el = document.querySelector({q}); "
+        f"if (!el) throw new Error('selector not found: ' + {q}); "
+        f"{body} }}"
+    )
 
 
 # ---------------------------------------------------------------------------
