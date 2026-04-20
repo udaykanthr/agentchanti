@@ -26,9 +26,26 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
 
 def _cmd_normalize(args: argparse.Namespace) -> int:
-    from .normalizer import Normalizer
-    # LLM client wiring will mirror what orchestrator/cli.py does — TODO.
-    raise NotImplementedError("agentchanti test normalize is not wired yet")
+    from ..config import Config
+    from ..llm import MissingAPIKeyError, build_llm_client
+    from .normalizer import Normalizer, NormalizerError
+
+    cfg = Config.load(args.config)
+    try:
+        llm = build_llm_client(cfg, provider=args.provider, model=args.model)
+    except MissingAPIKeyError as e:
+        print(f"\n  [ERROR] {e.provider.title()} provider requires an API key.\n"
+              f"  Set {e.env_var} env var or add it to .agentchanti.yaml.\n",
+              file=sys.stderr)
+        return 1
+
+    try:
+        out = Normalizer(llm, spec_name=args.name).normalize(args.trace, args.out)
+    except NormalizerError as e:
+        print(f"\n  [ERROR] normalize failed: {e}\n", file=sys.stderr)
+        return 2
+    print(f"wrote spec → {out}")
+    return 0
 
 
 def _cmd_replay(args: argparse.Namespace) -> int:
@@ -55,6 +72,13 @@ def test_main(argv: list[str]) -> int:
     p_norm = sub.add_parser("normalize", help="Convert a raw trace into a semantic spec.")
     p_norm.add_argument("--trace", required=True, help="Raw trace path from `record`.")
     p_norm.add_argument("--out", required=True, help="Where to write the semantic spec (YAML).")
+    p_norm.add_argument("--name", default=None,
+                        help="Optional human name for the spec (hint to the LLM).")
+    p_norm.add_argument("--provider", default=None,
+                        choices=["ollama", "lm_studio", "openai", "gemini", "anthropic"],
+                        help="LLM provider override (default: from config).")
+    p_norm.add_argument("--model", default=None, help="Model name override.")
+    p_norm.add_argument("--config", default=None, help="Path to .agentchanti.yaml.")
     p_norm.set_defaults(func=_cmd_normalize)
 
     p_rep = sub.add_parser("replay", help="Replay a spec against a live browser + validate.")
