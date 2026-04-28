@@ -129,6 +129,7 @@ class TraceWriter:
         selector_used: str,
         element: ElementContext,
         value: str | None = None,
+        coord: dict[str, int] | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "action": action,
@@ -137,6 +138,11 @@ class TraceWriter:
         }
         if value is not None:
             payload["value"] = value
+        if coord is not None:
+            # Recorded only for clicks today. Carries clientX/clientY in
+            # CSS pixels so the Normalizer can synthesise a coord=X,Y
+            # fallback when label/text-based locators look weak.
+            payload["coord"] = {"x": int(coord["x"]), "y": int(coord["y"])}
         self._emit(INTERACTION, payload)
 
     def write_network(

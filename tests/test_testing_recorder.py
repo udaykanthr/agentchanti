@@ -25,13 +25,20 @@ from agentchanti.testing.trace import (
 
 
 class FakeMCPClient:
-    """Minimal BrowserMCPClient substitute that records every call."""
+    """Minimal BrowserMCPClient substitute that records every call.
+
+    ``_call_tool`` is the same private method the real client exposes —
+    we need it because the live recorder loop talks directly to it for
+    inject + drain via ``browser_evaluate``. Tests can pre-program a
+    queue of evaluate response strings to simulate the live JS buffer.
+    """
 
     def __init__(self, navigate_result: ActionResult | None = None):
         self.navigate_result = navigate_result or ActionResult(success=True)
         self.calls: list[tuple[str, tuple, dict]] = []
         self.entered = False
         self.exited = False
+        self.evaluate_responses: list[str] = []
 
     def __enter__(self) -> FakeMCPClient:
         self.entered = True
@@ -43,6 +50,18 @@ class FakeMCPClient:
     def navigate(self, url: str) -> ActionResult:
         self.calls.append(("navigate", (url,), {}))
         return self.navigate_result
+
+    def _call_tool(self, name: str, arguments: dict) -> str:
+        self.calls.append(("_call_tool", (name,), arguments))
+        if name != "browser_evaluate":
+            return ""
+        if self.evaluate_responses:
+            return self.evaluate_responses.pop(0)
+        # Default: nothing buffered, page hasn't navigated.
+        return (
+            '### Result\n{"events": [], "url": "about:blank", "missing": false}\n'
+            '### Ran Playwright code\n```js\n```'
+        )
 
 
 def _make_recorder(tmp_path: Path, mcp: FakeMCPClient | None = None) -> Recorder:
@@ -149,9 +168,83 @@ def test_from_url_builds_concrete_collaborators(tmp_path: Path):
     assert rec.writer.path == tmp_path / "t.jsonl"
 
 
-def test_subscribe_to_live_events_is_stubbed(tmp_path: Path):
+def test_subscribe_drains_buffered_js_events_into_trace(tmp_path: Path):
+    """Live polling path with a fake MCP — verifies the wiring between
+    JS buffer payload and trace.write_interaction without needing a live
+    Playwright MCP server."""
+    mcp = FakeMCPClient()
+    # Pre-program three drain responses: install (any reply), one with
+    # buffered events, then steady-state empties.
+    buffered = (
+        '### Result\n'
+        '{"events": ['
+        '{"type":"click","clientX":42,"clientY":99,"button":0,'
+        '"element":{"tag":"button","data_testid":"go","text":"Go",'
+        '"id":null,"classes":[],"aria_label":null,"role":"button","name":null}}'
+        '], "url": "/", "missing": false}\n'
+        '### Ran Playwright code\n```js\n```'
+    )
+    mcp.evaluate_responses = ['### Result\n"installed"\n### Ran Playwright code\n```js\n```',
+                              buffered]
+    with _make_recorder(tmp_path, mcp) as rec:
+        rec.start("/")
+        rec.subscribe_to_live_events(poll_interval_s=0.05)
+        # Give the polling thread a moment to consume the buffered drain.
+        import time as _t
+        _t.sleep(0.25)
+        rec.stop()
+    events = list(read_trace(tmp_path / "trace.jsonl"))
+    interactions = [e for e in events if e["type"] == INTERACTION]
+    assert len(interactions) == 1
+    assert interactions[0]["action"] == "click"
+    assert interactions[0]["selector_used"] == "[data-testid=go]"
+    assert interactions[0]["coord"] == {"x": 42, "y": 99}
+
+
+def test_subscribe_emits_navigate_event_on_url_change(tmp_path: Path):
+    """A drain that reports a different URL than the last one should
+    produce a navigate event so the trace records the page change."""
+
+    class StickyURLMCP(FakeMCPClient):
+        # Override default drain so once the test programs /page-2, every
+        # subsequent steady-state poll keeps reporting /page-2.
+        current_url = "/page-2"
+
+        def _call_tool(self, name, arguments):
+            self.calls.append(("_call_tool", (name,), arguments))
+            if name != "browser_evaluate":
+                return ""
+            if self.evaluate_responses:
+                return self.evaluate_responses.pop(0)
+            return (
+                f'### Result\n{{"events": [], "url": "{self.current_url}",'
+                f' "missing": false}}\n'
+                '### Ran Playwright code\n```js\n```'
+            )
+
+    mcp = StickyURLMCP()
+    mcp.evaluate_responses = [
+        '### Result\n"installed"\n### Ran Playwright code\n```js\n```',
+    ]
+    with _make_recorder(tmp_path, mcp) as rec:
+        rec.start("/page-1")
+        rec.subscribe_to_live_events(poll_interval_s=0.05)
+        import time as _t
+        _t.sleep(0.25)
+        rec.stop()
+    nav_urls = [e["url"] for e in read_trace(tmp_path / "trace.jsonl")
+                if e["type"] == NAVIGATE]
+    # /page-1 from start() and ONE /page-2 from URL-change detection.
+    # Subsequent polls also see /page-2 but must not duplicate.
+    assert nav_urls == ["/page-1", "/page-2"]
+
+
+def test_subscribe_is_idempotent(tmp_path: Path):
+    """Calling subscribe twice must not start two polling threads."""
     with _make_recorder(tmp_path) as rec:
         rec.start("/")
-        with pytest.raises(NotImplementedError, match="Playwright MCP"):
-            rec.subscribe_to_live_events()
+        rec.subscribe_to_live_events(poll_interval_s=1.0)
+        first_thread = rec._live_thread
+        rec.subscribe_to_live_events(poll_interval_s=1.0)
+        assert rec._live_thread is first_thread
         rec.stop()

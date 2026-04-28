@@ -18,26 +18,44 @@ import sys
 
 
 def _cmd_record(args: argparse.Namespace) -> int:
+    """Open a browser, inject the JS event recorder, block until the user
+    presses Ctrl+C, write the trace."""
     from .recorder import Recorder
 
-    with Recorder.from_url(args.mcp_server, args.out) as rec:
-        rec.start(start_url=args.url)
+    viewport = None
+    if args.viewport:
         try:
-            rec.subscribe_to_live_events()
-        except NotImplementedError as e:
-            print(
-                f"\n  [record] live event subscription not yet wired: {e}\n"
-                f"  The session was opened and navigated to {args.url}\n"
-                f"  and the initial navigate event was written to {args.out}.\n"
-                f"  For now, use the scripted Python API:\n"
-                f"    from agentchanti.testing import Recorder\n"
-                f"    with Recorder.from_url(mcp_url, out) as rec:\n"
-                f"        rec.start(url); rec.record_interaction(...); rec.stop()\n",
-                file=sys.stderr,
-            )
-            rec.stop(reason="live_subscription_unavailable")
+            w, h = (int(x) for x in args.viewport.lower().split("x", 1))
+            viewport = {"width": w, "height": h}
+        except ValueError:
+            print(f"\n  [ERROR] --viewport expects WxH, got {args.viewport!r}\n",
+                  file=sys.stderr)
             return 2
-        rec.stop()
+
+    print(f"opening session at {args.url}")
+    print(f"writing trace to {args.out}")
+    print()
+    print("  Browse the site as you would normally — clicks, typing,")
+    print("  selections, and key presses are streamed into the trace.")
+    print("  Sensitive inputs (type=password, [data-sensitive]) are redacted.")
+    print()
+    print("  Press Ctrl+C when you're done to finalize the trace.")
+    print()
+
+    with Recorder.from_url(args.mcp_server, args.out) as rec:
+        rec.start(start_url=args.url, viewport=viewport)
+        rec.subscribe_to_live_events()
+        try:
+            # Block until the user signals stop. Sleeping in short slices
+            # so KeyboardInterrupt is responsive on Windows.
+            import time as _t
+            while True:
+                _t.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        out_path = rec.stop()
+
+    print(f"\nrecording complete: {out_path}")
     return 0
 
 
@@ -132,8 +150,11 @@ def test_main(argv: list[str]) -> int:
     p_rec = sub.add_parser("record", help="Record a browser session via MCP.")
     p_rec.add_argument("--url", required=True, help="Start URL for the session.")
     p_rec.add_argument("--out", required=True, help="Path to write the raw trace.")
-    p_rec.add_argument("--mcp-server", default="http://localhost:8931",
-                       help="Browser MCP server URL.")
+    p_rec.add_argument("--mcp-server", default="http://localhost:8931/mcp",
+                       help="Browser MCP server URL (default: http://localhost:8931/mcp).")
+    p_rec.add_argument("--viewport", default=None,
+                       help="Viewport in WxH form, e.g. 1280x720. "
+                            "Saved into the trace so replay can match it.")
     p_rec.set_defaults(func=_cmd_record)
 
     p_norm = sub.add_parser("normalize", help="Convert a raw trace into a semantic spec.")
