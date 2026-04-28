@@ -113,6 +113,18 @@ def test_spec_name_hint_reaches_prompt(tmp_path: Path):
     assert "login regression" in llm.last_prompt
 
 
+def test_prompt_directs_llm_to_propagate_viewport_into_metadata(tmp_path: Path):
+    """The Replayer enforces spec.metadata.viewport before first navigate
+    so coord=X,Y fallbacks land on the same screen positions. The prompt
+    must explicitly direct the LLM to copy session_start.viewport into
+    metadata — otherwise viewport silently drops on every recording."""
+    trace = _write_simple_trace(tmp_path)
+    llm = FakeLLM(VALID_SPEC_YAML)
+    Normalizer(llm).normalize(trace, tmp_path / "spec.yaml")
+    assert "viewport" in llm.last_prompt
+    assert "session_start.viewport" in llm.last_prompt
+
+
 def test_markdown_fences_are_stripped(tmp_path: Path):
     trace = _write_simple_trace(tmp_path)
     fenced = "```yaml\n" + VALID_SPEC_YAML + "```\n"

@@ -173,8 +173,8 @@ def test_main(argv: list[str]) -> int:
     p_rep.add_argument("--spec", required=True, help="Semantic spec path.")
     p_rep.add_argument("--report", default=None,
                        help="Optional path to write a JSON report for CI.")
-    p_rep.add_argument("--mcp-server", default="http://localhost:8931",
-                       help="Browser MCP server URL.")
+    p_rep.add_argument("--mcp-server", default="http://localhost:8931/mcp",
+                       help="Browser MCP server URL (default: http://localhost:8931/mcp).")
     p_rep.add_argument("--cache-path", default=None,
                        help="Locator cache path (default: .agentchanti/testing/locator-cache.json).")
     p_rep.add_argument("--provider", default=None,

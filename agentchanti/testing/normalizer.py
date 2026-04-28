@@ -67,7 +67,13 @@ SCHEMA (required):
   version: "{SPEC_VERSION}"
   name: <short description of the user journey>
   start_url: <url captured in the session_start event>
-  metadata: {{ recorded_by: agentchanti }}
+  metadata:
+    recorded_by: agentchanti
+    viewport: <copy verbatim from session_start.viewport when present —
+               replay enforces this so coord=X,Y fallbacks hit the same
+               screen positions; omit the key only if session_start has
+               no viewport>
+    user_agent: <copy from session_start.user_agent when present>
   steps:
     - id: step-<n>
       action: one of {sorted(ALLOWED_ACTIONS)}

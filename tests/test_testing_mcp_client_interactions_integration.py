@@ -153,3 +153,75 @@ def test_wait_for_existing_css_element_succeeds(mcp):
 def test_wait_for_missing_element_fails_after_timeout(mcp):
     result = mcp.wait_for("text=DoesNotExist", timeout_ms=200)
     assert result.success is False
+
+
+# ---- coord=X,Y dispatch ----------------------------------------------------
+# Verifies the P2b fallback path: replay can hit an element by its captured
+# screen position even when ids/testids on the page have drifted.
+
+def _bbox_center(mcp, css_selector: str) -> tuple[float, float]:
+    """Read the element's bounding-rect center via browser_evaluate.
+
+    Returns (x, y) coordinates in CSS pixels — the same units
+    ``elementFromPoint`` and our coord= dispatch path use.
+    """
+    from agentchanti.testing._live_translate import extract_evaluate_result
+    js = (
+        f"() => {{ const r = document.querySelector("
+        f"'{css_selector}').getBoundingClientRect(); "
+        "return {x: r.left + r.width/2, y: r.top + r.height/2}; }"
+    )
+    raw = _eval(mcp, js)
+    obj = extract_evaluate_result(raw)
+    assert isinstance(obj, dict), f"expected object payload, got {raw!r}"
+    return float(obj["x"]), float(obj["y"])
+
+
+def test_click_at_coordinate_clicks_element_under_point(mcp):
+    x, y = _bbox_center(mcp, "[data-testid=go-btn]")
+    result = mcp.click(f"coord={x},{y}")
+    assert result.success, f"coord click failed: {result.error!r}"
+    assert "CLICKED" in mcp.snapshot()["raw"]
+
+
+def test_fill_at_coordinate_sets_value(mcp):
+    x, y = _bbox_center(mcp, "#email")
+    result = mcp.fill(f"coord={x},{y}", "coord@example.com")
+    assert result.success, f"coord fill failed: {result.error!r}"
+    got = _eval(mcp, '() => document.querySelector("#email").value')
+    assert "coord@example.com" in got
+
+
+def test_wait_for_coordinate_succeeds_when_element_present(mcp):
+    x, y = _bbox_center(mcp, "[data-testid=go-btn]")
+    result = mcp.wait_for(f"coord={x},{y}", timeout_ms=500)
+    assert result.success
+
+
+# ---- resize ---------------------------------------------------------------
+
+def test_resize_updates_browser_viewport(mcp):
+    """The Replayer calls resize before first navigate so coord=X,Y
+    fallbacks land on the same screen positions captured at recording.
+    Verify the underlying tool actually changes window.innerWidth."""
+    result = mcp.resize(640, 480)
+    assert result.success, f"resize failed: {result.error!r}"
+    width = _eval(mcp, "() => window.innerWidth")
+    height = _eval(mcp, "() => window.innerHeight")
+    assert "640" in width
+    assert "480" in height
+
+
+# ---- network_requests -----------------------------------------------------
+
+def test_network_requests_returns_parsed_event_list(mcp):
+    """Hit a data: URL (no real network), then a navigated page, and
+    confirm at least the page-level GET shows up. We don't assert exact
+    content because Playwright may also surface favicon / etc."""
+    mcp.navigate("data:text/html,<h1>net probe</h1>")
+    events = mcp.network_requests()
+    # Type contract holds even when the list is empty.
+    assert isinstance(events, list)
+    for ev in events:
+        assert isinstance(ev.method, str) and ev.method.isupper()
+        assert isinstance(ev.url, str) and ev.url

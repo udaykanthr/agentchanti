@@ -87,16 +87,33 @@ class Replayer:
         self.cache = locator_cache
         self.llm_client = llm_client
         self.probe_timeout_ms = probe_timeout_ms
+        # Cursor into ``mcp.network_requests()`` so each step gets only
+        # the traffic it triggered. Reset at the top of every replay().
+        self._network_seen: int = 0
 
     def replay(self, spec: Spec) -> RunResult:
         """Run every step of ``spec`` and return what was observed."""
         result = RunResult(spec_name=spec.name)
+
+        # Enforce the recorded viewport BEFORE the first navigate so
+        # coord=X,Y fallbacks land on the same screen positions they did
+        # during recording. Skipping silently breaks coordinate-based
+        # replay on a different monitor — a class of flake we want to
+        # eliminate end-to-end, not paper over with retries.
+        self._enforce_viewport(spec)
+
+        # Anchor the network cursor at whatever the browser had
+        # accumulated from a prior session — anything before this point
+        # is not ours to attribute to a step.
+        self._network_seen = 0
+        self._drain_new_network()
 
         # The spec's own start_url is the entry point — not a Step, so
         # dispatch it up front. Its network events count toward whatever
         # the first step expects (pre-step traffic).
         nav = self.mcp.navigate(spec.start_url)
         pre_step_network = list(getattr(nav, "network_events", ()) or ())
+        pre_step_network.extend(self._drain_new_network())
 
         for step in spec.steps:
             step_result = self._run_step(spec, step, pre_step_network)
@@ -117,6 +134,29 @@ class Replayer:
         result.final_url = _current_url(self.mcp, result)
         return result
 
+    # ---- Viewport enforcement -------------------------------------------
+
+    def _enforce_viewport(self, spec: Spec) -> None:
+        viewport = (spec.metadata or {}).get("viewport")
+        if not isinstance(viewport, dict):
+            return
+        try:
+            width = int(viewport["width"])
+            height = int(viewport["height"])
+        except (KeyError, TypeError, ValueError):
+            return
+        # Best-effort: if the MCP client doesn't expose resize (older fake,
+        # or a transport that hasn't wired it yet) we skip rather than
+        # crash the whole replay. Coord fallbacks may still match if the
+        # default viewport is close enough.
+        resize = getattr(self.mcp, "resize", None)
+        if not callable(resize):
+            return
+        try:
+            resize(width, height)
+        except Exception:
+            pass
+
     # ---- Step dispatch ---------------------------------------------------
 
     def _run_step(
@@ -132,11 +172,13 @@ class Replayer:
             try:
                 ar = self.mcp.navigate(step.url or "")
             except Exception as e:
+                network.extend(self._drain_new_network())
                 return StepResult(
                     step_id=step.id, action=step.action, success=False,
                     network_events=network, error=f"navigate raised: {e}",
                 )
             network.extend(getattr(ar, "network_events", ()) or ())
+            network.extend(self._drain_new_network())
             return StepResult(
                 step_id=step.id, action=step.action, success=ar.success,
                 network_events=network,
@@ -155,6 +197,7 @@ class Replayer:
         try:
             ar = self._dispatch_action(step, selector)
         except Exception as e:
+            network.extend(self._drain_new_network())
             return StepResult(
                 step_id=step.id, action=step.action, success=False,
                 selector_used=selector, network_events=network,
@@ -162,6 +205,7 @@ class Replayer:
             )
 
         network.extend(getattr(ar, "network_events", ()) or ())
+        network.extend(self._drain_new_network())
         if not ar.success:
             # Selector matched something but the action failed — invalidate
             # the cache so the next run re-probes from scratch.
@@ -172,6 +216,29 @@ class Replayer:
             selector_used=selector, network_events=network,
             error=ar.error if not ar.success else None,
         )
+
+    # ---- Network diff drain ----------------------------------------------
+
+    def _drain_new_network(self) -> list[NetworkEvent]:
+        """Return network events the browser logged since the last drain.
+
+        Empty list when the MCP client doesn't expose ``network_requests``
+        (older fakes, or transports that haven't wired it). The fall-back
+        path is the legacy per-call ``ActionResult.network_events`` —
+        replay correctness still holds, just less observability.
+        """
+        fetcher = getattr(self.mcp, "network_requests", None)
+        if not callable(fetcher):
+            return []
+        try:
+            current = fetcher()
+        except Exception:
+            return []
+        if not isinstance(current, list):
+            return []
+        new = current[self._network_seen:]
+        self._network_seen = len(current)
+        return list(new)
 
     def _dispatch_action(self, step: Step, selector: str) -> ActionResult:
         if step.action == "click":

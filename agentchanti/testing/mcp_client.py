@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -196,6 +197,8 @@ class BrowserMCPClient:
             return self._dispatch_semantic(selector, "browser_click", extra={})
         if kind is SelectorKind.CSS:
             return self._dispatch_css(selector, "click")
+        if kind is SelectorKind.COORDINATE:
+            return self._dispatch_coordinate(selector, "click")
         return _unsupported_selector(selector, kind)
 
     def fill(self, selector: str, value: str) -> ActionResult:
@@ -206,6 +209,8 @@ class BrowserMCPClient:
             )
         if kind is SelectorKind.CSS:
             return self._dispatch_css(selector, "fill", value=value)
+        if kind is SelectorKind.COORDINATE:
+            return self._dispatch_coordinate(selector, "fill", value=value)
         return _unsupported_selector(selector, kind)
 
     def press(self, selector: str, key: str) -> ActionResult:
@@ -228,6 +233,8 @@ class BrowserMCPClient:
             )
         if kind is SelectorKind.CSS:
             return self._dispatch_css(selector, "select", value=value)
+        if kind is SelectorKind.COORDINATE:
+            return self._dispatch_coordinate(selector, "select", value=value)
         return _unsupported_selector(selector, kind)
 
     def hover(self, selector: str) -> ActionResult:
@@ -236,6 +243,8 @@ class BrowserMCPClient:
             return self._dispatch_semantic(selector, "browser_hover", extra={})
         if kind is SelectorKind.CSS:
             return self._dispatch_css(selector, "hover")
+        if kind is SelectorKind.COORDINATE:
+            return self._dispatch_coordinate(selector, "hover")
         return _unsupported_selector(selector, kind)
 
     def wait_for(self, selector: str, timeout_ms: int = 5000) -> ActionResult:
@@ -284,6 +293,28 @@ class BrowserMCPClient:
             return ActionResult(success=False, error=f"{action} via evaluate failed: {e}")
         return ActionResult(success=True)
 
+    def _dispatch_coordinate(
+        self, selector: str, action: str, *, value: str | None = None,
+    ) -> ActionResult:
+        """Dispatch an action against the element at coord=X,Y.
+
+        Used when the Spec carries a captured ``coord=`` fallback — the
+        Recorder grabs ``clientX/clientY`` for every interaction, so even
+        if the DOM has been restructured (different ids, no testids) we
+        can still aim at the same screen position. Pairs with viewport
+        enforcement at replay so X,Y means the same thing both runs.
+        """
+        coord = _parse_coord(selector)
+        if coord is None:
+            return ActionResult(success=False, error=f"bad coord selector {selector!r}")
+        x, y = coord
+        js = _build_coord_action_js(x, y, action, value)
+        try:
+            self._call_tool("browser_evaluate", {"function": js})
+        except Exception as e:
+            return ActionResult(success=False, error=f"{action} via coord failed: {e}")
+        return ActionResult(success=True)
+
     def _focus(self, selector: str) -> ActionResult:
         kind = classify_selector(selector)
         if kind is SelectorKind.SEMANTIC:
@@ -315,6 +346,21 @@ class BrowserMCPClient:
             except Exception as e:
                 return ActionResult(success=False, error=f"focus failed: {e}")
             return ActionResult(success=True)
+        if kind is SelectorKind.COORDINATE:
+            coord = _parse_coord(selector)
+            if coord is None:
+                return ActionResult(success=False, error=f"bad coord selector {selector!r}")
+            x, y = coord
+            js = (
+                f"() => {{ const el = document.elementFromPoint({x}, {y}); "
+                f"if (!el) throw new Error('no element at coord {x},{y}'); "
+                f"el.focus(); }}"
+            )
+            try:
+                self._call_tool("browser_evaluate", {"function": js})
+            except Exception as e:
+                return ActionResult(success=False, error=f"focus failed: {e}")
+            return ActionResult(success=True)
         return _unsupported_selector(selector, kind)
 
     def _selector_exists(self, selector: str) -> bool:
@@ -331,6 +377,17 @@ class BrowserMCPClient:
             # is the success case. The result includes the ### Result
             # header — simple substring check is robust.
             return "true" in (result_text or "").lower()
+        if kind is SelectorKind.COORDINATE:
+            coord = _parse_coord(selector)
+            if coord is None:
+                return False
+            x, y = coord
+            js = f"() => document.elementFromPoint({x}, {y}) !== null"
+            try:
+                result_text = self._call_tool("browser_evaluate", {"function": js})
+            except Exception:
+                return False
+            return "true" in (result_text or "").lower()
         return False
 
     def _resolve_ref(self, selector: str) -> str | None:
@@ -344,6 +401,39 @@ class BrowserMCPClient:
         except Exception as e:
             raise RuntimeError(f"screenshot failed: {e}") from e
         return path
+
+    def resize(self, width: int, height: int) -> ActionResult:
+        """Resize the browser viewport to ``width`` x ``height`` (CSS pixels).
+
+        Replay calls this before the first navigate so a captured
+        ``coord=X,Y`` fallback hits the same screen position as it did
+        during recording. Skipping this would silently invalidate every
+        coordinate-based selector on a different-sized monitor.
+        """
+        try:
+            self._call_tool("browser_resize", {"width": width, "height": height})
+        except Exception as e:
+            return ActionResult(success=False, error=f"resize failed: {e}")
+        return ActionResult(success=True)
+
+    def network_requests(self) -> list[NetworkEvent]:
+        """Return every network request observed by the browser so far.
+
+        Playwright MCP accumulates network traffic across the whole
+        session — there's no per-action filter on the transport. The
+        Replayer wraps this in a "drain new since last call" pattern so
+        each step gets only the requests it triggered, which is what
+        ``expected_network`` assertions need.
+
+        Returns an empty list if the underlying tool call fails or the
+        response can't be parsed — network observability is best-effort,
+        not a hard dependency for replay correctness.
+        """
+        try:
+            text = self._call_tool("browser_network_requests", {})
+        except Exception:
+            return []
+        return _parse_network_requests(text)
 
     # ---- Internals -------------------------------------------------------
 
@@ -374,6 +464,105 @@ def _unsupported_selector(selector: str, kind: SelectorKind) -> ActionResult:
     return ActionResult(
         success=False,
         error=f"cannot dispatch selector {selector!r} of kind {kind.value}",
+    )
+
+
+# Match a Playwright MCP `browser_network_requests` line.
+# Observed shapes (depending on whether the response landed):
+#   [GET] http://example.com/foo => [200] OK
+#   [POST] /api/login => [201] Created
+#   [GET] /still/loading
+# The status group is optional so pending requests survive parsing
+# without dropping methods/URLs we may still want to surface.
+_NETWORK_LINE_RE = re.compile(
+    r"^\s*\[(?P<method>[A-Z]+)\]\s+(?P<url>\S+?)"
+    r"(?:\s+=>\s+\[(?P<status>\d+)\].*)?\s*$"
+)
+
+
+def _parse_network_requests(text: str) -> list[NetworkEvent]:
+    """Parse the markdown-ish payload from ``browser_network_requests``.
+
+    Tolerant by design: skips fences, headers, blank lines, and any
+    line that doesn't fit the request grammar. A single weird line must
+    not poison an entire step's network observation.
+    """
+    events: list[NetworkEvent] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("###") or stripped.startswith("```"):
+            continue
+        m = _NETWORK_LINE_RE.match(stripped)
+        if not m:
+            continue
+        status = int(m.group("status")) if m.group("status") else 0
+        events.append(NetworkEvent(
+            method=m.group("method"),
+            url=m.group("url"),
+            status=status,
+        ))
+    return events
+
+
+def _parse_coord(selector: str) -> tuple[float, float] | None:
+    """Parse a ``coord=X,Y`` selector. Returns None on any malformed input.
+
+    X and Y are kept as floats — Recorder captures clientX/clientY as
+    integers but elementFromPoint accepts fractions and we don't want to
+    silently round if a future caller passes them.
+    """
+    s = selector.strip()
+    if not s.startswith("coord="):
+        return None
+    rest = s[len("coord="):].strip()
+    if "," not in rest:
+        return None
+    xs, ys = rest.split(",", 1)
+    try:
+        return float(xs.strip()), float(ys.strip())
+    except ValueError:
+        return None
+
+
+def _build_coord_action_js(
+    x: float, y: float, action: str, value: str | None,
+) -> str:
+    """Return JS that locates the element at (x,y) and performs ``action``.
+
+    Mirrors ``_build_css_action_js`` shape for symmetry. Element lookup is
+    via ``document.elementFromPoint`` — same primitive the browser uses
+    for hit-testing real mouse clicks, so an X,Y captured from a real
+    click resolves to the same target on replay (assuming viewport
+    parity, enforced separately).
+    """
+    if action == "click":
+        body = "el.click();"
+    elif action == "fill":
+        v = json.dumps(value or "")
+        body = (
+            f"el.focus(); el.value = {v}; "
+            f"el.dispatchEvent(new Event('input', {{bubbles: true}})); "
+            f"el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        )
+    elif action == "select":
+        v = json.dumps(value or "")
+        body = (
+            f"el.value = {v}; "
+            f"el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        )
+    elif action == "hover":
+        body = (
+            f"const opts = {{bubbles: true, clientX: {x}, clientY: {y}}};"
+            "el.dispatchEvent(new MouseEvent('mouseover', opts));"
+            "el.dispatchEvent(new MouseEvent('mouseenter', opts));"
+            "el.dispatchEvent(new MouseEvent('mousemove', opts));"
+        )
+    else:
+        raise ValueError(f"unsupported coord action {action!r}")
+    return (
+        f"() => {{ const el = document.elementFromPoint({x}, {y}); "
+        f"if (!el) throw new Error('no element at coord {x},{y}'); "
+        f"{body} }}"
     )
 
 

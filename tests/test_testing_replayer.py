@@ -72,6 +72,10 @@ class FakeMCP:
         self.calls.append(("snapshot", (), {}))
         return self._snapshot
 
+    def resize(self, width: int, height: int) -> ActionResult:
+        self.calls.append(("resize", (width, height), {}))
+        return ActionResult(success=True)
+
 
 def _simple_spec() -> Spec:
     return Spec(
@@ -249,3 +253,128 @@ def test_replay_captures_final_snapshot(tmp_path: Path):
     r = Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(_simple_spec())
 
     assert r.final_snapshot["text"] == "Welcome back"
+
+
+# ---- Network diff capture --------------------------------------------------
+
+def test_step_picks_up_new_network_requests_via_drain(tmp_path: Path):
+    """When the MCP client exposes ``network_requests``, each step should
+    receive only the events that were new during it. The browser
+    accumulates traffic across the session — the Replayer is responsible
+    for slicing the diff."""
+
+    class NetMCP(FakeMCP):
+        def __init__(self):
+            super().__init__(known_selectors={"#email", "#signin"})
+            # Simulates the browser's running network log, growing as
+            # each call is made. Keys are the call name we expect to be
+            # made — a poor-mans script.
+            self._timeline = [
+                # Pre-replay state (already in the log from a prior session)
+                [],
+                # After spec.start_url navigate — one request shows up
+                [NetworkEvent("GET", "/start", 200)],
+                # After step-1 fill — no traffic added
+                [NetworkEvent("GET", "/start", 200)],
+                # After step-2 click — login POST + redirect GET
+                [
+                    NetworkEvent("GET", "/start", 200),
+                    NetworkEvent("POST", "/api/login", 200),
+                    NetworkEvent("GET", "/dashboard", 200),
+                ],
+            ]
+            self._step = 0
+
+        def network_requests(self) -> list[NetworkEvent]:
+            i = min(self._step, len(self._timeline) - 1)
+            self._step += 1
+            return list(self._timeline[i])
+
+    mcp = NetMCP()
+    r = Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(_simple_spec())
+    assert r.passed
+
+    # First step inherits start_url's traffic; second step gets the
+    # login POST + redirect GET that fired during the click.
+    step1_urls = [e.url for e in r.steps[0].network_events]
+    step2_urls = [e.url for e in r.steps[1].network_events]
+    assert "/start" in step1_urls
+    assert step2_urls == ["/api/login", "/dashboard"]
+
+
+def test_replayer_falls_back_when_mcp_lacks_network_requests(tmp_path: Path):
+    """The legacy ActionResult.network_events path must still work for
+    fakes that pre-date the network diff plumbing."""
+    mcp = FakeMCP(
+        known_selectors={"#email", "#signin"},
+        navigate_result=ActionResult(
+            success=True,
+            current_url="/home",
+            network_events=[NetworkEvent("GET", "/legacy", 200)],
+        ),
+    )
+    r = Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(_simple_spec())
+    assert r.passed
+    assert any(e.url == "/legacy" for e in r.steps[0].network_events)
+
+
+# ---- Viewport enforcement --------------------------------------------------
+
+def test_viewport_metadata_triggers_resize_before_first_navigate(tmp_path: Path):
+    mcp = FakeMCP(known_selectors={"#email", "#signin"})
+    spec = _simple_spec()
+    spec.metadata["viewport"] = {"width": 1280, "height": 720}
+
+    Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(spec)
+
+    methods = [c[0] for c in mcp.calls]
+    # resize must be the first thing we ask the browser to do, so a
+    # captured coord=X,Y fallback hits the same screen position.
+    assert methods[0] == "resize"
+    assert mcp.calls[0][1] == (1280, 720)
+    # navigate happens after resize
+    assert methods.index("navigate") > methods.index("resize")
+
+
+def test_replay_without_viewport_metadata_does_not_resize(tmp_path: Path):
+    mcp = FakeMCP(known_selectors={"#email", "#signin"})
+    Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(_simple_spec())
+    methods = [c[0] for c in mcp.calls]
+    assert "resize" not in methods
+
+
+def test_replay_tolerates_mcp_without_resize(tmp_path: Path):
+    """A minimal MCP fake that doesn't implement resize must not crash
+    the run — coord fallbacks may still match on the default viewport."""
+
+    class MinimalMCP:
+        def __init__(self):
+            self.calls: list[tuple[str, tuple, dict]] = []
+
+        def navigate(self, url):
+            self.calls.append(("navigate", (url,), {}))
+            return ActionResult(success=True, current_url="/home")
+
+        def wait_for(self, sel, timeout_ms=5000):
+            self.calls.append(("wait_for", (sel,), {"timeout_ms": timeout_ms}))
+            return ActionResult(success=sel in {"#email", "#signin"})
+
+        def fill(self, sel, val):
+            self.calls.append(("fill", (sel, val), {}))
+            return ActionResult(success=True)
+
+        def click(self, sel):
+            self.calls.append(("click", (sel,), {}))
+            return ActionResult(success=True)
+
+        def snapshot(self):
+            return {}
+        # Deliberately no `resize` attribute.
+
+    mcp = MinimalMCP()
+    spec = _simple_spec()
+    spec.metadata["viewport"] = {"width": 1024, "height": 768}
+
+    r = Replayer(mcp, LocatorCache(tmp_path / "c.json")).replay(spec)
+    assert r.passed
+    assert "resize" not in [c[0] for c in mcp.calls]
