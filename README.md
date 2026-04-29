@@ -78,6 +78,20 @@ The **plugin system** (`StepPlugin` base class) lets teams extend the pipeline w
 
 Plugins are discovered automatically from your config or via setuptools entry points — no changes to the core pipeline needed.
 
+### Browser E2E Testing — Record, Replay, Self-Heal
+
+AgentChanti also ships a **second product line** for end-to-end browser testing: record a real user session via [Playwright MCP](https://github.com/microsoft/playwright-mcp), normalize the trace into a semantic spec, replay it with three-tier locator resolution (cache → fallbacks → LLM self-heal), and validate URL/DOM/network contracts. Spec authoring takes one click-around session in your browser; replays are cheap on CI thanks to a pinned locator cache.
+
+```bash
+pip install "agentchanti[testing]"
+npx @playwright/mcp@latest --port 8931            # in another terminal
+agentchanti test record   --url https://app.example.com/login --out trace.jsonl
+agentchanti test normalize --trace trace.jsonl --out login.spec.yaml
+agentchanti test replay   --spec login.spec.yaml --report report.json
+```
+
+Full how-to, spec format, troubleshooting, and CI integration in **[TESTING.md](./TESTING.md)**.
+
 ### Built-in RAG — Any LLM Understands Your Codebase
 
 AgentChanti includes a **4-phase RAG system** that automatically indexes your project and injects relevant context into every agent prompt — so even a small local model running offline has deep awareness of your internal code and docs:
