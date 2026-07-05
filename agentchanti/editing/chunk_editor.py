@@ -136,6 +136,27 @@ _EDIT_FULL_FILE_MARKER = re.compile(
     re.IGNORECASE,
 )
 
+# Matches "#### [EDIT]: file.py:symbol" with an optional non-numeric
+# "(lines ...)" range — LLMs often echo the prompt template's placeholder
+# verbatim ("(lines start-end)") or drop the range entirely.  The chunk
+# must then be resolved by symbol name against known_chunks at apply time
+# (sentinel line range 0-0).  Without the parens, the suffix is only a
+# symbol when it is not a language tag ("file.py:python" stays full-file).
+_EDIT_SYMBOL_MARKER = re.compile(
+    r"####\s*\[EDIT\]:\s*(\S+?):([\w.]+)\s*(?:(\(\s*lines?\b[^)]*\))\s*)?$",
+    re.IGNORECASE,
+)
+
+# Suffixes after "file:" that denote a language tag (full-file marker),
+# never a symbol name to resolve.
+_LANGUAGE_TAGS = frozenset({
+    "py", "python", "js", "javascript", "jsx", "ts", "typescript", "tsx",
+    "java", "go", "golang", "rust", "rb", "ruby", "c", "cpp", "cs",
+    "csharp", "php", "swift", "kotlin", "scala", "sh", "bash", "shell",
+    "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "md",
+    "markdown", "sql", "text", "txt", "code",
+})
+
 _NEW_MARKER = re.compile(
     r"####\s*\[NEW\]:\s*(\S+)\s*\(after\s+line\s+(\d+)\)",
 )
@@ -462,6 +483,32 @@ class ChunkEditor:
             if (not edit_match
                     and line_stripped.startswith("####")
                     and "[EDIT]:" in line_stripped):
+                # Symbol-named edit — "#### [EDIT]: game.py:on_draw" with a
+                # non-numeric "(lines start-end)" placeholder or no range at
+                # all.  Emit a sentinel range; apply resolves it by chunk_id.
+                # Without parens, a language-tag suffix ("file.py:python")
+                # keeps its full-file-replacement behavior.
+                sym_match = _EDIT_SYMBOL_MARKER.match(line_stripped)
+                if sym_match and (
+                    sym_match.group(3)
+                    or sym_match.group(2).strip().lower() not in _LANGUAGE_TAGS
+                ):
+                    fpath = sym_match.group(1)
+                    chunk_name = sym_match.group(2).strip()
+                    code, end_i = self._extract_code_block(lines, i + 1)
+                    if code is not None and chunk_name:
+                        logger.info(
+                            "[ChunkEditor] Symbol-resolved edit for %s:%s "
+                            "(no numeric line range)", fpath, chunk_name)
+                        edits.append(ChunkEditResponse(
+                            file_path=fpath,
+                            chunk_id=chunk_name,
+                            line_start=0,
+                            line_end=0,
+                            new_content=code,
+                        ))
+                        i = end_i
+                        continue
                 full_match = _EDIT_FULL_FILE_MARKER.match(line_stripped)
                 if full_match:
                     fpath = full_match.group(1)
@@ -756,6 +803,23 @@ class ChunkEditor:
            Fix: use content-based alignment to find the correct
            sub-range within the chunk, preserving the rest.
         """
+        # Sentinel range (0-0): the marker had no usable line numbers — the
+        # chunk MUST be resolved by symbol name or the edit cannot be
+        # applied safely.
+        if not edit.is_new and (edit.line_start <= 0
+                                or edit.line_end < edit.line_start):
+            for chunk in (known_chunks or []):
+                if (chunk.file_path == edit.file_path
+                        and _chunk_id_matches(chunk.chunk_id, edit.chunk_id)):
+                    logger.info(
+                        "[ChunkEditor] Resolved %s:%s by symbol → lines %d-%d",
+                        edit.file_path, edit.chunk_id,
+                        chunk.line_start, chunk.line_end)
+                    return chunk.line_start, chunk.line_end
+            raise ValueError(
+                f"Cannot resolve edit for {edit.file_path}:{edit.chunk_id} — "
+                f"no numeric line range and no matching chunk")
+
         if not known_chunks or edit.is_new:
             return edit.line_start, edit.line_end
 

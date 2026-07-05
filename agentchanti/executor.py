@@ -903,6 +903,44 @@ class Executor:
 
         return cmd
 
+    @staticmethod
+    def _venv_bin_dir(cwd: str | None = None) -> str | None:
+        """Return the Scripts/bin dir of a project venv under *cwd*, if any.
+
+        Only returns a directory that actually contains a python executable,
+        so a half-created or foreign 'venv' folder is ignored.
+        """
+        root = cwd or os.getcwd()
+        if os.name == 'nt':
+            sub, py = "Scripts", "python.exe"
+        else:
+            sub, py = "bin", "python"
+        for name in ("venv", ".venv"):
+            bin_dir = os.path.join(root, name, sub)
+            if os.path.isfile(os.path.join(bin_dir, py)):
+                return os.path.abspath(bin_dir)
+        return None
+
+    @staticmethod
+    def _inject_venv_path(run_env: dict, cwd: str | None = None) -> None:
+        """Prepend the project venv's bin dir to PATH in *run_env* (in place).
+
+        Each command runs in a fresh shell, so a `venv\\Scripts\\activate` in
+        an earlier step never persists.  Prepending the venv's bin dir makes
+        bare `python`/`pip`/`pytest` resolve to the venv interpreter where the
+        project's packages were installed.
+        """
+        venv_bin = Executor._venv_bin_dir(cwd)
+        if not venv_bin:
+            return
+        # Windows env vars are case-insensitive ('Path' vs 'PATH') — reuse the
+        # existing key to avoid passing duplicates to the subprocess.
+        path_key = next((k for k in run_env if k.upper() == "PATH"), "PATH")
+        current = run_env.get(path_key, "")
+        if venv_bin not in current.split(os.pathsep):
+            run_env[path_key] = venv_bin + os.pathsep + current if current else venv_bin
+        run_env.setdefault("VIRTUAL_ENV", os.path.dirname(venv_bin))
+
     def run_command(self, cmd: str, env: dict | None = None,
                     timeout: int = 120, background: bool = False,
                     cwd: str | None = None) -> Tuple[bool, str]:
@@ -938,7 +976,9 @@ class Executor:
             cmd = Executor._rewrite_interactive_cmd(cmd)
 
             # Build environment — disable color codes and interactive prompts
-            run_env = env if env else os.environ.copy()
+            run_env = dict(env) if env else os.environ.copy()
+            # Prefer the project venv's interpreter/tools over the system ones
+            Executor._inject_venv_path(run_env, cwd)
             run_env.setdefault("NO_COLOR", "1")
             run_env.setdefault("FORCE_COLOR", "0")
             # Non-interactive: prevent CLI tools from prompting for input
@@ -1037,26 +1077,38 @@ class Executor:
             log.error(f"[Executor] Exception running command: {e}")
             return False, str(e)
 
+    @staticmethod
+    def kill_process_tree(proc: subprocess.Popen) -> None:
+        """Terminate *proc* and all of its children."""
+        try:
+            if proc.poll() is None:  # still running
+                # On Windows, taskkill is often more reliable for tree cleanup
+                if os.name == 'nt':
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                                   capture_output=True)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+        except Exception as e:
+            log.warning(f"[Executor] Failed to kill process {proc.pid}: {e}")
+
+    def stop_background_processes_from(self, baseline_count: int) -> None:
+        """Kill background processes started after *baseline_count* were tracked."""
+        new_procs = self._background_processes[baseline_count:]
+        for proc in new_procs:
+            Executor.kill_process_tree(proc)
+        del self._background_processes[baseline_count:]
+
     def cleanup(self):
         """Terminate all background processes."""
         if not self._background_processes:
             return
         log.info(f"[Executor] Cleaning up {len(self._background_processes)} background processes")
         for proc in self._background_processes:
-            try:
-                if proc.poll() is None:  # still running
-                    # On Windows, taskkill is often more reliable for tree cleanup
-                    if os.name == 'nt':
-                         subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                                        capture_output=True)
-                    else:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-            except Exception as e:
-                log.warning(f"[Executor] Failed to cleanup process {proc.pid}: {e}")
+            Executor.kill_process_tree(proc)
         self._background_processes.clear()
 
     @staticmethod

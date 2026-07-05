@@ -179,6 +179,10 @@ class FileMemory:
         self._store = embedding_store
         self._top_k = top_k
         self._lock = threading.Lock()
+        # Bumped on every real write in update() — lets callers (e.g. the
+        # test baseline cache) detect that files changed since they last
+        # looked, without tracking each path individually.
+        self._version: int = 0
 
     def update(self, files: dict[str, str]):
         """Store or overwrite file contents and update embeddings.
@@ -203,6 +207,7 @@ class FileMemory:
                 self._files[fpath] = content
                 # Invalidate skeleton cache for updated file
                 self._skeleton_cache.pop(fpath, None)
+                self._version += 1
                 if self._store:
                     to_embed.append((fpath, content))
 
@@ -248,6 +253,11 @@ class FileMemory:
     def all_files(self) -> dict[str, str]:
         with self._lock:
             return dict(self._files)
+
+    def version(self) -> int:
+        """Monotonic counter bumped on every real file write."""
+        with self._lock:
+            return self._version
 
     def as_dict(self) -> dict[str, str]:
         """Snapshot for checkpoint serialization."""

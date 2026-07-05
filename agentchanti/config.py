@@ -71,6 +71,7 @@ _DEFAULTS = {
     "dependency_check_enabled": True,
     "analyser_enabled": False,
     "wiring_verification_enabled": True,
+    "smoke_test_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -405,6 +406,17 @@ class Config:
             _wv_section.get("enabled", _DEFAULTS["wiring_verification_enabled"]),
         )
 
+        # Runtime smoke test — launch the app entry point after the pipeline
+        # succeeds and feed launch crashes into the fix loop (on by default;
+        # disable via `smoke_test: {enabled: false}` or SMOKE_TEST_ENABLED=false)
+        _st_section = yd.get("smoke_test", {})
+        if not isinstance(_st_section, dict):
+            _st_section = {}
+        self.SMOKE_TEST_ENABLED = _get_bool(
+            "SMOKE_TEST_ENABLED", "smoke_test_enabled",
+            _st_section.get("enabled", _DEFAULTS["smoke_test_enabled"]),
+        )
+
         # Plugins
         self.PLUGINS: list[str] = yd.get("plugins", _DEFAULTS["plugins"])
         if not isinstance(self.PLUGINS, list):
@@ -491,6 +503,9 @@ class Config:
             },
             "wiring_verification": {
                 "enabled": self.WIRING_VERIFICATION_ENABLED,
+            },
+            "smoke_test": {
+                "enabled": self.SMOKE_TEST_ENABLED,
             },
         }
 

@@ -94,6 +94,13 @@ _BARE_FILENAME_RE = re.compile(
     r'\b([\w.\-/]+\.(?:jsx|tsx|js|ts|mjs|cjs|py|css|html|json|go|rb|rs|java|cs|vue|svelte))\b'
 )
 
+def _has_code_ext(file_path: str) -> bool:
+    """True if *file_path* has a source-code extension (see _SOURCE_EXTS)."""
+    name = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return ("." in name
+            and "." + name.rsplit(".", 1)[-1].lower() in _SOURCE_EXTS)
+
+
 def _is_test_file(file_path: str) -> bool:
     """Return True if *file_path* looks like a test file."""
     import os
@@ -1644,6 +1651,22 @@ def _execute_step(step_idx: int, step_text: str, *,
 
                     if not _edit_all_ok:
                         break
+                    # Reject syntactically broken patches before promotion —
+                    # the fuzzy/minimal-diff fallbacks can mangle docstrings
+                    # (observed: an unterminated triple-quote written to
+                    # disk, poisoning the base file for every later edit
+                    # tier). Fall through to the coder instead.
+                    if _resolved.endswith((".py", ".pyw")):
+                        try:
+                            import ast as _ast_inline
+                            _ast_inline.parse(_patched)
+                        except SyntaxError as _syn_exc:
+                            _logger.warning(
+                                "[InlineEdit] Patched %s has a syntax error "
+                                "(%s) — falling through to coder",
+                                _resolved, _syn_exc)
+                            _edit_all_ok = False
+                            break
                     # Promote the patched content into inline_code so the
                     # existing quality gate below handles writing + validation.
                     plan_step.inline_code[_resolved] = _patched
@@ -1698,9 +1721,18 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 # import lines from the first edit pair)
                                 # and would produce a corrupt file.
                                 #
-                                # For multi-block concatenations also check
-                                # balanced braces — fragments like "add
-                                # import" + "add plugin line" won't close.
+                                # For multi-block concatenations, validate the
+                                # combined text with the same language-aware
+                                # syntax checker used by the Tier-B static-check
+                                # gate below (compile() for Python, tree-sitter
+                                # via `syntax_checker` for everything else in
+                                # EXTENSION_MAP). This replaces a brace/paren
+                                # balance count, which is meaningless for
+                                # indentation-scoped languages like Python and
+                                # let syntactically-broken concatenations (e.g.
+                                # dangling methods missing their class header)
+                                # through to disk.
+                                from .step_handlers import _quick_offline_lint
                                 _ext = _os_inline_fb.path.splitext(_ie_resolved)[1].lower()
                                 _js_like = _ext in {
                                     '.js', '.jsx', '.ts', '.tsx', '.mjs',
@@ -1715,11 +1747,11 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     )
                                     if not _has_export:
                                         _is_complete = False
-                                # Multi-block: also need balanced delimiters
+                                _lint_errs = ""
                                 if _is_complete and len(_repl_parts) > 1:
-                                    _opens = _combined.count('{') + _combined.count('(')
-                                    _closes = _combined.count('}') + _combined.count(')')
-                                    if _opens == 0 or _opens != _closes:
+                                    _lint_errs = _quick_offline_lint(
+                                        {_ie_resolved: _combined})
+                                    if _lint_errs:
                                         _is_complete = False
                                 if _is_complete:
                                     plan_step.inline_code[_ie_resolved] = _combined
@@ -1734,10 +1766,10 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 else:
                                     _logger.warning(
                                         "[InlineEdit] FIND failed and %d REPLACE "
-                                        "block(s) for %s look like fragments "
-                                        "(unbalanced delimiters) — falling "
-                                        "through to coder LLM",
+                                        "block(s) for %s look like fragments — "
+                                        "falling through to coder LLM%s",
                                         len(_repl_parts), _ie_resolved,
+                                        f" ({_lint_errs.strip()})" if _lint_errs else "",
                                     )
 
                     if _used_replace_fallback:
@@ -2018,6 +2050,49 @@ def _execute_step(step_idx: int, step_text: str, *,
                 # verification (run_wiring_verification), which checks all
                 # files together after all CODE steps complete.
 
+                # ── API grounding probe (no LLM cost) ──
+                # Verify that module.attr usages in the new Python code exist
+                # in the *installed* package versions (probed in the project
+                # venv).  Code written against the wrong major version passes
+                # lint, review, and tests that never exercise the library —
+                # this is the only pre-runtime gate that catches it.
+                _api_issues: list[str] = []
+                _py_inline = {
+                    p: c for p, c in _inline_files.items() if p.endswith(".py")
+                }
+                if _py_inline:
+                    try:
+                        from .api_grounding import (
+                            probe_api_usage, local_top_levels_from_files)
+                        _api_issues = probe_api_usage(
+                            _py_inline, executor,
+                            local_top_levels=local_top_levels_from_files(
+                                memory.all_files().keys()),
+                        )
+                    except Exception as _probe_exc:
+                        _logger.debug(
+                            "[ApiGrounding] Probe skipped: %s", _probe_exc)
+
+                # ── Per-step execution check (no LLM cost) ──
+                # Actually load each written file in the project environment
+                # (import for Python, compile for registered compiled
+                # languages).  Catches missing modules, broken relative
+                # imports, and module-level crashes the moment they are
+                # written instead of at the end of the pipeline.
+                try:
+                    from .step_verify import verify_step_files
+                    _api_issues.extend(verify_step_files(
+                        _inline_files, language, executor))
+                except Exception as _sv_exc:
+                    _logger.debug("[StepVerify] Skipped: %s", _sv_exc)
+
+                if _api_issues:
+                    display.step_info(
+                        step_idx,
+                        f"[ApiGrounding] {len(_api_issues)} API usage "
+                        f"issue(s) in inline code — routing to fix loop",
+                    )
+
                 # ── Inline code quality gate (Phase 1) ──
                 # The planner wrote this code WITH full KB context, so it is
                 # typically correct.  We avoid unconditional reviewer LLM calls
@@ -2039,7 +2114,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         if s.index > step_idx
                     )
 
-                if _has_test_after_inline:
+                if _has_test_after_inline and not _api_issues:
                     # Tier A: TEST follows — tests will validate, skip review.
                     _logger.info(
                         "[Inline] Skipping review for step %s — TEST step follows",
@@ -2065,7 +2140,12 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     _covered.add(_sp)
                         # Skip files that are inherently untestable or
                         # produce fragile/circular tests:
+                        # - Non-code files (README.md, requirements.txt, …):
+                        #   nothing to import, the LLM call is wasted
                         # - __main__.py: trivial entry points, runpy+patch fails
+                        # - __init__.py: package markers / re-export hubs —
+                        #   covered via the modules they re-export; importing
+                        #   them directly can drag in heavy deps (GUI libs)
                         # - Config/scaffold files: importing vitest.config
                         #   inside vitest creates circular issues; postcss/
                         #   tailwind/vite configs are validated by the build
@@ -2078,7 +2158,9 @@ def _execute_step(step_idx: int, step_text: str, *,
                         _uncovered = [
                             p for p in _inline_sources
                             if p not in _covered
+                            and _has_code_ext(p)
                             and not p.endswith('__main__.py')
+                            and not p.endswith('__init__.py')
                             and not any(
                                 cfg in p.replace("\\", "/").rsplit("/", 1)[-1]
                                 for cfg in _CONFIG_SKIP
@@ -2109,6 +2191,10 @@ def _execute_step(step_idx: int, step_text: str, *,
                         (_inline_lint + "\n" + _inline_import_errs).strip()
                         if _inline_import_errs else _inline_lint
                     )
+                    if _api_issues:
+                        _inline_static_errs = (
+                            "\n".join(_api_issues) + "\n" + _inline_static_errs
+                        ).strip()
                     if _inline_static_errs:
                         display.step_info(
                             step_idx,
@@ -2922,6 +3008,22 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             # command.  Re-running verifies the original intent is satisfied
             # (e.g. tests actually pass, build actually succeeds).
             display.step_info(step_idx, "Fix applied — retrying step...")
+            # The plan's inline content is by definition what failed —
+            # re-applying it on the re-run clobbers the diagnosis fix
+            # (observed: a correct probe-verified rewrite overwritten by
+            # the stale inline content seconds later). Clear it so the
+            # re-run builds on the fixed files via the coder path.
+            if plan_step is not None:
+                try:
+                    if plan_step.inline_code:
+                        log.info(
+                            "Task %d: Clearing stale inline content before "
+                            "post-diagnosis re-run", step_idx + 1)
+                        plan_step.inline_code.clear()
+                    if plan_step.inline_edits:
+                        plan_step.inline_edits = {}
+                except Exception:
+                    pass
             _, success, error_info = _execute_step(
                 step_idx, step_text,
                 steps=steps,
@@ -3621,6 +3723,47 @@ def _parse_failed_test_files(
     return failed
 
 
+def _ensure_pytest_available(executor, cwd: str | None = None) -> None:
+    """Install pytest into the target environment if it is missing.
+
+    agentchanti runs tests via ``python -m pytest`` regardless of what the
+    plan installed, so pytest is a runtime dependency of the pipeline
+    itself: a fresh venv that only installed runtime packages fails every
+    test run with ``No module named pytest`` — an environment error that
+    the test-fix loop (which may only edit test files) can never repair.
+    """
+    ok, _ = executor.run_command(
+        "python -m pytest --version", cwd=cwd, timeout=60)
+    if ok:
+        return
+    _logger.info("[BulkTest] pytest missing in target environment — installing")
+    print("  [BulkTest] pytest not installed — installing it now...")
+    ok, out = executor.run_command(
+        "python -m pip install pytest", cwd=cwd, timeout=300)
+    if not ok:
+        _logger.warning(
+            "[BulkTest] pytest install failed: %s", (out or "")[:300])
+
+
+def _missing_third_party_module(output: str, project_files) -> str | None:
+    """Extract a missing-module name from test output — unless it is a
+    project-local module (a sys.path/code problem; pip-installing a name
+    that happens to exist on PyPI would be wrong and a supply-chain risk).
+    """
+    m = re.search(r"No module named ['\"]?([\w\.]+)", output or "")
+    if not m:
+        return None
+    mod = m.group(1).split(".")[0]
+    from .api_grounding import local_top_levels_from_files
+    if mod in local_top_levels_from_files(project_files):
+        return None
+    for p in project_files:
+        pn = p.replace("\\", "/")
+        if pn.startswith(f"{mod}/") or f"/{mod}/" in f"/{pn}":
+            return None
+    return mod
+
+
 def run_bulk_test_execution_and_fix(
     *,
     memory: FileMemory,
@@ -3749,6 +3892,11 @@ def run_bulk_test_execution_and_fix(
             base_cmd = "npx vitest run"
             _logger.info("[BulkTest] Overriding to vitest (import/config fallback)")
 
+    # The runner itself is a pipeline dependency, not a project one —
+    # make sure it exists in the target venv before the first run.
+    if "pytest" in base_cmd:
+        _ensure_pytest_available(executor, cwd=subproject_cwd)
+
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
     if ok:
@@ -3760,6 +3908,49 @@ def run_bulk_test_execution_and_fix(
         return True, ""
 
     _logger.warning("[BulkTest] Tests failed:\n%s", output[:1000])
+
+    # ── Environment-error self-heal ─────────────────────────────────────
+    # "No module named X" is an environment problem — editing test files
+    # can never fix it (observed: three LLM fix rounds, all blocked by
+    # guardrails, while the real fix was one pip install). Install the
+    # missing module and re-run before burning per-file fix budgets.
+    if not lang or lang == "python":
+        _missing_mod = _missing_third_party_module(output, list(all_files))
+        if _missing_mod:
+            _logger.info(
+                "[BulkTest] Missing third-party module '%s' — installing "
+                "into the project environment", _missing_mod)
+            print(f"  [BulkTest] Installing missing module: {_missing_mod}")
+            _inst_ok, _inst_out = executor.run_command(
+                f"python -m pip install {_missing_mod}",
+                cwd=subproject_cwd, timeout=300)
+            if _inst_ok:
+                try:
+                    from .api_grounding import refresh_installed_versions
+                    refresh_installed_versions(
+                        project_context, executor=executor,
+                        cwd=subproject_cwd)
+                except Exception:
+                    pass
+                ok, output = executor.run_command(
+                    base_cmd, cwd=subproject_cwd)
+                if ok:
+                    _logger.info(
+                        "[BulkTest] All tests pass after installing '%s'.",
+                        _missing_mod)
+                    print(f"  [BulkTest] All tests passed after installing "
+                          f"{_missing_mod}.")
+                    for fpath in test_files:
+                        display.record_test_result(
+                            fpath, passed=1, total=1, failures=[])
+                    return True, ""
+                _logger.warning(
+                    "[BulkTest] Still failing after installing '%s' — "
+                    "continuing to fix loop", _missing_mod)
+            else:
+                _logger.warning(
+                    "[BulkTest] Install of '%s' failed: %s",
+                    _missing_mod, (_inst_out or "")[:300])
 
     # ── Startup crash detection (Django only) ──────────────────────────────
     # Django raises ImportError / ModuleNotFoundError at collection time when
@@ -4524,7 +4715,36 @@ def run_bulk_test_execution_and_fix(
         if ok_final:
             _logger.info("[BulkTest] Final run-all passed.")
             print("  [BulkTest] All tests pass after fixes.")
+            # Files that were never confirmed fixed in the per-file loop
+            # (their fix attempts were skipped/exhausted) can still show
+            # as passing here if the combined run happens to succeed —
+            # e.g. import-order-dependent test doubles that pass only in
+            # a particular file collection order. Re-verify those in
+            # isolation instead of trusting the aggregate result, so the
+            # TEST RESULTS panel never shows a green badge for a file
+            # that fails standalone.
+            _unconfirmed = set(failed_files)
             for fpath in test_files:
+                if fpath in _unconfirmed:
+                    _verify_cmd = _build_scoped_test_cmd(
+                        base_cmd, {fpath: ""}, subproject_cwd)
+                    _ok_v, _out_v = executor.run_command(
+                        _verify_cmd, cwd=subproject_cwd)
+                    _p_v, _t_v, _f_v = _parse_test_counts(_out_v)
+                    display.record_test_result(
+                        fpath, passed=_p_v, total=_t_v, failures=_f_v)
+                    if not _ok_v:
+                        _logger.warning(
+                            "[BulkTest] %s passed in the combined run-all "
+                            "but fails in isolation — likely "
+                            "order-dependent test pollution; leaving "
+                            "marked as failing.", fpath)
+                    continue
+                _existing = display.get_test_result(fpath)
+                if _existing and _existing.get("total", 0) > 1:
+                    # Already have real per-file counts — don't clobber
+                    # them with a fake 1/1.
+                    continue
                 display.record_test_result(fpath, passed=1, total=1, failures=[])
             return True, ""
 
@@ -5110,8 +5330,24 @@ def run_wiring_verification(
         for path, content in verification_context.items()
     )
 
+    ver_line = ""
+    try:
+        from .api_grounding import get_installed_package_versions
+        _versions = get_installed_package_versions(
+            cwd=project_root or None, executor=executor)
+        _pkgs = [f"{n}=={v}" for n, v in sorted(_versions.items())
+                 if n not in ("pip", "setuptools", "wheel")]
+        if _pkgs:
+            ver_line = (
+                "Installed packages — any fix must only use APIs that exist "
+                "in these EXACT versions: " + ", ".join(_pkgs[:40]) + "\n\n"
+            )
+    except Exception:
+        pass
+
     prompt = (
         f"Task: {task}\n\n"
+        f"{ver_line}"
         "You are performing a final cross-file wiring review. "
         "Examine ALL files below together and identify any integration "
         "issue that would cause a blank screen, runtime crash, or silent "
@@ -5185,6 +5421,38 @@ def run_wiring_verification(
                 "blocks found; review manually:\n%s", response[:400],
             )
             return True, ""
+
+        # The wiring LLM regenerates whole files and can reintroduce
+        # removed APIs that earlier stages already fixed. A rejected
+        # rewrite is strictly safer than an ungrounded one — the files
+        # on disk have already passed their own step checks.
+        _py_fixes = {p: c for p, c in fix_files.items()
+                     if p.endswith(".py")}
+        if _py_fixes:
+            try:
+                from .api_grounding import (local_top_levels_from_files,
+                                            probe_api_usage)
+                _api_errs = probe_api_usage(
+                    _py_fixes, executor,
+                    cwd=project_root or None,
+                    local_top_levels=local_top_levels_from_files(
+                        memory.all_files().keys()),
+                )
+            except Exception as exc:
+                _logger.debug(
+                    "[WiringVerification] API probe failed (non-fatal): %s",
+                    exc)
+                _api_errs = []
+            if _api_errs:
+                _logger.warning(
+                    "[WiringVerification] Rejecting rewrite — it uses APIs "
+                    "missing from the installed packages: %s",
+                    "; ".join(e.split(" — ")[0] for e in _api_errs))
+                print(
+                    "  [WiringVerify] Proposed fix rejected (uses APIs not "
+                    "in installed packages) — keeping existing files."
+                )
+                return True, ""
 
         _logger.info(
             "[WiringVerification] Applying fixes for: %s",

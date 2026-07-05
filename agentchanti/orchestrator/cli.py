@@ -205,6 +205,19 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         sys.exit(130)
+    except Exception:
+        # Last-resort safety net: without this, an unhandled exception
+        # anywhere in the pipeline (e.g. a worker-thread error re-raised
+        # via future.result(), or an LLM client error) propagates to
+        # Python's default excepthook, which prints only to stderr and
+        # bypasses the `logging` module entirely — so the run's own log
+        # file shows no trace of the crash at all, and the traceback can
+        # be lost if a Rich/Textual live display has taken over the
+        # terminal. Log it here (with traceback) so the log file always
+        # has a record, then re-raise so the process still exits
+        # non-zero and the traceback still reaches stderr.
+        log.exception("Unhandled exception — pipeline crashed")
+        raise
 
 
 def _main_impl():
@@ -594,6 +607,15 @@ def _main_impl():
             plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
         language = checkpoint_state.get("language", language)
+
+        # Restore intent_spec — the planning phase that normally produces it
+        # (parse_intent_spec on the enriched task) is skipped on resume.
+        # Without this, step handlers crash with UnboundLocalError.
+        try:
+            intent_spec = parse_intent_spec(
+                checkpoint_state.get("task") or args.task)
+        except Exception:
+            intent_spec = None
 
         # Restore ProjectContext if saved (avoids re-running analysis LLM call)
         saved_project_context = checkpoint_state.get("project_context")
@@ -1335,6 +1357,26 @@ def _main_impl():
         )
         if not wv_ok:
             log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
+
+    # ── 13.7. Runtime smoke verification ──
+    # Tests can pass while the app crashes at launch (GUI apps especially —
+    # tests mock the graphics library and never render a frame).  Launch the
+    # entry point briefly and feed any crash traceback into a bounded fix
+    # loop.  Skips silently when there is no runnable entry point.
+    if pipeline_success:
+        from .smoke_test import run_smoke_verification
+        smoke_ok, smoke_err = run_smoke_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            task=args.task,
+            language=language,
+            cfg=cfg,
+        )
+        if not smoke_ok:
+            pipeline_success = False
+            log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

@@ -166,3 +166,20 @@ def test_looks_like_command_rejects_paths():
     """Bare file paths should not be treated as commands."""
     assert not _looks_like_command("src/main.py")
     assert not _looks_like_command("tests/test_logic.c")
+
+
+def test_looks_like_command_accepts_windows_call():
+    """``call venv\\Scripts\\activate && ...`` must be recognized.
+
+    Regression: this is the standard Windows-venv activation idiom the
+    planner uses for every CMD step, but "call" was missing from
+    known_commands. When a diagnosis fix command happened to start with
+    "call" instead of "python" (e.g. because the venv already existed
+    so the fix skipped recreating it), the real fenced fix command was
+    silently dropped by the primary extractor and the fuzzy fallback
+    parser picked up unrelated prose text instead — which then got
+    executed as a shell command and failed immediately, wasting a
+    diagnosis retry and leaving the actual fix never applied.
+    """
+    assert _looks_like_command(
+        r"call venv\Scripts\activate && python -m pip install pytest")

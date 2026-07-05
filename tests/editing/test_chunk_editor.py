@@ -712,3 +712,111 @@ class TestStripDiffMarkers:
         )
         assert result == expected
 
+
+
+class TestSymbolResolvedEdits:
+    """[EDIT] markers with placeholder line ranges like "(lines start-end)"
+    must resolve by symbol name instead of being dropped (which previously
+    cascaded into full-file misparse + structural-guard rejection)."""
+
+    SOURCE = (
+        "class Game:\n"
+        "    def on_draw(self):\n"
+        "        old_draw()\n"
+        "\n"
+        "    def on_update(self, dt):\n"
+        "        old_update()\n"
+    )
+
+    def _response(self):
+        return (
+            "Fix explanation here.\n"
+            "#### [EDIT]: game.py:on_draw (lines start-end)\n"
+            "```python\n"
+            "    def on_draw(self):\n"
+            "        new_draw()\n"
+            "```\n"
+            "\n"
+            "#### [EDIT]: game.py:on_update (lines start-end)\n"
+            "```python\n"
+            "    def on_update(self, dt):\n"
+            "        new_update()\n"
+            "```\n"
+        )
+
+    def test_placeholder_range_parses_as_symbol_edit(self):
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(self._response())
+        assert edits is not None and len(edits) == 2
+        assert edits[0].file_path == "game.py"
+        assert edits[0].chunk_id == "on_draw"
+        assert edits[0].line_start == 0  # sentinel: resolve by symbol
+
+    def test_apply_resolves_by_symbol_and_keeps_others(self):
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(self._response())
+        known = editor.chunk_file("game.py", self.SOURCE)
+        result = editor.apply_chunk_edits(self.SOURCE, edits, known_chunks=known)
+        assert "new_draw()" in result
+        assert "new_update()" in result
+        assert "old_draw()" not in result
+        assert "class Game:" in result
+
+    def test_unresolvable_symbol_raises(self):
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(
+            "#### [EDIT]: game.py:no_such_method (lines start-end)\n"
+            "```python\n"
+            "x = 1\n"
+            "```\n"
+        )
+        known = editor.chunk_file("game.py", self.SOURCE)
+        import pytest as _pytest
+        with _pytest.raises(ValueError):
+            editor.apply_chunk_edits(self.SOURCE, edits, known_chunks=known)
+
+    def test_language_tag_still_full_file(self):
+        # "#### [EDIT]: foo.py:python" (no parens) must keep its existing
+        # full-file-replacement behavior
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(
+            "#### [EDIT]: foo.py:python\n"
+            "```python\n"
+            "x = 1\n"
+            "```\n"
+        )
+        assert edits is not None and len(edits) == 1
+        assert edits[0].line_start != 0 or edits[0].line_end != 0
+
+    def test_no_parens_symbol_edit_parses(self):
+        # Diagnosis LLMs drop the "(lines ...)" part entirely:
+        # "#### [EDIT]: src/game_window.py:_draw_hud" — must resolve by
+        # symbol, not become a full-file replacement with "_draw_hud"
+        # misread as a language tag.
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(
+            "#### [EDIT]: game.py:on_draw\n"
+            "```python\n"
+            "    def on_draw(self):\n"
+            "        new_draw()\n"
+            "```\n"
+        )
+        assert edits is not None and len(edits) == 1
+        assert edits[0].file_path == "game.py"
+        assert edits[0].chunk_id == "on_draw"
+        assert edits[0].line_start == 0  # sentinel: resolve by symbol
+
+    def test_no_parens_symbol_edit_applies_surgically(self):
+        editor = ChunkEditor()
+        edits = editor.parse_chunk_response(
+            "#### [EDIT]: game.py:on_draw\n"
+            "```python\n"
+            "    def on_draw(self):\n"
+            "        new_draw()\n"
+            "```\n"
+        )
+        known = editor.chunk_file("game.py", self.SOURCE)
+        result = editor.apply_chunk_edits(self.SOURCE, edits, known_chunks=known)
+        assert "new_draw()" in result
+        assert "old_update()" in result  # sibling method untouched
+        assert "class Game:" in result

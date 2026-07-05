@@ -235,7 +235,13 @@ def perform_baseline_test_analysis(
 
     Returns a summary string of the analysis.
     """
-    if getattr(memory, '_tester_pre_analysis_done', False):
+    # Cache is only valid while no files have changed since it was
+    # computed. Without this, a baseline captured before this test step
+    # (e.g. by an earlier TEST step) would be trusted even after later
+    # CODE steps rewrote the source files it was verifying — showing the
+    # TEST RESULTS panel as stale green while the code has since broken.
+    if (getattr(memory, '_tester_pre_analysis_done', False)
+            and getattr(memory, '_tester_pre_analysis_version', -1) == memory.version()):
         return getattr(memory, '_tester_pre_analysis_summary', "")
 
     if display:
@@ -305,6 +311,9 @@ def perform_baseline_test_analysis(
             analysis_lines.append("- PASSING TEST FILES (must NOT be modified):")
             for fp in _baseline_passing_files:
                 analysis_lines.append(f"  - {fp}")
+        if display:
+            for fp in _baseline_passing_files:
+                display.record_test_result(fp, passed=1, total=1, failures=[])
 
         if _is_test_fix:
             analysis_lines.append("- DIRECTIVE: Test environment is HEALTHY. Do NOT add setup or fix steps for tests.")
@@ -342,6 +351,9 @@ def perform_baseline_test_analysis(
                     analysis_lines.append("- HEALTHY (PASSING) files — only update if new code changes require it:")
                 for p in passing_paths:
                     analysis_lines.append(f"  - {p}")
+                if display:
+                    for p in passing_paths:
+                        display.record_test_result(p, passed=1, total=1, failures=[])
 
             if failed_paths:
                 analysis_lines.append("- BROKEN (FAILING) files — THESE ARE THE ONLY FILES TO FIX:")
@@ -363,6 +375,14 @@ def perform_baseline_test_analysis(
                         analysis_lines.append(f"\n  --- {full_path} ---")
                         for err_line in err_text.splitlines():
                             analysis_lines.append(f"  {err_line}")
+
+                if display:
+                    for p in failed_paths:
+                        basename = p.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+                        err_text = per_file_errors.get(basename, "")
+                        display.record_test_result(
+                            p, passed=0, total=1,
+                            failures=[{"name": basename, "message": err_text[:80]}])
 
             analysis_lines.append("")
             if _is_test_fix:
@@ -387,6 +407,7 @@ def perform_baseline_test_analysis(
 
     summary = "\n".join(analysis_lines)
     memory._tester_pre_analysis_done = True
+    memory._tester_pre_analysis_version = memory.version()
     memory._tester_pre_analysis_summary = summary
     memory._tester_baseline_success = success
     # Store file lists so callers can build richer task interpretations
