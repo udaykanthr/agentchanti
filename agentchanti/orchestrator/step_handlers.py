@@ -265,6 +265,13 @@ def _ensure_packages_installed(
             p for p in project_context.missing_packages
             if p not in missing
         ]
+        # Refresh version snapshot so agents target the installed versions
+        from .api_grounding import refresh_installed_versions
+        try:
+            refresh_installed_versions(
+                project_context, executor=executor, cwd=subproject_cwd)
+        except Exception as _rv_exc:
+            log.debug(f"[ApiGrounding] Version refresh failed: {_rv_exc}")
     else:
         log.warning(f"[Pre-install] Bulk install failed (non-fatal): "
                     f"{output[:300]}")
@@ -1891,6 +1898,18 @@ def _handle_cmd_step(step_text: str, executor: Executor,
 
     if success:
         display.step_info(step_idx, "Command succeeded.")
+
+        # Package install commands change the API surface downstream CODE
+        # steps must target — refresh the installed-version snapshot.  On a
+        # blank project the initial snapshot predates the venv entirely.
+        from .api_grounding import is_install_command, refresh_installed_versions
+        if is_install_command(cmd):
+            try:
+                refresh_installed_versions(
+                    project_context, executor=executor, cwd=subproject_cwd)
+            except Exception as _rv_exc:
+                log.debug(f"[ApiGrounding] Version refresh failed: {_rv_exc}")
+
         # Mark scaffold files: when a project-creation command succeeds, record
         # the subproject so that _auto_fix_hazards can skip hazard checks for
         # npm/framework-generated template files on their first modification.
@@ -3380,6 +3399,86 @@ def _build_batch_error_summary(output: str, max_chars: int = 6000) -> str:
     return result
 
 
+_REVIEW_APPROVAL_PHRASES = (
+    "code looks good", "looks good", "no issues", "no critical issues",
+    "no bugs found", "code is correct", "functionally correct", "lgtm",
+)
+
+
+def _review_verdict(review: str, api_errs) -> bool:
+    """Final accept/reject verdict for a code review.
+
+    The runtime API probe is ground truth: a reviewer can add findings on
+    top of it but can never subtract them (observed live: a reviewer
+    approving code the probe had flagged, shipping dead APIs to disk).
+    """
+    if api_errs:
+        return False
+    review_lower = (review or "").lower()
+    return any(p in review_lower for p in _REVIEW_APPROVAL_PHRASES)
+
+
+def _api_grounding_context(
+    written_files: dict[str, str],
+    memory: FileMemory,
+    executor: Executor,
+    project_context=None,
+    language: str | None = None,
+    cwd: str | None = None,
+) -> tuple[list[str], str]:
+    """Ground *written_files* against the real project environment.
+
+    Two checks feed the same gate: the API usage probe (module.attr
+    existence with rename suggestions) and, when *language* has a
+    registered per-step verifier, an execution-grade load check (import /
+    compile) that catches integration failures the moment a file is
+    written instead of at the end of the pipeline.
+
+    Returns ``(errors, verified_ctx)``.  On a clean probe, *verified_ctx*
+    is a reviewer prompt block listing the runtime-verified APIs — without
+    it, the reviewer re-litigates API existence from training data and can
+    FAIL correct code (observed: verified arcade 3.x names rejected as
+    "misspelled" with the removed 2.x names recommended back).
+    """
+    load_errs: list[str] = []
+    try:
+        from .step_verify import verify_step_files
+        load_errs = verify_step_files(
+            written_files, language, executor, cwd=cwd)
+    except Exception as exc:
+        log.debug(f"[StepVerify] Skipped: {exc}")
+
+    py_files = {p: c for p, c in written_files.items() if p.endswith(".py")}
+    if not py_files:
+        return load_errs, ""
+    try:
+        from .api_grounding import (collect_api_usages,
+                                    local_top_levels_from_files,
+                                    probe_api_usage)
+        tops = local_top_levels_from_files(memory.all_files().keys())
+        errs = probe_api_usage(py_files, executor, local_top_levels=tops)
+        if errs or load_errs:
+            return errs + load_errs, ""
+        usages = collect_api_usages(py_files, tops)
+    except Exception as exc:
+        log.debug(f"[ApiGrounding] Probe skipped: {exc}")
+        return load_errs, ""
+    if not usages:
+        return [], ""
+    versions = getattr(project_context, "installed_versions", None) or {}
+    tops_used = sorted({u.split(".")[0] for u in usages})
+    pkg_note = ", ".join(
+        f"{t}=={versions[t]}" if t in versions else t for t in tops_used)
+    verified_ctx = (
+        "\n\nVERIFIED APIs — a runtime probe against the installed "
+        f"packages ({pkg_note}) confirmed that every one of these exists "
+        "exactly as written: "
+        + ", ".join(f"`{u}`" for u in usages[:40])
+        + ". Do NOT flag any of them as missing, renamed, misspelled, or "
+        "nonexistent — the probe result is ground truth and overrides "
+        "your training data."
+    )
+    return [], verified_ctx
 
 
 def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
@@ -3503,6 +3602,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
 
     # --- Tier 3: Full-file flow (fallback) ---
     feedback = initial_error  # Pre-seed with inline static errors when falling back
+    _chunk_review_fb = getattr(memory, "_chunk_review_feedback", "")
+    if _chunk_review_fb:
+        memory._chunk_review_feedback = ""  # consume once
+        feedback = ((feedback + "\n\n") if feedback else "") + (
+            "A chunk-level edit for this step was already attempted and "
+            "reverted after review. Address this feedback in your rewrite:\n"
+            + _chunk_review_fb
+        )
     context_window = cfg.CONTEXT_WINDOW if cfg else 8192
     ctx_budget = int(context_window * 0.8)
     prev_files: dict[str, str] = {}  # Track files from previous attempt
@@ -3788,6 +3895,19 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         import_errors = _validate_import_paths(files, memory)
         lint_errors = lint_errors + import_errors
 
+        # API grounding probe: verify module.attr usages exist in the
+        # installed package versions (project venv).  Runs on EVERY retry —
+        # a fix that swaps one removed API for another hallucinated one must
+        # fail here with the exact error, not survive to runtime.
+        _api_errs, _verified_api_ctx = _api_grounding_context(
+            files, memory, executor, project_context, language=language)
+        if _api_errs:
+            log.warning(
+                f"Step {step_idx+1}: API grounding found "
+                f"{len(_api_errs)} issue(s)")
+            lint_errors = ((lint_errors + "\n") if lint_errors else "") \
+                + "\n".join(_api_errs)
+
         # Determine review mode: "static" (default) or "full"
         review_mode = "static"
         if cfg:
@@ -3862,14 +3982,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         if use_diff_review:
             review = reviewer.process(
                 f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}",
+                context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}{_verified_api_ctx}",
                 language=language,
                 review_mode="diff",
             )
         else:
             review = reviewer.process(
                 f"Review this code for the step: {step_text}\n\n{response}",
-                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}{reviewer_kb}{criteria_ctx}",
+                context=f"Step: {step_text}\nOnly review changes relevant to this step.{lint_context}{reviewer_kb}{criteria_ctx}{_verified_api_ctx}",
                 language=language,
             )
 
@@ -3884,17 +4004,14 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         log.info(f"Step {step_idx+1}: Review:\n{review}")
 
         review_lower = review.lower()
-        # Accept if the reviewer explicitly approves
-        approved = any(phrase in review_lower for phrase in (
-            "code looks good",
-            "looks good",
-            "no issues",
-            "no critical issues",
-            "no bugs found",
-            "code is correct",
-            "functionally correct",
-            "lgtm",
-        ))
+        # Accept if the reviewer explicitly approves — but never while the
+        # API probe reports errors (probe is ground truth).
+        approved = _review_verdict(review, _api_errs)
+        if not approved and _api_errs and _review_verdict(review, None):
+            log.warning(
+                f"Step {step_idx+1}: Reviewer approved but the API probe "
+                f"found {len(_api_errs)} issue(s) — probe is ground truth, "
+                f"rejecting")
 
         if approved:
             display.step_info(step_idx, "Review passed ✔")
@@ -3910,13 +4027,23 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                 "syntaxerror", "attributeerror", "keyerror",
                 "referenceerror",
             ))
-            if not has_critical:
+            if not has_critical and not _api_errs:
                 display.step_info(step_idx, "Review has only minor suggestions, accepting ✔")
                 log.info(f"Step {step_idx+1}: Accepted on last attempt "
                          f"(review had no critical keywords)")
                 return True, ""
 
         feedback = review
+        if _api_errs:
+            # The reviewer's prose can hallucinate replacement API names
+            # (observed: recommending the removed `draw_lrtb_*` as the fix).
+            # The probe's suggestions are runtime-verified — make them
+            # outrank anything the reviewer suggested.
+            feedback += (
+                "\n\nAUTHORITATIVE API CHECK (runtime probe against the "
+                "installed packages — if the review above suggests different "
+                "API names, use THESE instead):\n" + "\n".join(_api_errs)
+            )
         display.step_info(step_idx, "Review found issues, retrying...")
         log.warning(f"Step {step_idx+1}: Review issues: {review[:200]}")
 
@@ -4684,10 +4811,15 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         except (ValueError, IndexError):
             actual_tool = None
         if actual_tool:
-            import importlib.util as _ilu
-            try:
-                module_found = _ilu.find_spec(actual_tool) is not None
-            except Exception:
+            # Probe the interpreter that will actually run the tests (the
+            # executor resolves `python` to the project venv when one exists)
+            # — an in-process find_spec would check agentchanti's own
+            # environment instead and give a false positive/negative.
+            if re.fullmatch(r'[\w.]+', actual_tool):
+                module_found, _ = executor.run_command(
+                    f'python -c "import {actual_tool}"', cwd=subproject_cwd,
+                )
+            else:
                 module_found = False
             if not module_found:
                 install_cmd = _get_runner_install_cmd(actual_tool, cwd=subproject_cwd)
@@ -6539,6 +6671,18 @@ def _try_chunk_edit(
     import_errors = _validate_import_paths(result_files, memory)
     lint_errors = lint_errors + import_errors
 
+    # API grounding: probe module.attr usages against installed packages.
+    # Errors join the lint feedback; a clean probe arms the reviewer with
+    # the verified-API list so it cannot FAIL correct code from stale
+    # training data and talk the coder into reintroducing removed APIs.
+    _api_errs, _verified_api_ctx = _api_grounding_context(
+        result_files, memory, executor, project_context, language=language)
+    if _api_errs:
+        log.warning("[ChunkEdit] API grounding found %d issue(s)",
+                    len(_api_errs))
+        lint_errors = ((lint_errors + "\n") if lint_errors else "") \
+            + "\n".join(_api_errs)
+
     # Determine review mode: "static" (default) or "full"
     review_mode_cfg = getattr(cfg, "REVIEW_MODE", "static") if cfg else "static"
 
@@ -6606,7 +6750,7 @@ def _try_chunk_edit(
 
     review = reviewer.process(
         f"Review this code change for the step: {step_text}\n\n{review_ctx}",
-        context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}",
+        context=f"Step: {step_text}\nReview ONLY the changes shown.{lint_context}{reviewer_kb}{criteria_ctx}{_verified_api_ctx}",
         language=language,
         review_mode=reviewer_mode,
     )
@@ -6619,18 +6763,35 @@ def _try_chunk_edit(
     if review:
         display.add_llm_log(review, source="Reviewer")
 
-    review_lower = review.lower()
-    approved = any(phrase in review_lower for phrase in (
-        "code looks good", "looks good", "no issues", "no critical issues",
-        "no bugs found", "code is correct", "functionally correct", "lgtm",
-    ))
+    # Probe errors are a hard gate — reviewer approval cannot waive them.
+    approved = _review_verdict(review, _api_errs)
+    if not approved and _api_errs and _review_verdict(review, None):
+        log.warning(
+            "[ChunkEdit] Reviewer approved but the API probe found %d "
+            "issue(s) — probe is ground truth, rejecting", len(_api_errs))
 
     if approved:
         display.step_info(step_idx, "Review passed")
         return True, ""
 
     log.info("[ChunkEdit] Review found issues, reverting and falling back to full-file for retry")
-    
+    log.info("[ChunkEdit] Review feedback:\n%s", review[:2000])
+
+    # Carry the review into the Tier-3 full-file retry — a blind
+    # regeneration rediscovers the same mistakes from scratch (observed:
+    # a reverted chunk fix regenerated with removed 2.x draw APIs).
+    _chunk_fb = review
+    if _api_errs:
+        _chunk_fb += (
+            "\n\nAUTHORITATIVE API CHECK (runtime probe against the "
+            "installed packages — trust these over any review suggestion "
+            "above):\n" + "\n".join(_api_errs)
+        )
+    try:
+        memory._chunk_review_feedback = _chunk_fb
+    except Exception:
+        pass
+
     # Revert memory and disk since the review failed
     for fpath, orig_content in original_files.items():
         if orig_content is not None:

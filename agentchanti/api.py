@@ -664,6 +664,24 @@ def _run_task_impl(
         if not wv_ok:
             log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
 
+    # ── Runtime smoke verification ──
+    # Tests can pass while the app crashes at launch (GUI apps especially).
+    # Launch the entry point briefly and feed crashes into a bounded fix loop.
+    if pipeline_success:
+        from .orchestrator.smoke_test import run_smoke_verification
+        smoke_ok, smoke_err = run_smoke_verification(
+            memory=memory,
+            executor=executor,
+            coder=coder,
+            display=display,
+            task=task,
+            language=language,
+            cfg=cfg,
+        )
+        if not smoke_ok:
+            pipeline_success = False
+            log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
+
     # Stop KB runtime watcher
     if kb_runtime_watcher is not None:
         try:

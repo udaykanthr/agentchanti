@@ -389,6 +389,25 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             + "\n\n"
         )
 
+    # Ground the fix in the installed package versions — diagnosis LLMs
+    # otherwise propose APIs from training data (e.g. the removed 2.x
+    # `draw_xywh_*` as a "fix" for the removed `draw_rectangle_*`).
+    _versions_note = ""
+    if executor is not None:
+        try:
+            from .api_grounding import get_installed_package_versions
+            _vers = get_installed_package_versions(executor=executor)
+            _pkgs = [f"{n}=={v}" for n, v in sorted(_vers.items())
+                     if n not in ("pip", "setuptools", "wheel")]
+            if _pkgs:
+                _versions_note = (
+                    "INSTALLED PACKAGES — any code fix must only use APIs "
+                    "that exist in these EXACT versions (do not assume "
+                    "older or newer APIs): " + ", ".join(_pkgs[:40]) + "\n\n"
+                )
+        except Exception:
+            pass
+
     prompt = (
         "A step in our automated coding pipeline has FAILED after multiple retries.\n"
         "Analyze the failure and provide a concrete fix.\n\n"
@@ -399,6 +418,7 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
         f"Step {step_idx+1}: {step_text}\n"
         f"Step type: {step_type}\n\n"
         f"Error details:\n{error_info}\n\n"
+        f"{_versions_note}"
     )
     if pre_investigation:
         prompt += (
@@ -563,10 +583,18 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     prompt += f"All project files: {memory.summary()}\n\n"
 
     if previous_diagnosis:
+        # Prefer the guard's recorded rejection reason (e.g. API probe
+        # failure) over the generic format complaint — the generic text
+        # makes the LLM repeat the same rejected fix verbatim.
+        _rejection_reason = getattr(memory, "_last_fix_rejection", "") or (
+            "Your previous diagnosis failed because it did not produce an "
+            "actionable fix in the correct format. You MUST use the exact "
+            "`#### [FILE]:` marker for code fixes, or exact shell commands "
+            "for CMD fixes."
+        )
         prompt += (
             "IMPORTANT FEEDBACK ON YOUR PREVIOUS ATTEMPT:\n"
-            "Your previous diagnosis failed because it did not produce an actionable fix in the correct format. "
-            "You MUST use the exact `#### [FILE]:` marker for code fixes, or exact shell commands for CMD fixes.\n\n"
+            f"{_rejection_reason}\n\n"
             "Your previous output was:\n"
             f"{previous_diagnosis}\n\n"
         )
@@ -758,6 +786,14 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     has_fix_commands = False
     executed_cmds: list[str] = []
 
+    # Reset the rejection record for this attempt — it is set below only
+    # when a guard rejects the fix, and consumed by the next attempt's
+    # _diagnose_failure prompt.
+    try:
+        memory._last_fix_rejection = ""
+    except Exception:
+        pass
+
     display.step_info(step_idx, "Applying diagnosis fix...")
 
     # ── Preferred: parse [EDIT]: chunk markers (surgical, avoids unintended changes) ──
@@ -767,8 +803,12 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         _ce = _CE()
         _chunk_edits = _ce.parse_chunk_response(diagnosis)
         if _chunk_edits:
+            # Group edits per file: applying them one call at a time would
+            # overwrite files[_fpath] with only the LAST edit applied.
+            _edits_by_file: dict[str, list] = {}
             for _edit in _chunk_edits:
-                _fpath = _edit.file_path
+                _edits_by_file.setdefault(_edit.file_path, []).append(_edit)
+            for _fpath, _file_edits in _edits_by_file.items():
                 _existing = memory.get(_fpath)
                 if _existing is None:
                     try:
@@ -778,14 +818,19 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                         pass
                 if _existing is not None:
                     try:
+                        # known_chunks lets symbol-named edits (and edits
+                        # with hallucinated line numbers) resolve against
+                        # the file's real function/class boundaries.
+                        _known = _ce.chunk_file(_fpath, _existing)
                         files[_fpath] = _ce.apply_chunk_edits(
-                            _existing, [_edit])
+                            _existing, _file_edits, known_chunks=_known)
                     except Exception as _exc:
                         log.warning(
                             "Step %d: ChunkEdit apply failed for %s: %s",
                             step_idx + 1, _fpath, _exc)
             if files:
-                log.info("Step %d: Diagnosis applied %d chunk edit(s): %s",
+                log.info("Step %d: Diagnosis applied chunk edits to %d "
+                         "file(s): %s",
                          step_idx + 1, len(files), list(files.keys()))
     except ImportError:
         pass
@@ -844,6 +889,50 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                 step_idx + 1, len(files) - len(_syntax_ok), len(files),
             )
         files = _syntax_ok
+
+    if files:
+        # ── API grounding guard ──
+        # Reject fixes that swap one missing API for another — the fix
+        # would fail the same probe on re-execution and burn a diagnosis
+        # attempt on code that is known-broken before it is written.
+        _py_fixes = {p: c for p, c in files.items() if p.endswith(".py")}
+        if _py_fixes:
+            try:
+                from .api_grounding import (local_top_levels_from_files,
+                                            probe_api_usage)
+                _api_errs = probe_api_usage(
+                    _py_fixes, executor,
+                    local_top_levels=local_top_levels_from_files(
+                        memory.all_files().keys()))
+            except Exception as _probe_exc:
+                log.debug("Step %d: Diagnosis API probe skipped: %s",
+                          step_idx + 1, _probe_exc)
+                _api_errs = []
+            if _api_errs:
+                log.warning(
+                    "Step %d: API grounding rejected diagnosis fix — %s",
+                    step_idx + 1,
+                    "; ".join(e.split(" — ")[0] for e in _api_errs))
+                display.step_info(
+                    step_idx,
+                    "Diagnosis fix uses APIs missing from installed "
+                    "packages — rejected")
+                # Record the real reason so the next diagnosis attempt is
+                # told exactly what to change instead of the generic
+                # "wrong format" feedback (which made attempt 2 repeat
+                # the same rejected fix verbatim).
+                try:
+                    memory._last_fix_rejection = (
+                        "Your previous fix was REJECTED by a runtime API "
+                        "check: it used APIs that do not exist in the "
+                        "installed packages:\n" + "\n".join(_api_errs)
+                        + "\nRemove those calls and use the suggested "
+                        "replacements."
+                    )
+                except Exception:
+                    pass
+                files = {p: c for p, c in files.items()
+                         if p not in _py_fixes}
 
     if files:
         # ── Structural preservation guard ──

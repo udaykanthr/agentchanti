@@ -47,6 +47,15 @@ class ProjectContext:
     installed_packages: list[str] = field(default_factory=list)
     required_packages: list[str] = field(default_factory=list)
     missing_packages: list[str] = field(default_factory=list)
+    # Actual installed versions from the project interpreter (pip list),
+    # keyed by lowercase package name.  Grounds the LLM in the real API
+    # version instead of whatever version dominates its training data.
+    installed_versions: dict[str, str] = field(default_factory=dict)
+
+    def _packages_with_versions(self, limit: int) -> list[str]:
+        from ..orchestrator.api_grounding import format_packages_with_versions
+        return format_packages_with_versions(
+            self.installed_packages[:limit], self.installed_versions)
 
     # Import patterns
     import_style: str = ""  # "import/export", "require/module.exports", "mixed"
@@ -82,7 +91,9 @@ class ProjectContext:
             for ex in self.import_examples[:5]:
                 parts.append(f"  {ex}")
         if self.installed_packages:
-            parts.append(f"Installed packages: {', '.join(self.installed_packages[:30])}")
+            parts.append(
+                "Installed packages (write code against these EXACT versions): "
+                + ", ".join(self._packages_with_versions(30)))
         if self.missing_packages:
             parts.append(f"NEED TO INSTALL: {', '.join(self.missing_packages)}")
         if self.source_root:
@@ -131,9 +142,13 @@ class ProjectContext:
 
         if self.installed_packages:
             parts.append(f"\n=== AVAILABLE PACKAGES (already installed) ===")
-            parts.append(", ".join(self.installed_packages[:40]))
+            parts.append(", ".join(self._packages_with_versions(40)))
             parts.append("ONLY import from packages listed above or from relative project files.")
             parts.append("Do NOT import from packages that are not installed.")
+            if self.installed_versions:
+                parts.append(
+                    "Target the EXACT versions shown — APIs from other major "
+                    "versions may not exist.")
 
         if self.testable_units:
             parts.append(f"\n=== WHAT TO TEST ===")
@@ -747,6 +762,15 @@ def build_project_context(
 
     # Packages — read first so framework detection can use them
     ctx.installed_packages = _get_installed_packages(pkg, root)
+
+    # Actual installed versions from the project interpreter (best-effort).
+    # Grounds codegen in the real API version — manifest names alone let the
+    # LLM assume whatever major version its training data prefers.
+    try:
+        from ..orchestrator.api_grounding import get_installed_package_versions
+        ctx.installed_versions = get_installed_package_versions(cwd=root)
+    except Exception as exc:  # never block planning on grounding
+        _logger.debug("Installed-version probe failed: %s", exc)
 
     # Framework — derive from packages, then override with profile if available
     ctx.framework = _detect_framework_from_packages(ctx.installed_packages)

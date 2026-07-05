@@ -856,6 +856,55 @@ def _file_matches_import(file_path: str, import_source: str) -> bool:
     return False
 
 
+_VENV_DIR_NAMES = ("venv", ".venv", "env", ".env")
+
+
+def _project_has_installed_package(top_module: str) -> bool:
+    """Check whether *top_module* is installed in the TARGET project's own
+    virtualenv (searched relative to the current working directory).
+
+    ``importlib.util.find_spec`` in ``_is_external_import`` only sees
+    packages installed in *agentchanti's own* Python environment — it has
+    no visibility into the venv a pipeline step just created for the
+    project being built (e.g. ``arcade``, ``pygame``, ``django``, none of
+    which agentchanti itself depends on). Without this check, any
+    third-party import that isn't coincidentally also an agentchanti
+    dependency gets misclassified as a "broken" local import, and DepCheck
+    then has the LLM generate a bogus local stub file with the same name
+    (e.g. ``src/arcade.py``) to "fix" it — corrupting the project by
+    shadowing the real installed package.
+    """
+    cwd = os.getcwd()
+    for venv_name in _VENV_DIR_NAMES:
+        venv_dir = os.path.join(cwd, venv_name)
+        if not os.path.isdir(venv_dir):
+            continue
+        # Windows layout: <venv>/Lib/site-packages/<module>
+        candidates = [os.path.join(venv_dir, "Lib", "site-packages")]
+        # POSIX layout: <venv>/lib/python3.X/site-packages/<module>
+        posix_lib = os.path.join(venv_dir, "lib")
+        if os.path.isdir(posix_lib):
+            for entry in os.listdir(posix_lib):
+                candidates.append(os.path.join(posix_lib, entry, "site-packages"))
+        for site_packages in candidates:
+            if not os.path.isdir(site_packages):
+                continue
+            if (os.path.isdir(os.path.join(site_packages, top_module))
+                    or os.path.isfile(os.path.join(site_packages, top_module + ".py"))):
+                return True
+            # Distribution names don't always match the import name
+            # (e.g. PyYAML -> yaml), so also check for a dist-info/egg-info
+            # directory whose name starts with the module name.
+            try:
+                for entry in os.listdir(site_packages):
+                    if entry.lower().startswith(top_module.lower()) and (
+                            entry.endswith(".dist-info") or entry.endswith(".egg-info")):
+                        return True
+            except OSError:
+                pass
+    return False
+
+
 def _is_external_import(import_source: str, importer_file: str) -> bool:
     """Return ``True`` if *import_source* refers to an external package.
 
@@ -880,6 +929,10 @@ def _is_external_import(import_source: str, importer_file: str) -> bool:
             return True
         # Also treat installed third-party packages (pytest, pygame, requests, …)
         # as external so they never trigger a "broken import" false positive.
+        # Check the TARGET project's own venv first — it's what actually
+        # matters, and covers packages agentchanti itself doesn't depend on.
+        if _project_has_installed_package(top_module):
+            return True
         try:
             import importlib.util as _ilu
             return _ilu.find_spec(top_module) is not None
@@ -1020,6 +1073,28 @@ def _llm_guess_parent_file(
         return None
 
 
+# Python entry-point guard: a module with `if __name__ == "__main__":` is
+# executed, not imported — "no importer" is expected, not a wiring gap.
+_MAIN_GUARD_RE = re.compile(r'if\s+__name__\s*==\s*["\']__main__["\']')
+
+
+def _plan_declares_import(nf: str, declared_imports: set[str]) -> bool:
+    """True if a plan step declares it will import file *nf*.
+
+    Declarations come from ``imports:`` plan lines and may use file paths
+    ('src/snake.py'), Python module notation ('src.snake'), or bare module
+    names ('snake').
+    """
+    nf_norm = nf.replace("\\", "/")
+    nf_noext = os.path.splitext(nf_norm)[0]
+    for decl in declared_imports:
+        d = decl.replace("\\", "/")
+        dpath = d if "/" in d else d.replace(".", "/")
+        if dpath in (nf_norm, nf_noext) or nf_noext.endswith("/" + dpath):
+            return True
+    return False
+
+
 def _find_file_by_name(name: str, memory_files: dict[str, str]) -> str | None:
     """Find a file in memory whose stem matches *name* (case-insensitive)."""
     name_lower = name.lower()
@@ -1040,6 +1115,7 @@ def find_gaps(
     memory_files: dict[str, str],
     plan_imported_by: dict[str, str] | None = None,
     pending_target_files: set[str] | None = None,
+    plan_declared_imports: set[str] | None = None,
 ) -> list[IntegrationGap]:
     """Compare before/after snapshots to detect integration gaps.
 
@@ -1066,6 +1142,25 @@ def find_gaps(
             continue  # config files are read by tools, never imported
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
+            continue
+
+        # Entry-point modules are executed, not imported — skip.
+        nf_content = (memory_files.get(nf)
+                      or memory_files.get(nf.replace("\\", "/")) or "")
+        if _MAIN_GUARD_RE.search(nf_content):
+            _logger.debug(
+                "[DepCheck] Skipping orphaned_export for '%s': "
+                "entry-point module (__main__ guard)", nf)
+            continue
+
+        # A pending plan step already declares it will import this file —
+        # the wiring belongs to that future step.  Pre-wiring it here (e.g.
+        # re-exporting from __init__.py) couples the package to the file's
+        # dependencies and can break unrelated imports.
+        if plan_declared_imports and _plan_declares_import(nf, plan_declared_imports):
+            _logger.info(
+                "[DepCheck] Skipping orphaned_export for '%s': "
+                "a pending plan step declares this import", nf)
             continue
 
         nf_basename = os.path.splitext(os.path.basename(nf))[0].lower()
@@ -1431,6 +1526,7 @@ def run_dependency_check(
     # broken_import gaps for files that a future step will create.
     plan_imported_by: dict[str, str] = {}
     _pending_targets: set[str] = set()
+    _pending_declared_imports: set[str] = set()
     if all_plan_steps:
         for ps in all_plan_steps:
             for tf in (ps.target_files or []):
@@ -1438,6 +1534,10 @@ def run_dependency_check(
                 session_files.add(_ntf)
                 if ps.status in ("pending", "in_progress"):
                     _pending_targets.add(_ntf)
+            if ps.status in ("pending", "in_progress"):
+                # Files a future step declares it will import — those steps
+                # do the wiring themselves, so their sources aren't orphans.
+                _pending_declared_imports.update(ps.imports_from or {})
             for consumer_file in (ps.imported_by or []):
                 for tf in (ps.target_files or []):
                     norm_tf = tf.replace("\\", "/")
@@ -1451,6 +1551,7 @@ def run_dependency_check(
             dep_before, dep_after, new_files, step_text, memory_files,
             plan_imported_by=plan_imported_by or None,
             pending_target_files=_pending_targets or None,
+            plan_declared_imports=_pending_declared_imports or None,
         )
     except Exception as exc:
         _logger.warning("[DepCheck] Gap detection failed: %s", exc)

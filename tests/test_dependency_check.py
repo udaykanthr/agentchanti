@@ -330,6 +330,34 @@ class TestIsExternalImport:
     def test_rust_crate_is_not_external(self):
         assert not _is_external_import("crate::models::User", "main.rs")
 
+    def test_python_project_venv_package_is_external(self, tmp_path, monkeypatch):
+        """A package installed only in the TARGET project's venv (not in
+        agentchanti's own environment) must still be recognized as
+        external.
+
+        Regression: ``_is_external_import`` used to rely solely on
+        ``importlib.util.find_spec`` against agentchanti's own
+        interpreter, which has no visibility into a venv a pipeline step
+        just created for the project being built. Packages like
+        ``arcade``/``pygame`` (which agentchanti itself doesn't depend
+        on) were misclassified as broken local imports, causing DepCheck
+        to have the LLM generate a bogus local stub file
+        (e.g. ``src/arcade.py``) that shadowed the real package.
+        """
+        monkeypatch.chdir(tmp_path)
+        site_packages = tmp_path / "venv" / "Lib" / "site-packages"
+        (site_packages / "arcade").mkdir(parents=True)
+        (site_packages / "arcade" / "__init__.py").write_text("")
+
+        assert _is_external_import("arcade", "src/game_window.py")
+
+    def test_python_venv_package_not_present_is_not_external(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        site_packages = tmp_path / "venv" / "Lib" / "site-packages"
+        site_packages.mkdir(parents=True)
+
+        assert not _is_external_import("totally_made_up_pkg_xyz", "src/main.py")
+
 
 # ── _guess_parent_file ────────────────────────────────────────────
 
@@ -947,3 +975,86 @@ class TestFindSignatureGaps:
         }
         gaps = _find_signature_gaps(["src/Foo.jsx"], files)
         assert [g for g in gaps if g.gap_type == "stale_caller"] == []
+
+
+# ── Orphaned-export suppressions ──────────────────────────────────
+
+
+class TestPlanDeclaresImport:
+    def test_module_dot_notation(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert _plan_declares_import("src/snake.py", {"src.snake"})
+
+    def test_windows_path_vs_module_notation(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert _plan_declares_import("src\\snake.py", {"src.snake"})
+
+    def test_file_path_notation(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert _plan_declares_import("src/snake.py", {"src/snake.py"})
+
+    def test_bare_module_name(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert _plan_declares_import("src/snake.py", {"snake"})
+
+    def test_no_match(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert not _plan_declares_import("src/snake.py", {"src.food"})
+
+    def test_no_partial_stem_match(self):
+        from agentchanti.orchestrator.dependency_check import _plan_declares_import
+        assert not _plan_declares_import("src/rattlesnake.py", {"snake"})
+
+
+class TestOrphanSuppressions:
+    def test_entrypoint_with_main_guard_not_orphaned(self):
+        """A module executed via `if __name__ == "__main__"` is an entry
+        point — no importer is expected, so it must not be flagged."""
+        after_files = {
+            "src/game.py": (
+                "class SnakeGame:\n    pass\n\n"
+                "def main():\n    pass\n\n"
+                'if __name__ == "__main__":\n    main()\n'
+            ),
+            "src/other.py": "def helper():\n    pass\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["src/game.py"],
+            step_text="Create the game entrypoint",
+            memory_files=after_files,
+        )
+        assert [g for g in gaps if g.gap_type == "orphaned_export"] == []
+
+    def test_pending_plan_import_suppresses_orphan(self):
+        """A pending TEST step declares `imports: src.snake:Snake` — the
+        wiring belongs to that future step, so snake.py is not an orphan."""
+        after_files = {
+            "src/snake.py": "class Snake:\n    pass\n",
+            "src/constants.py": "GRID_WIDTH = 20\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["src/snake.py"],
+            step_text="Create Snake game logic class",
+            memory_files=after_files,
+            plan_declared_imports={"src.snake"},
+        )
+        assert [g for g in gaps if g.gap_type == "orphaned_export"] == []
+
+    def test_orphan_still_detected_without_declared_import(self):
+        """Control: same scenario without a plan declaration still flags."""
+        after_files = {
+            "src/snake.py": "class Snake:\n    pass\n",
+            "src/constants.py": "GRID_WIDTH = 20\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["src/snake.py"],
+            step_text="Create Snake game logic class",
+            memory_files=after_files,
+            plan_declared_imports={"src.food"},
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert len(orphan) == 1
+        assert orphan[0].source_file == "src/snake.py"

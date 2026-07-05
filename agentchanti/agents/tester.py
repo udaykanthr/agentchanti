@@ -323,4 +323,15 @@ PYTHON TEST RULES (critical for pytest):
 4. For exceptions, use `pytest.raises(ExceptionType)`.
 5. For fixtures, use `@pytest.fixture` decorator.
 6. Do NOT install packages or modify requirements.txt.
+7. If the source code imports a third-party package that may not be
+   installed (e.g. a GUI/hardware library like `arcade`, `pygame`,
+   `RPi.GPIO`), do NOT stub it with `sys.modules["pkg"] = ...` inside
+   each test file's own module-level code. `sys.modules` is one global
+   cache shared by the whole pytest process — if two test files each
+   install a different fake for the same module, whichever file gets
+   imported first "wins" for the rest of the run, and other test files
+   silently pass or fail depending on collection order instead of their
+   own logic. Put a single stub in a shared `conftest.py` at the test
+   root (pytest imports it before any test module) so every test file
+   in the session sees the exact same fake module.
 """

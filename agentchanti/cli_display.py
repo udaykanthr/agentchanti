@@ -497,6 +497,14 @@ class CLIDisplay:
         if added:
             self.render()
 
+    def get_test_result(self, file_path: str) -> dict | None:
+        """Return the last recorded result for *file_path*, or None."""
+        with self._lock:
+            for existing in self._test_results:
+                if existing["file"] == file_path:
+                    return dict(existing)
+        return None
+
     def record_test_result(self, file_path: str, passed: int, total: int,
                            failures: list[dict] | None = None,
                            duration: float = 0.0):

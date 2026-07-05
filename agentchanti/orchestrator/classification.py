@@ -154,7 +154,7 @@ def _looks_like_command(text: str) -> bool:
         'git', 'docker', 'make', 'cmake',
         'mkdir', 'rmdir', 'del', 'copy', 'move', 'ren', 'type', 'dir',
         'ls', 'cat', 'cp', 'mv', 'rm', 'find', 'grep', 'chmod', 'chown',
-        'cd', 'echo', 'set', 'export', 'source', 'touch',
+        'cd', 'echo', 'set', 'export', 'source', 'touch', 'call',
         'curl', 'wget', 'ssh', 'scp',
         'apt', 'apt-get', 'brew', 'choco', 'yum', 'dnf', 'pacman',
         'powershell', 'pwsh', 'cmd',

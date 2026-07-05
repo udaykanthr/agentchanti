@@ -696,6 +696,13 @@ def _derive_imported_by(steps: list[PlanStep]) -> None:
             src_norm = src_file.replace("\\", "/")
             src_basename = _os.path.basename(src_norm)
             producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
+            if producer is None and "/" not in src_norm:
+                # Python module notation: 'src.snake' → target 'src/snake.py'
+                dotted_path = src_norm.replace(".", "/")
+                for key, st in file_to_step.items():
+                    if _os.path.splitext(key)[0] == dotted_path:
+                        producer = st
+                        break
             if producer is None:
                 continue
             for cf in consumer_files:
@@ -795,9 +802,13 @@ def _infer_missing_imported_by(steps: list[PlanStep]) -> None:
                 break
 
 
-# File header comment pattern for splitting multi-file inline code blocks
+# File header comment pattern for splitting multi-file inline code blocks.
+# Supports "//" (JS/C/Go/Rust/Java) and "#" (Python/Ruby/shell/YAML) and
+# "--" (SQL/Lua) line-comment styles, since the planner picks the comment
+# style that matches the target file's language. Path chars include "\"
+# for Windows-style relative paths (e.g. "snake_game\logic\board.py").
 _FILE_COMMENT_RE = re.compile(
-    r"^//\s*([\w./-]+\.\w{1,5})\s*$"
+    r"^(?://|#|--)\s*([\w./\\-]+\.\w{1,5})\s*$"
 )
 
 # Sentinel inserted into code_lines at each closing ``` fence boundary

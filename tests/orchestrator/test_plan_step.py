@@ -99,6 +99,55 @@ export function Footer() {
         self.assertIn("export function Header", step.inline_code["src/Header.jsx"])
         self.assertIn("export function Footer", step.inline_code["src/Footer.jsx"])
 
+    def test_multi_target_with_python_style_file_headers(self):
+        """File-header matching must work for ``#``-style comments too,
+        not just ``//``.
+
+        Regression: ``_FILE_COMMENT_RE`` only recognised ``//`` headers,
+        so for Python (and Ruby/shell/YAML) steps Strategy 1 silently
+        found zero matches and fell through to Strategy 2's blind
+        positional zip. When the planner emitted content blocks in a
+        different order than the ``target:`` list (as happened for a
+        real snake-game plan: target order snake.py/food.py/board.py but
+        content order board.py/snake.py/food.py), the positional zip
+        scrambled the Snake/Food/board logic across the wrong files —
+        board.py's ``random_cell`` ended up under ``snake.py``, and so
+        on — producing ImportErrors that looked like source bugs and
+        burned a full diagnosis retry loop chasing the wrong root cause.
+        """
+        text = """
+==PLAN==
+--STEP 3.1 [CODE] depends:none
+Create pure-logic modules
+target: pkg/snake.py, pkg/food.py, pkg/board.py
+exports: Snake, Food, random_cell
+imports: none
+---file-content-start---
+# pkg/board.py
+import random
+
+def random_cell():
+    return (0, 0)
+
+# pkg/snake.py
+class Snake:
+    def __init__(self):
+        self.segments = []
+
+# pkg/food.py
+class Food:
+    def __init__(self):
+        self.position = None
+---file-content-end---
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(len(steps), 1)
+        step = steps[0]
+        self.assertIn("def random_cell", step.inline_code["pkg/board.py"])
+        self.assertIn("class Snake", step.inline_code["pkg/snake.py"])
+        self.assertIn("class Food", step.inline_code["pkg/food.py"])
+
     def test_multi_target_with_separate_content_blocks(self):
         """Multi-target step where each target has its OWN ``content:``
         block (one per file).  Real-world planner output for a step that
@@ -635,3 +684,46 @@ target: config.js
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeriveImportedByModuleNotation(unittest.TestCase):
+    """imports: written in Python module notation (src.snake) must link to
+    the producer step targeting src/snake.py."""
+
+    def test_module_dot_notation_links_producer(self):
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:none
+Create Snake class
+target: src/snake.py
+exports: Snake
+imports: none
+
+--STEP 3.1 [TEST] depends:2.1
+Add unit tests
+target: tests/test_game_logic.py
+imports: src.snake:Snake
+==END==
+"""
+        steps = parse_structured_plan(text)
+        producer = next(s for s in steps if s.id == "2.1")
+        self.assertIn("tests/test_game_logic.py", producer.imported_by)
+
+    def test_file_path_notation_still_links(self):
+        text = """
+==PLAN==
+--STEP 2.1 [CODE] depends:none
+Create Snake class
+target: src/snake.py
+exports: Snake
+imports: none
+
+--STEP 3.1 [TEST] depends:2.1
+Add unit tests
+target: tests/test_game_logic.py
+imports: src/snake.py:Snake
+==END==
+"""
+        steps = parse_structured_plan(text)
+        producer = next(s for s in steps if s.id == "2.1")
+        self.assertIn("tests/test_game_logic.py", producer.imported_by)
