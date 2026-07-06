@@ -328,6 +328,29 @@ class TestAnthropicChat(unittest.TestCase):
     def test_supports_tools_true(self):
         self.assertTrue(self._client().supports_tools())
 
+    @patch("agentchanti.llm.anthropic_client.requests.post")
+    def test_consecutive_user_messages_merged(self, mock_post):
+        mock_post.return_value = _mock_response({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+        self._client().chat([
+            Message(role="user", content="go"),
+            Message(role="assistant",
+                    tool_calls=[ToolCall(name="read_file",
+                                         arguments={}, id="t1")]),
+            Message(role="tool", content="data", tool_call_id="t1"),
+            Message(role="user", content="also fix the tests"),
+        ])
+        messages = mock_post.call_args[1]["json"]["messages"]
+        # user, assistant, merged user (tool_result + text) — roles alternate
+        self.assertEqual([m["role"] for m in messages],
+                         ["user", "assistant", "user"])
+        blocks = messages[2]["content"]
+        self.assertEqual([b["type"] for b in blocks],
+                         ["tool_result", "text"])
+        self.assertEqual(blocks[1]["text"], "also fix the tests")
+
 
 # ---------------------------------------------------------------------------
 # OpenAI native chat

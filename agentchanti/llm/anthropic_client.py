@@ -193,7 +193,18 @@ class AnthropicClient(LLMClient):
                 else:
                     out.append({"role": "user", "content": [block]})
             else:
-                out.append({"role": m.role, "content": m.content or ""})
+                prev = out[-1] if out else None
+                if m.role == "user" and prev and prev["role"] == "user":
+                    # The API requires alternating roles — merge consecutive
+                    # user messages (e.g. tool results followed by loop
+                    # feedback) into one message's content blocks.
+                    if isinstance(prev["content"], str):
+                        prev["content"] = [{"type": "text",
+                                            "text": prev["content"]}]
+                    prev["content"].append({"type": "text",
+                                            "text": m.content or ""})
+                else:
+                    out.append({"role": m.role, "content": m.content or ""})
         return "\n\n".join(system_parts), out
 
     def _chat(self, messages: List[Message],

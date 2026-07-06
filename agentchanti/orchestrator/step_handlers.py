@@ -3497,6 +3497,23 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
                       partial_inline_code: dict[str, str] | None = None,
                       initial_error: str = "",
                       intent_spec=None) -> tuple[bool, str]:
+    # ── Agent loop (opt-in): run the step as a bounded tool-calling loop ──
+    from .agent_loop import agent_loop_enabled
+    if agent_loop_enabled(cfg, getattr(coder, "llm_client", None)):
+        from .agent_loop import build_step_tools, run_agent_loop
+        display.step_info(step_idx, "Agent loop: executing step with tools")
+        tools = build_step_tools(executor, memory,
+                                 kb_context_builder=kb_context_builder)
+        loop_context = memory.summary()
+        if initial_error:
+            loop_context = f"{loop_context}\n\nKnown problem to fix:\n{initial_error}"
+        return run_agent_loop(
+            coder.llm_client, tools, step_text, task,
+            display=display, step_idx=step_idx, language=language,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            context=loop_context,
+        )
+
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
     # By the first CODE step the manifest exists, so we bulk-install any
@@ -4691,7 +4708,28 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       plan_step=None,
                       all_plan_steps=None,
                       project_profile=None,
-                      intent_spec=None) -> tuple[bool, str]:
+                      intent_spec=None,
+                      cfg: Config | None = None) -> tuple[bool, str]:
+    # ── Agent loop (opt-in): run the step as a bounded tool-calling loop ──
+    from .agent_loop import agent_loop_enabled
+    if agent_loop_enabled(cfg, getattr(tester, "llm_client", None)):
+        from .agent_loop import build_step_tools, run_agent_loop
+        display.step_info(step_idx, "Agent loop: executing test step with tools")
+        tools = build_step_tools(executor, memory,
+                                 kb_context_builder=kb_context_builder)
+        # Deterministic exit: the model's "done" claim is only accepted
+        # once the test suite actually passes (Python for now; other
+        # languages rely on the loop's own command runs).
+        verify_cmd = ("python -m pytest -q"
+                      if (language or "python") == "python" else None)
+        return run_agent_loop(
+            tester.llm_client, tools, step_text, task,
+            display=display, step_idx=step_idx, language=language,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=verify_cmd,
+            context=memory.summary(),
+        )
+
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
 

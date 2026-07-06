@@ -2504,7 +2504,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                         plan_step=plan_step,
                         all_plan_steps=all_plan_steps,
                         project_profile=project_profile,
-                        intent_spec=intent_spec)
+                        intent_spec=intent_spec, cfg=cfg)
                 else:
                     executor.write_files(_inline_test_files)
                     memory.update(_inline_test_files)
@@ -2554,7 +2554,7 @@ def _execute_step(step_idx: int, step_text: str, *,
                     plan_step=plan_step,
                     all_plan_steps=all_plan_steps,
                     project_profile=project_profile,
-                    intent_spec=intent_spec)
+                    intent_spec=intent_spec, cfg=cfg)
 
         elif step_type == "SEARCH":
             success, error_info = _handle_search_step(
