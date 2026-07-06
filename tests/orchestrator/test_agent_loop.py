@@ -11,9 +11,12 @@ from agentchanti.config import Config
 from agentchanti.llm.chat_types import ChatResponse, ToolCall
 from agentchanti.orchestrator.agent_loop import (
     AGENT_LOOP_SYSTEM_PROMPT,
+    RECOVERY_FAILED_MARKER,
     agent_loop_enabled,
     build_step_tools,
     run_agent_loop,
+    run_recovery_loop,
+    verify_cmd_for_language,
 )
 
 
@@ -216,6 +219,119 @@ class TestConfigFlags(unittest.TestCase):
         cfg = Config({"agent_loop": True, "agent_loop_max_turns": 5})
         self.assertTrue(cfg.AGENT_LOOP)
         self.assertEqual(cfg.AGENT_LOOP_MAX_TURNS, 5)
+
+
+class TestVerifyCmdForLanguage(unittest.TestCase):
+
+    def test_python_default(self):
+        self.assertEqual(verify_cmd_for_language("python"),
+                         "python -m pytest -q")
+        self.assertEqual(verify_cmd_for_language(None),
+                         "python -m pytest -q")
+
+    def test_go(self):
+        self.assertEqual(verify_cmd_for_language("go"), "go test ./...")
+
+    def test_js_without_package_json(self):
+        root = tempfile.mkdtemp(prefix="vcl_")
+        try:
+            self.assertIsNone(verify_cmd_for_language("javascript", root))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_js_with_test_script(self):
+        root = tempfile.mkdtemp(prefix="vcl_")
+        try:
+            with open(f"{root}/package.json", "w") as f:
+                f.write('{"scripts": {"test": "vitest run"}}')
+            self.assertEqual(verify_cmd_for_language("typescript", root),
+                             "npm test --silent")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_js_without_test_script(self):
+        root = tempfile.mkdtemp(prefix="vcl_")
+        try:
+            with open(f"{root}/package.json", "w") as f:
+                f.write('{"scripts": {"build": "tsc"}}')
+            self.assertIsNone(verify_cmd_for_language("javascript", root))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_unknown_language(self):
+        self.assertIsNone(verify_cmd_for_language("rust"))
+
+
+class TestRunRecoveryLoop(AgentLoopTestCase):
+
+    def test_error_context_reaches_model(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "fix"}, id="c")),
+            _final("recovered"),
+        )
+        ok, info = run_recovery_loop(
+            llm, self.tools, "run the tests", "overall task",
+            "Command `g++ x.cpp` failed.\nOutput:\n'g++' is not recognized")
+        self.assertTrue(ok)
+        user_msg = llm.chat.call_args_list[0][0][0][1]
+        self.assertIn("previous attempt at this step FAILED", user_msg.content)
+        self.assertIn("g++", user_msg.content)
+
+
+class TestDiagnosisLoopRecovery(unittest.TestCase):
+    """_run_diagnosis_loop delegates to the recovery loop when enabled."""
+
+    def _kwargs(self, cfg):
+        display = MagicMock()
+        display.steps = [{"type": "CODE"}]
+        return dict(
+            steps=["step"], llm_client=MagicMock(), executor=MagicMock(),
+            coder=MagicMock(), reviewer=MagicMock(), tester=MagicMock(),
+            task="task", memory=MagicMock(), display=display,
+            language="python", cfg=cfg)
+
+    def _cfg(self, enabled=True):
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = enabled
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        return cfg
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_recovery_success_returns_true(self, mock_rec):
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        result = _run_diagnosis_loop(0, "step text", "assertion failed",
+                                     **kwargs)
+        self.assertTrue(result)
+        mock_rec.assert_called_once()
+
+    @patch("agentchanti.orchestrator.pipeline._diagnose_failure")
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(False, "could not fix"))
+    def test_recovery_failure_skips_classic_diagnosis(self, mock_rec,
+                                                      mock_diag):
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        result = _run_diagnosis_loop(0, "step text", "assertion failed",
+                                     **kwargs)
+        self.assertFalse(result)
+        mock_rec.assert_called_once()
+        mock_diag.assert_not_called()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop")
+    def test_marker_prevents_second_recovery(self, mock_rec):
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        result = _run_diagnosis_loop(
+            0, "step text",
+            f"{RECOVERY_FAILED_MARKER} Command `x` failed.", **kwargs)
+        self.assertFalse(result)
+        mock_rec.assert_not_called()
 
 
 class TestStepHandlerIntegration(unittest.TestCase):

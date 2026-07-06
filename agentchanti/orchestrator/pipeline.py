@@ -1428,7 +1428,7 @@ def _execute_step(step_idx: int, step_text: str, *,
             success, error_info = _handle_cmd_step(
                 step_text, executor, llm_client, memory, display, step_idx,
                 language=language, project_context=project_context,
-                plan_step=plan_step, intent_spec=intent_spec)
+                plan_step=plan_step, intent_spec=intent_spec, cfg=cfg)
 
         elif step_type == "CODE":
             # ── Inline edit fast path ──
@@ -2698,6 +2698,42 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
         log.warning(f"Task {step_idx+1}: System-level issue: {sys_issue}")
         log.warning(f"Task {step_idx+1}: Skipping diagnosis — "
                     f"this is an environment issue, not a code bug.")
+        display.complete_step(step_idx, "failed")
+        return False
+
+    # ── Agent-loop recovery (opt-in) ─────────────────────────────
+    # One bounded tool-loop attempt REPLACES the diagnose → fix → re-run
+    # machinery: the model reads the real error, inspects the project
+    # with tools, fixes the cause and completes the step in place.
+    from .agent_loop import (
+        RECOVERY_FAILED_MARKER, agent_loop_enabled, build_step_tools,
+        run_recovery_loop, verify_cmd_for_language,
+    )
+    if agent_loop_enabled(cfg, llm_client):
+        if RECOVERY_FAILED_MARKER in (error_info or ""):
+            log.warning(
+                f"Task {step_idx+1}: Agent-loop recovery already attempted "
+                f"for this failure — not retrying.")
+            display.complete_step(step_idx, "failed")
+            return False
+        display.step_info(step_idx, "Agent loop: recovering from failure")
+        _rec_step_type = display.steps[step_idx].get("type", "CODE")
+        _rec_verify = (verify_cmd_for_language(language)
+                       if _rec_step_type == "TEST" else None)
+        _rec_tools = build_step_tools(
+            executor, memory, kb_context_builder=kb_context_builder)
+        recovered, rec_info = run_recovery_loop(
+            llm_client, _rec_tools, step_text, task, error_info,
+            display=display, step_idx=step_idx, language=language,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=_rec_verify)
+        if recovered:
+            log.info(f"Task {step_idx+1}: Agent loop recovered the step: "
+                     f"{rec_info[:200]}")
+            display.complete_step(step_idx, "done")
+            return True
+        log.warning(f"Task {step_idx+1}: Agent-loop recovery failed: "
+                    f"{rec_info[:300]}")
         display.complete_step(step_idx, "failed")
         return False
 

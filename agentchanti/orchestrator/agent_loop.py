@@ -168,6 +168,37 @@ def _verify_call(verify_cmd: str):
                     id="verify")
 
 
+def verify_cmd_for_language(language: str | None,
+                            project_root: str = ".") -> str | None:
+    """Deterministic test command for the loop's exit verification.
+
+    Returns None when no trustworthy command exists for the language —
+    a wrong verify command is worse than none (the loop would chase
+    failures in the verifier instead of the code).
+    """
+    import json
+    import os
+
+    lang = (language or "python").lower()
+    if lang == "python":
+        return "python -m pytest -q"
+    if lang in ("javascript", "typescript"):
+        # Only trust `npm test` when the project actually defines it;
+        # guessing a runner (jest vs vitest) misfires too often.
+        pkg_path = os.path.join(project_root, "package.json")
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            if (pkg.get("scripts") or {}).get("test"):
+                return "npm test --silent"
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+    if lang == "go":
+        return "go test ./..."
+    return None
+
+
 def build_step_tools(executor, memory, kb_context_builder=None,
                      project_root: str = ".") -> AgentTools:
     """Assemble :class:`AgentTools` from the objects a step handler holds."""
@@ -183,3 +214,33 @@ def agent_loop_enabled(cfg, llm_client) -> bool:
             and getattr(cfg, "AGENT_LOOP", False)
             and llm_client is not None
             and getattr(llm_client, "supports_tools", lambda: False)())
+
+
+# Marker prepended to error_info after a failed recovery attempt so the
+# pipeline's diagnosis stage doesn't launch a second (redundant) loop.
+RECOVERY_FAILED_MARKER = "[agent-loop-recovery-failed]"
+
+
+def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
+                      task: str, error_info: str,
+                      display=None, step_idx: int = 0,
+                      language: str | None = None,
+                      max_turns: int = 8,
+                      verify_cmd: str | None = None) -> tuple[bool, str]:
+    """One bounded loop attempt to recover a failed step.
+
+    Replaces the diagnose → fix → re-run machinery: the model gets the
+    real error, inspects the actual project state with tools, fixes the
+    cause and completes the step in place.
+    """
+    context = (
+        "A previous attempt at this step FAILED. Error:\n"
+        f"{error_info[:4000]}\n\n"
+        "Investigate the actual state of the project, fix the cause, and "
+        "complete the step. If the failure is an environment limitation "
+        "you cannot fix (e.g. a required tool is not installed and cannot "
+        "be installed), say so clearly in your summary.")
+    return run_agent_loop(
+        llm_client, tools, step_text, task,
+        display=display, step_idx=step_idx, language=language,
+        max_turns=max_turns, verify_cmd=verify_cmd, context=context)

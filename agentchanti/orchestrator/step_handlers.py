@@ -1692,7 +1692,8 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                      language: str | None = None,
                      project_context=None,
                      plan_step=None,
-                     intent_spec=None) -> tuple[bool, str]:
+                     intent_spec=None,
+                     cfg: Config | None = None) -> tuple[bool, str]:
     # Prefer the structured plan's explicit command field
     cmd = (plan_step.command if plan_step is not None and plan_step.command
            else _extract_command_from_step(step_text))
@@ -1956,10 +1957,35 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     if success:
         display.step_info(step_idx, "Command succeeded.")
         return True, ""
-    else:
-        display.step_info(step_idx, "Command failed. See log.")
-        log.warning(f"Step {step_idx+1}: Command failed.")
-        return False, f"Command `{cmd}` failed.\nOutput:\n{output}"
+
+    display.step_info(step_idx, "Command failed. See log.")
+    log.warning(f"Step {step_idx+1}: Command failed.")
+    error_info = f"Command `{cmd}` failed.\nOutput:\n{output}"
+
+    # ── Agent-loop recovery (opt-in) ──────────────────────────────
+    # The planned command is a fixed guess made at planning time; when
+    # it fails, a bounded tool-loop can adapt (different command, install
+    # a missing dependency) or report the blocker in plain terms.
+    from .agent_loop import (
+        RECOVERY_FAILED_MARKER, agent_loop_enabled, build_step_tools,
+        run_recovery_loop,
+    )
+    if agent_loop_enabled(cfg, llm_client):
+        display.step_info(step_idx, "Command failed — agent loop recovery")
+        tools = build_step_tools(executor, memory)
+        _task_goal = (getattr(project_context, "goal_summary", "")
+                      if project_context else "") or step_text
+        recovered, info = run_recovery_loop(
+            llm_client, tools, step_text, _task_goal, error_info,
+            display=display, step_idx=step_idx, language=language,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8))
+        if recovered:
+            log.info(f"Step {step_idx+1}: Agent loop recovered failed "
+                     f"command: {info[:200]}")
+            return True, ""
+        return False, f"{RECOVERY_FAILED_MARKER} {error_info}\n\n{info}"
+
+    return False, error_info
 
 
 def _auto_fix_hazards(files: dict[str, str], coder: CoderAgent,
@@ -4718,10 +4744,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         tools = build_step_tools(executor, memory,
                                  kb_context_builder=kb_context_builder)
         # Deterministic exit: the model's "done" claim is only accepted
-        # once the test suite actually passes (Python for now; other
-        # languages rely on the loop's own command runs).
-        verify_cmd = ("python -m pytest -q"
-                      if (language or "python") == "python" else None)
+        # once the test suite actually passes (when a trustworthy test
+        # command exists for the language).
+        from .agent_loop import verify_cmd_for_language
+        verify_cmd = verify_cmd_for_language(language)
         return run_agent_loop(
             tester.llm_client, tools, step_text, task,
             display=display, step_idx=step_idx, language=language,
