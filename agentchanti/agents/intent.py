@@ -59,6 +59,86 @@ _DIRECTIVE_MAX_LEN = 500
 # Whitespace normalization for dedup keys.
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Language families whose members may reference each other in KB topics
+# without counting as scope creep (TS tasks legitimately involve JS docs).
+_LANGUAGE_FAMILIES = [
+    {"javascript", "typescript"},
+]
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split on commas outside parentheses (topics may contain
+    parenthesised detail with its own commas)."""
+    items: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth = max(0, depth - 1)
+        if ch == ',' and depth == 0:
+            items.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        items.append(''.join(buf).strip())
+    return [i for i in items if i]
+
+
+def _filter_kb_topics_language(spec: str, language: str | None) -> str:
+    """Drop KB topics that name a programming language other than the
+    project's.
+
+    Web search results routinely present solutions in several languages
+    (tutorial sites show C++/Java/Python side by side); when those leak
+    into the REQUIREMENTS_SPEC's ``KB topics:`` line the planner treats
+    them as scope and generates implementations nobody asked for.
+    """
+    if not language or not spec:
+        return spec
+    from ..language import _LANGUAGE_NAMES
+
+    m = re.search(r'(KB topics[^:\n]*:[ \t]*)([^\n]+)', spec, re.IGNORECASE)
+    if not m:
+        return spec
+    header, topics_raw = m.group(1), m.group(2)
+
+    own = {language.lower(),
+           _LANGUAGE_NAMES.get(language, language).lower()}
+    for family in _LANGUAGE_FAMILIES:
+        if own & family:
+            own |= family
+            own |= {_LANGUAGE_NAMES.get(l, l).lower() for l in family}
+
+    foreign_labels = [
+        label
+        for key, name in _LANGUAGE_NAMES.items()
+        if key.lower() not in own and name.lower() not in own
+        for label in (name.lower(), key.lower())
+    ]
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for topic in _split_top_level_commas(topics_raw):
+        t_low = topic.lower()
+        is_foreign = any(
+            re.search(r'(?<![\w+#])' + re.escape(lbl) + r'(?![\w+#])', t_low)
+            for lbl in foreign_labels
+        )
+        (dropped if is_foreign else kept).append(topic)
+
+    if not dropped:
+        return spec
+    _logger.info(
+        "[IntentAnalysis] Dropped %d off-language KB topic(s) "
+        "(project language: %s): %s",
+        len(dropped), language, "; ".join(dropped),
+    )
+    new_line = header + (", ".join(kept) if kept else "none")
+    return spec[:m.start()] + new_line + spec[m.end():]
+
 
 def _sanitize_directive_arg(raw: str) -> str:
     """Clean a directive argument captured by the `.+$` regex tail.
@@ -510,6 +590,7 @@ class IntentAgent(Agent):
         cli_display=None,
         available_kb_docs: list[str] | None = None,
         subproject_cwd: str | None = None,
+        language: str | None = None,
     ) -> str:
         """
         Investigate the task and produce a grounded REQUIREMENTS_SPEC.
@@ -1416,6 +1497,9 @@ class IntentAgent(Agent):
                     # instead of a comma-separated line.  Convert to one line so
                     # downstream parsers (cli.py / api.py) can split on ',' reliably.
                     spec = self._normalize_kb_topics(spec)
+                    # Drop KB topics naming other languages (web-search noise
+                    # must not expand the plan's scope beyond the project).
+                    spec = _filter_kb_topics_language(spec, language)
                     _logger.info("[IntentAnalysis] Successfully generated REQUIREMENTS_SPEC.")
                     if cli_display:
                         cli_display.show_intent_event("spec",
@@ -1444,7 +1528,7 @@ class IntentAgent(Agent):
                 return (
                     f"{raw_task}\n\n"
                     f"=== INTENT CLARIFICATION (from requirements analyst) ===\n"
-                    f"{response.strip()}"
+                    f"{_filter_kb_topics_language(response.strip(), language)}"
                 )
 
             except Exception as e:
@@ -1473,7 +1557,7 @@ class IntentAgent(Agent):
             return (
                 f"{raw_task}\n\n"
                 f"=== INTENT CLARIFICATION (from requirements analyst) ===\n"
-                f"{last_response.strip()}"
+                f"{_filter_kb_topics_language(last_response.strip(), language)}"
             )
         if _mid_research:
             _logger.warning(

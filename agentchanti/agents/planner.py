@@ -362,6 +362,7 @@ class PlannerAgent(Agent):
                 cli_display=cli_display,
                 available_kb_docs=_available_kb_titles or None,
                 subproject_cwd=subproject_cwd,
+                language=language,
             )
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")
@@ -1172,8 +1173,25 @@ class PlannerAgent(Agent):
 
         return "\n".join(parts) if parts else ""
 
-    def process(self, task: str, context: str = "") -> str:
+    def process(self, task: str, context: str = "",
+                language: str | None = None) -> str:
         prompt = self._build_prompt(task, context)
+        _lang_constraint = ""
+        if language:
+            from ..language import get_language_name
+            _lang_name = get_language_name(language)
+            _lang_constraint = f"""
+═══════ LANGUAGE CONSTRAINT (HARD RULE) ═══════
+The project language is {_lang_name}. Implement ONLY in {_lang_name}.
+- Do NOT create implementations, examples, or ports in any other
+  programming language, even if reference material or search results
+  show solutions in other languages.
+- Do NOT add compile/build/toolchain steps for other languages
+  (e.g. g++, javac, cargo, go build) — the required toolchain may not
+  exist on the host.
+- The ONLY exception: the task itself explicitly names another language
+  and asks for it.
+"""
         prompt += """
 
 You are a SENIOR SOFTWARE ARCHITECT creating an execution plan that will be
@@ -1182,7 +1200,7 @@ agents: a CODER (writes files), a CMD runner (executes shell commands), a
 TESTER (generates and runs unit tests), or a SEARCHER (searches the web for
 documentation and latest info). Your plan MUST be precise enough for
 these agents to succeed on the first attempt.
-
+""" + _lang_constraint + """
 ═══════ HOST ENVIRONMENT ═══════
 """ + _os_context_for_prompt() + """
 ═══════ OUTPUT FORMAT ═══════

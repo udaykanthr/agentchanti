@@ -791,7 +791,8 @@ def _main_impl():
             display.show_status(
                 f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
             )
-            plan = planner.process(args.task, context=planner_context)
+            plan = planner.process(args.task, context=planner_context,
+                                   language=language)
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
             # ── Planner no-op signal ──
@@ -941,7 +942,8 @@ def _main_impl():
             elif action == "replan":
                 display.resume()  # restart Live for spinner during replan
                 display.show_status("Re-planning...")
-                plan = planner.process(args.task, context=planner_context)
+                plan = planner.process(args.task, context=planner_context,
+                                       language=language)
                 log.info(f"Re-plan:\n{plan}")
 
                 if is_structured_plan(plan):
