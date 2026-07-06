@@ -7,6 +7,7 @@ import requests
 from typing import List, Optional
 
 from .base import LLMClient
+from .chat_types import ChatResponse, Message, ToolCall, ToolDef
 from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
 
@@ -14,6 +15,7 @@ from ..cli_display import token_tracker, log
 class AnthropicClient(LLMClient):
 
     ANTHROPIC_VERSION = "2023-06-01"
+    NATIVE_CHAT = True
 
     def __init__(self, base_url: str, model: str, api_key: str, **kwargs):
         super().__init__(**kwargs)
@@ -146,6 +148,107 @@ class AnthropicClient(LLMClient):
             self._stream_callback(tokens_generated)
 
         return result
+
+    # ── Native chat (Messages API with tools) ──
+
+    @staticmethod
+    def _serialize_messages(messages: List[Message]) -> tuple[str, list[dict]]:
+        """Convert chat messages to (system_prompt, api_messages).
+
+        Anthropic takes system prompts as a top-level parameter, renders
+        assistant tool calls as ``tool_use`` content blocks, and expects
+        tool results as ``tool_result`` blocks inside a *user* message —
+        consecutive tool results (parallel calls) merge into one message.
+        """
+        system_parts: list[str] = []
+        out: list[dict] = []
+        for m in messages:
+            if m.role == "system":
+                if m.content:
+                    system_parts.append(m.content)
+            elif m.role == "assistant" and m.tool_calls:
+                blocks: list[dict] = []
+                if m.content:
+                    blocks.append({"type": "text", "text": m.content})
+                for i, tc in enumerate(m.tool_calls):
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.id or f"call_{len(out)}_{i}",
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                out.append({"role": "assistant", "content": blocks})
+            elif m.role == "tool":
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id,
+                    "content": m.content or "",
+                }
+                prev = out[-1] if out else None
+                if (prev and prev["role"] == "user"
+                        and isinstance(prev["content"], list)
+                        and any(b.get("type") == "tool_result"
+                                for b in prev["content"])):
+                    prev["content"].append(block)
+                else:
+                    out.append({"role": "user", "content": [block]})
+            else:
+                out.append({"role": m.role, "content": m.content or ""})
+        return "\n\n".join(system_parts), out
+
+    def _chat(self, messages: List[Message],
+              tools: Optional[List[ToolDef]] = None) -> ChatResponse:
+        est_tokens = int(sum(len((m.content or "").split()) for m in messages) * 1.3)
+        log.debug(f"[Anthropic] Chat: ~{est_tokens} est. tokens, "
+                  f"{len(messages)} messages, {len(tools or [])} tools")
+        token_tracker.set_context(est_tokens)
+
+        system, api_messages = self._serialize_messages(messages)
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": self.max_output_tokens,
+            "messages": api_messages,
+        }
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = [
+                {"name": t.name, "description": t.description,
+                 "input_schema": t.parameters}
+                for t in tools
+            ]
+
+        url = f"{self.base_url}/messages"
+        response = requests.post(url, headers=self._headers(), json=payload,
+                                 timeout=(10, 300))
+        response.raise_for_status()
+        data = response.json()
+
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("input_tokens", est_tokens)
+        completion_tokens = usage.get("output_tokens", 0)
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else 0,
+            model_name=self.model,
+        )
+
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
+                tool_calls.append(ToolCall(
+                    name=block.get("name", ""),
+                    arguments=block.get("input") or {},
+                    id=block.get("id", ""),
+                ))
+
+        log.debug(f"[Anthropic] Chat usage: prompt={prompt_tokens} "
+                  f"completion={completion_tokens} tool_calls={len(tool_calls)}")
+        return ChatResponse(text="".join(text_parts), tool_calls=tool_calls,
+                            stop_reason=data.get("stop_reason", "") or "")
 
     # ── Embeddings ──
 

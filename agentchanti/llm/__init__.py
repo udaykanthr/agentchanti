@@ -1,4 +1,5 @@
-from .base import LLMClient, LLMError
+from .base import LLMClient, LLMError, ToolsNotSupportedError
+from .chat_types import ChatResponse, Message, ToolCall, ToolDef, flatten_messages
 from .ollama import OllamaClient
 from .lm_studio import LMStudioClient
 from .openai_client import OpenAIClient
