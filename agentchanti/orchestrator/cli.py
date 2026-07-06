@@ -1405,6 +1405,10 @@ def _main_impl():
     if pipeline_success:
         display.finish(success=True)
         clear_checkpoint(checkpoint_file)
+        from .agent_loop import loop_stats_summary as _als_fn
+        _als = _als_fn()
+        if _als:
+            log.info(_als)
         log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
                  f"(sent={token_tracker.total_prompt_tokens}, "
                  f"recv={token_tracker.total_completion_tokens})")
@@ -1443,6 +1447,10 @@ def _main_impl():
                 git_utils.delete_checkpoint_branch(checkpoint_branch)
     else:
         display.finish(success=False)
+        from .agent_loop import loop_stats_summary as _als_fail_fn
+        _als_fail = _als_fail_fn()
+        if _als_fail:
+            log.info(_als_fail)
         log.info(f"Pipeline failed. Total tokens: {token_tracker.total_tokens}")
 
         # Generate HTML report even on failure

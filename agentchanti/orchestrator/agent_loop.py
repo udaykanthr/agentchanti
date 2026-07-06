@@ -16,11 +16,62 @@ prefix.
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from threading import Lock
 
 from ..agent_tools import AgentTools
 from ..llm.chat_types import Message
 
 _logger = logging.getLogger(__name__)
+
+
+# ── Telemetry ─────────────────────────────────────────────────────────
+# Per-run loop statistics, consumed by the CLI summary and the A/B
+# benchmark harness. Thread-safe: steps in the same wave run in parallel.
+
+_stats_lock = Lock()
+_loop_runs: list[dict] = []
+
+
+def _record_loop_run(step_idx: int, turns_used: int,
+                     tool_counts: Counter, outcome: str,
+                     recovery: bool) -> None:
+    with _stats_lock:
+        _loop_runs.append({
+            "step_idx": step_idx,
+            "turns": turns_used,
+            "tool_calls": dict(tool_counts),
+            "outcome": outcome,
+            "recovery": recovery,
+        })
+    _logger.info(
+        "[AgentLoop] stats: step=%d turns=%d outcome=%s recovery=%s tools=%s",
+        step_idx + 1, turns_used, outcome, recovery, dict(tool_counts))
+
+
+def get_loop_stats() -> list[dict]:
+    """All loop runs recorded in this process (copy)."""
+    with _stats_lock:
+        return [dict(r) for r in _loop_runs]
+
+
+def reset_loop_stats() -> None:
+    with _stats_lock:
+        _loop_runs.clear()
+
+
+def loop_stats_summary() -> str | None:
+    """One-line human summary for the end-of-run log, or None if unused."""
+    runs = get_loop_stats()
+    if not runs:
+        return None
+    outcomes = Counter(r["outcome"] for r in runs)
+    total_turns = sum(r["turns"] for r in runs)
+    recoveries = sum(1 for r in runs if r["recovery"])
+    return (f"[AgentLoop] session: {len(runs)} loop run(s), "
+            f"{total_turns} total turns "
+            f"(avg {total_turns / len(runs):.1f}), "
+            f"{recoveries} recovery run(s), outcomes: {dict(outcomes)}")
 
 
 # Stable prefix — keep byte-identical across steps (see module docstring).
@@ -65,6 +116,7 @@ def run_agent_loop(
     max_turns: int = 8,
     verify_cmd: str | None = None,
     context: str = "",
+    _recovery: bool = False,
 ) -> tuple[bool, str]:
     """Run one step as a capped tool-calling loop.
 
@@ -87,6 +139,12 @@ def run_agent_loop(
     ]
     definitions = tools.definitions()
     any_tool_used = False
+    tool_counts: Counter = Counter()
+
+    def _finish(outcome: str, turns: int,
+                result: tuple[bool, str]) -> tuple[bool, str]:
+        _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
+        return result
 
     for turn in range(1, max_turns + 1):
         # Final turn: withhold tools so the model must produce a text
@@ -102,6 +160,7 @@ def run_agent_loop(
 
         if response.has_tool_calls:
             any_tool_used = True
+            tool_counts.update(tc.name for tc in response.tool_calls)
             names = ", ".join(tc.name for tc in response.tool_calls)
             _logger.info("[AgentLoop] step %d turn %d/%d: %s",
                          step_idx + 1, turn, max_turns, names)
@@ -117,9 +176,9 @@ def run_agent_loop(
         if not any_tool_used:
             _logger.warning("[AgentLoop] step %d: model finished without "
                             "using any tool", step_idx + 1)
-            return False, (
+            return _finish("no-tools", turn, (False, (
                 "Agent loop made no tool calls — no files were changed and "
-                f"no commands were run. Model said: {summary[:500]}")
+                f"no commands were run. Model said: {summary[:500]}")))
 
         if verify_cmd:
             if display is not None:
@@ -129,11 +188,11 @@ def run_agent_loop(
             if result.startswith("exit: success"):
                 _logger.info("[AgentLoop] step %d verified in %d turn(s)",
                              step_idx + 1, turn)
-                return True, summary
+                return _finish("verified", turn, (True, summary))
             if final_turn:
-                return False, (
+                return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
-                    f"{result[:1000]}")
+                    f"{result[:1000]}")))
             _logger.info("[AgentLoop] step %d: verification failed on "
                          "turn %d — feeding back", step_idx + 1, turn)
             messages.append(response.to_message())
@@ -144,7 +203,7 @@ def run_agent_loop(
 
         _logger.info("[AgentLoop] step %d finished in %d turn(s)",
                      step_idx + 1, turn)
-        return True, summary
+        return _finish("done", turn, (True, summary))
 
     # Exhausted without a final text answer (e.g. text-mode model ignored
     # the no-tools instruction). The work may still be done — let the
@@ -154,12 +213,13 @@ def run_agent_loop(
         if result.startswith("exit: success"):
             _logger.info("[AgentLoop] step %d: turns exhausted but "
                          "verification passes — accepting", step_idx + 1)
-            return True, ("Step verified complete (turn budget exhausted "
-                          "before the model summarized).")
+            return _finish("exhausted-verified", max_turns, (True, (
+                "Step verified complete (turn budget exhausted "
+                "before the model summarized).")))
 
-    return False, (
+    return _finish("exhausted", max_turns, (False, (
         f"Agent loop exhausted {max_turns} turns without completing the "
-        f"step: {step_text[:200]}")
+        f"step: {step_text[:200]}")))
 
 
 def _verify_call(verify_cmd: str):
@@ -243,4 +303,5 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     return run_agent_loop(
         llm_client, tools, step_text, task,
         display=display, step_idx=step_idx, language=language,
-        max_turns=max_turns, verify_cmd=verify_cmd, context=context)
+        max_turns=max_turns, verify_cmd=verify_cmd, context=context,
+        _recovery=True)

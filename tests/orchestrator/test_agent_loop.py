@@ -14,6 +14,9 @@ from agentchanti.orchestrator.agent_loop import (
     RECOVERY_FAILED_MARKER,
     agent_loop_enabled,
     build_step_tools,
+    get_loop_stats,
+    loop_stats_summary,
+    reset_loop_stats,
     run_agent_loop,
     run_recovery_loop,
     verify_cmd_for_language,
@@ -219,6 +222,52 @@ class TestConfigFlags(unittest.TestCase):
         cfg = Config({"agent_loop": True, "agent_loop_max_turns": 5})
         self.assertTrue(cfg.AGENT_LOOP)
         self.assertEqual(cfg.AGENT_LOOP_MAX_TURNS, 5)
+
+
+class TestLoopTelemetry(AgentLoopTestCase):
+
+    def setUp(self):
+        super().setUp()
+        reset_loop_stats()
+
+    def test_happy_path_recorded(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="write_file",
+                                    arguments={"path": "a.py",
+                                               "content": "x = 1\n"},
+                                    id="c")),
+            _final(),
+        )
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=5)
+        stats = get_loop_stats()
+        self.assertEqual(len(stats), 1)
+        self.assertEqual(stats[0]["outcome"], "done")
+        self.assertEqual(stats[0]["turns"], 2)
+        self.assertEqual(stats[0]["tool_calls"], {"write_file": 1})
+        self.assertFalse(stats[0]["recovery"])
+
+    def test_recovery_flagged_and_summary_line(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final(),
+        )
+        run_recovery_loop(llm, self.tools, "step", "task", "err")
+        stats = get_loop_stats()
+        self.assertTrue(stats[0]["recovery"])
+        summary = loop_stats_summary()
+        self.assertIn("1 loop run(s)", summary)
+        self.assertIn("1 recovery run(s)", summary)
+
+    def test_no_runs_means_no_summary(self):
+        self.assertIsNone(loop_stats_summary())
+
+    def test_exhaustion_outcome_recorded(self):
+        endless = _tool_response(ToolCall(name="list_files", arguments={},
+                                          id="c"))
+        llm = self._llm(endless, endless, endless)
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=3)
+        self.assertEqual(get_loop_stats()[0]["outcome"], "exhausted")
 
 
 class TestVerifyCmdForLanguage(unittest.TestCase):

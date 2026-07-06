@@ -62,7 +62,15 @@ Chat-native entry point: `chat(messages, tools=None) -> ChatResponse` (types in 
 
 ### Agent Loop (orchestrator/agent_loop.py)
 
-Opt-in alternative execution path for CODE/TEST steps (`agent_loop: true` in config, requires a provider with native tool calling). `run_agent_loop()` runs the step as a bounded tool-calling conversation (`agent_loop_max_turns`, default 8): stable byte-identical system prompt (KV-cache friendly), model edits/runs via `AgentTools`, observes real output, self-corrects. Exit rules: the final turn withholds tools to force a text summary; a `verify_cmd` (TEST steps: `python -m pytest -q` for Python) must pass before the model's "done" claim is accepted, and passes on exhaustion still count as success. Returns the same `(success, error_info)` contract as the classic handlers; gate is at the top of `_handle_code_step`/`_handle_test_step` via `agent_loop_enabled()`.
+Opt-in alternative execution path for CODE/TEST steps (`agent_loop: true` in config, requires a provider with native tool calling). `run_agent_loop()` runs the step as a bounded tool-calling conversation (`agent_loop_max_turns`, default 8): stable byte-identical system prompt (KV-cache friendly), model edits/runs via `AgentTools`, observes real output, self-corrects. Exit rules: the final turn withholds tools to force a text summary; a `verify_cmd` (from `verify_cmd_for_language()`: pytest for Python, `npm test` when package.json defines it, `go test ./...`) must pass before the model's "done" claim is accepted, and passes on exhaustion still count as success. Returns the same `(success, error_info)` contract as the classic handlers; gate is at the top of `_handle_code_step`/`_handle_test_step` via `agent_loop_enabled()`.
+
+Failure recovery: `run_recovery_loop()` gives one bounded loop attempt when a CMD step's planned command fails (`_handle_cmd_step`) or when any step reaches `_run_diagnosis_loop` — with the loop enabled it replaces the diagnose→fix→re-run machinery entirely; `RECOVERY_FAILED_MARKER` in the error prevents double attempts.
+
+Telemetry: every loop run records turns/tool-call counts/outcome/recovery-flag (`get_loop_stats()`, `loop_stats_summary()`); the CLI logs a `[AgentLoop] session:` summary line at the end of each run.
+
+### Benchmarks (benchmarks/)
+
+A/B harness comparing `agent_loop` on vs off over the task set in `benchmarks/tasks.py`. Ground truth is per-task `success_cmds` run in the isolated workdir, independent of the pipeline's own claim. Run from repo root: `python benchmarks/run_ab.py --config <yaml-with-keys> [--tasks id1,id2] [--modes on,off] [--truststore]`. Results land in `benchmarks/results/*.json`. Not part of pytest — it spends real API tokens.
 
 ### Key Subsystems
 
