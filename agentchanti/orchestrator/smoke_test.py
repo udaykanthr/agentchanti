@@ -305,6 +305,89 @@ def _attempt_fix(
     return list(fix_files.keys())
 
 
+def _find_js_project_dir(memory_files: dict[str, str]) -> str | None:
+    """Locate the directory holding package.json for this run's JS files.
+
+    Session file keys are relative to the run cwd (possibly prefixed with
+    a scaffolded sub-project, e.g. ``my-app/src/main.jsx``). Checks each
+    candidate prefix on disk, most-specific first, then the cwd itself.
+    """
+    prefixes: list[str] = []
+    for path in memory_files:
+        norm = path.replace("\\", "/")
+        if "/" in norm:
+            top = norm.split("/", 1)[0]
+            if top not in prefixes and not top.startswith("_"):
+                prefixes.append(top)
+    for candidate in prefixes + ["."]:
+        if os.path.isfile(os.path.join(candidate, "package.json")):
+            return candidate
+    return None
+
+
+def _run_js_build_verification(memory, executor, coder, display,
+                               task: str, language: str | None,
+                               cfg=None) -> tuple[bool, str]:
+    """Run the project's production build as the JS ground-truth check.
+
+    Failure gets one agent-loop recovery attempt (when enabled) with the
+    build command as the deterministic verify_cmd; otherwise the failure
+    is reported as-is.
+    """
+    import json
+
+    project_dir = _find_js_project_dir(memory.all_files())
+    if project_dir is None:
+        _logger.info("[SmokeTest] No package.json found — skipping JS build check")
+        return True, ""
+    try:
+        with open(os.path.join(project_dir, "package.json"),
+                  encoding="utf-8") as fh:
+            pkg = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        _logger.warning("[SmokeTest] Could not read package.json: %s", exc)
+        return True, ""
+    if not (pkg.get("scripts") or {}).get("build"):
+        _logger.info("[SmokeTest] No build script in package.json — skipping")
+        return True, ""
+
+    build_cmd = "npm run build"
+    _logger.info("[SmokeTest] JS build check: %s (cwd=%s)",
+                 build_cmd, project_dir)
+    _show_status = getattr(display, "show_status", None)
+    if callable(_show_status):
+        _show_status("Verifying production build...")
+    cwd = None if project_dir == "." else project_dir
+    ok, out = executor.run_command(build_cmd, timeout=300, cwd=cwd)
+    if ok:
+        _logger.info("[SmokeTest] JS build passed")
+        return True, ""
+
+    _logger.warning("[SmokeTest] JS build FAILED:\n%s", (out or "")[-1500:])
+
+    from .agent_loop import (
+        agent_loop_enabled, build_step_tools, run_recovery_loop,
+    )
+    llm_client = getattr(coder, "llm_client", None)
+    if agent_loop_enabled(cfg, llm_client):
+        tools = build_step_tools(executor, memory,
+                                 project_root=project_dir if cwd else ".")
+        recovered, info = run_recovery_loop(
+            llm_client, tools,
+            step_text=f"Make the production build pass: {build_cmd}",
+            task=task,
+            error_info=f"Command `{build_cmd}` failed.\nOutput:\n{out}",
+            display=display, step_idx=0, language=language,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=build_cmd)
+        if recovered:
+            _logger.info("[SmokeTest] JS build recovered: %s", info[:200])
+            return True, ""
+        return False, f"Production build failing after recovery: {info[:500]}"
+
+    return False, f"Production build failed: {(out or '')[-1000:]}"
+
+
 def run_smoke_verification(
     memory,
     executor,
@@ -318,6 +401,12 @@ def run_smoke_verification(
     """Launch the app entry point and fix launch crashes. Returns (ok, error)."""
     if cfg is not None and not getattr(cfg, "SMOKE_TEST_ENABLED", True):
         return True, ""
+    if language in ("javascript", "typescript"):
+        # JS/TS apps have no launchable entry point, but the production
+        # build is a cheap deterministic ground truth: a broken import or
+        # JSX error fails `npm run build` even when no tests exist.
+        return _run_js_build_verification(
+            memory, executor, coder, display, task, language, cfg)
     if language not in (None, "python"):
         return True, ""  # Python entry points only, for now
 

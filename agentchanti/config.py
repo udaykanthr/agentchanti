@@ -68,6 +68,8 @@ _DEFAULTS = {
     "editing_reviewer_diff_mode": True,
     "editing_max_chunk_files": 3,
     "review_mode": "static",
+    "agent_loop": True,
+    "agent_loop_max_turns": 8,
     "dependency_check_enabled": True,
     "analyser_enabled": False,
     "wiring_verification_enabled": True,
@@ -380,6 +382,18 @@ class Config:
             "REVIEW_MODE", "review_mode",
             editing_section.get("review_mode", _DEFAULTS["review_mode"]),
         )
+
+        # Agent loop: run CODE/TEST steps as a bounded tool-calling loop
+        # instead of the generate → review → retry pipeline. Default ON —
+        # A/B benchmarked at parity on success rate and ~14% cheaper on
+        # tokens. Only takes effect when the provider supports native tool
+        # calling (Ollama/OpenAI/Anthropic); other providers automatically
+        # use the classic pipeline. Set `agent_loop: false` to opt out.
+        self.AGENT_LOOP = _get_bool(
+            "AGENT_LOOP", "agent_loop", _DEFAULTS["agent_loop"])
+        self.AGENT_LOOP_MAX_TURNS = _get(
+            "AGENT_LOOP_MAX_TURNS", "agent_loop_max_turns",
+            _DEFAULTS["agent_loop_max_turns"], cast=int)
 
         # Dependency check (post-step integration validation)
         dep_section = yd.get("dependency_check", {}) if isinstance(yd.get("dependency_check"), dict) else {}

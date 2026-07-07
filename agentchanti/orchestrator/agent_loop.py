@@ -1,0 +1,307 @@
+"""
+Bounded agent micro-loop — tool-calling step execution.
+
+When ``agent_loop: true`` is configured and the provider supports native
+tool calling, CODE and TEST steps run through this loop instead of the
+generate → review → retry pipeline: the model edits files and runs
+commands via :class:`~agentchanti.agent_tools.AgentTools`, observes real
+execution output, and self-corrects — capped at a fixed number of turns
+so cost stays predictable.
+
+The system prompt below is deliberately byte-identical across all steps
+of a run so provider prompt caches and local KV caches get a stable
+prefix.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import Counter
+from threading import Lock
+
+from ..agent_tools import AgentTools
+from ..llm.chat_types import Message
+
+_logger = logging.getLogger(__name__)
+
+
+# ── Telemetry ─────────────────────────────────────────────────────────
+# Per-run loop statistics, consumed by the CLI summary and the A/B
+# benchmark harness. Thread-safe: steps in the same wave run in parallel.
+
+_stats_lock = Lock()
+_loop_runs: list[dict] = []
+
+
+def _record_loop_run(step_idx: int, turns_used: int,
+                     tool_counts: Counter, outcome: str,
+                     recovery: bool) -> None:
+    with _stats_lock:
+        _loop_runs.append({
+            "step_idx": step_idx,
+            "turns": turns_used,
+            "tool_calls": dict(tool_counts),
+            "outcome": outcome,
+            "recovery": recovery,
+        })
+    _logger.info(
+        "[AgentLoop] stats: step=%d turns=%d outcome=%s recovery=%s tools=%s",
+        step_idx + 1, turns_used, outcome, recovery, dict(tool_counts))
+
+
+def get_loop_stats() -> list[dict]:
+    """All loop runs recorded in this process (copy)."""
+    with _stats_lock:
+        return [dict(r) for r in _loop_runs]
+
+
+def reset_loop_stats() -> None:
+    with _stats_lock:
+        _loop_runs.clear()
+
+
+def loop_stats_summary() -> str | None:
+    """One-line human summary for the end-of-run log, or None if unused."""
+    runs = get_loop_stats()
+    if not runs:
+        return None
+    outcomes = Counter(r["outcome"] for r in runs)
+    total_turns = sum(r["turns"] for r in runs)
+    recoveries = sum(1 for r in runs if r["recovery"])
+    return (f"[AgentLoop] session: {len(runs)} loop run(s), "
+            f"{total_turns} total turns "
+            f"(avg {total_turns / len(runs):.1f}), "
+            f"{recoveries} recovery run(s), outcomes: {dict(outcomes)}")
+
+
+# Stable prefix — keep byte-identical across steps (see module docstring).
+# Step-specific data (task, context, platform quirks) belongs in the user
+# message, never here.
+AGENT_LOOP_SYSTEM_PROMPT = """\
+You are a coding agent executing one step of a larger implementation plan.
+Work autonomously with the provided tools until the step is complete.
+
+Rules:
+- Read a file before editing it; base edits on its actual current content.
+- Prefer edit_file for changes to existing files; write_file only for new \
+files or full rewrites.
+- After making changes, verify them: run the relevant command or test and \
+check its output. Do not claim success without evidence.
+- Stay within the scope of this step. Do not refactor unrelated code.
+- If a command fails, read the error and fix the cause; do not retry the \
+same command unchanged.
+- When the step is complete and verified, reply with a short plain-text \
+summary (no tool calls). If you cannot complete it, explain what is blocking.
+"""
+
+
+def _build_user_message(step_text: str, task: str, language: str | None,
+                        context: str) -> str:
+    parts = [f"Overall task: {task}", f"Current step: {step_text}"]
+    if language:
+        parts.append(f"Project language: {language}")
+    if context:
+        parts.append(f"Project state:\n{context}")
+    return "\n\n".join(parts)
+
+
+def run_agent_loop(
+    llm_client,
+    tools: AgentTools,
+    step_text: str,
+    task: str,
+    display=None,
+    step_idx: int = 0,
+    language: str | None = None,
+    max_turns: int = 8,
+    verify_cmd: str | None = None,
+    context: str = "",
+    _recovery: bool = False,
+) -> tuple[bool, str]:
+    """Run one step as a capped tool-calling loop.
+
+    Exit conditions, in order:
+    - Model stops calling tools AND ``verify_cmd`` (when given) passes
+      → ``(True, summary)``. A failing ``verify_cmd`` is fed back to the
+      model as a new user message and the loop continues.
+    - Model stops calling tools without having used any tool at all
+      → ``(False, ...)`` — a step that changed nothing cannot have
+      succeeded.
+    - ``max_turns`` exhausted → ``(False, ...)``.
+
+    Returns the same ``(success, error_info)`` contract as the step
+    handlers in ``step_handlers.py``.
+    """
+    messages = [
+        Message(role="system", content=AGENT_LOOP_SYSTEM_PROMPT),
+        Message(role="user",
+                content=_build_user_message(step_text, task, language, context)),
+    ]
+    definitions = tools.definitions()
+    any_tool_used = False
+    tool_counts: Counter = Counter()
+
+    def _finish(outcome: str, turns: int,
+                result: tuple[bool, str]) -> tuple[bool, str]:
+        _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
+        return result
+
+    for turn in range(1, max_turns + 1):
+        # Final turn: withhold tools so the model must produce a text
+        # summary instead of burning the last turn on another tool call.
+        final_turn = turn == max_turns
+        if final_turn and any_tool_used:
+            messages.append(Message(role="user", content=(
+                "Turn budget exhausted — tools are no longer available. "
+                "Reply now with a short summary of what you completed and "
+                "whether it was verified.")))
+        response = llm_client.chat(
+            messages, tools=None if final_turn else definitions)
+
+        if response.has_tool_calls:
+            any_tool_used = True
+            tool_counts.update(tc.name for tc in response.tool_calls)
+            names = ", ".join(tc.name for tc in response.tool_calls)
+            _logger.info("[AgentLoop] step %d turn %d/%d: %s",
+                         step_idx + 1, turn, max_turns, names)
+            if display is not None:
+                display.step_info(step_idx,
+                                  f"Agent loop {turn}/{max_turns}: {names}")
+            messages.append(response.to_message())
+            messages.extend(tools.execute_all(response.tool_calls))
+            continue
+
+        # Model stopped calling tools — it believes the step is done.
+        summary = response.text.strip()
+        if not any_tool_used:
+            _logger.warning("[AgentLoop] step %d: model finished without "
+                            "using any tool", step_idx + 1)
+            return _finish("no-tools", turn, (False, (
+                "Agent loop made no tool calls — no files were changed and "
+                f"no commands were run. Model said: {summary[:500]}")))
+
+        if verify_cmd:
+            if display is not None:
+                display.step_info(step_idx, f"Verifying: {verify_cmd}")
+            result = tools.execute_all(
+                [_verify_call(verify_cmd)])[0].content
+            if result.startswith("exit: success"):
+                _logger.info("[AgentLoop] step %d verified in %d turn(s)",
+                             step_idx + 1, turn)
+                return _finish("verified", turn, (True, summary))
+            if final_turn:
+                return _finish("verify-failed", turn, (False, (
+                    f"Verification still failing after {max_turns} turns:\n"
+                    f"{result[:1000]}")))
+            _logger.info("[AgentLoop] step %d: verification failed on "
+                         "turn %d — feeding back", step_idx + 1, turn)
+            messages.append(response.to_message())
+            messages.append(Message(role="user", content=(
+                f"Verification command failed:\n{verify_cmd}\n\n{result}\n\n"
+                "The step is not complete. Fix the problem and verify again.")))
+            continue
+
+        _logger.info("[AgentLoop] step %d finished in %d turn(s)",
+                     step_idx + 1, turn)
+        return _finish("done", turn, (True, summary))
+
+    # Exhausted without a final text answer (e.g. text-mode model ignored
+    # the no-tools instruction). The work may still be done — let the
+    # deterministic check have the last word.
+    if verify_cmd and any_tool_used:
+        result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+        if result.startswith("exit: success"):
+            _logger.info("[AgentLoop] step %d: turns exhausted but "
+                         "verification passes — accepting", step_idx + 1)
+            return _finish("exhausted-verified", max_turns, (True, (
+                "Step verified complete (turn budget exhausted "
+                "before the model summarized).")))
+
+    return _finish("exhausted", max_turns, (False, (
+        f"Agent loop exhausted {max_turns} turns without completing the "
+        f"step: {step_text[:200]}")))
+
+
+def _verify_call(verify_cmd: str):
+    from ..llm.chat_types import ToolCall
+    return ToolCall(name="run_command", arguments={"command": verify_cmd},
+                    id="verify")
+
+
+def verify_cmd_for_language(language: str | None,
+                            project_root: str = ".") -> str | None:
+    """Deterministic test command for the loop's exit verification.
+
+    Returns None when no trustworthy command exists for the language —
+    a wrong verify command is worse than none (the loop would chase
+    failures in the verifier instead of the code).
+    """
+    import json
+    import os
+
+    lang = (language or "python").lower()
+    if lang == "python":
+        return "python -m pytest -q"
+    if lang in ("javascript", "typescript"):
+        # Only trust `npm test` when the project actually defines it;
+        # guessing a runner (jest vs vitest) misfires too often.
+        pkg_path = os.path.join(project_root, "package.json")
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            if (pkg.get("scripts") or {}).get("test"):
+                return "npm test --silent"
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+    if lang == "go":
+        return "go test ./..."
+    return None
+
+
+def build_step_tools(executor, memory, kb_context_builder=None,
+                     project_root: str = ".") -> AgentTools:
+    """Assemble :class:`AgentTools` from the objects a step handler holds."""
+    searcher = getattr(kb_context_builder, "_searcher", None) \
+        if kb_context_builder is not None else None
+    return AgentTools(project_root=project_root, executor=executor,
+                      searcher=searcher, memory=memory)
+
+
+def agent_loop_enabled(cfg, llm_client) -> bool:
+    """True when the config opts in AND the provider can do native tools."""
+    return (cfg is not None
+            and getattr(cfg, "AGENT_LOOP", False)
+            and llm_client is not None
+            and getattr(llm_client, "supports_tools", lambda: False)())
+
+
+# Marker prepended to error_info after a failed recovery attempt so the
+# pipeline's diagnosis stage doesn't launch a second (redundant) loop.
+RECOVERY_FAILED_MARKER = "[agent-loop-recovery-failed]"
+
+
+def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
+                      task: str, error_info: str,
+                      display=None, step_idx: int = 0,
+                      language: str | None = None,
+                      max_turns: int = 8,
+                      verify_cmd: str | None = None) -> tuple[bool, str]:
+    """One bounded loop attempt to recover a failed step.
+
+    Replaces the diagnose → fix → re-run machinery: the model gets the
+    real error, inspects the actual project state with tools, fixes the
+    cause and completes the step in place.
+    """
+    context = (
+        "A previous attempt at this step FAILED. Error:\n"
+        f"{error_info[:4000]}\n\n"
+        "Investigate the actual state of the project, fix the cause, and "
+        "complete the step. If the failure is an environment limitation "
+        "you cannot fix (e.g. a required tool is not installed and cannot "
+        "be installed), say so clearly in your summary.")
+    return run_agent_loop(
+        llm_client, tools, step_text, task,
+        display=display, step_idx=step_idx, language=language,
+        max_turns=max_turns, verify_cmd=verify_cmd, context=context,
+        _recovery=True)

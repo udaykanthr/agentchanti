@@ -9,5 +9,6 @@ Public API for library usage::
 """
 
 from .api import run_task, TaskResult
+from .agent_tools import AgentTools
 
-__all__ = ["run_task", "TaskResult"]
+__all__ = ["run_task", "TaskResult", "AgentTools"]

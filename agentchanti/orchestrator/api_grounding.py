@@ -31,16 +31,23 @@ def get_installed_package_versions(
     cwd: str | None = None,
     executor=None,
     timeout: int = 60,
+    language: str | None = None,
 ) -> dict[str, str]:
-    """Return ``{package_name_lower: version}`` for the target interpreter.
+    """Return ``{package_name_lower: version}`` for the project's ecosystem.
 
-    Runs ``pip list`` through the Executor so the project venv's interpreter
-    is used when one exists (bare ``python`` resolves to it).  Returns an
-    empty dict on any failure — grounding is best-effort, never blocking.
+    Python (default): ``pip list`` through the Executor so the project
+    venv's interpreter is used when one exists. JavaScript/TypeScript:
+    ``npm ls`` in the project directory — probing pip on a JS project
+    grounds agents in the wrong package universe. Returns an empty dict
+    on any failure — grounding is best-effort, never blocking.
     """
     if executor is None:
         from ..executor import Executor
         executor = Executor()
+
+    if language in ("javascript", "typescript"):
+        return _get_npm_versions(cwd, executor, timeout)
+
     ok, out = executor.run_command(
         "python -m pip list --format=json --disable-pip-version-check",
         cwd=cwd, timeout=timeout,
@@ -59,6 +66,33 @@ def get_installed_package_versions(
         }
     except (ValueError, json.JSONDecodeError, TypeError):
         _logger.debug("[ApiGrounding] Could not parse pip list output")
+        return {}
+
+
+def _get_npm_versions(cwd: str | None, executor,
+                      timeout: int) -> dict[str, str]:
+    """Top-level npm dependency versions for a JS/TS project."""
+    import os
+    if not os.path.isfile(os.path.join(cwd or ".", "package.json")):
+        return {}
+    # npm ls exits non-zero on peer-dep warnings but still prints the
+    # JSON tree — parse the output regardless of the exit code.
+    _ok, out = executor.run_command(
+        "npm ls --json --depth=0", cwd=cwd, timeout=timeout)
+    if not out:
+        return {}
+    try:
+        start = out.index("{")
+        end = out.rindex("}") + 1
+        data = json.loads(out[start:end])
+        deps = data.get("dependencies") or {}
+        return {
+            name.lower(): info["version"]
+            for name, info in deps.items()
+            if isinstance(info, dict) and info.get("version")
+        }
+    except (ValueError, json.JSONDecodeError, TypeError):
+        _logger.debug("[ApiGrounding] Could not parse npm ls output")
         return {}
 
 
@@ -298,7 +332,8 @@ def is_install_command(cmd: str) -> bool:
 
 
 def refresh_installed_versions(project_context, executor=None,
-                               cwd: str | None = None) -> None:
+                               cwd: str | None = None,
+                               language: str | None = None) -> None:
     """Re-probe installed versions after packages were installed mid-run.
 
     On a blank project the initial snapshot is taken before the venv even
@@ -309,7 +344,8 @@ def refresh_installed_versions(project_context, executor=None,
     if project_context is None or not hasattr(project_context,
                                               "installed_versions"):
         return
-    versions = get_installed_package_versions(cwd=cwd, executor=executor)
+    versions = get_installed_package_versions(cwd=cwd, executor=executor,
+                                              language=language)
     if not versions:
         return
     project_context.installed_versions = versions

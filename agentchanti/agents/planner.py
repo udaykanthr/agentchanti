@@ -362,6 +362,7 @@ class PlannerAgent(Agent):
                 cli_display=cli_display,
                 available_kb_docs=_available_kb_titles or None,
                 subproject_cwd=subproject_cwd,
+                language=language,
             )
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")
@@ -773,8 +774,29 @@ class PlannerAgent(Agent):
                                     _hfc = None  # type: ignore[assignment]
                                     _TK_f = None  # type: ignore[assignment]
                                     _ntk = None  # type: ignore[assignment]
+                                # Only force testing-framework guides when the
+                                # task actually asks for tests — otherwise they
+                                # nudge the planner into adding TEST steps the
+                                # user never requested (rule 10 violation).
+                                # Check the RAW task: by this point `task` has
+                                # been replaced by the enriched spec, which
+                                # routinely mentions testing on its own.
+                                _task_wants_tests = bool(re.search(
+                                    r'\btest(s|ing|case|cases)?\b'
+                                    r'|pytest|vitest|jest|coverage',
+                                    _raw_task, re.IGNORECASE))
+                                _TEST_GUIDE_KWS = (
+                                    "test", "vitest", "jest", "pytest")
                                 for _t in _blank_titles:
                                     _tl = _t.lower()
+                                    if (not _task_wants_tests
+                                            and any(k in _tl
+                                                    for k in _TEST_GUIDE_KWS)):
+                                        _logger.debug(
+                                            "[PreAnalysis] Skipping "
+                                            "force-include '%s' — task does "
+                                            "not request tests", _t)
+                                        continue
                                     if ("setup" in _tl or "install" in _tl) and \
                                             _t not in _selected:
                                         if any(kw in _tl for kw in _task_kw):
@@ -1172,8 +1194,25 @@ class PlannerAgent(Agent):
 
         return "\n".join(parts) if parts else ""
 
-    def process(self, task: str, context: str = "") -> str:
+    def process(self, task: str, context: str = "",
+                language: str | None = None) -> str:
         prompt = self._build_prompt(task, context)
+        _lang_constraint = ""
+        if language:
+            from ..language import get_language_name
+            _lang_name = get_language_name(language)
+            _lang_constraint = f"""
+═══════ LANGUAGE CONSTRAINT (HARD RULE) ═══════
+The project language is {_lang_name}. Implement ONLY in {_lang_name}.
+- Do NOT create implementations, examples, or ports in any other
+  programming language, even if reference material or search results
+  show solutions in other languages.
+- Do NOT add compile/build/toolchain steps for other languages
+  (e.g. g++, javac, cargo, go build) — the required toolchain may not
+  exist on the host.
+- The ONLY exception: the task itself explicitly names another language
+  and asks for it.
+"""
         prompt += """
 
 You are a SENIOR SOFTWARE ARCHITECT creating an execution plan that will be
@@ -1182,7 +1221,7 @@ agents: a CODER (writes files), a CMD runner (executes shell commands), a
 TESTER (generates and runs unit tests), or a SEARCHER (searches the web for
 documentation and latest info). Your plan MUST be precise enough for
 these agents to succeed on the first attempt.
-
+""" + _lang_constraint + """
 ═══════ HOST ENVIRONMENT ═══════
 """ + _os_context_for_prompt() + """
 ═══════ OUTPUT FORMAT ═══════
@@ -1343,6 +1382,12 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 
 13. **SKIP already-installed packages**: If the project knowledge lists
     packages as already installed, do NOT add install steps for them.
+    Install ONLY packages that the code in your plan actually imports —
+    do NOT add packages merely because a setup guide or KB doc mentions
+    them (e.g. no router library when the task has no routing, no test
+    runner when no tests are requested). Combine related installs into
+    ONE CMD step; never add a bare `npm install` step right after a
+    scaffold command that already installed dependencies.
 
 14. **KB documentation overrides your training data**: Use exact commands
     from KB docs — including ALL packages and peer dependencies.

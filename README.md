@@ -53,6 +53,12 @@ AgentChanti is a **command-line tool and Python library** that takes a plain Eng
 
 Supports local LLMs ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai)) and cloud providers (OpenAI, Google Gemini, Anthropic Claude).
 
+### Agent Loop (v0.3)
+
+When the provider supports native tool calling (Ollama with llama3.1/qwen2.5-coder+, OpenAI, Anthropic), CODE and TEST steps run as a **bounded tool-calling loop**: the model reads files, edits, runs commands and tests, observes the real output, and self-corrects — capped at `agent_loop_max_turns` (default 8) so cost stays predictable. A step only counts as done once its verification command actually passes. Failed shell commands and failed steps get one bounded recovery loop instead of hard-failing the pipeline.
+
+This is on by default; set `agent_loop: false` in `.agentchanti.yaml` to use the classic generate→review→retry pipeline, which also remains the automatic fallback for models without tool support. A/B benchmarks (see `benchmarks/`) show parity on success rate with ~14% fewer tokens.
+
 ### Beyond the CLI — Use It as a Service
 
 AgentChanti ships as both a CLI and a **Python library**, so it can be embedded directly into any service:

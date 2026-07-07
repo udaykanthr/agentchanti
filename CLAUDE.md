@@ -54,6 +54,24 @@ Auto-detects project language by scanning file extensions (`detect_language()`) 
 
 `LLMClient` base class with provider implementations: `OllamaClient`, `LMStudioClient`, `OpenAIClient`, `GeminiClient`, `AnthropicClient`. All expose `generate_response(prompt) -> str` with retry and streaming support.
 
+Chat-native entry point: `chat(messages, tools=None) -> ChatResponse` (types in `llm/chat_types.py`: `Message`, `ToolDef`, `ToolCall`, `ChatResponse`). Ollama (`/api/chat`), OpenAI (`/chat/completions`) and Anthropic (Messages API) implement it natively with structured tool calling (`NATIVE_CHAT = True`); other providers fall back to flattening the conversation into a text prompt via `flatten_messages()`. Models that reject tools at runtime raise `ToolsNotSupportedError` and are downgraded to the text path for the session. Check availability with `client.supports_tools()`.
+
+### Agent Tools (agent_tools.py)
+
+`AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.
+
+### Agent Loop (orchestrator/agent_loop.py)
+
+Default execution path for CODE/TEST steps when the provider supports native tool calling (`agent_loop: true` by default; set `false` to use the classic generate→review→retry pipeline, which also remains the automatic fallback for providers without tool support). `run_agent_loop()` runs the step as a bounded tool-calling conversation (`agent_loop_max_turns`, default 8): stable byte-identical system prompt (KV-cache friendly), model edits/runs via `AgentTools`, observes real output, self-corrects. Exit rules: the final turn withholds tools to force a text summary; a `verify_cmd` (from `verify_cmd_for_language()`: pytest for Python, `npm test` when package.json defines it, `go test ./...`) must pass before the model's "done" claim is accepted, and passes on exhaustion still count as success. Returns the same `(success, error_info)` contract as the classic handlers; gate is at the top of `_handle_code_step`/`_handle_test_step` via `agent_loop_enabled()`.
+
+Failure recovery: `run_recovery_loop()` gives one bounded loop attempt when a CMD step's planned command fails (`_handle_cmd_step`) or when any step reaches `_run_diagnosis_loop` — with the loop enabled it replaces the diagnose→fix→re-run machinery entirely; `RECOVERY_FAILED_MARKER` in the error prevents double attempts.
+
+Telemetry: every loop run records turns/tool-call counts/outcome/recovery-flag (`get_loop_stats()`, `loop_stats_summary()`); the CLI logs a `[AgentLoop] session:` summary line at the end of each run.
+
+### Benchmarks (benchmarks/)
+
+A/B harness comparing `agent_loop` on vs off over the task set in `benchmarks/tasks.py`. Ground truth is per-task `success_cmds` run in the isolated workdir, independent of the pipeline's own claim. Run from repo root: `python benchmarks/run_ab.py --config <yaml-with-keys> [--tasks id1,id2] [--modes on,off] [--truststore]`. Results land in `benchmarks/results/*.json`. Not part of pytest — it spends real API tokens.
+
 ### Key Subsystems
 
 - **Config** (`config.py`): Priority resolution: CLI args > env vars > `.agentchanti.yaml` > defaults
