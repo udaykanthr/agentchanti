@@ -774,8 +774,26 @@ class PlannerAgent(Agent):
                                     _hfc = None  # type: ignore[assignment]
                                     _TK_f = None  # type: ignore[assignment]
                                     _ntk = None  # type: ignore[assignment]
+                                # Only force testing-framework guides when the
+                                # task actually asks for tests — otherwise they
+                                # nudge the planner into adding TEST steps the
+                                # user never requested (rule 10 violation).
+                                _task_wants_tests = bool(re.search(
+                                    r'\btest(s|ing|case|cases)?\b'
+                                    r'|pytest|vitest|jest|coverage',
+                                    task, re.IGNORECASE))
+                                _TEST_GUIDE_KWS = (
+                                    "test", "vitest", "jest", "pytest")
                                 for _t in _blank_titles:
                                     _tl = _t.lower()
+                                    if (not _task_wants_tests
+                                            and any(k in _tl
+                                                    for k in _TEST_GUIDE_KWS)):
+                                        _logger.debug(
+                                            "[PreAnalysis] Skipping "
+                                            "force-include '%s' — task does "
+                                            "not request tests", _t)
+                                        continue
                                     if ("setup" in _tl or "install" in _tl) and \
                                             _t not in _selected:
                                         if any(kw in _tl for kw in _task_kw):
@@ -1361,6 +1379,12 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 
 13. **SKIP already-installed packages**: If the project knowledge lists
     packages as already installed, do NOT add install steps for them.
+    Install ONLY packages that the code in your plan actually imports —
+    do NOT add packages merely because a setup guide or KB doc mentions
+    them (e.g. no router library when the task has no routing, no test
+    runner when no tests are requested). Combine related installs into
+    ONE CMD step; never add a bare `npm install` step right after a
+    scaffold command that already installed dependencies.
 
 14. **KB documentation overrides your training data**: Use exact commands
     from KB docs — including ALL packages and peer dependencies.

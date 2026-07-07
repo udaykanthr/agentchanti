@@ -3781,6 +3781,28 @@ def _ensure_pytest_available(executor, cwd: str | None = None) -> None:
             "[BulkTest] pytest install failed: %s", (out or "")[:300])
 
 
+# Vitest/Node resolution errors for uninstalled npm packages, e.g.
+#   Cannot find package '@testing-library/react' imported from ...
+#   Cannot find module 'axios'
+_JS_MISSING_PKG_RE = re.compile(
+    r"Cannot find (?:package|module) '((?:@[\w.-]+/)?[\w.-]+)")
+
+
+def _missing_js_packages(output: str) -> list[str]:
+    """npm package names whose absence made the JS test run fail.
+
+    Relative-path imports (``./Header``) are source problems, not
+    packages — the regex's character class already excludes anything
+    starting with ``.`` or ``/``.
+    """
+    seen: list[str] = []
+    for m in _JS_MISSING_PKG_RE.finditer(output):
+        pkg = m.group(1)
+        if pkg not in seen and not pkg.startswith("."):
+            seen.append(pkg)
+    return seen
+
+
 def _missing_third_party_module(output: str, project_files) -> str | None:
     """Extract a missing-module name from test output — unless it is a
     project-local module (a sys.path/code problem; pip-installing a name
@@ -3987,6 +4009,50 @@ def run_bulk_test_execution_and_fix(
                 _logger.warning(
                     "[BulkTest] Install of '%s' failed: %s",
                     _missing_mod, (_inst_out or "")[:300])
+
+    # ── Environment-error self-heal (JS/TS) ─────────────────────────────
+    # Vitest/Jest "Cannot find package 'X'" means an uninstalled npm
+    # dependency — editing test code can never fix it (observed: nine LLM
+    # fix rounds, some blocked at node_modules guardrails, while the real
+    # fix was one `npm install -D @testing-library/react`).
+    elif lang in ("javascript", "typescript"):
+        _missing_pkgs = _missing_js_packages(output)
+        if _missing_pkgs:
+            _pkg_list = " ".join(_missing_pkgs)
+            _logger.info(
+                "[BulkTest] Missing npm package(s) %s — installing into "
+                "the project", _missing_pkgs)
+            print(f"  [BulkTest] Installing missing package(s): {_pkg_list}")
+            _inst_ok, _inst_out = executor.run_command(
+                f"npm install -D {_pkg_list}",
+                cwd=subproject_cwd, timeout=300)
+            if _inst_ok:
+                try:
+                    from .api_grounding import refresh_installed_versions
+                    refresh_installed_versions(
+                        project_context, executor=executor,
+                        cwd=subproject_cwd, language=lang)
+                except Exception:
+                    pass
+                ok, output = executor.run_command(
+                    base_cmd, cwd=subproject_cwd)
+                if ok:
+                    _logger.info(
+                        "[BulkTest] All tests pass after installing %s.",
+                        _pkg_list)
+                    print(f"  [BulkTest] All tests passed after installing "
+                          f"{_pkg_list}.")
+                    for fpath in test_files:
+                        display.record_test_result(
+                            fpath, passed=1, total=1, failures=[])
+                    return True, ""
+                _logger.warning(
+                    "[BulkTest] Still failing after installing %s — "
+                    "continuing to fix loop", _pkg_list)
+            else:
+                _logger.warning(
+                    "[BulkTest] npm install of %s failed: %s",
+                    _pkg_list, (_inst_out or "")[:300])
 
     # ── Startup crash detection (Django only) ──────────────────────────────
     # Django raises ImportError / ModuleNotFoundError at collection time when
@@ -5294,6 +5360,48 @@ def _resolve_fix_scope_files(
     return result
 
 
+# Vendor/build artifacts that must never enter an LLM verification prompt.
+_WIRING_SKIP_DIRS = frozenset({
+    "node_modules", "dist", "build", "coverage", ".git",
+    "venv", ".venv", "__pycache__",
+})
+_WIRING_SKIP_FILES = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+})
+_WIRING_MAX_FILE_CHARS = 12_000
+
+
+def _sanitize_wiring_context(ctx: dict[str, str]) -> dict[str, str]:
+    """Clean the wiring-verification file set before prompt assembly.
+
+    - Normalises path separators and deduplicates (the same file can be
+      resolved once with ``/`` and once with ``\\`` — it would otherwise
+      be injected twice).
+    - Drops vendor/build files (``node_modules``, lockfiles, minified
+      assets): a single ``bootstrap.min.css`` is ~50k tokens of noise.
+    - Caps per-file content so one big file cannot dominate the prompt.
+    """
+    clean: dict[str, str] = {}
+    for path, content in ctx.items():
+        norm = path.replace("\\", "/")
+        if norm in clean:
+            continue
+        parts = norm.split("/")
+        basename = parts[-1]
+        if any(p in _WIRING_SKIP_DIRS for p in parts[:-1]):
+            _logger.debug("[WiringVerification] Skipping vendor/build "
+                          "file: %s", norm)
+            continue
+        if basename in _WIRING_SKIP_FILES or ".min." in basename:
+            _logger.debug("[WiringVerification] Skipping artifact: %s", norm)
+            continue
+        if len(content) > _WIRING_MAX_FILE_CHARS:
+            content = (content[:_WIRING_MAX_FILE_CHARS]
+                       + "\n/* ... truncated for verification ... */")
+        clean[norm] = content
+    return clean
+
+
 def run_wiring_verification(
     *,
     memory: FileMemory,
@@ -5350,6 +5458,8 @@ def run_wiring_verification(
             if not _should_skip_for_context(p)
         }
 
+    verification_context = _sanitize_wiring_context(verification_context)
+
     if not verification_context:
         _logger.info("[WiringVerification] No files resolved — skipping")
         return True, ""
@@ -5370,7 +5480,7 @@ def run_wiring_verification(
     try:
         from .api_grounding import get_installed_package_versions
         _versions = get_installed_package_versions(
-            cwd=project_root or None, executor=executor)
+            cwd=project_root or None, executor=executor, language=language)
         _pkgs = [f"{n}=={v}" for n, v in sorted(_versions.items())
                  if n not in ("pip", "setuptools", "wheel")]
         if _pkgs:

@@ -269,7 +269,8 @@ def _ensure_packages_installed(
         from .api_grounding import refresh_installed_versions
         try:
             refresh_installed_versions(
-                project_context, executor=executor, cwd=subproject_cwd)
+                project_context, executor=executor, cwd=subproject_cwd,
+                language=language)
         except Exception as _rv_exc:
             log.debug(f"[ApiGrounding] Version refresh failed: {_rv_exc}")
     else:
@@ -1907,7 +1908,8 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         if is_install_command(cmd):
             try:
                 refresh_installed_versions(
-                    project_context, executor=executor, cwd=subproject_cwd)
+                    project_context, executor=executor, cwd=subproject_cwd,
+                    language=language)
             except Exception as _rv_exc:
                 log.debug(f"[ApiGrounding] Version refresh failed: {_rv_exc}")
 
