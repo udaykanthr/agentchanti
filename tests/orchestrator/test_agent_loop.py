@@ -213,14 +213,14 @@ class TestGating(unittest.TestCase):
 
 class TestConfigFlags(unittest.TestCase):
 
-    def test_defaults_off(self):
+    def test_defaults_on(self):
         cfg = Config({})
-        self.assertFalse(cfg.AGENT_LOOP)
+        self.assertTrue(cfg.AGENT_LOOP)
         self.assertEqual(cfg.AGENT_LOOP_MAX_TURNS, 8)
 
-    def test_yaml_opt_in(self):
-        cfg = Config({"agent_loop": True, "agent_loop_max_turns": 5})
-        self.assertTrue(cfg.AGENT_LOOP)
+    def test_yaml_opt_out(self):
+        cfg = Config({"agent_loop": False, "agent_loop_max_turns": 5})
+        self.assertFalse(cfg.AGENT_LOOP)
         self.assertEqual(cfg.AGENT_LOOP_MAX_TURNS, 5)
 
 
