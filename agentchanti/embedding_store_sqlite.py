@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from typing import List, Optional, Tuple
 
 from .embedding_store import EmbeddingStore, _chunk_text
@@ -44,9 +45,19 @@ class SQLiteEmbeddingStore(EmbeddingStore):
         super().__init__(llm_client, embed_model)
         self._db_path = db_path
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        # One shared connection used from several threads: FileMemory's
+        # background _bg_embed workers write while pipeline wave threads
+        # read. sqlite3 connections are NOT thread-safe — unsynchronized
+        # use first surfaces as "bad parameter or other API misuse" and
+        # can hard-crash the interpreter (observed: silent process exit
+        # mid-run). Every connection touch must hold _db_lock.
+        self._db_lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute(_CREATE_TABLE)
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute(_CREATE_TABLE)
+            self._conn.commit()
         log.debug(f"[SQLiteEmbeddingStore] Opened {db_path}")
 
     def add(self, key: str, text: str) -> bool:
@@ -87,8 +98,9 @@ class SQLiteEmbeddingStore(EmbeddingStore):
     def _load_cached(self, key: str, content_hash: str) -> List[Tuple[int, List[float]]] | None:
         """Load cached embedding vectors from SQLite."""
         try:
-            cursor = self._conn.execute(_SELECT, (key, content_hash))
-            rows = cursor.fetchall()
+            with self._db_lock:
+                cursor = self._conn.execute(_SELECT, (key, content_hash))
+                rows = cursor.fetchall()
             if not rows:
                 return None
             return [(row[0], json.loads(row[1])) for row in rows]
@@ -100,17 +112,20 @@ class SQLiteEmbeddingStore(EmbeddingStore):
                       vectors: List[Tuple[int, List[float]]]):
         """Persist embedding vectors to SQLite, replacing stale entries."""
         try:
-            self._conn.execute(_DELETE_STALE, (key, content_hash))
-            for chunk_idx, vec in vectors:
-                vec_json = json.dumps(vec)
-                self._conn.execute(_INSERT, (key, content_hash, chunk_idx, vec_json))
-            self._conn.commit()
+            with self._db_lock:
+                self._conn.execute(_DELETE_STALE, (key, content_hash))
+                for chunk_idx, vec in vectors:
+                    vec_json = json.dumps(vec)
+                    self._conn.execute(
+                        _INSERT, (key, content_hash, chunk_idx, vec_json))
+                self._conn.commit()
         except sqlite3.Error as e:
             log.warning(f"[SQLiteEmbeddingStore] Cache write error: {e}")
 
     def close(self):
         """Close the SQLite connection."""
         try:
-            self._conn.close()
+            with self._db_lock:
+                self._conn.close()
         except sqlite3.Error:
             pass
