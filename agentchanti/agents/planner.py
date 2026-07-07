@@ -778,10 +778,13 @@ class PlannerAgent(Agent):
                                 # task actually asks for tests — otherwise they
                                 # nudge the planner into adding TEST steps the
                                 # user never requested (rule 10 violation).
+                                # Check the RAW task: by this point `task` has
+                                # been replaced by the enriched spec, which
+                                # routinely mentions testing on its own.
                                 _task_wants_tests = bool(re.search(
                                     r'\btest(s|ing|case|cases)?\b'
                                     r'|pytest|vitest|jest|coverage',
-                                    task, re.IGNORECASE))
+                                    _raw_task, re.IGNORECASE))
                                 _TEST_GUIDE_KWS = (
                                     "test", "vitest", "jest", "pytest")
                                 for _t in _blank_titles:
