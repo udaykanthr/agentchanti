@@ -4136,6 +4136,50 @@ def run_bulk_test_execution_and_fix(
     if "manage.py" in base_cmd:
         output = _fix_django_startup_crashes(output, subproject_cwd, executor)
 
+    # ── Agent-loop first-line fix (opt-in) ──────────────────────────────
+    # One grounded loop attempt before the per-file coder machinery: the
+    # model gets the real runner output and the exact exit criterion.
+    # (Observed without this: three per-file fix rounds rewriting
+    # templates and __init__ files — all blocked as destructive — while
+    # the actual bug was one wrong import root in the test file.)
+    from .agent_loop import (
+        agent_loop_enabled, build_step_tools, run_recovery_loop,
+    )
+    _bt_llm = getattr(coder, "llm_client", None)
+    if agent_loop_enabled(cfg, _bt_llm):
+        _bt_verify = (f"cd {subproject_cwd} && {base_cmd}"
+                      if subproject_cwd else base_cmd)
+        _bt_tools = build_step_tools(
+            executor, memory, kb_context_builder=kb_context_builder)
+        _logger.info("[BulkTest] Agent-loop fix attempt before per-file loop")
+        print("  [BulkTest] Agent loop attempting a grounded fix...")
+        recovered, rec_info = run_recovery_loop(
+            _bt_llm, _bt_tools,
+            step_text=f"Make the project's test suite pass: `{_bt_verify}`",
+            task=task,
+            error_info=(output or "")[-4000:],
+            display=None, step_idx=0, language=lang,
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=_bt_verify)
+        if recovered:
+            _logger.info("[BulkTest] Agent loop fixed the suite: %s",
+                         rec_info[:200])
+            print("  [BulkTest] All tests passed (agent-loop fix).")
+            for fpath in test_files:
+                display.record_test_result(fpath, passed=1, total=1,
+                                           failures=[])
+            return True, ""
+        _logger.warning("[BulkTest] Agent-loop fix failed (%s) — "
+                        "falling back to per-file fix loop",
+                        rec_info[:200])
+        # Refresh the failure output for the classic path below.
+        ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
+        if ok:
+            for fpath in test_files:
+                display.record_test_result(fpath, passed=1, total=1,
+                                           failures=[])
+            return True, ""
+
     # ── Step 2a: Fix shared root causes before per-file loop ─────────────────
     # When all (or most) test files fail with the same error pointing at a
     # shared config file (vitest.config.js, jest.config.js, vite.config.js,

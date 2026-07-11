@@ -213,6 +213,10 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     checks = json.load(f)
 
+# Framework modules (Django especially) refuse to import without app
+# settings configured. That means "needs app context", not "missing".
+_INCONCLUSIVE = ("ImproperlyConfigured", "AppRegistryNotReady")
+
 failed_modules = set()
 for mod, attr in checks:
     if mod in failed_modules:
@@ -220,6 +224,9 @@ for mod, attr in checks:
     try:
         m = importlib.import_module(mod)
     except BaseException as exc:
+        if type(exc).__name__ in _INCONCLUSIVE:
+            failed_modules.add(mod)
+            continue
         failed_modules.add(mod)
         print("MODULE_MISSING::%s::%s: %s" % (mod, type(exc).__name__, exc))
         continue
@@ -227,7 +234,9 @@ for mod, attr in checks:
         # May be a submodule the package __init__ doesn't re-export
         try:
             importlib.import_module(mod + "." + attr)
-        except BaseException:
+        except BaseException as sub_exc:
+            if type(sub_exc).__name__ in _INCONCLUSIVE:
+                continue
             import difflib
             ver = str(getattr(m, "__version__", "") or getattr(m, "VERSION", ""))
             close = difflib.get_close_matches(

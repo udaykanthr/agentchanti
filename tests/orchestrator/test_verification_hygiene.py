@@ -121,6 +121,75 @@ class TestResolveExistingByBasename(unittest.TestCase):
             _resolve_existing_by_basename("wrong/urls.py", self.memory))
 
 
+class TestProbeInconclusiveExceptions(unittest.TestCase):
+    """Framework modules that need app settings must not be reported missing."""
+
+    def _run_probe(self, checks, module_src):
+        import subprocess
+        import sys
+        from agentchanti.orchestrator.api_grounding import _PROBE_TEMPLATE
+        root = tempfile.mkdtemp(prefix="probe_")
+        try:
+            with open(os.path.join(root, "fakefw.py"), "w",
+                      encoding="utf-8") as f:
+                f.write(module_src)
+            with open(os.path.join(root, "probe.py"), "w",
+                      encoding="utf-8") as f:
+                f.write(_PROBE_TEMPLATE)
+            with open(os.path.join(root, "checks.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(checks, f)
+            proc = subprocess.run(
+                [sys.executable, "probe.py", "checks.json"],
+                cwd=root, capture_output=True, text=True, timeout=60)
+            return proc.stdout
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_improperly_configured_is_not_missing(self):
+        out = self._run_probe(
+            [["fakefw", None]],
+            "class ImproperlyConfigured(Exception):\n    pass\n"
+            "raise ImproperlyConfigured('settings required')\n")
+        self.assertIn("PROBE_DONE", out)
+        self.assertNotIn("MODULE_MISSING", out)
+
+    def test_genuinely_missing_module_still_reported(self):
+        out = self._run_probe([["no_such_module_xyz", None]], "")
+        self.assertIn("MODULE_MISSING::no_such_module_xyz", out)
+
+
+class TestBulkTestLoopFirstFix(unittest.TestCase):
+    """A grounded loop attempt runs before the per-file fix machinery."""
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed the import root"))
+    def test_loop_recovery_short_circuits_bulk_fixing(self, mock_rec):
+        from agentchanti.orchestrator.pipeline import (
+            run_bulk_test_execution_and_fix,
+        )
+        memory = MagicMock()
+        memory._scaffolded_subproject = None
+        memory.all_files.return_value = {
+            "tests/test_views.py": "from app import views\n"}
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "No module named 'app'")
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        coder = MagicMock()
+        coder.llm_client.supports_tools.return_value = True
+        ok, err = run_bulk_test_execution_and_fix(
+            memory=memory, executor=executor, coder=coder,
+            display=MagicMock(), language="python",
+            task="build the app", cfg=cfg)
+        self.assertTrue(ok)
+        mock_rec.assert_called_once()
+        self.assertIn("No module named", mock_rec.call_args[1]["error_info"])
+        self.assertTrue(
+            mock_rec.call_args[1]["verify_cmd"].endswith("pytest"))
+
+
 class TestMissingJsPackages(unittest.TestCase):
 
     VITEST_OUTPUT = """
