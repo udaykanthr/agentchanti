@@ -408,6 +408,21 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 code_lines.append(code_line)  # preserve original indentation
                 continue
 
+        # Re-open code capture: multi-file steps often close each block
+        # with ---file-content-end--- and start the next with a bare
+        # ``` fence, without repeating `content:`. Without this, every
+        # block after the first silently leaks into the step description
+        # (observed: 8 of 9 templates in a step never written). Only
+        # re-open while the step still has unassigned target files, so
+        # fenced snippets in prose never get captured by accident.
+        if (line.startswith("```") and not in_code_block
+                and current is not None
+                and len(current.target_files) > len(current.inline_code)):
+            in_code_block = True
+            in_markdown_fence = True
+            code_lines = []
+            continue
+
         # Skip plan boundary markers
         if line.upper() in ("==PLAN==", "==END==", ""):
             continue

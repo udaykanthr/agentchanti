@@ -163,6 +163,42 @@ class TestRunAgentLoop(AgentLoopTestCase):
         self.assertIn("Verification command failed", third_messages[-1].content)
         self.assertIn("1 failed", third_messages[-1].content)
 
+    def test_read_only_streak_triggers_act_nudge(self):
+        read = _tool_response(ToolCall(name="read_file",
+                                       arguments={"path": "a.txt"}, id="c"))
+        llm = self._llm(read, read, read, read, _final("done"))
+        self._write_helper()
+        success, _ = run_agent_loop(
+            llm, self.tools, "fix the tests", "task", max_turns=8)
+        self.assertTrue(success)
+        # The conversation contains exactly one act-now nudge, placed
+        # right after the 3rd read-only turn's tool result. (call_args
+        # holds a reference to the mutated list — inspect the final state.)
+        messages = llm.chat.call_args_list[-1][0][0]
+        nudges = [i for i, m in enumerate(messages)
+                  if m.role == "user" and "ACT now" in m.content]
+        self.assertEqual(len(nudges), 1)
+        self.assertEqual(messages[nudges[0] - 1].role, "tool")
+
+    def test_acting_resets_read_only_streak(self):
+        read = _tool_response(ToolCall(name="read_file",
+                                       arguments={"path": "a.txt"}, id="c"))
+        write = _tool_response(ToolCall(
+            name="write_file",
+            arguments={"path": "b.txt", "content": "x"}, id="w"))
+        llm = self._llm(read, read, write, read, _final("done"))
+        self._write_helper()
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=8)
+        # No nudge anywhere: streak never reached 3
+        for call in llm.chat.call_args_list:
+            for msg in call[0][0]:
+                if msg.role == "user":
+                    self.assertNotIn("ACT now", msg.content)
+
+    def _write_helper(self):
+        with open(os.path.join(self.root, "a.txt"), "w") as f:
+            f.write("data")
+
     def test_user_message_contains_step_task_and_context(self):
         llm = self._llm(
             _tool_response(ToolCall(name="list_files", arguments={}, id="c")),

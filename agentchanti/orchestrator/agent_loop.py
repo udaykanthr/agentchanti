@@ -74,6 +74,10 @@ def loop_stats_summary() -> str | None:
             f"{recoveries} recovery run(s), outcomes: {dict(outcomes)}")
 
 
+# Tools that inspect without changing anything — used to detect loops
+# stuck in analysis mode.
+_READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
+
 # Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
 # message, never here.
@@ -140,6 +144,7 @@ def run_agent_loop(
     definitions = tools.definitions()
     any_tool_used = False
     tool_counts: Counter = Counter()
+    read_only_streak = 0
 
     def _finish(outcome: str, turns: int,
                 result: tuple[bool, str]) -> tuple[bool, str]:
@@ -169,6 +174,24 @@ def run_agent_loop(
                                   f"Agent loop {turn}/{max_turns}: {names}")
             messages.append(response.to_message())
             messages.extend(tools.execute_all(response.tool_calls))
+            # Read-only intervention: some models settle into inspecting
+            # file after file without ever acting (observed: whole 8-turn
+            # budgets of read_file, twice in one run, even with the
+            # failing output already in context). After three consecutive
+            # inspection-only turns, tell the model to act.
+            if all(tc.name in _READ_ONLY_TOOLS for tc in response.tool_calls):
+                read_only_streak += 1
+            else:
+                read_only_streak = 0
+            if read_only_streak == 3 and turn <= max_turns - 2:
+                _logger.info("[AgentLoop] step %d: 3 read-only turns — "
+                             "injecting act-now nudge", step_idx + 1)
+                messages.append(Message(role="user", content=(
+                    "You have spent 3 consecutive turns only inspecting "
+                    "files. You have enough context — ACT now: apply the "
+                    "fix with edit_file or write_file, or run the command "
+                    "that completes this step. "
+                    f"{max_turns - turn} turn(s) remain.")))
             continue
 
         # Model stopped calling tools — it believes the step is done.
