@@ -3,8 +3,10 @@ CLI entry point — argument parsing and main execution flow.
 """
 
 import argparse
+import os
 import sys
 import time
+from datetime import datetime
 
 from ..config import Config
 from ..llm.ollama import OllamaClient
@@ -198,8 +200,37 @@ def _parse_kb_doc_titles(task: str) -> list[str]:
     return [t for t in titles if t and t.lower() not in ('none', 'n/a')]
 
 
+# Keep a module-level reference so the crash-log handle stays open for
+# the whole process — faulthandler writes to the raw fd at fault time.
+_FAULT_LOG = None
+
+
+def _arm_faulthandler() -> None:
+    """Capture native crashes (segfault/access violation) to a file.
+
+    Silent process deaths (no traceback, no exit message) have occurred
+    when native extensions were used across threads. Python-level guards
+    exist for the known cases; this makes any remaining one identify
+    itself: on a fatal signal, faulthandler dumps every thread's stack
+    to .agentchanti/crash.log.
+    """
+    global _FAULT_LOG
+    import faulthandler
+    try:
+        os.makedirs(".agentchanti", exist_ok=True)
+        _FAULT_LOG = open(os.path.join(".agentchanti", "crash.log"), "a",
+                          encoding="utf-8", errors="replace")
+        _FAULT_LOG.write(f"\n=== session start {datetime.now().isoformat()} "
+                         f"pid={os.getpid()} ===\n")
+        _FAULT_LOG.flush()
+        faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+    except OSError:
+        faulthandler.enable()  # fall back to stderr
+
+
 def main():
     install_sigint_handler()
+    _arm_faulthandler()
     try:
         _main_impl()
     except KeyboardInterrupt:
