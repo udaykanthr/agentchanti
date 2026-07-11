@@ -103,9 +103,10 @@ _TEST_FILE_RE = re.compile(
     r'(?:'
     # JS/TS: *.test.js, *.spec.tsx, etc.
     r'\.(?:test|spec)\.(?:js|jsx|ts|tsx|mjs|cjs)$'
-    # Python: test_*.py or *_test.py
+    # Python: test_*.py or *_test.py, plus Django's conventional tests.py
     r'|(?:^|[/\\])test_\w+\.py$'
     r'|\w+_test\.py$'
+    r'|(?:^|[/\\])tests\.py$'
     # Go: *_test.go
     r'|\w+_test\.go$'
     # Ruby: *_spec.rb

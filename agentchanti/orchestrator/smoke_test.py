@@ -305,6 +305,192 @@ def _attempt_fix(
     return list(fix_files.keys())
 
 
+# Django page/template verification.
+#
+# Executed with the project venv's interpreter inside the Django root.
+# argv: 1=settings module, 2=json file of [template_name, expected_path]
+# pairs, 3=comma-separated URLs to render. Exits non-zero on failures so
+# it doubles as the recovery loop's verify_cmd. ASCII-only: this source
+# is written to disk and parsed by an arbitrary interpreter.
+_DJANGO_PROBE = '''\
+import json
+import os
+import sys
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", sys.argv[1])
+import django
+django.setup()
+from django.conf import settings
+from django.template.loader import get_template
+from django.test import Client
+
+failures = []
+
+with open(sys.argv[2], encoding="utf-8") as f:
+    checks = json.load(f)
+for name, expected in checks:
+    try:
+        t = get_template(name)
+        got = os.path.realpath(t.origin.name)
+        if os.path.realpath(expected) != got:
+            failures.append(
+                "SHADOWED: template %r resolves to %s, NOT the created %s. "
+                "The created file is invisible to Django - it must live in "
+                "an app templates/ dir (APP_DIRS) or a directory listed in "
+                "TEMPLATES[0][\\'DIRS\\']." % (name, got, expected))
+    except Exception as e:
+        failures.append("UNREACHABLE: template %r cannot be loaded: %s: %s"
+                        % (name, type(e).__name__, e))
+
+if "testserver" not in settings.ALLOWED_HOSTS:
+    settings.ALLOWED_HOSTS.append("testserver")
+client = Client()
+for url in [u for u in sys.argv[3].split(",") if u]:
+    try:
+        resp = client.get(url)
+        if resp.status_code >= 500:
+            failures.append("RENDER_FAILED: GET %s -> HTTP %s"
+                            % (url, resp.status_code))
+    except Exception as e:
+        failures.append("RENDER_CRASH: GET %s raised %s: %s"
+                        % (url, type(e).__name__, e))
+
+for line in failures:
+    print(line)
+print("DJANGO_PROBE_DONE")
+sys.exit(1 if failures else 0)
+'''
+
+
+def _find_django_project_dir(memory_files: dict[str, str]) -> str | None:
+    """Directory holding manage.py for this run, or None."""
+    candidates = ["."]
+    for path in memory_files:
+        norm = path.replace("\\", "/")
+        if "/" in norm:
+            top = norm.split("/", 1)[0]
+            if top not in candidates and not top.startswith("_"):
+                candidates.append(top)
+    for cand in candidates:
+        if os.path.isfile(os.path.join(cand, "manage.py")):
+            return cand
+    return None
+
+
+def _django_settings_module(django_dir: str) -> str | None:
+    """Find the '<pkg>.settings' module inside the Django root."""
+    try:
+        for entry in os.listdir(django_dir):
+            if os.path.isfile(os.path.join(django_dir, entry, "settings.py")):
+                return f"{entry}.settings"
+    except OSError:
+        pass
+    return None
+
+
+def _django_template_checks(memory_files: dict[str, str],
+                            django_dir: str) -> list[tuple[str, str]]:
+    """(template_name, absolute_expected_path) for session template files.
+
+    The template NAME is the path after the last ``templates/`` segment —
+    what Django's loader is asked for. Pre-existing files resolve to
+    themselves and pass; a new file shadowed by an old one under the same
+    name is exactly the failure this exists to catch.
+    """
+    checks: list[tuple[str, str]] = []
+    for path in memory_files:
+        norm = path.replace("\\", "/")
+        if "/templates/" not in norm or not norm.endswith(".html"):
+            continue
+        name = norm.rsplit("/templates/", 1)[1]
+        if os.path.isfile(path):
+            checks.append((name, os.path.abspath(path)))
+    return checks
+
+
+def _run_django_verification(memory, executor, coder, display,
+                             task: str, language: str | None,
+                             cfg, django_dir: str) -> tuple[bool, str]:
+    """Ground-truth check for Django: template reachability + page render.
+
+    Catches the class of failure where a run creates template/static files
+    at paths Django never consults — every static check passes, yet the
+    rendered site is unchanged.
+    """
+    import json as _json
+    import tempfile as _tempfile
+
+    settings_module = _django_settings_module(django_dir)
+    if settings_module is None:
+        _logger.info("[SmokeTest] Django settings module not found — skipping")
+        return True, ""
+    checks = _django_template_checks(memory.all_files(), django_dir)
+
+    tmp_dir = _tempfile.mkdtemp(prefix="agentchanti_django_probe_")
+    script = os.path.join(tmp_dir, "django_probe.py")
+    checks_file = os.path.join(tmp_dir, "checks.json")
+    try:
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(_DJANGO_PROBE)
+        with open(checks_file, "w", encoding="utf-8") as f:
+            _json.dump(checks, f)
+
+        probe_cmd = (f'python "{script}" {settings_module} '
+                     f'"{checks_file}" /')
+        verify_cmd = (probe_cmd if django_dir == "."
+                      else f"cd {django_dir} && {probe_cmd}")
+        _logger.info("[SmokeTest] Django verification: %d template check(s) "
+                     "+ page render (cwd=%s)", len(checks), django_dir)
+        _show_status = getattr(display, "show_status", None)
+        if callable(_show_status):
+            _show_status("Verifying Django templates and page render...")
+        ok, out = executor.run_command(
+            probe_cmd, timeout=180,
+            cwd=None if django_dir == "." else django_dir)
+        if "DJANGO_PROBE_DONE" not in (out or ""):
+            _logger.info("[SmokeTest] Django probe did not complete — "
+                         "skipping (non-blocking): %s", (out or "")[:300])
+            return True, ""
+        if ok:
+            _logger.info("[SmokeTest] Django verification passed")
+            return True, ""
+
+        _logger.warning("[SmokeTest] Django verification FAILED:\n%s",
+                        (out or "")[:1500])
+        from .agent_loop import (
+            agent_loop_enabled, build_step_tools, run_recovery_loop,
+        )
+        llm_client = getattr(coder, "llm_client", None)
+        if agent_loop_enabled(cfg, llm_client):
+            tools = build_step_tools(executor, memory)
+            recovered, info = run_recovery_loop(
+                llm_client, tools,
+                step_text=("Make the created Django templates reachable by "
+                           "the template loader and the pages render "
+                           "without errors."),
+                task=task,
+                error_info=f"Django verification failed:\n{out}",
+                display=display, step_idx=0, language=language,
+                max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+                verify_cmd=verify_cmd)
+            if recovered:
+                _logger.info("[SmokeTest] Django verification recovered: %s",
+                             info[:200])
+                return True, ""
+            return False, f"Django verification failing: {info[:600]}"
+        return False, f"Django verification failed: {(out or '')[:800]}"
+    finally:
+        for p in (script, checks_file):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
 def _find_js_project_dir(memory_files: dict[str, str]) -> str | None:
     """Locate the directory holding package.json for this run's JS files.
 
@@ -411,6 +597,17 @@ def run_smoke_verification(
         return True, ""  # Python entry points only, for now
 
     memory_files = memory.all_files()
+
+    # Django projects have no launchable entry point, but template
+    # reachability + a test-client page render are cheap ground truth
+    # (observed: a run created 7 template/static files at paths Django
+    # never consults — green pipeline, unchanged site).
+    _django_dir = _find_django_project_dir(memory_files)
+    if _django_dir is not None:
+        return _run_django_verification(
+            memory, executor, coder, display, task, language, cfg,
+            _django_dir)
+
     entry = find_python_entrypoint(memory_files)
     if not entry:
         _logger.info("[SmokeTest] No runnable Python entry point — skipping")

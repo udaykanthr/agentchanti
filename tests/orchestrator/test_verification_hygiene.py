@@ -18,7 +18,11 @@ from agentchanti.orchestrator.api_grounding import (
     get_installed_package_versions,
 )
 from agentchanti.orchestrator.smoke_test import (
+    _django_settings_module,
+    _django_template_checks,
+    _find_django_project_dir,
     _find_js_project_dir,
+    _run_django_verification,
     run_smoke_verification,
 )
 
@@ -266,6 +270,107 @@ class TestNpmGrounding(unittest.TestCase):
             executor=executor, language="python")
         self.assertEqual(versions, {"pytest": "9.1.1"})
         self.assertIn("pip list", executor.run_command.call_args[0][0])
+
+
+class TestDjangoVerification(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="djv_")
+        self.prev = os.getcwd()
+        os.chdir(self.root)
+
+    def tearDown(self):
+        os.chdir(self.prev)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _seed_django(self, sub="user_portal"):
+        os.makedirs(f"{sub}/config", exist_ok=True)
+        open(f"{sub}/manage.py", "w").write("#!/usr/bin/env python\n")
+        open(f"{sub}/config/settings.py", "w").write("DEBUG = True\n")
+        return sub
+
+    def test_find_django_project_dir(self):
+        sub = self._seed_django()
+        files = {f"{sub}/accounts/views.py": "x"}
+        self.assertEqual(_find_django_project_dir(files), sub)
+        self.assertIsNone(_find_django_project_dir({"other/x.py": "x"}))
+
+    def test_settings_module_discovery(self):
+        sub = self._seed_django()
+        self.assertEqual(_django_settings_module(sub), "config.settings")
+        self.assertIsNone(_django_settings_module("."))
+
+    def test_template_checks_derive_loader_names(self):
+        sub = self._seed_django()
+        paths = [
+            f"{sub}/templates/accounts/partials/header.html",
+            f"{sub}/accounts/templates/accounts/home.html",
+        ]
+        for p in paths:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w").write("<html/>")
+        files = {p: "<html/>" for p in paths}
+        files[f"{sub}/static/css/home.css"] = "css"  # not a template
+        checks = dict(_django_template_checks(files, sub))
+        self.assertEqual(set(checks), {"accounts/partials/header.html",
+                                       "accounts/home.html"})
+        self.assertTrue(checks["accounts/home.html"].endswith("home.html"))
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "moved templates into app dir"))
+    def test_probe_failure_triggers_recovery(self, mock_rec):
+        sub = self._seed_django()
+        memory = MagicMock()
+        memory.all_files.return_value = {}
+        executor = MagicMock()
+        executor.run_command.return_value = (
+            False, "SHADOWED: template 'accounts/home.html' resolves to "
+                   "old path\nDJANGO_PROBE_DONE")
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        coder = MagicMock()
+        coder.llm_client.supports_tools.return_value = True
+        ok, _ = _run_django_verification(
+            memory, executor, coder, MagicMock(), "task", "python", cfg, sub)
+        self.assertTrue(ok)
+        mock_rec.assert_called_once()
+        self.assertIn("SHADOWED", mock_rec.call_args[1]["error_info"])
+        self.assertIn(f"cd {sub} &&", mock_rec.call_args[1]["verify_cmd"])
+
+    def test_probe_pass_returns_ok(self):
+        sub = self._seed_django()
+        memory = MagicMock()
+        memory.all_files.return_value = {}
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "DJANGO_PROBE_DONE")
+        ok, err = _run_django_verification(
+            memory, executor, MagicMock(), MagicMock(), "task", "python",
+            MagicMock(), sub)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_incomplete_probe_is_nonblocking(self):
+        sub = self._seed_django()
+        memory = MagicMock()
+        memory.all_files.return_value = {}
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "ImportError: django")
+        ok, _ = _run_django_verification(
+            memory, executor, MagicMock(), MagicMock(), "task", "python",
+            MagicMock(), sub)
+        self.assertTrue(ok)
+
+
+class TestDjangoTestsPyRecognized(unittest.TestCase):
+
+    def test_tests_py_is_a_test_file(self):
+        from agentchanti.orchestrator.pipeline import _is_test_file
+        self.assertTrue(_is_test_file("user_portal/accounts/tests.py"))
+        self.assertTrue(_is_test_file("accounts\\tests.py"))
+        self.assertFalse(_is_test_file("accounts/forms.py"))
+        # 'contests.py' must not match
+        self.assertFalse(_is_test_file("app/contests.py"))
 
 
 class TestJsBuildVerification(unittest.TestCase):
