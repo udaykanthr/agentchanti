@@ -362,6 +362,66 @@ class TestDjangoVerification(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestParserThreadSafety(unittest.TestCase):
+    """tree_sitter.Parser is stateful native code — one instance per thread."""
+
+    def test_each_thread_gets_its_own_parser(self):
+        import threading
+        from agentchanti.kb.local.parser import _get_ts_parser
+
+        results = {}
+
+        def grab(tid):
+            # Keep strong references: without them a finished thread's
+            # parser is freed and a later allocation can reuse its id.
+            p1 = _get_ts_parser("python")
+            p2 = _get_ts_parser("python")
+            results[tid] = (p1, p2)
+
+        threads = [threading.Thread(target=grab, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        if any(p1 is None for p1, _ in results.values()):
+            self.skipTest("tree-sitter python grammar not available")
+        # Cached within a thread…
+        for p1, p2 in results.values():
+            self.assertIs(p1, p2)
+        # …but never shared across threads.
+        distinct = {id(p1) for p1, _ in results.values()}
+        self.assertEqual(len(distinct), len(results))
+
+
+class TestStepVerifyDjangoInconclusive(unittest.TestCase):
+    """Django app modules that need app context are not load failures."""
+
+    def _run(self, output):
+        from agentchanti.orchestrator.step_verify import verify_step_files
+        executor = MagicMock()
+        executor.run_command.return_value = (False, output)
+        return verify_step_files(
+            {"accounts/views.py": "from django.shortcuts import render"},
+            "python", executor)
+
+    def test_app_registry_not_ready_is_inconclusive(self):
+        self.assertEqual(
+            self._run("raise AppRegistryNotReady(...)\n"
+                      "django.core.exceptions.AppRegistryNotReady: Apps "
+                      "aren't loaded yet."), [])
+
+    def test_improperly_configured_is_inconclusive(self):
+        self.assertEqual(
+            self._run("ImproperlyConfigured: Requested setting "
+                      "INSTALLED_APPS, but settings are not configured."), [])
+
+    def test_real_import_error_still_reported(self):
+        errors = self._run("ModuleNotFoundError: No module named 'flask'")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("fails to load", errors[0])
+
+
 class TestDjangoTestsPyRecognized(unittest.TestCase):
 
     def test_tests_py_is_a_test_file(self):

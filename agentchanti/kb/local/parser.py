@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -175,7 +176,12 @@ def _get_lang_func(language: str):
 
 # Cache Language objects to avoid repeated construction
 _LANG_CACHE: dict[str, object] = {}
-_PARSER_CACHE: dict[str, object] = {}
+# Parsers are cached PER THREAD: tree_sitter.Parser is a stateful native
+# object and is not thread-safe. The KB watcher thread parses files
+# concurrently with pipeline wave threads — a shared parser corrupts
+# memory and kills the interpreter silently (no traceback, observed
+# twice mid-run). Language objects are immutable and safe to share.
+_thread_local = threading.local()
 
 
 def _get_ts_language(language: str):
@@ -203,17 +209,20 @@ def _get_ts_parser(language: str):
     """
     Return a tree-sitter Parser configured for *language*, or None.
 
-    Caches parsers for performance.
+    Caches parsers per thread — see the note at ``_thread_local``.
     """
-    if language in _PARSER_CACHE:
-        return _PARSER_CACHE[language]
+    cache = getattr(_thread_local, "parsers", None)
+    if cache is None:
+        cache = _thread_local.parsers = {}
+    if language in cache:
+        return cache[language]
     try:
         import tree_sitter as ts  # type: ignore
         lang_obj = _get_ts_language(language)
         if lang_obj is None:
             return None
         parser = ts.Parser(lang_obj)
-        _PARSER_CACHE[language] = parser
+        cache[language] = parser
         return parser
     except Exception as exc:
         logger.warning("Cannot create tree-sitter parser for %s: %s", language, exc)

@@ -142,6 +142,16 @@ def verify_step_files(
             _logger.debug("[StepVerify] %s could not run: %s", cmd, exc)
             continue
         if not ok:
+            # Django app modules refuse to import outside an app context
+            # (settings not configured / app registry not ready). That is
+            # framework behavior, not a broken file — manage.py-driven
+            # checks and tests cover these modules instead.
+            if ("AppRegistryNotReady" in (out or "")
+                    or "ImproperlyConfigured" in (out or "")):
+                _logger.debug(
+                    "[StepVerify] %s needs app context (Django) — "
+                    "inconclusive, skipping", path)
+                continue
             tail = "\n".join((out or "").strip().splitlines()[-12:])
             errors.append(
                 f"`{path}` fails to load in the project environment "
