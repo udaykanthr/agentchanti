@@ -317,6 +317,9 @@ import json
 import os
 import sys
 
+# `python <script>` puts the SCRIPT dir on sys.path, not the cwd -- the
+# settings package lives in the cwd (the Django project root).
+sys.path.insert(0, os.getcwd())
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", sys.argv[1])
 import django
 django.setup()
