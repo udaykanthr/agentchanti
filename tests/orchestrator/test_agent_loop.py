@@ -273,10 +273,24 @@ class TestLoopTelemetry(AgentLoopTestCase):
 class TestVerifyCmdForLanguage(unittest.TestCase):
 
     def test_python_default(self):
-        self.assertEqual(verify_cmd_for_language("python"),
-                         "python -m pytest -q")
-        self.assertEqual(verify_cmd_for_language(None),
-                         "python -m pytest -q")
+        root = tempfile.mkdtemp(prefix="vcl_")
+        try:
+            self.assertEqual(verify_cmd_for_language("python", root),
+                             "python -m pytest -q")
+            self.assertEqual(verify_cmd_for_language(None, root),
+                             "python -m pytest -q")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_python_django_project_uses_manage_py(self):
+        root = tempfile.mkdtemp(prefix="vcl_")
+        try:
+            with open(f"{root}/manage.py", "w") as f:
+                f.write("#!/usr/bin/env python\n")
+            self.assertEqual(verify_cmd_for_language("python", root),
+                             "python manage.py test --noinput")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_go(self):
         self.assertEqual(verify_cmd_for_language("go"), "go test ./...")

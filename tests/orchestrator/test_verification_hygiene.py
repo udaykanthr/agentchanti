@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from agentchanti.orchestrator.pipeline import (
     _WIRING_MAX_FILE_CHARS,
     _missing_js_packages,
+    _resolve_existing_by_basename,
     _sanitize_wiring_context,
 )
 from agentchanti.orchestrator.api_grounding import (
@@ -56,6 +57,57 @@ class TestSanitizeWiringContext(unittest.TestCase):
         ctx = {"scripts/build.py": "print(1)", "build/out.js": "x"}
         clean = _sanitize_wiring_context(ctx)
         self.assertEqual(list(clean.keys()), ["scripts/build.py"])
+
+
+class TestResolveExistingByBasename(unittest.TestCase):
+    """Phantom plan paths must retarget to the real file, or refuse."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="rebb_")
+        self.prev = os.getcwd()
+        os.chdir(self.root)
+        self.memory = MagicMock()
+        self.memory.all_files.return_value = {}
+
+    def tearDown(self):
+        os.chdir(self.prev)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _write(self, rel):
+        os.makedirs(os.path.dirname(rel) or ".", exist_ok=True)
+        with open(rel, "w") as f:
+            f.write("x = 1\n")
+
+    def test_django_dot_layout_retargets(self):
+        # Plan said project/project/urls.py; reality is project/urls.py
+        self._write("project/urls.py")
+        self.assertEqual(
+            _resolve_existing_by_basename(r"project\project\urls.py",
+                                          self.memory),
+            "project/urls.py")
+
+    def test_memory_match_preferred(self):
+        self._write("app/settings.py")
+        self.memory.all_files.return_value = {"app\\settings.py": "..."}
+        self.assertEqual(
+            _resolve_existing_by_basename("wrong/place/settings.py",
+                                          self.memory),
+            "app/settings.py")
+
+    def test_ambiguous_returns_none(self):
+        self._write("a/urls.py")
+        self._write("b/urls.py")
+        self.assertIsNone(
+            _resolve_existing_by_basename("wrong/urls.py", self.memory))
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(
+            _resolve_existing_by_basename("no/such/file.py", self.memory))
+
+    def test_vendor_dirs_ignored(self):
+        self._write("venv/Lib/urls.py")
+        self.assertIsNone(
+            _resolve_existing_by_basename("wrong/urls.py", self.memory))
 
 
 class TestMissingJsPackages(unittest.TestCase):

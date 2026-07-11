@@ -241,6 +241,11 @@ def verify_cmd_for_language(language: str | None,
 
     lang = (language or "python").lower()
     if lang == "python":
+        # Django projects test through manage.py — pytest is usually not
+        # even installed there, so a pytest verifier fails regardless of
+        # the app's real state (mirrors BulkTest's Django detection).
+        if os.path.isfile(os.path.join(project_root, "manage.py")):
+            return "python manage.py test --noinput"
         return "python -m pytest -q"
     if lang in ("javascript", "typescript"):
         # Only trust `npm test` when the project actually defines it;

@@ -29,6 +29,46 @@ _logger = logging.getLogger(__name__)
 MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
 
 
+_RESOLVE_SKIP_DIRS = frozenset({
+    "node_modules", "venv", ".venv", "__pycache__", ".git",
+    ".agentchanti", "dist", "build",
+})
+
+
+def _resolve_existing_by_basename(declared: str, memory) -> str | None:
+    """Find the real on-disk file a plan-declared path refers to.
+
+    Planners routinely declare paths for the wrong scaffold layout (e.g.
+    ``project/project/urls.py`` when ``django-admin startproject X .``
+    actually created ``project/urls.py``). When the declared path does
+    not exist, look for existing files with the same basename — in
+    session memory first, then on disk. Returns the single unambiguous
+    match, or None (missing or ambiguous — caller must not guess).
+    """
+    import os
+
+    basename = os.path.basename(declared.replace("\\", "/"))
+    candidates: set[str] = set()
+
+    for mem_path in memory.all_files():
+        norm = mem_path.replace("\\", "/")
+        if norm.rsplit("/", 1)[-1] == basename and os.path.isfile(mem_path):
+            candidates.add(norm)
+
+    if not candidates:
+        for dirpath, dirnames, filenames in os.walk("."):
+            dirnames[:] = [d for d in dirnames
+                           if d not in _RESOLVE_SKIP_DIRS
+                           and not d.startswith(".")]
+            if basename in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, basename))
+                candidates.add(rel.replace("\\", "/"))
+
+    if len(candidates) == 1:
+        return candidates.pop()
+    return None
+
+
 def _try_trivial_close(
     partial: dict[str, str],
     language: str | None,
@@ -1691,6 +1731,31 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 if _kf.endswith(_ie_path) or _ie_path.endswith(_os_inline_fb.path.basename(_kf)):
                                     _ie_resolved = _kf
                                     break
+                            # An edit: block targets an EXISTING file. If the
+                            # declared path doesn't exist the planner assumed
+                            # the wrong scaffold layout — writing there would
+                            # create a dead file (e.g. project/project/urls.py
+                            # that Django never loads) while the real target
+                            # stays unedited. Retarget by basename when
+                            # unambiguous; otherwise skip promotion so the
+                            # step falls through to the coder/agent loop.
+                            if not _os_inline_fb.path.exists(_ie_resolved):
+                                _reresolved = _resolve_existing_by_basename(
+                                    _ie_resolved, memory)
+                                if _reresolved is not None:
+                                    _logger.info(
+                                        "[InlineEdit] Declared edit target %s "
+                                        "does not exist — retargeting to "
+                                        "existing %s", _ie_resolved, _reresolved)
+                                    _ie_resolved = _reresolved
+                                else:
+                                    _logger.warning(
+                                        "[InlineEdit] Declared edit target %s "
+                                        "does not exist and no unambiguous "
+                                        "same-name file found — not promoting "
+                                        "REPLACE (would create a dead file at "
+                                        "a phantom path)", _ie_resolved)
+                                    continue
                             # Collect ALL REPLACE blocks for this file and
                             # concatenate them in order.  Plans often split
                             # a file into multiple FIND/REPLACE pairs (e.g.
