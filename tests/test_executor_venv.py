@@ -47,6 +47,28 @@ class TestVenvBinDir:
         _make_fake_venv(tmp_path, ".venv")
         assert Executor._venv_bin_dir(str(tmp_path)) == os.path.abspath(bin_dir)
 
+    def test_finds_single_subproject_venv(self, tmp_path):
+        # Scaffolded project one level down: probes run from the pipeline
+        # root but the venv lives in user_portal/venv.
+        sub = tmp_path / "user_portal"
+        sub.mkdir()
+        bin_dir = _make_fake_venv(sub, "venv")
+        assert Executor._venv_bin_dir(str(tmp_path)) == os.path.abspath(bin_dir)
+
+    def test_direct_venv_wins_over_subproject(self, tmp_path):
+        bin_dir = _make_fake_venv(tmp_path, "venv")
+        sub = tmp_path / "app"
+        sub.mkdir()
+        _make_fake_venv(sub, "venv")
+        assert Executor._venv_bin_dir(str(tmp_path)) == os.path.abspath(bin_dir)
+
+    def test_ambiguous_subproject_venvs_return_none(self, tmp_path):
+        for name in ("app_a", "app_b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            _make_fake_venv(sub, "venv")
+        assert Executor._venv_bin_dir(str(tmp_path)) is None
+
     def test_ignores_venv_dir_without_python(self, tmp_path):
         # A half-created or foreign 'venv' folder must not hijack PATH
         sub = "Scripts" if os.name == 'nt' else "bin"

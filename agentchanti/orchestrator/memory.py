@@ -198,6 +198,10 @@ class FileMemory:
         to_embed: list[tuple[str, str]] = []
         with self._lock:
             for fpath, content in files.items():
+                # Normalise separators: writers vary ('/' from the pipeline,
+                # '\\' from tool loops) and un-normalised keys track the
+                # same file twice, double-reporting every DepCheck finding.
+                fpath = fpath.replace("\\", "/")
                 basename = os.path.basename(fpath)
                 if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(fpath):
                     log.warning(f"[FileMemory] Skipping protected file update: "
@@ -226,10 +230,11 @@ class FileMemory:
 
     def get(self, filepath: str) -> str | None:
         with self._lock:
-            return self._files.get(filepath)
+            return self._files.get(filepath.replace("\\", "/"))
 
     def delete(self, filepath: str) -> None:
         """Remove a tracked file from memory (e.g., after path correction)."""
+        filepath = filepath.replace("\\", "/")
         with self._lock:
             self._files.pop(filepath, None)
             self._skeleton_cache.pop(filepath, None)

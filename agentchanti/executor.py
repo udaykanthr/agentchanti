@@ -909,17 +909,42 @@ class Executor:
 
         Only returns a directory that actually contains a python executable,
         so a half-created or foreign 'venv' folder is ignored.
+
+        Scaffolded projects often live one level down (a CMD step ran
+        ``mkdir user_portal && cd user_portal && python -m venv venv``)
+        while probes and verification commands run from the pipeline root.
+        When no venv exists directly under *cwd*, look one directory level
+        deeper — otherwise every import probe resolves to the system
+        interpreter and reports the project's own packages as missing.
         """
         root = cwd or os.getcwd()
         if os.name == 'nt':
             sub, py = "Scripts", "python.exe"
         else:
             sub, py = "bin", "python"
-        for name in ("venv", ".venv"):
-            bin_dir = os.path.join(root, name, sub)
-            if os.path.isfile(os.path.join(bin_dir, py)):
-                return os.path.abspath(bin_dir)
-        return None
+
+        def _check(base: str) -> str | None:
+            for name in ("venv", ".venv"):
+                bin_dir = os.path.join(base, name, sub)
+                if os.path.isfile(os.path.join(bin_dir, py)):
+                    return os.path.abspath(bin_dir)
+            return None
+
+        found = _check(root)
+        if found:
+            return found
+        try:
+            subdirs = [
+                os.path.join(root, d) for d in os.listdir(root)
+                if not d.startswith(".")
+                and d not in ("node_modules", "venv", ".venv", "__pycache__")
+                and os.path.isdir(os.path.join(root, d))
+            ]
+        except OSError:
+            return None
+        hits = [h for h in (_check(d) for d in subdirs) if h]
+        # Only trust an unambiguous single sub-project venv.
+        return hits[0] if len(hits) == 1 else None
 
     @staticmethod
     def _inject_venv_path(run_env: dict, cwd: str | None = None) -> None:

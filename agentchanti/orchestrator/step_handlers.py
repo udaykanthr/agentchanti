@@ -1936,8 +1936,28 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             _m = _pat.search(cmd)
             if _m:
                 _candidate = _m.group(1).strip().rstrip('/')
-                # Resolve sentinel path: for `.` target use cwd, else subdir
+                # `startproject NAME .` (and friends) place files in the
+                # CURRENT directory, not NAME/ — an explicit `.` target
+                # after the name overrides the name as the location.
+                _after_toks = cmd[_m.end():].split()
+                if _after_toks and _after_toks[0] in ('.', './'):
+                    _candidate = '.'
+                # The command may carry `cd <dir> &&` prefixes (e.g.
+                # `mkdir user_portal && cd user_portal && django-admin ...`)
+                # — the scaffold ran inside that directory, so the sentinel
+                # lives there too. Without this the check looked for
+                # ./config/manage.py while reality was user_portal/manage.py,
+                # flagging a successful scaffold as failed on every run.
+                _cd_dirs = [
+                    d.strip().strip('"').rstrip('/\\')
+                    for d in re.findall(
+                        r'(?:^|&&)\s*cd\s+("[^"]+"|[^&|;]+?)\s*(?:&&|\|\||;)',
+                        cmd[:_m.start()])
+                ]
                 _base = subproject_cwd or '.'
+                for _cd in _cd_dirs:
+                    if _cd not in ('.', './'):
+                        _base = os.path.join(_base, _cd)
                 if _candidate in ('.', './', ''):
                     _sentinel_path = os.path.join(_base, _sentinel)
                 else:
@@ -1950,9 +1970,13 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                     )
                     success = False
                 elif not getattr(memory, '_scaffolded_subproject', None):
+                    _marker_parts = [d for d in _cd_dirs if d not in ('.', './')]
                     if _candidate not in ('.', './', '') and not _candidate.startswith('./'):
-                        memory._scaffolded_subproject = _candidate
-                        log.info(f"[Scaffold] Marked '{_candidate}' as freshly "
+                        _marker_parts.append(_candidate)
+                    if _marker_parts:
+                        _marker = "/".join(_marker_parts)
+                        memory._scaffolded_subproject = _marker
+                        log.info(f"[Scaffold] Marked '{_marker}' as freshly "
                                  f"scaffolded — hazard check skipped on first write")
                 break
 
