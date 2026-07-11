@@ -408,6 +408,9 @@ class TestStepHandlerIntegration(unittest.TestCase):
         agent.llm_client.supports_tools.return_value = True
         memory = MagicMock()
         memory.summary.return_value = "files: none"
+        # Keep subproject detection out of play for the gate tests
+        memory._scaffolded_subproject = None
+        memory.all_files.return_value = {}
         return cfg, agent, memory, MagicMock()  # display
 
     @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
@@ -427,12 +430,19 @@ class TestStepHandlerIntegration(unittest.TestCase):
     def test_test_step_delegates_with_verify_cmd(self, mock_loop):
         from agentchanti.orchestrator.step_handlers import _handle_test_step
         cfg, tester, memory, display = self._common()
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "1 failed: assert x")
         result = _handle_test_step(
-            "write tests", tester, MagicMock(), MagicMock(), MagicMock(),
+            "write tests", tester, MagicMock(), MagicMock(), executor,
             "task", memory, display, 0, language="python", cfg=cfg)
         self.assertEqual(result, (True, "loop ran"))
         self.assertEqual(mock_loop.call_args[1]["verify_cmd"],
                          "python -m pytest -q")
+        # The loop is grounded in the pre-run verify output + exit criterion
+        ctx = mock_loop.call_args[1]["context"]
+        self.assertIn("Current test status (FAILING)", ctx)
+        self.assertIn("1 failed: assert x", ctx)
+        self.assertIn("complete ONLY when", ctx)
 
 
 if __name__ == "__main__":

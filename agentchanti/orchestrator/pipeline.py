@@ -50,19 +50,23 @@ def _resolve_existing_by_basename(declared: str, memory) -> str | None:
     basename = os.path.basename(declared.replace("\\", "/"))
     candidates: set[str] = set()
 
+    # Memory and disk must be considered TOGETHER: session memory only
+    # knows files this run wrote, so a memory-first shortcut retargets to
+    # the session file even when a scaffold-created file with the same
+    # basename (e.g. the real root urls.py) also exists on disk — exactly
+    # the ambiguity that must refuse instead of guess.
     for mem_path in memory.all_files():
         norm = mem_path.replace("\\", "/")
         if norm.rsplit("/", 1)[-1] == basename and os.path.isfile(mem_path):
             candidates.add(norm)
 
-    if not candidates:
-        for dirpath, dirnames, filenames in os.walk("."):
-            dirnames[:] = [d for d in dirnames
-                           if d not in _RESOLVE_SKIP_DIRS
-                           and not d.startswith(".")]
-            if basename in filenames:
-                rel = os.path.relpath(os.path.join(dirpath, basename))
-                candidates.add(rel.replace("\\", "/"))
+    for dirpath, dirnames, filenames in os.walk("."):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _RESOLVE_SKIP_DIRS
+                       and not d.startswith(".")]
+        if basename in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, basename))
+            candidates.add(rel.replace("\\", "/").removeprefix("./"))
 
     if len(candidates) == 1:
         return candidates.pop()
@@ -2783,8 +2787,12 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             return False
         display.step_info(step_idx, "Agent loop: recovering from failure")
         _rec_step_type = display.steps[step_idx].get("type", "CODE")
-        _rec_verify = (verify_cmd_for_language(language)
-                       if _rec_step_type == "TEST" else None)
+        _rec_verify = None
+        if _rec_step_type == "TEST":
+            _rec_sub = _detect_subproject_root(memory)
+            _rec_verify = verify_cmd_for_language(language, _rec_sub or ".")
+            if _rec_verify and _rec_sub:
+                _rec_verify = f"cd {_rec_sub} && {_rec_verify}"
         _rec_tools = build_step_tools(
             executor, memory, kb_context_builder=kb_context_builder)
         recovered, rec_info = run_recovery_loop(

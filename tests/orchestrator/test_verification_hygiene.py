@@ -86,13 +86,24 @@ class TestResolveExistingByBasename(unittest.TestCase):
                                           self.memory),
             "project/urls.py")
 
-    def test_memory_match_preferred(self):
+    def test_memory_and_disk_agree_on_single_file(self):
         self._write("app/settings.py")
         self.memory.all_files.return_value = {"app\\settings.py": "..."}
         self.assertEqual(
             _resolve_existing_by_basename("wrong/place/settings.py",
                                           self.memory),
             "app/settings.py")
+
+    def test_memory_file_plus_scaffold_file_is_ambiguous(self):
+        # Session memory knows only accounts/urls.py; the scaffold's real
+        # root urls.py exists on disk. Retargeting must refuse — guessing
+        # here previously wired the root URLconf edit into the app file.
+        self._write("proj/accounts/urls.py")
+        self._write("proj/proj/urls.py")
+        self.memory.all_files.return_value = {
+            "proj/accounts/urls.py": "..."}
+        self.assertIsNone(
+            _resolve_existing_by_basename("proj/urls.py", self.memory))
 
     def test_ambiguous_returns_none(self):
         self._write("a/urls.py")

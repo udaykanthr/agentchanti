@@ -4747,15 +4747,36 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                                  kb_context_builder=kb_context_builder)
         # Deterministic exit: the model's "done" claim is only accepted
         # once the test suite actually passes (when a trustworthy test
-        # command exists for the language).
+        # command exists for the language). The project may live in a
+        # scaffolded subdirectory — detect it so manage.py/package.json
+        # are found and the command runs in the right cwd.
         from .agent_loop import verify_cmd_for_language
-        verify_cmd = verify_cmd_for_language(language)
+        _vsub = _detect_subproject_root(memory)
+        verify_cmd = verify_cmd_for_language(language, _vsub or ".")
+        if verify_cmd and _vsub:
+            verify_cmd = f"cd {_vsub} && {verify_cmd}"
+
+        # Ground the loop in the CURRENT test status: without this the
+        # model tends to spend its whole turn budget reading files
+        # (observed twice: 8 turns of read_file, zero commands run).
+        # Seeing the failing output — and the exact exit criterion —
+        # up front turns the loop into a fix loop instead of a tour.
+        loop_context = memory.summary()
+        if verify_cmd:
+            _pre_ok, _pre_out = executor.run_command(verify_cmd, timeout=300)
+            _status = "PASSING" if _pre_ok else "FAILING"
+            loop_context += (
+                f"\n\nCurrent test status ({_status}) from `{verify_cmd}`:\n"
+                f"{(_pre_out or '(no output)')[-1500:]}\n\n"
+                f"This step is complete ONLY when `{verify_cmd}` exits "
+                f"successfully — it will be run to verify your work.")
+
         return run_agent_loop(
             tester.llm_client, tools, step_text, task,
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
-            context=memory.summary(),
+            context=loop_context,
         )
 
     # Detect sub-project (if the test targets a nested folder)
