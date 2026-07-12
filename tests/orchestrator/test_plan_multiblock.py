@@ -42,6 +42,31 @@ content:
 """
 
 
+class TestTargetPathNormalization(unittest.TestCase):
+    """Planner-emitted doubled backslashes must not survive parsing."""
+
+    def test_doubled_backslash_targets_normalized(self):
+        plan = (
+            "==PLAN==\n\n"
+            "--STEP 1.1 [CODE] depends:none\n"
+            "Create template\n"
+            "target: main\\\\templates\\\\main\\\\base.html, spacious_site\\\\settings.py\n"
+            "content:\n"
+            "```html\n<p>x</p>\n```\n"
+            "---file-content-end---\n\n"
+            "==END==\n"
+        )
+        from agentchanti.orchestrator.plan_step import parse_structured_plan
+        steps = parse_structured_plan(plan)
+        self.assertEqual(steps[0].target_files,
+                         ["main/templates/main/base.html",
+                          "spacious_site/settings.py"])
+        # inline code keys derive from targets — no backslashes anywhere
+        for key in steps[0].inline_code:
+            self.assertNotIn("\\", key)
+            self.assertNotIn("//", key)
+
+
 class TestMultiBlockContentCapture(unittest.TestCase):
 
     def test_all_blocks_captured(self):

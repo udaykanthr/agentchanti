@@ -567,6 +567,11 @@ class Executor:
         written_basenames: dict[str, str] = {}  # basename → full relative path
 
         for filename, content in files.items():
+            # Normalise separators before touching the filesystem: planner
+            # output sometimes carries doubled backslashes, which Windows
+            # silently collapses but Linux treats as literal characters in
+            # a single (broken) filename.
+            filename = re.sub(r"[\\/]+", "/", filename)
             filepath = os.path.join(base_dir, filename)
             dirpath = os.path.dirname(filepath)
 
@@ -576,7 +581,7 @@ class Executor:
             # Hard block: never write internal memory-only paths to disk.
             # These are in-memory tracking entries (_cmd_output/, etc.)
             # that should never appear in the project directory.
-            _norm_filename = filename.replace("\\", "/")
+            _norm_filename = filename
             if _norm_filename.startswith((
                     "_cmd_output/", "_fix_output/", "_search_context/")):
                 continue

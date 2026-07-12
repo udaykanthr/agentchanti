@@ -402,12 +402,14 @@ def _django_template_checks(memory_files: dict[str, str],
     """
     checks: list[tuple[str, str]] = []
     for path in memory_files:
-        norm = path.replace("\\", "/")
+        # Collapse duplicate separators — malformed keys otherwise derive
+        # loader names like '/main//base.html' that fail for a working app.
+        norm = re.sub(r"/+", "/", path.replace("\\", "/"))
         if "/templates/" not in norm or not norm.endswith(".html"):
             continue
-        name = norm.rsplit("/templates/", 1)[1]
-        if os.path.isfile(path):
-            checks.append((name, os.path.abspath(path)))
+        name = norm.rsplit("/templates/", 1)[1].lstrip("/")
+        if name and os.path.isfile(norm):
+            checks.append((name, os.path.abspath(norm)))
     return checks
 
 

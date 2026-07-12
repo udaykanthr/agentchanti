@@ -206,7 +206,9 @@ class FileMemory:
                 # Normalise separators: writers vary ('/' from the pipeline,
                 # '\\' from tool loops) and un-normalised keys track the
                 # same file twice, double-reporting every DepCheck finding.
-                fpath = fpath.replace("\\", "/")
+                # Collapse duplicate slashes too — planner-emitted doubled
+                # backslashes otherwise become 'main//templates//...' keys.
+                fpath = re.sub(r"/+", "/", fpath.replace("\\", "/"))
                 basename = os.path.basename(fpath)
                 if (basename in Executor._PROTECTED_FILENAMES
                         and os.path.isfile(fpath)

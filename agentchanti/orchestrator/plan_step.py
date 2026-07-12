@@ -260,6 +260,18 @@ _STEP_RE = re.compile(
 )
 
 
+def _norm_target_path(path: str) -> str:
+    """Normalise a planner-emitted file path.
+
+    Planners sometimes emit doubled backslashes (``main\\\\templates\\...``)
+    or mixed separators. Left raw, these survive into memory keys as
+    ``main//templates//...`` and poison every downstream consumer (the
+    Django probe derived template names like ``/main//base.html`` and
+    failed verification against a working app).
+    """
+    return re.sub(r"[\\/]+", "/", path.strip()).lstrip("./")
+
+
 def parse_structured_plan(text: str) -> list[PlanStep]:
     """Parse the line-based structured plan format into PlanStep objects.
 
@@ -343,7 +355,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 if current is not None and (_edit_find_lines or _edit_replace_lines):
                     _find_str = "\n".join(_edit_find_lines)
                     _repl_str = "\n".join(_edit_replace_lines)
-                    _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+                    _tgt = _norm_target_path(
+                        _edit_target or (current.target_files[0]
+                                         if current.target_files else ""))
                     if _tgt:
                         current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
                 # Stay in edit block — there may be more <<<FIND>>>...<<<END>>> pairs.
@@ -468,7 +482,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             if _bare_lower.startswith("target:"):
                 raw = _bare[7:].strip()
                 if raw:
-                    current.target_files = [f.strip() for f in raw.split(",") if f.strip()]
+                    current.target_files = [
+                        _norm_target_path(f) for f in raw.split(",")
+                        if f.strip()]
                 continue
             elif _bare_lower.startswith("exports:"):
                 raw = _bare[8:].strip()
@@ -543,7 +559,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         elif line.lower().startswith("target:"):
             raw = line[7:].strip()
             if raw:
-                current.target_files = [f.strip() for f in raw.split(",") if f.strip()]
+                current.target_files = [
+                    _norm_target_path(f) for f in raw.split(",")
+                    if f.strip()]
 
         # Exports
         elif line.lower().startswith("exports:"):
@@ -646,7 +664,9 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             if l.strip() and not l.strip().startswith("---")
         ]
         if _find_meaningful:
-            _tgt = _edit_target or (current.target_files[0] if current.target_files else "")
+            _tgt = _norm_target_path(
+                _edit_target or (current.target_files[0]
+                                 if current.target_files else ""))
             if _tgt:
                 current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
 
