@@ -184,17 +184,22 @@ class FileMemory:
         # looked, without tracking each path individually.
         self._version: int = 0
 
-    def update(self, files: dict[str, str]):
+    def update(self, files: dict[str, str],
+               allow_protected: "set[str] | None" = None):
         """Store or overwrite file contents and update embeddings.
 
         Protected manifest files (package.json, go.mod, etc.) are skipped
         when they already exist on disk to prevent LLM-generated corruption.
+        ``allow_protected`` exempts paths whose content came from an
+        exact-match edit of the real file (mirrors Executor.write_files).
 
         Embedding is done in a background thread so it never blocks the
         pipeline (the LLM server may be busy with code generation).
         """
         from ..executor import Executor
 
+        _allowed = {p.replace("\\", "/").lstrip("./")
+                    for p in (allow_protected or ())}
         to_embed: list[tuple[str, str]] = []
         with self._lock:
             for fpath, content in files.items():
@@ -203,7 +208,9 @@ class FileMemory:
                 # same file twice, double-reporting every DepCheck finding.
                 fpath = fpath.replace("\\", "/")
                 basename = os.path.basename(fpath)
-                if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(fpath):
+                if (basename in Executor._PROTECTED_FILENAMES
+                        and os.path.isfile(fpath)
+                        and fpath.lstrip("./") not in _allowed):
                     log.warning(f"[FileMemory] Skipping protected file update: "
                                 f"{fpath} (already exists on disk)")
                     continue

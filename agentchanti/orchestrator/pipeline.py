@@ -1715,6 +1715,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                     # Promote the patched content into inline_code so the
                     # existing quality gate below handles writing + validation.
                     plan_step.inline_code[_resolved] = _patched
+                    # The patch applied against the file's REAL current
+                    # content — mark it grounded so the protected-manifest
+                    # write guard lets it through (editing package.json is
+                    # sometimes the whole task; a skipped write previously
+                    # reported success while changing nothing).
+                    _ge = getattr(plan_step, "_grounded_edit_targets", None)
+                    if _ge is None:
+                        _ge = plan_step._grounded_edit_targets = set()
+                    _ge.add(_resolved)
                     _logger.info(
                         "[InlineEdit] Promoted patched %s -> inline_code", _resolved,
                     )
@@ -2040,14 +2049,25 @@ def _execute_step(step_idx: int, step_text: str, *,
                     p for p in _inline_files if _os_inline.path.exists(p)
                 }
 
-                executor.write_files(_inline_files)
-                memory.update(_inline_files)
+                _grounded = getattr(plan_step, "_grounded_edit_targets", None)
+                _written_files = executor.write_files(
+                    _inline_files, allow_protected=_grounded)
+                memory.update(_inline_files, allow_protected=_grounded)
                 display.step_tokens(step_idx, 0, 0)
                 _logger.info(
-                    "[PlanStep] Inline code: wrote %d file(s) for step %s: %s",
-                    len(_inline_files), plan_step.id,
+                    "[PlanStep] Inline code: wrote %d of %d file(s) for "
+                    "step %s: %s",
+                    len(_written_files), len(_inline_files), plan_step.id,
                     list(_inline_files.keys()),
                 )
+                if len(_written_files) < len(_inline_files):
+                    _logger.warning(
+                        "[PlanStep] %d file(s) were NOT written (protected "
+                        "or blocked) for step %s — the step may not have "
+                        "taken effect",
+                        len(_inline_files) - len(_written_files),
+                        plan_step.id,
+                    )
 
                 # ── Seed scaffold entry-point files into memory ──
                 # When writing into a scaffolded subproject, the entry-point

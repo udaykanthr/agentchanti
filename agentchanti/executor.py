@@ -540,7 +540,8 @@ class Executor:
         return result
 
     @staticmethod
-    def write_files(files: Dict[str, str], base_dir: str = ".") -> List[str]:
+    def write_files(files: Dict[str, str], base_dir: str = ".",
+                    allow_protected: "set[str] | None" = None) -> List[str]:
         """
         Writes files to disk. Returns list of written file paths.
 
@@ -551,7 +552,14 @@ class Executor:
         Protected manifest files (package.json, go.mod, etc.) are never
         overwritten if they already exist — LLM-generated replacements
         almost always drop dependencies and corrupt the project.
+        ``allow_protected`` lists paths exempt from that guard: content
+        that was produced by an exact-match edit of the file's CURRENT
+        on-disk content (e.g. the plan's FIND block matched verbatim) is
+        grounded, not hallucinated — and editing a manifest is sometimes
+        the entire task.
         """
+        _allowed_norm = {p.replace("\\", "/").lstrip("./")
+                         for p in (allow_protected or ())}
         written = []
         init_dirs: set[str] = set()
 
@@ -586,9 +594,14 @@ class Executor:
             # Guard: never overwrite dependency manifests / lock files
             basename = os.path.basename(filename)
             if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(filepath):
-                log.warning(f"[Executor] Skipping protected file: {filepath} "
-                            f"(already exists — overwriting could corrupt dependencies)")
-                continue
+                if _norm_filename.lstrip("./") in _allowed_norm:
+                    log.info(f"[Executor] Writing protected file {filepath} — "
+                             f"content derived from exact-match edit of the "
+                             f"current file")
+                else:
+                    log.warning(f"[Executor] Skipping protected file: {filepath} "
+                                f"(already exists — overwriting could corrupt dependencies)")
+                    continue
 
             # Warn about potential path conflicts (same basename, different dir)
             if basename in written_basenames:
