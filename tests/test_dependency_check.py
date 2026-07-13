@@ -486,6 +486,31 @@ class TestFindGaps:
         assert len(broken) == 1
         assert broken[0].symbol == "./components/Header"
 
+    def test_package_self_import_not_broken(self):
+        # `from . import views` in a Django app's urls.py — the package
+        # is the importer's own directory; flagging it burned an LLM
+        # fix call on every Django run.
+        before = DependencySnapshot()
+        after_files = {
+            "spacious_site/sitepages/urls.py": (
+                "from django.urls import path\n"
+                "from . import views\n"
+                "urlpatterns = [path('', views.home, name='home')]\n"
+            ),
+            "spacious_site/sitepages/views.py": (
+                "def home(request):\n    return None\n"
+            ),
+        }
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["spacious_site/sitepages/urls.py"],
+            step_text="Create app URL router",
+            memory_files=after_files,
+        )
+        broken = [g for g in gaps if g.gap_type == "broken_import"]
+        assert broken == []
+
     def test_ignores_external_imports(self):
         before = DependencySnapshot()
         after_files = {

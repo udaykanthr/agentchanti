@@ -1254,6 +1254,15 @@ def find_gaps(
             if _is_external_import(imp_src, fpath):
                 continue
 
+            # `from . import x` / `from .. import x` — the referenced
+            # package is the importer's own parent directory, which
+            # exists by construction (scaffolders don't register their
+            # __init__.py in memory, so file matching can't prove it).
+            # Observed as a false broken_import on every Django app's
+            # urls.py, each costing an LLM fix call that got discarded.
+            if fpath.endswith(".py") and imp_src.strip(".") == "":
+                continue
+
             resolved = _normalize_import_path(imp_src, fpath)
             found = any(
                 _file_matches_import(known, resolved) or _file_matches_import(known, imp_src)
