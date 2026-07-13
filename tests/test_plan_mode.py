@@ -4,7 +4,10 @@ import unittest
 from unittest.mock import MagicMock
 
 from agentchanti.config import Config
-from agentchanti.agents.planner import PlannerAgent
+from agentchanti.agents.planner import (
+    PlannerAgent,
+    done_contradicted_by_briefing,
+)
 
 
 def _captured_prompt(plan_mode: str) -> str:
@@ -94,6 +97,41 @@ class TestPlannerPromptModes(unittest.TestCase):
             prompt = _captured_prompt(mode)
             self.assertIn("NEVER emit angle-bracket placeholders", prompt)
             self.assertIn("NEVER activate a virtualenv", prompt)
+
+
+class TestDoneContradictionGuard(unittest.TestCase):
+    """Deterministic ==DONE== rejection — prompt rules lost this fight
+    twice (the DONE reason literally described the required fix)."""
+
+    def test_agent_directive_contradicts_done(self):
+        briefing = ("Task summary: fix the failing tests\n"
+                    "Agent directive: Change the body of `calc.py`'s "
+                    "`add(a, b)` from `return a - b` to `return a + b` "
+                    "and do nothing else\n"
+                    "New packages: NONE\n")
+        hit = done_contradicted_by_briefing(briefing)
+        self.assertIsNotNone(hit)
+        self.assertIn("Agent directive:", hit)
+        self.assertIn("return a + b", hit)
+
+    def test_required_changes_contradicts_done(self):
+        briefing = "Required changes: add LOGIN_URL to settings.py\n"
+        self.assertIn("LOGIN_URL", done_contradicted_by_briefing(briefing))
+
+    def test_noop_directives_allow_done(self):
+        for value in ("NONE", "none", "No changes needed", "N/A"):
+            briefing = f"Agent directive: {value}\nRequired changes: NONE\n"
+            self.assertIsNone(done_contradicted_by_briefing(briefing),
+                              value)
+
+    def test_already_satisfied_allows_done(self):
+        briefing = ("Already satisfied: Yes\n"
+                    "Agent directive: Change add to return a + b\n")
+        self.assertIsNone(done_contradicted_by_briefing(briefing))
+
+    def test_empty_and_non_string_allow_done(self):
+        self.assertIsNone(done_contradicted_by_briefing(""))
+        self.assertIsNone(done_contradicted_by_briefing(None))
 
 
 if __name__ == "__main__":

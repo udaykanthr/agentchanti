@@ -193,6 +193,52 @@ class TestLoginUrlLint(unittest.TestCase):
         self.assertIn("LOGIN_URL = 'sitepages:login'", login_errors[0])
 
 
+class TestTestsShadowLint(unittest.TestCase):
+    """tests.py + tests/ package = Django discovery ImportError —
+    struck three benchmark runs (twice content, once intent)."""
+
+    def test_both_in_memory_flagged(self):
+        errors = check_django_project({
+            "spacious_site/main_site/tests.py": "# startapp stub",
+            "spacious_site/main_site/tests/test_views.py": "def test(): pass",
+        })
+        self.assertEqual(len(errors), 1)
+        self.assertIn("main_site/tests.py", errors[0])
+        self.assertIn("module incorrectly imported", errors[0])
+
+    def test_stub_on_disk_only_flagged(self):
+        # startapp's tests.py stub is on disk but never entered memory
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            app = os.path.join(tmp, "myapp")
+            os.makedirs(app)
+            with open(os.path.join(app, "tests.py"), "w") as f:
+                f.write("# stub\n")
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                errors = check_django_project({
+                    "myapp/tests/test_views.py": "def test(): pass",
+                })
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("myapp/tests.py", errors[0])
+
+    def test_package_only_clean(self):
+        errors = check_django_project({
+            "myapp/tests/test_views.py": "def test(): pass",
+        })
+        self.assertEqual(errors, [])
+
+    def test_file_only_clean(self):
+        errors = check_django_project({
+            "myapp/tests.py": "from django.test import TestCase",
+        })
+        self.assertEqual(errors, [])
+
+
 class TestLintScope(unittest.TestCase):
 
     def test_non_django_project_is_clean(self):

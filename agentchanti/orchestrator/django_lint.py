@@ -13,6 +13,10 @@ machine-checkable, yet invisible to ``manage.py check``:
    custom route, but settings never sets ``LOGIN_URL``, so Django
    redirects to its default ``/accounts/login/`` — a 404. Every
    protected view breaks for anonymous users.
+4. **tests.py shadowed by a tests/ package**: ``startapp`` scaffolds
+   ``app/tests.py``; a later step creates ``app/tests/`` — Django test
+   discovery then dies with "module incorrectly imported". Disk-aware:
+   the scaffold stub is rarely in the run's file memory.
 
 The checks are conservative: a bare name is only flagged when it is NOT
 reachable unnamespaced anywhere but IS defined under some ``app_name``
@@ -21,6 +25,7 @@ namespace — so third-party names (admin, auth) never false-positive.
 
 from __future__ import annotations
 
+import os
 import re
 
 _APP_NAME_RE = re.compile(
@@ -107,6 +112,37 @@ def check_django_project(files: dict[str, str]) -> list[str]:
 
     errors.extend(_check_login_url(files, namespaced, plain,
                                    auth_urls_mounted))
+    errors.extend(_check_tests_shadow(files))
+    return errors
+
+
+def _check_tests_shadow(files: dict[str, str]) -> list[str]:
+    """Both ``app/tests.py`` and ``app/tests/`` existing kills test
+    discovery ("module incorrectly imported") — struck three benchmark
+    runs. The tests.py side is usually the untracked startapp stub, so
+    check the disk as well as the run's file memory.
+    """
+    apps_with_pkg: set[str] = set()
+    apps_with_file: set[str] = set()
+    for path in files:
+        p = _norm(path)
+        if p.startswith("_"):
+            continue
+        m = re.match(r"^(.+)/tests/[^/]+\.py$", p)
+        if m:
+            apps_with_pkg.add(m.group(1))
+        elif p.endswith("/tests.py"):
+            apps_with_file.add(p[: -len("/tests.py")])
+
+    errors: list[str] = []
+    for app in sorted(apps_with_pkg):
+        stub = f"{app}/tests.py"
+        if app in apps_with_file or os.path.isfile(stub):
+            errors.append(
+                f"{stub}: both tests.py and a tests/ package exist in "
+                f"'{app}' — Django test discovery fails with 'module "
+                f"incorrectly imported'. Delete {stub} (usually the "
+                f"startapp stub) or move its cases into {app}/tests/")
     return errors
 
 

@@ -62,6 +62,41 @@ _INTENT_PATTERNS: dict[str, list[re.Pattern]] = {
 }
 
 
+# ── ==DONE== contradiction guard ──────────────────────────────────────────
+# Prompt rules alone lose this fight: two benchmark runs emitted ==DONE==
+# while literally describing the required one-line fix in the reason —
+# and the prompt paragraph forbidding exactly that made it MORE frequent
+# (added salience). The check must be deterministic, at the parse site.
+
+_BRIEFING_DIRECTIVE_RE = re.compile(
+    r"^(Agent directive|Required changes?):\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE)
+_ALREADY_SATISFIED_RE = re.compile(
+    r"^Already satisfied:\s*yes\b", re.IGNORECASE | re.MULTILINE)
+_DIRECTIVE_NOOP_VALUES = ("none", "no change", "no changes", "n/a",
+                          "nothing")
+
+
+def done_contradicted_by_briefing(briefing: str) -> str | None:
+    """The briefing line that contradicts a ==DONE== no-op, or None.
+
+    A ==DONE== is legitimate only when the briefing does not demand a
+    change: "Already satisfied: Yes" clears it, and an "Agent directive:"
+    or "Required changes:" whose value is a real instruction refutes it.
+    The caller re-plans once with the contradiction quoted back.
+    """
+    if not isinstance(briefing, str) or not briefing.strip():
+        return None
+    if _ALREADY_SATISFIED_RE.search(briefing):
+        return None
+    for m in _BRIEFING_DIRECTIVE_RE.finditer(briefing):
+        value = m.group(2).strip()
+        if value and not any(value.lower().startswith(v)
+                             for v in _DIRECTIVE_NOOP_VALUES):
+            return f"{m.group(1)}: {value}"
+    return None
+
+
 # ── Intent-mode plan format (plan_mode: intent) ──────────────────────────
 # The planner emits goals + acceptance gates only; a tool-calling agent
 # authors the file contents against the real project state. No content:

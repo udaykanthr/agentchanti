@@ -842,13 +842,35 @@ def _main_impl():
 
             # ── Planner no-op signal ──
             # If the planner determined the task is already satisfied it
-            # emits ==DONE== instead of steps.  Honour that and exit cleanly.
+            # emits ==DONE== instead of steps.  Honour that and exit
+            # cleanly — unless the briefing itself demands a change, in
+            # which case the DONE is provably wrong: reject it and
+            # re-plan with the contradiction quoted back (observed twice:
+            # ==DONE== whose reason DESCRIBED the required one-line fix).
             if "==DONE==" in plan:
                 _done_reason = ""
                 for _line in plan.splitlines():
                     if _line.startswith("reason:"):
                         _done_reason = _line[len("reason:"):].strip()
                         break
+                from ..agents.planner import done_contradicted_by_briefing
+                # The briefing is only copied onto memory AFTER planning
+                # succeeds — at this point it lives on the planner.
+                _contradiction = done_contradicted_by_briefing(
+                    getattr(planner, "_task_briefing", "")
+                    or getattr(memory, "_task_briefing", "") or "")
+                if _contradiction and plan_attempt < MAX_PLAN_RETRIES:
+                    log.warning(
+                        "[Plan] ==DONE== rejected — the briefing requires "
+                        "a change: %s", _contradiction[:200])
+                    planner_context += (
+                        "\n\n[PLANNER CORRECTION] Your previous response "
+                        "was ==DONE==, but the change below is REQUIRED "
+                        "and has NOT been made:\n"
+                        f"{_contradiction}\n"
+                        "Emit a plan whose steps make this change. "
+                        "Do NOT output ==DONE==.")
+                    continue
                 _done_msg = _done_reason or "Task already satisfied — no changes needed."
                 log.info("[Plan] Planner signalled ==DONE==: %s", _done_msg)
                 display.show_status(_done_msg)
