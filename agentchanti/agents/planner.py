@@ -1319,6 +1319,7 @@ app.post('/api/data', (req, res) => {
 Write and run tests for the server and validation
 target: src/__tests__/server.test.js
 imports: src/server.js:app, src/utils/validate.js:validateInput
+verify: npm test --silent
 
 ==END==
 
@@ -1342,6 +1343,7 @@ content:                               ← CODE/TEST steps that CREATE new files
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 produces: <file1>, <file2>             ← CMD steps. Files created by the command.
+verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). Must be runnable from the project root and re-runnable (no scaffolding). Example: python manage.py test main --noinput
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
 ```<lang>                              ←   Fenced code block immediately after content:

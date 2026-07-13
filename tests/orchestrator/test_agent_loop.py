@@ -796,6 +796,109 @@ class TestStepHandlerIntegration(unittest.TestCase):
         self.assertIn("1 failed: assert x", ctx)
         self.assertIn("complete ONLY when", ctx)
 
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(True, "loop ran"))
+    def test_plan_declared_verify_reaches_code_loop(self, mock_loop):
+        # A CODE step with a plan-declared verify: gains a deterministic
+        # exit gate (previously the CODE loop path had none at all).
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _handle_code_step
+        cfg, coder, memory, display = self._common()
+        ps = PlanStep(id="1.1", step_type="CODE",
+                      verify_cmd="python manage.py check")
+        _handle_code_step(
+            "write code", coder, MagicMock(), MagicMock(), "task",
+            memory, display, 0, cfg=cfg, plan_step=ps)
+        self.assertEqual(mock_loop.call_args[1]["verify_cmd"],
+                         "python manage.py check")
+        self.assertIn("complete ONLY when",
+                      mock_loop.call_args[1]["context"])
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(True, "loop ran"))
+    def test_plan_declared_verify_beats_language_default(self, mock_loop):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _handle_test_step
+        cfg, tester, memory, display = self._common()
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "OK")
+        ps = PlanStep(id="5.1", step_type="TEST",
+                      verify_cmd="python manage.py test main --noinput")
+        _handle_test_step(
+            "run tests", tester, MagicMock(), MagicMock(), executor,
+            "task", memory, display, 0, language="python", cfg=cfg,
+            plan_step=ps)
+        self.assertEqual(mock_loop.call_args[1]["verify_cmd"],
+                         "python manage.py test main --noinput")
+
+
+class TestDeclaredVerifyGate(unittest.TestCase):
+    """The classic-path acceptance gate and its command resolution."""
+
+    def _memory(self, sub=None):
+        memory = MagicMock()
+        memory._scaffolded_subproject = sub
+        memory.all_files.return_value = (
+            {f"{sub}/manage.py": ""} if sub else {})
+        return memory
+
+    def test_declared_cmd_passthrough(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(id="1.1", step_type="CODE", verify_cmd="pytest -q")
+        self.assertEqual(_declared_verify_cmd(ps, self._memory()), "pytest -q")
+
+    def test_none_without_plan_step_or_verify(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        self.assertIsNone(_declared_verify_cmd(None, self._memory()))
+        ps = PlanStep(id="1.1", step_type="CODE")
+        self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
+
+    def test_scaffold_command_rejected(self):
+        # A one-shot scaffold command is not a re-runnable gate
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(id="1.1", step_type="CODE",
+                      verify_cmd="django-admin startproject config .")
+        self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
+
+    def test_gate_failure_flips_success(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import (
+            _gate_on_declared_verify,
+        )
+        ps = PlanStep(id="1.1", step_type="CODE",
+                      verify_cmd="python manage.py test")
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "FAILED (errors=2)")
+        ok, err = _gate_on_declared_verify(
+            True, "handler said done", ps, executor, self._memory(),
+            MagicMock(), 0)
+        self.assertFalse(ok)
+        self.assertIn("python manage.py test", err)
+        self.assertIn("FAILED (errors=2)", err)
+
+    def test_gate_pass_and_noop_cases(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import (
+            _gate_on_declared_verify,
+        )
+        ps = PlanStep(id="1.1", step_type="CODE", verify_cmd="pytest -q")
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "3 passed")
+        self.assertEqual(
+            _gate_on_declared_verify(True, "done", ps, executor,
+                                     self._memory(), MagicMock(), 0),
+            (True, "done"))
+        # Already-failed results pass through without running the gate
+        executor.reset_mock()
+        self.assertEqual(
+            _gate_on_declared_verify(False, "broke", ps, executor,
+                                     self._memory(), MagicMock(), 0),
+            (False, "broke"))
+        executor.run_command.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3538,7 +3538,78 @@ def _api_grounding_context(
     return [], verified_ctx
 
 
-def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
+def _declared_verify_cmd(plan_step, memory: FileMemory) -> str | None:
+    """The plan-declared acceptance command for a step, or None.
+
+    Prefixes ``cd <subproject> && `` when the project lives in a
+    scaffolded subdirectory so manage.py / package.json are found.
+    One-shot scaffolding commands are rejected — a verify gate must be
+    safely re-runnable (same rule as the recovery loop's verifier).
+    """
+    cmd = getattr(plan_step, "verify_cmd", None) if plan_step is not None else None
+    if not cmd:
+        return None
+    from .agent_loop import reverifiable_cmd
+    if reverifiable_cmd(cmd) is None:
+        return None
+    sub = _detect_subproject_root(memory)
+    if sub and not cmd.lstrip().startswith("cd "):
+        cmd = f"cd {sub} && {cmd}"
+    return cmd
+
+
+def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
+                             executor: Executor, memory: FileMemory,
+                             display: CLIDisplay,
+                             step_idx: int) -> tuple[bool, str]:
+    """Deterministic per-step acceptance gate for the classic path.
+
+    A handler's own success claim is only accepted once the step's
+    plan-declared ``verify:`` command (when present) exits 0. A failing
+    gate turns the result into a failure whose error carries the command
+    output, so the pipeline's normal diagnosis/recovery machinery gets
+    the real evidence. No-op when the plan declared nothing.
+    """
+    if not success:
+        return success, error_info
+    cmd = _declared_verify_cmd(plan_step, memory)
+    if not cmd:
+        return success, error_info
+    display.step_info(step_idx, f"Step gate: {cmd}")
+    ok, out = executor.run_command(cmd, timeout=300)
+    if ok:
+        display.step_info(step_idx, "Step gate passed ✔")
+        return success, error_info
+    return False, (
+        f"Step acceptance command failed: `{cmd}`\n"
+        f"{(out or '(no output)')[-2000:]}")
+
+
+def _handle_code_step(step_text: str, coder: CoderAgent,
+                      reviewer: ReviewerAgent, executor: Executor,
+                      task: str, memory: FileMemory,
+                      display: CLIDisplay, step_idx: int,
+                      **kwargs) -> tuple[bool, str]:
+    """Public CODE-step entry: runs the handler, then the acceptance gate.
+
+    The agent-loop path gates itself (the declared verify is its exit
+    criterion, with feedback turns to fix failures), so the outer gate
+    only fires for the classic generate→review path, where nothing else
+    executes the plan's ``verify:`` command.
+    """
+    success, error_info = _handle_code_step_impl(
+        step_text, coder, reviewer, executor, task, memory, display,
+        step_idx, **kwargs)
+    from .agent_loop import agent_loop_enabled
+    if agent_loop_enabled(kwargs.get("cfg"),
+                          getattr(coder, "llm_client", None)):
+        return success, error_info
+    return _gate_on_declared_verify(
+        success, error_info, kwargs.get("plan_step"), executor, memory,
+        display, step_idx)
+
+
+def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
                       executor: Executor, task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
                       language: str | None = None,
@@ -3564,10 +3635,19 @@ def _handle_code_step(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent
         loop_context = memory.summary()
         if initial_error:
             loop_context = f"{loop_context}\n\nKnown problem to fix:\n{initial_error}"
+        # Plan-declared acceptance command becomes the loop's exit gate:
+        # the model's "done" claim is only accepted once it exits 0, and
+        # failures feed back as fix turns.
+        verify_cmd = _declared_verify_cmd(plan_step, memory)
+        if verify_cmd:
+            loop_context += (
+                f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
+                "successfully — it will be run to verify your work.")
         return run_agent_loop(
             coder.llm_client, tools, step_text, task,
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=verify_cmd,
             context=loop_context,
         )
 
@@ -4757,6 +4837,29 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                       reviewer: ReviewerAgent, executor: Executor,
                       task: str, memory: FileMemory,
                       display: CLIDisplay, step_idx: int,
+                      **kwargs) -> tuple[bool, str]:
+    """Public TEST-step entry: runs the handler, then the acceptance gate.
+
+    Mirrors :func:`_handle_code_step` — the agent-loop path already gates
+    on the declared verify (or the language default), so the outer gate
+    only fires for the classic generate→run→fix path.
+    """
+    success, error_info = _handle_test_step_impl(
+        step_text, tester, coder, reviewer, executor, task, memory,
+        display, step_idx, **kwargs)
+    from .agent_loop import agent_loop_enabled
+    if agent_loop_enabled(kwargs.get("cfg"),
+                          getattr(tester, "llm_client", None)):
+        return success, error_info
+    return _gate_on_declared_verify(
+        success, error_info, kwargs.get("plan_step"), executor, memory,
+        display, step_idx)
+
+
+def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgent,
+                      reviewer: ReviewerAgent, executor: Executor,
+                      task: str, memory: FileMemory,
+                      display: CLIDisplay, step_idx: int,
                       language: str | None = None,
                       auto: bool = False,
                       search_agent=None,
@@ -4781,9 +4884,14 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         # are found and the command runs in the right cwd.
         from .agent_loop import verify_cmd_for_language
         _vsub = _detect_subproject_root(memory)
-        verify_cmd = verify_cmd_for_language(language, _vsub or ".")
-        if verify_cmd and _vsub:
-            verify_cmd = f"cd {_vsub} && {verify_cmd}"
+        # Plan-declared acceptance command wins (it names the exact
+        # suite/app this step must satisfy); the language-level default
+        # is the fallback when the plan declared nothing.
+        verify_cmd = _declared_verify_cmd(plan_step, memory)
+        if not verify_cmd:
+            verify_cmd = verify_cmd_for_language(language, _vsub or ".")
+            if verify_cmd and _vsub:
+                verify_cmd = f"cd {_vsub} && {verify_cmd}"
 
         # Ground the loop in the CURRENT test status: without this the
         # model tends to spend its whole turn budget reading files

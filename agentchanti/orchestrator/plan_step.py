@@ -53,6 +53,7 @@ class PlanStep:
     inline_code: dict[str, str] = field(default_factory=dict)  # file -> code from plan
     inline_edits: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # file -> [(find, replace), ...]
     kb_docs: list[str] = field(default_factory=list)  # KB doc titles used when writing inline code
+    verify_cmd: Optional[str] = None  # plan-declared acceptance command for this step
 
     # Which files should import this step's target file (plan-declared or derived)
     imported_by: list[str] = field(default_factory=list)
@@ -83,6 +84,8 @@ class PlanStep:
             d["kb_docs"] = list(self.kb_docs)
         if self.imported_by:
             d["imported_by"] = list(self.imported_by)
+        if self.verify_cmd:
+            d["verify_cmd"] = self.verify_cmd
         return d
 
     @classmethod
@@ -104,6 +107,7 @@ class PlanStep:
             kb_docs=d.get("kb_docs", []),
             imported_by=d.get("imported_by", []),
             index=d.get("index", -1),
+            verify_cmd=d.get("verify_cmd"),
         )
 
 
@@ -526,6 +530,11 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                         f.strip() for f in raw.split(",") if f.strip()
                     )
                 continue
+            elif _bare_lower.startswith("verify:"):
+                raw = _bare[7:].strip().strip("`")
+                if raw and raw.lower() != "none":
+                    current.verify_cmd = raw
+                continue
             _meta_prefixes = ("note:", "output:", "creates:",
                               "result:", "generates:", "returns:")
             if cmd_text.startswith("**") or any(
@@ -593,6 +602,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             raw = line[8:].strip()
             if raw and raw.lower() != "none":
                 current.kb_docs = [t.strip() for t in raw.split(",") if t.strip()]
+
+        # Per-step acceptance command — the deterministic gate for this step
+        elif line.lower().startswith("verify:"):
+            raw = line[7:].strip().strip("`")
+            if raw and raw.lower() != "none":
+                current.verify_cmd = raw
 
         # imported_by: which files should import this step's target file
         elif line.lower().startswith("imported_by:"):

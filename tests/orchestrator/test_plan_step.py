@@ -41,6 +41,78 @@ imports: none
         self.assertFalse(is_structured_plan("1. Install express\n2. Create server"))
 
 
+class TestVerifyCmd(unittest.TestCase):
+    """Per-step verify: line — the plan-declared acceptance command."""
+
+    def test_bare_verify_line(self):
+        text = """
+==PLAN==
+--STEP 1.1 [CODE] depends:none
+Create home view
+target: main/views.py
+exports: home
+imports: none
+verify: python manage.py test main --noinput
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(steps[0].verify_cmd,
+                         "python manage.py test main --noinput")
+
+    def test_gt_prefixed_verify_line(self):
+        # Some models copy the CMD "> " prefix onto metadata lines
+        text = """
+==PLAN==
+--STEP 1.1 [TEST] depends:none
+Run tests
+target: tests/test_app.py
+> verify: npm test --silent
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(steps[0].verify_cmd, "npm test --silent")
+        self.assertIsNone(steps[0].command)  # not treated as a CMD command
+
+    def test_verify_none_and_absent(self):
+        text = """
+==PLAN==
+--STEP 1.1 [CODE] depends:none
+Create thing
+target: a.py
+verify: none
+
+--STEP 1.2 [CODE] depends:none
+Create other
+target: b.py
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertIsNone(steps[0].verify_cmd)
+        self.assertIsNone(steps[1].verify_cmd)
+
+    def test_backtick_wrapping_stripped(self):
+        text = """
+==PLAN==
+--STEP 1.1 [CODE] depends:none
+Create thing
+target: a.py
+verify: `pytest -q tests/test_a.py`
+==END==
+"""
+        steps = parse_structured_plan(text)
+        self.assertEqual(steps[0].verify_cmd, "pytest -q tests/test_a.py")
+
+    def test_serialization_roundtrip(self):
+        step = PlanStep(id="1.1", step_type="CODE",
+                        verify_cmd="python manage.py check")
+        restored = PlanStep.from_dict(step.to_dict())
+        self.assertEqual(restored.verify_cmd, "python manage.py check")
+        # Absent stays absent (and doesn't bloat the dict)
+        bare = PlanStep(id="1.2", step_type="CODE")
+        self.assertNotIn("verify_cmd", bare.to_dict())
+        self.assertIsNone(PlanStep.from_dict(bare.to_dict()).verify_cmd)
+
+
 class TestInlineCode(unittest.TestCase):
     """Tests for ---file-content-start--- / ---file-content-end--- parsing."""
 
