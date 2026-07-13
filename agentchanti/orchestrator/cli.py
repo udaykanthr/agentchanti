@@ -572,6 +572,17 @@ def _main_impl():
                          "Create unit tests for the provided code.",
                          _make_llm_for_agent("tester"),
                          prompt_suffix=tester_suffix)
+
+    # Escalation model for failed agent loops (config: models.escalation).
+    # When a step's loop fails with the regular model, one retry runs with
+    # this stronger one before the step is marked failed.
+    if cfg.get_agent_model("escalation"):
+        _escalation_client = _make_llm_for_agent("escalation")
+        coder.escalation_client = _escalation_client
+        tester.escalation_client = _escalation_client
+        log.info("[AgentLoop] Escalation model configured: %s",
+                 cfg.get_agent_model("escalation"))
+
     executor = Executor()
 
     # ── 6. Init display ──
@@ -824,7 +835,9 @@ def _main_impl():
                 f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
             )
             plan = planner.process(args.task, context=planner_context,
-                                   language=language)
+                                   language=language,
+                                   plan_mode=getattr(cfg, "PLAN_MODE",
+                                                     "content"))
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
             # ── Planner no-op signal ──
@@ -975,7 +988,9 @@ def _main_impl():
                 display.resume()  # restart Live for spinner during replan
                 display.show_status("Re-planning...")
                 plan = planner.process(args.task, context=planner_context,
-                                       language=language)
+                                       language=language,
+                                       plan_mode=getattr(cfg, "PLAN_MODE",
+                                                         "content"))
                 log.info(f"Re-plan:\n{plan}")
 
                 if is_structured_plan(plan):

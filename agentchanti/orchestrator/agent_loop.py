@@ -367,6 +367,35 @@ def run_agent_loop(
         f"step: {step_text[:200]}")))
 
 
+def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
+                                   step_text: str, task: str,
+                                   escalation_client=None,
+                                   **kw) -> tuple[bool, str]:
+    """Run the loop; on failure, retry once with a stronger model.
+
+    A weak model exhausting its turns is a capability floor, not a step
+    the pipeline must fail on (observed: 8 read-only turns while the
+    one-line fix sat in context). When ``models: escalation:`` names a
+    stronger model, that client gets one fresh loop with the failed
+    attempt's error in context. No escalation configured → identical to
+    :func:`run_agent_loop`.
+    """
+    success, info = run_agent_loop(llm_client, tools, step_text, task, **kw)
+    if success or escalation_client is None or escalation_client is llm_client:
+        return success, info
+    if not getattr(escalation_client, "supports_tools", lambda: False)():
+        return success, info
+    _logger.info(
+        "[AgentLoop] step %d: loop failed — escalating to stronger model",
+        kw.get("step_idx", 0) + 1)
+    kw = dict(kw)
+    kw["context"] = (
+        (kw.get("context") or "")
+        + "\n\nA previous attempt by another model FAILED:\n"
+        + truncate_middle(info, 2000))
+    return run_agent_loop(escalation_client, tools, step_text, task, **kw)
+
+
 def _verify_call(verify_cmd: str):
     from ..llm.chat_types import ToolCall
     return ToolCall(name="run_command", arguments={"command": verify_cmd},

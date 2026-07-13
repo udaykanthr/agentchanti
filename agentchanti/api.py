@@ -386,7 +386,8 @@ def _run_task_impl(
         memory._task_briefing = _briefing_text
 
     # Plan
-    plan = planner.process(task, context=planner_context, language=language)
+    plan = planner.process(task, context=planner_context, language=language,
+                           plan_mode=getattr(cfg, "PLAN_MODE", "content"))
 
     # ── Parse plan: try structured format first, fall back to legacy ──
     from .orchestrator.plan_step import (

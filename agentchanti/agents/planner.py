@@ -62,6 +62,83 @@ _INTENT_PATTERNS: dict[str, list[re.Pattern]] = {
 }
 
 
+# ── Intent-mode plan format (plan_mode: intent) ──────────────────────────
+# The planner emits goals + acceptance gates only; a tool-calling agent
+# authors the file contents against the real project state. No content:
+# or edit: blocks — those belong to content mode.
+
+_PLAN_EXAMPLE_INTENT = """
+==PLAN==
+
+--STEP 1.1 [CMD] depends:none
+Install Express and CORS
+> npm install express cors
+produces: package.json
+
+--STEP 2.1 [CODE] depends:1.1
+Create the Express server: GET /api/health returns JSON {"status": "ok"}; export the app and a startServer(port) helper
+target: src/server.js
+exports: app, startServer
+imports: none
+verify: node -e "require('./src/server.js')"
+
+--STEP 2.2 [CODE] depends:1.1
+Create input validation utility: validateInput(input) rejects null/empty strings; sanitize(input) trims and strips angle brackets
+target: src/utils/validate.js
+exports: validateInput, sanitize
+imports: none
+verify: node -e "const v=require('./src/utils/validate.js'); if (v.validateInput('')) process.exit(1)"
+
+--STEP 3.1 [CODE] depends:2.1, 2.2
+Add POST /api/data to the existing server: reject invalid req.body.value with 400, otherwise respond with the sanitized value
+target: src/server.js
+imports: src/utils/validate.js:validateInput, src/utils/validate.js:sanitize
+verify: node -e "require('./src/server.js')"
+
+--STEP 4.1 [TEST] depends:3.1
+Write and run tests for the server and validation
+target: src/__tests__/server.test.js
+imports: src/server.js:app, src/utils/validate.js:validateInput
+verify: npm test --silent
+
+==END==
+"""
+
+_INTENT_INLINE_RULES = """
+19. **NO inline code (intent mode)**: Do NOT write file contents. No
+    content: blocks, no edit: blocks, no fenced source code. Each
+    CODE/TEST step is a precise GOAL: state WHAT the file must do — its
+    exports, routes, redirects, validation rules, key behaviours — in
+    the description. A tool-using agent implements the step against the
+    real project state, so precision of intent matters more than code.
+
+20. **verify: is REQUIRED on every CODE and TEST step**: It is the
+    deterministic acceptance gate the executing agent must satisfy
+    before the step counts as done. Choose the cheapest re-runnable
+    command that proves the goal (e.g. `python manage.py check`,
+    `python manage.py test <app> --noinput`, `npm test --silent`,
+    `node -e "require('./src/x.js')"`). Never a scaffolding command.
+"""
+
+_CHECKLIST_INTENT = """
+═══════ QUALITY CHECKLIST ═══════
+- [ ] Every CODE step has a target: line with exact file paths
+- [ ] Every CODE step has exports: and imports: lines
+- [ ] Every CODE/TEST step has a verify: line with a re-runnable acceptance command
+- [ ] NO content: or edit: blocks anywhere — descriptions carry the intent
+- [ ] Each description states the file's exports and key behaviours precisely
+- [ ] No two steps have the same target: file (consolidate into one step)
+- [ ] If step B imports from step A's target file, B depends on A
+- [ ] No vague steps — each step is specific and actionable
+- [ ] Total steps between 2-15
+- [ ] No install steps for already-installed packages
+- [ ] Config/tooling steps come BEFORE code that depends on them
+- [ ] Leaf components created BEFORE parent components
+- [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
+- [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
+"""
+
+
 def _classify_task_intent(task: str) -> str:
     """Classify task intent without LLM. Returns one of:
     bug_fix, refactor, test, feature, general.
@@ -1220,7 +1297,8 @@ class PlannerAgent(Agent):
         return "\n".join(parts) if parts else ""
 
     def process(self, task: str, context: str = "",
-                language: str | None = None) -> str:
+                language: str | None = None,
+                plan_mode: str = "content") -> str:
         prompt = self._build_prompt(task, context)
         _lang_constraint = ""
         if language:
@@ -1262,7 +1340,7 @@ reason: <one sentence explaining why no action is needed>
 ==END==
 
 Otherwise, output steps using the format below:
-
+""" + (_PLAN_EXAMPLE_INTENT if plan_mode == "intent" else """
 ==PLAN==
 
 --STEP 1.1 [CMD] depends:none
@@ -1322,7 +1400,7 @@ imports: src/server.js:app, src/utils/validate.js:validateInput
 verify: npm test --silent
 
 ==END==
-
+""") + """
 ═══════ LINE REFERENCE ═══════
 --STEP <id> [<TYPE>] depends:<deps>   ← REQUIRED. id=wave.seq, TYPE=CMD|CODE|TEST, deps=comma-separated step ids or "none"
 <description text>                     ← REQUIRED. One-line description of what this step does.
@@ -1331,7 +1409,7 @@ target: <file1>, <file2>               ← CODE/TEST steps. Files to create or m
 exports: <Symbol1>, <Symbol2>          ← CODE steps. Symbols this file will export.
 imports: <file>:<Symbol>, ...          ← CODE/TEST steps. File:Symbol pairs this step needs. "none" if no imports.
 imported_by: <file1>, <file2>          ← CODE steps. Optional. Files that will import this step's target. Use when no explicit wiring step exists.
-edit:                                  ← CODE steps that MODIFY existing files. Preferred over content: for modifications.
+""" + ("" if plan_mode == "intent" else """edit:                                  ← CODE steps that MODIFY existing files. Preferred over content: for modifications.
 <<<FIND>>>                             ←   Exact text to find (copied verbatim from current source).
 <old text>
 <<<REPLACE>>>                          ←   Replacement text.
@@ -1342,15 +1420,19 @@ content:                               ← CODE/TEST steps that CREATE new files
 <complete file source>                 ←   Full file — not a snippet. Every line.
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
-produces: <file1>, <file2>             ← CMD steps. Files created by the command.
+""") + """produces: <file1>, <file2>             ← CMD steps. Files created by the command.
 verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). Must be runnable from the project root and re-runnable (no scaffolding). Example: python manage.py test main --noinput
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
-content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
+""" + ("""
+DO NOT include file contents anywhere in the plan. No content: blocks,
+no edit: blocks, no fenced source code — the executing agent writes the
+files. Every CODE/TEST step MUST carry a verify: line.
+""" if plan_mode == "intent" else """content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
 ```<lang>                              ←   Fenced code block immediately after content:
 <complete file source>                 ←   Full file — not a snippet. Every line.
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
-
+""") + """
 ═══════ STEP ID FORMAT ═══════
 Use wave.sequence numbering:
   - Wave 1 (no deps): 1.1, 1.2, 1.3
@@ -1444,7 +1526,7 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     If you cannot add a wiring step, declare `imported_by: <parent-file>` on
     the child component step so the dependency checker knows where to wire it.
 
-19. **Inline code for CODE and TEST steps — two formats**:
+""" + (_INTENT_INLINE_RULES if plan_mode == "intent" else """19. **Inline code for CODE and TEST steps — two formats**:
 
     **For MODIFYING an existing file** (the file appears in [FILES TO MODIFY]):
     Use an `edit:` block with find/replace pairs. This is PREFERRED — it is
@@ -1496,7 +1578,7 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
       ...
       ```
       ---file-content-end---
-
+""") + """
 21. **Tests import ONLY frameworks the environment will have**: Every
     package a test file imports must either appear in the installed
     packages of the project knowledge or be installed by an earlier CMD
@@ -1507,7 +1589,7 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     Django >= 5, `LogoutView` rejects GET, so logout tests must use
     `self.client.post(...)` and views/templates must log out via a POST
     form, not a link.
-
+""" + (_CHECKLIST_INTENT if plan_mode == "intent" else """
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
@@ -1522,5 +1604,5 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] Leaf components created BEFORE parent components
 - [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
 - [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
-"""
+""")
         return self.llm_client.generate_response(prompt)

@@ -871,6 +871,131 @@ class TestStepHandlerIntegration(unittest.TestCase):
                          "python manage.py test main --noinput")
 
 
+class TestLoopEscalation(unittest.TestCase):
+    """One retry with a stronger model when the first loop fails."""
+
+    def _clients(self, esc_supports_tools=True):
+        primary = MagicMock(name="primary")
+        escalation = MagicMock(name="escalation")
+        escalation.supports_tools.return_value = esc_supports_tools
+        return primary, escalation
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_success_skips_escalation(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        mock_loop.return_value = (True, "done")
+        primary, escalation = self._clients()
+        result = run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task",
+            escalation_client=escalation)
+        self.assertEqual(result, (True, "done"))
+        mock_loop.assert_called_once()
+        self.assertIs(mock_loop.call_args[0][0], primary)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_failure_without_escalation_client(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        mock_loop.return_value = (False, "verify failed")
+        primary, _ = self._clients()
+        result = run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task")
+        self.assertEqual(result, (False, "verify failed"))
+        mock_loop.assert_called_once()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_failure_escalates_with_error_in_context(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        mock_loop.side_effect = [
+            (False, "NoReverseMatch: 'dashboard' not found"),
+            (True, "fixed by stronger model"),
+        ]
+        primary, escalation = self._clients()
+        result = run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task",
+            escalation_client=escalation, context="base context")
+        self.assertEqual(result, (True, "fixed by stronger model"))
+        self.assertEqual(mock_loop.call_count, 2)
+        # Second run uses the escalation client with the failure in context
+        second = mock_loop.call_args_list[1]
+        self.assertIs(second[0][0], escalation)
+        self.assertIn("base context", second[1]["context"])
+        self.assertIn("NoReverseMatch", second[1]["context"])
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_no_escalation_without_tool_support(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        mock_loop.return_value = (False, "failed")
+        primary, escalation = self._clients(esc_supports_tools=False)
+        result = run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task",
+            escalation_client=escalation)
+        self.assertEqual(result, (False, "failed"))
+        mock_loop.assert_called_once()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_same_client_not_escalated(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        mock_loop.return_value = (False, "failed")
+        primary, _ = self._clients()
+        result = run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task",
+            escalation_client=primary)
+        self.assertEqual(result, (False, "failed"))
+        mock_loop.assert_called_once()
+
+
+class TestPlanStepBrief(unittest.TestCase):
+    """Plan metadata reaches the loop — in intent mode it is all the
+    loop knows about WHAT to build."""
+
+    def test_brief_contents(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _plan_step_brief
+        ps = PlanStep(id="2.1", step_type="CODE",
+                      target_files=["main/views.py"],
+                      exports=["home", "dashboard"],
+                      imports_from={"main/urls.py": ["urlpatterns"]})
+        brief = _plan_step_brief(ps)
+        self.assertIn("Target files: main/views.py", brief)
+        self.assertIn("Must export: home, dashboard", brief)
+        self.assertIn("main/urls.py: urlpatterns", brief)
+        self.assertEqual(_plan_step_brief(None), "")
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(True, "ok"))
+    def test_brief_reaches_code_loop_context(self, mock_loop):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _handle_code_step
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        coder = MagicMock()
+        coder.llm_client.supports_tools.return_value = True
+        coder.escalation_client = None
+        memory = MagicMock()
+        memory.summary.return_value = "files: none"
+        memory._scaffolded_subproject = None
+        memory.all_files.return_value = {}
+        ps = PlanStep(id="2.1", step_type="CODE",
+                      target_files=["main/views.py"], exports=["home"])
+        _handle_code_step(
+            "create views", coder, MagicMock(), MagicMock(), "task",
+            memory, MagicMock(), 0, cfg=cfg, plan_step=ps)
+        ctx = mock_loop.call_args[1]["context"]
+        self.assertIn("Target files: main/views.py", ctx)
+        self.assertIn("Must export: home", ctx)
+
+
 class TestDeclaredVerifyGate(unittest.TestCase):
     """The classic-path acceptance gate and its command resolution."""
 

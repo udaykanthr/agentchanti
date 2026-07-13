@@ -3585,6 +3585,33 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         f"{(out or '(no output)')[-2000:]}")
 
 
+def _plan_step_brief(plan_step) -> str:
+    """Structured step metadata for the agent loop's context.
+
+    In intent mode (plan_mode: intent) the plan carries no file bodies,
+    so these lines are everything the loop knows about WHAT to build —
+    which files, which exports, which imports. Cheap and harmless in
+    content mode too (steps with inline code never reach the loop).
+    """
+    if plan_step is None:
+        return ""
+    lines = []
+    targets = getattr(plan_step, "target_files", None)
+    if targets:
+        lines.append("Target files: " + ", ".join(targets))
+    exports = getattr(plan_step, "exports", None)
+    if exports:
+        lines.append("Must export: " + ", ".join(exports))
+    imports_from = getattr(plan_step, "imports_from", None)
+    if imports_from:
+        pairs = [
+            f"{fp}: {', '.join(syms)}" if syms else fp
+            for fp, syms in imports_from.items()
+        ]
+        lines.append("Imports to use: " + "; ".join(pairs))
+    return "\n".join(lines)
+
+
 def _record_passed_gate(success: bool, plan_step, memory: FileMemory) -> None:
     """Add a step's declared verify to the monotonic gate ledger.
 
@@ -3648,11 +3675,16 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
     # ── Agent loop (opt-in): run the step as a bounded tool-calling loop ──
     from .agent_loop import agent_loop_enabled
     if agent_loop_enabled(cfg, getattr(coder, "llm_client", None)):
-        from .agent_loop import build_step_tools, run_agent_loop
+        from .agent_loop import (
+            build_step_tools, run_agent_loop_with_escalation,
+        )
         display.step_info(step_idx, "Agent loop: executing step with tools")
         tools = build_step_tools(executor, memory,
                                  kb_context_builder=kb_context_builder)
         loop_context = memory.summary()
+        _brief = _plan_step_brief(plan_step)
+        if _brief:
+            loop_context = f"{_brief}\n\n{loop_context}"
         if initial_error:
             loop_context = f"{loop_context}\n\nKnown problem to fix:\n{initial_error}"
         # Plan-declared acceptance command becomes the loop's exit gate:
@@ -3663,8 +3695,9 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             loop_context += (
                 f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
                 "successfully — it will be run to verify your work.")
-        return run_agent_loop(
+        return run_agent_loop_with_escalation(
             coder.llm_client, tools, step_text, task,
+            escalation_client=getattr(coder, "escalation_client", None),
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
@@ -4894,7 +4927,9 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
     # ── Agent loop (opt-in): run the step as a bounded tool-calling loop ──
     from .agent_loop import agent_loop_enabled
     if agent_loop_enabled(cfg, getattr(tester, "llm_client", None)):
-        from .agent_loop import build_step_tools, run_agent_loop
+        from .agent_loop import (
+            build_step_tools, run_agent_loop_with_escalation,
+        )
         display.step_info(step_idx, "Agent loop: executing test step with tools")
         tools = build_step_tools(executor, memory,
                                  kb_context_builder=kb_context_builder)
@@ -4920,6 +4955,9 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
         # Seeing the failing output — and the exact exit criterion —
         # up front turns the loop into a fix loop instead of a tour.
         loop_context = memory.summary()
+        _brief = _plan_step_brief(plan_step)
+        if _brief:
+            loop_context = f"{_brief}\n\n{loop_context}"
         if verify_cmd:
             _pre_ok, _pre_out = executor.run_command(verify_cmd, timeout=300)
             # Missing-dependency failures are environment problems the
@@ -4939,8 +4977,9 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                 f"This step is complete ONLY when `{verify_cmd}` exits "
                 f"successfully — it will be run to verify your work.")
 
-        return run_agent_loop(
+        return run_agent_loop_with_escalation(
             tester.llm_client, tools, step_text, task,
+            escalation_client=getattr(tester, "escalation_client", None),
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,

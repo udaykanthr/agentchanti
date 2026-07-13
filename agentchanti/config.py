@@ -71,6 +71,7 @@ _DEFAULTS = {
     "agent_loop": True,
     "agent_loop_max_turns": 8,
     "wave_snapshots": True,
+    "plan_mode": "content",
     "dependency_check_enabled": True,
     "analyser_enabled": False,
     "wiring_verification_enabled": True,
@@ -401,6 +402,16 @@ class Config:
         # Only activates in a workdir that is NOT already a git repo.
         self.WAVE_SNAPSHOTS = _get_bool(
             "WAVE_SNAPSHOTS", "wave_snapshots", _DEFAULTS["wave_snapshots"])
+
+        # Planning mode: "content" (planner emits full file bodies,
+        # classic) or "intent" (planner emits goals + verify: gates; the
+        # tool-calling agent loop authors the files against real project
+        # state). Intent mode requires a tool-capable provider — steps
+        # without inline code route through the agent loop.
+        _plan_mode = str(_get(
+            "PLAN_MODE", "plan_mode", _DEFAULTS["plan_mode"])).lower()
+        self.PLAN_MODE = _plan_mode if _plan_mode in ("content", "intent") \
+            else _DEFAULTS["plan_mode"]
 
         # Dependency check (post-step integration validation)
         dep_section = yd.get("dependency_check", {}) if isinstance(yd.get("dependency_check"), dict) else {}
