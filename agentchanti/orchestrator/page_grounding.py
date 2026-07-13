@@ -71,6 +71,40 @@ def parse_acceptance_checks(briefing: str) -> list[dict]:
     return checks
 
 
+# ── Task-pinned URL extraction ────────────────────────────────────────
+
+# URL paths the task text names verbatim ("a dashboard page at
+# /dashboard/", "homepage at /"). A token qualifies when it starts with
+# '/' at a boundary and contains only path characters — this skips
+# 'and/or', Windows paths, and the '//' of absolute http URLs.
+_TASK_URL_RE = re.compile(
+    r"(?:^|[\s('\"])((?:/[A-Za-z0-9_-]+)+/?|/)(?=[\s,.;:)'\"]|$)")
+
+
+def pinned_urls_from_task(task: str) -> list[str]:
+    """URL paths named verbatim in the task text, deduped, capped.
+
+    Each becomes a must_resolve acceptance check: a pinned URL that
+    404s means the task was not accomplished at the address the user
+    asked for, no matter how green the generated tests are (observed:
+    task pinned /dashboard/, the app served the dashboard elsewhere,
+    every in-pipeline gate passed).
+    """
+    if not isinstance(task, str):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for m in _TASK_URL_RE.finditer(task):
+        url = m.group(1)
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= _MAX_ACCEPTANCE_CHECKS:
+            break
+    return urls
+
+
 # ── Page rendering (pre-analysis) ─────────────────────────────────────
 
 # Renders every no-argument named route with the test client and writes

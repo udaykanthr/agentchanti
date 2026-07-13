@@ -1339,6 +1339,12 @@ says no changes are needed), output ONLY this — no steps, no explanation:
 reason: <one sentence explaining why no action is needed>
 ==END==
 
+==DONE== means ZERO changes are required — the code on disk already
+satisfies the task RIGHT NOW. If ANY file change is required, however
+small or obvious ("just change X to Y"), that is NOT done: emit a plan
+with a step that makes the change. Describing the needed fix inside a
+==DONE== reason is a failure — nothing executes it.
+
 Otherwise, output steps using the format below:
 """ + (_PLAN_EXAMPLE_INTENT if plan_mode == "intent" else """
 ==PLAN==
@@ -1476,6 +1482,9 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 10. **TEST steps only when explicitly requested**: Do NOT include TEST steps
     unless the user's task explicitly asks for tests. Tests consume significant
     tokens and time. When tests ARE requested, place them AFTER all CODE steps.
+    When the task names exact URL paths (e.g. "a dashboard page at
+    /dashboard/"), the tests MUST assert those exact paths respond
+    correctly — delivering the feature at a different route fails the task.
     CRITICAL: If the [Baseline Test Analysis] shows tests are PASSING,
     do NOT include any steps for "Fixing tests" or "Ensuring test setup".
     NEVER include steps to modify or "fix" test files that are explicitly

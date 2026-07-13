@@ -72,6 +72,21 @@ class TestPlannerPromptModes(unittest.TestCase):
             self.assertIn("verify: <shell command>", prompt)
             self.assertIn("imported_by:", prompt)
 
+    def test_done_requires_zero_changes_in_both_modes(self):
+        # Regression: the planner emitted ==DONE== while DESCRIBING the
+        # required one-line fix in the reason — nothing executed it.
+        for mode in ("content", "intent"):
+            prompt = _captured_prompt(mode)
+            self.assertIn("ZERO changes are required", prompt)
+            self.assertIn("nothing executes it", prompt)
+
+    def test_pinned_url_test_rule_in_both_modes(self):
+        # Regression: task pinned /dashboard/, app served the dashboard
+        # elsewhere, generated tests never asserted the pinned path.
+        for mode in ("content", "intent"):
+            prompt = _captured_prompt(mode)
+            self.assertIn("MUST assert those exact paths", prompt)
+
     def test_no_placeholder_rule_in_both_modes(self):
         # Regression: a plan emitted `cd <project_name>` in every CMD and
         # verify line; the resolver guessed 'react-app' for a Django task.

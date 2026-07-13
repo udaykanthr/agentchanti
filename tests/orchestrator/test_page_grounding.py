@@ -21,6 +21,7 @@ from agentchanti.orchestrator.page_grounding import (
     _find_django_root,
     extract_task_page_lines,
     parse_acceptance_checks,
+    pinned_urls_from_task,
 )
 from agentchanti.orchestrator.smoke_test import (
     _DJANGO_PROBE,
@@ -63,6 +64,41 @@ class TestParseAcceptanceChecks:
         many = "\n".join(
             f'- GET /p{i}/ MUST_CONTAIN "x"' for i in range(20))
         assert len(parse_acceptance_checks(many)) == _MAX_ACCEPTANCE_CHECKS
+
+
+class TestPinnedUrlsFromTask:
+    """URLs the task names verbatim become must_resolve acceptance
+    checks — the A/B run shipped the dashboard at a route other than
+    the pinned /dashboard/ and stayed green."""
+
+    def test_django_benchmark_task(self):
+        task = ("create a django application with a responsive spacious "
+                "homepage at / (header, large herobanner), and by default "
+                "logged in users should auto redirect to a dashboard page "
+                "at /dashboard/.")
+        assert pinned_urls_from_task(task) == ["/", "/dashboard/"]
+
+    def test_nested_and_unslashed_paths(self):
+        task = "serve the API at /api/v1/users and docs at /docs"
+        assert pinned_urls_from_task(task) == ["/api/v1/users", "/docs"]
+
+    def test_prose_slashes_ignored(self):
+        task = ("build a signup and/or login flow, run A/B tests, "
+                "see https://example.com/docs for reference")
+        assert pinned_urls_from_task(task) == []
+
+    def test_windows_paths_ignored(self):
+        task = r"read the config from C:\apps\config and fix src\main.py"
+        assert pinned_urls_from_task(task) == []
+
+    def test_dedupe_and_cap(self):
+        task = " ".join(f"page at /p{i}/ and again /p{i}/" for i in range(12))
+        urls = pinned_urls_from_task(task)
+        assert len(urls) == _MAX_ACCEPTANCE_CHECKS
+        assert len(set(urls)) == len(urls)
+
+    def test_non_string_is_empty(self):
+        assert pinned_urls_from_task(None) == []
 
 
 class TestExtractTaskPageLines:
@@ -119,6 +155,11 @@ class TestProbeSources:
         assert "ACCEPTANCE_FAILED" in _DJANGO_PROBE
         assert "get_resolver" in _DJANGO_PROBE  # renders all no-arg routes
         assert "sys.argv[4]" in _DJANGO_PROBE
+
+    def test_django_probe_handles_must_resolve(self):
+        # Task-pinned URLs: exists-at-this-path check, redirects allowed
+        assert "must_resolve" in _DJANGO_PROBE
+        assert "404" in _DJANGO_PROBE
 
 
 class TestDjangoVerificationPlumbing:

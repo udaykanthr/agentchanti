@@ -384,6 +384,22 @@ if len(sys.argv) > 4 and sys.argv[4]:
     with open(sys.argv[4], encoding="utf-8") as f:
         acceptance = json.load(f)
     for chk in acceptance:
+        if chk.get("kind") == "must_resolve":
+            # Task-pinned URL: it must exist at this exact path. Any
+            # response but 404/5xx counts -- redirects (auth guards)
+            # are fine; the address just has to be served.
+            try:
+                resp = client.get(chk["url"])
+                if resp.status_code == 404 or resp.status_code >= 500:
+                    failures.append(
+                        "ACCEPTANCE_FAILED: GET %s -> HTTP %s, but the "
+                        "task names this exact path -- serve it there "
+                        "(any 2xx/3xx response)."
+                        % (chk["url"], resp.status_code))
+            except Exception as e:
+                failures.append("ACCEPTANCE_FAILED: GET %s raised %s: %s"
+                                % (chk["url"], type(e).__name__, e))
+            continue
         try:
             resp = client.get(chk["url"], follow=True)
             html = resp.content.decode("utf-8", "replace")
@@ -475,7 +491,7 @@ def _run_django_verification(memory, executor, coder, display,
     import json as _json
     import tempfile as _tempfile
 
-    from .page_grounding import parse_acceptance_checks
+    from .page_grounding import parse_acceptance_checks, pinned_urls_from_task
 
     settings_module = _django_settings_module(django_dir)
     if settings_module is None:
@@ -486,6 +502,15 @@ def _run_django_verification(memory, executor, coder, display,
     # that catches "everything renders but the task wasn't accomplished".
     acceptance = parse_acceptance_checks(
         getattr(memory, "_task_briefing", "") or "")
+    # URLs the task text pins verbatim become resolvability checks: the
+    # user named the address, so delivering the feature at another route
+    # is a miss the generated tests won't catch (observed: /dashboard/
+    # pinned, dashboard served elsewhere, pipeline green).
+    _covered = {c["url"] for c in acceptance}
+    for _url in pinned_urls_from_task(task):
+        if _url not in _covered:
+            acceptance.append(
+                {"url": _url, "kind": "must_resolve", "needle": ""})
 
     tmp_dir = _tempfile.mkdtemp(prefix="agentchanti_django_probe_")
     script = os.path.join(tmp_dir, "django_probe.py")
