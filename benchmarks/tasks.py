@@ -74,6 +74,22 @@ def greet(name):
 '''
 
 
+def _dj(args: str) -> str:
+    """manage.py ground-truth command for the django-webapp task.
+
+    Prefers the project venv's python when the pipeline created one
+    (Django is installed there, not in the harness env), falling back
+    to the ambient python. Windows cmd syntax — the harness runs
+    success_cmds with shell=True on the host.
+    """
+    return (
+        "cd spacious_site && "
+        "(if exist venv\\Scripts\\python.exe "
+        f"(venv\\Scripts\\python.exe manage.py {args}) "
+        f"else (python manage.py {args}))"
+    )
+
+
 TASKS = [
     {
         "id": "func-noloop",
@@ -125,6 +141,39 @@ TASKS = [
                  "negative-input ValueError cases. Run them."),
         "files": {"shapes.py": SHAPES},
         "success_cmds": ["python -m pytest -q"],
+        "language": "python",
+    },
+    {
+        # The framework-wiring class where content-mode runs repeatedly
+        # died on cross-file defaults (URL namespaces, {% load static %},
+        # LOGIN_URL) — the case the plan_mode A/B actually decides.
+        "id": "django-webapp",
+        "task": ("create a django application in a new folder named "
+                 "spacious_site with a responsive spacious homepage at / "
+                 "(header, large herobanner, price list component, large "
+                 "footer), login, signup and forgot password screens, and "
+                 "by default logged in users should auto redirect to a "
+                 "dashboard page at /dashboard/. Add Django tests covering "
+                 "the pages and the redirect behaviour."),
+        "files": {},
+        "success_cmds": [
+            _dj("check"),
+            _dj("test --noinput"),
+            # Behaviour probes independent of the generated tests:
+            # anonymous homepage renders; anonymous dashboard redirects.
+            # ALLOWED_HOSTS override: outside the test runner Django does
+            # not auto-allow the client's 'testserver' host.
+            _dj('shell -c "from django.conf import settings; '
+                "settings.ALLOWED_HOSTS = ['*']; "
+                "from django.test import Client; import sys; "
+                "r = Client().get('/'); "
+                'sys.exit(0 if r.status_code == 200 else 1)"'),
+            _dj('shell -c "from django.conf import settings; '
+                "settings.ALLOWED_HOSTS = ['*']; "
+                "from django.test import Client; import sys; "
+                "r = Client().get('/dashboard/'); "
+                'sys.exit(0 if r.status_code in (301, 302) else 1)"'),
+        ],
         "language": "python",
     },
     {
