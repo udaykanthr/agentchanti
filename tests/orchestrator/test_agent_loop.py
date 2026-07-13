@@ -816,6 +816,45 @@ class TestStepHandlerIntegration(unittest.TestCase):
 
     @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
            return_value=(True, "loop ran"))
+    def test_passed_gate_recorded_in_ledger(self, mock_loop):
+        # A successful step's declared verify lands in the monotonic
+        # ledger so later fix rounds can be checked for regressions.
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _handle_code_step
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        try:
+            cfg, coder, memory, display = self._common()
+            ps = PlanStep(id="3.1", step_type="CODE",
+                          verify_cmd="python manage.py check")
+            _handle_code_step(
+                "write code", coder, MagicMock(), MagicMock(), "task",
+                memory, display, 0, cfg=cfg, plan_step=ps)
+            self.assertEqual(get_gate_ledger().gates(),
+                             {"python manage.py check": "3.1"})
+        finally:
+            get_gate_ledger().reset()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(False, "loop failed"))
+    def test_failed_step_not_recorded_in_ledger(self, mock_loop):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _handle_code_step
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        try:
+            cfg, coder, memory, display = self._common()
+            ps = PlanStep(id="3.1", step_type="CODE",
+                          verify_cmd="python manage.py check")
+            _handle_code_step(
+                "write code", coder, MagicMock(), MagicMock(), "task",
+                memory, display, 0, cfg=cfg, plan_step=ps)
+            self.assertEqual(get_gate_ledger().gates(), {})
+        finally:
+            get_gate_ledger().reset()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(True, "loop ran"))
     def test_plan_declared_verify_beats_language_default(self, mock_loop):
         from agentchanti.orchestrator.plan_step import PlanStep
         from agentchanti.orchestrator.step_handlers import _handle_test_step

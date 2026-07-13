@@ -1154,6 +1154,16 @@ def _main_impl():
     display.show_status("")
     pipeline_success = True
 
+    # Per-wave snapshots + monotonic gate ledger: every green wave is a
+    # git commit in the (machine-managed) workdir repo, and every gate
+    # that passes is recorded so later fix rounds can be checked for
+    # regressions and rolled back instead of shipped.
+    from .wave_snapshots import ProjectSnapshots, get_gate_ledger
+    get_gate_ledger().reset()
+    snapshots = ProjectSnapshots(
+        os.getcwd(), enabled=getattr(cfg, "WAVE_SNAPSHOTS", True))
+    snapshots.start()
+
     for wave_idx, wave in enumerate(waves):
         # Filter out already-completed steps (for resume)
         pending = [i for i in wave if i >= start_from]
@@ -1334,6 +1344,10 @@ def _main_impl():
             if not pipeline_success:
                 break
 
+        # Green wave — snapshot the workdir so later fix rounds have a
+        # rollback point (no-op when snapshots are disabled).
+        snapshots.commit_wave(f"wave {wave_idx + 1}")
+
     # ── 13.5. Bulk test execution + per-file fix ──
     # All TEST steps with inline code deferred their runs until now so that:
     #   • parallel wave steps don't race to run the full suite simultaneously
@@ -1358,6 +1372,31 @@ def _main_impl():
         if not verif_ok:
             pipeline_success = False
             log.warning(f"[BulkTest] Pipeline marked failed: {verif_err[:200]}")
+
+        # ── Monotonic-progress check ──
+        # Fix rounds may touch source files; a fix that turns a
+        # previously-green per-step gate red is a regression. Re-run the
+        # recorded gates and roll the workdir back to the last wave
+        # snapshot rather than shipping the regression.
+        _regressions = get_gate_ledger().recheck(executor)
+        if _regressions:
+            _reg_names = ", ".join(
+                f"step {label or '?'}: `{cmd}`"
+                for cmd, label, _out in _regressions)
+            log.warning(
+                "[Monotonic] %d previously-passing gate(s) now fail "
+                "after fix rounds: %s", len(_regressions), _reg_names)
+            _rb_ok, _rb_msg = snapshots.rollback_to_last()
+            if _rb_ok:
+                log.warning(
+                    "[Monotonic] Workdir rolled back to the last green "
+                    "wave snapshot — the regressing fixes were discarded.")
+            else:
+                log.warning(
+                    "[Monotonic] Rollback unavailable (%s) — regressing "
+                    "state left in place for inspection.", _rb_msg)
+            pipeline_success = False
+            verif_ok = False
 
     # ── 13.6. Wiring verification ──
     # One LLM call that checks all fix-scope files together for cross-file

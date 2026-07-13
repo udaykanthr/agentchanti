@@ -70,6 +70,7 @@ _DEFAULTS = {
     "review_mode": "static",
     "agent_loop": True,
     "agent_loop_max_turns": 8,
+    "wave_snapshots": True,
     "dependency_check_enabled": True,
     "analyser_enabled": False,
     "wiring_verification_enabled": True,
@@ -394,6 +395,12 @@ class Config:
         self.AGENT_LOOP_MAX_TURNS = _get(
             "AGENT_LOOP_MAX_TURNS", "agent_loop_max_turns",
             _DEFAULTS["agent_loop_max_turns"], cast=int)
+
+        # Per-wave git snapshots of the target project + monotonic
+        # rollback when fix rounds break previously-passing gates.
+        # Only activates in a workdir that is NOT already a git repo.
+        self.WAVE_SNAPSHOTS = _get_bool(
+            "WAVE_SNAPSHOTS", "wave_snapshots", _DEFAULTS["wave_snapshots"])
 
         # Dependency check (post-step integration validation)
         dep_section = yd.get("dependency_check", {}) if isinstance(yd.get("dependency_check"), dict) else {}

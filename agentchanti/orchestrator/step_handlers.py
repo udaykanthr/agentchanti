@@ -3585,6 +3585,25 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         f"{(out or '(no output)')[-2000:]}")
 
 
+def _record_passed_gate(success: bool, plan_step, memory: FileMemory) -> None:
+    """Add a step's declared verify to the monotonic gate ledger.
+
+    Only called with the step's final verdict: by then the gate has been
+    enforced either by the agent loop (as its exit criterion) or by
+    :func:`_gate_on_declared_verify`, so a successful step means the
+    command passed. Later fix rounds are rechecked against the ledger
+    and rolled back if they break it.
+    """
+    if not success:
+        return
+    cmd = _declared_verify_cmd(plan_step, memory)
+    if not cmd:
+        return
+    from .wave_snapshots import get_gate_ledger
+    get_gate_ledger().record(
+        cmd, getattr(plan_step, "id", "") or "")
+
+
 def _handle_code_step(step_text: str, coder: CoderAgent,
                       reviewer: ReviewerAgent, executor: Executor,
                       task: str, memory: FileMemory,
@@ -3601,12 +3620,13 @@ def _handle_code_step(step_text: str, coder: CoderAgent,
         step_text, coder, reviewer, executor, task, memory, display,
         step_idx, **kwargs)
     from .agent_loop import agent_loop_enabled
-    if agent_loop_enabled(kwargs.get("cfg"),
-                          getattr(coder, "llm_client", None)):
-        return success, error_info
-    return _gate_on_declared_verify(
-        success, error_info, kwargs.get("plan_step"), executor, memory,
-        display, step_idx)
+    if not agent_loop_enabled(kwargs.get("cfg"),
+                              getattr(coder, "llm_client", None)):
+        success, error_info = _gate_on_declared_verify(
+            success, error_info, kwargs.get("plan_step"), executor, memory,
+            display, step_idx)
+    _record_passed_gate(success, kwargs.get("plan_step"), memory)
+    return success, error_info
 
 
 def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: ReviewerAgent,
@@ -4848,12 +4868,13 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         step_text, tester, coder, reviewer, executor, task, memory,
         display, step_idx, **kwargs)
     from .agent_loop import agent_loop_enabled
-    if agent_loop_enabled(kwargs.get("cfg"),
-                          getattr(tester, "llm_client", None)):
-        return success, error_info
-    return _gate_on_declared_verify(
-        success, error_info, kwargs.get("plan_step"), executor, memory,
-        display, step_idx)
+    if not agent_loop_enabled(kwargs.get("cfg"),
+                              getattr(tester, "llm_client", None)):
+        success, error_info = _gate_on_declared_verify(
+            success, error_info, kwargs.get("plan_step"), executor, memory,
+            display, step_idx)
+    _record_passed_gate(success, kwargs.get("plan_step"), memory)
+    return success, error_info
 
 
 def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgent,
