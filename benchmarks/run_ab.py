@@ -1,8 +1,7 @@
-"""A/B benchmark harness: agent_loop on vs off.
+"""A/B benchmark harness: agent_loop on/off × plan_mode content/intent.
 
-Runs each benchmark task through the full agentchanti CLI twice — once
-with ``agent_loop: true`` and once with ``false`` — in isolated work
-directories, then measures:
+Runs each benchmark task through the full agentchanti CLI once per mode
+combination in isolated work directories, then measures:
 
   ground truth   — do the task's success_cmds pass? (primary metric)
   pipeline claim — did the pipeline report success?
@@ -15,8 +14,12 @@ Usage (from the repo root):
   python benchmarks/run_ab.py --config cfg.yaml --tasks bugfix,cmd-recovery
   python benchmarks/run_ab.py --config cfg.yaml --modes on --truststore
 
+  # The Phase-4 decision run — intent vs content planning, loop on:
+  python benchmarks/run_ab.py --config cfg.yaml --modes on \\
+      --plan-modes content,intent --truststore
+
 The config file supplies provider/model/API keys; the harness overrides
-only the agent_loop flags. Results are written to
+only the agent_loop / plan_mode flags. Results are written to
 benchmarks/results/ab_<timestamp>.json and printed as a table.
 """
 
@@ -65,18 +68,22 @@ def parse_loop_stats(log_text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _build_config(base_config: str, agent_loop: bool) -> str:
+def _build_config(base_config: str, agent_loop: bool,
+                  plan_mode: str | None = None) -> str:
     """Base yaml with harness overrides appended (last key wins in yaml
     loaders that dict-merge; agentchanti's loader reads top-level keys,
-    so strip any existing agent_loop lines first)."""
+    so strip any existing overridden lines first)."""
     lines = [
         ln for ln in base_config.splitlines()
-        if not ln.strip().startswith(("agent_loop:", "agent_loop_max_turns:"))
+        if not ln.strip().startswith(("agent_loop:", "agent_loop_max_turns:",
+                                      "plan_mode:"))
     ]
     lines += [
         f"agent_loop: {'true' if agent_loop else 'false'}",
         "agent_loop_max_turns: 8",
     ]
+    if plan_mode:
+        lines.append(f"plan_mode: {plan_mode}")
     return "\n".join(lines) + "\n"
 
 
@@ -100,18 +107,22 @@ def _read_run_log(workdir: Path) -> str:
 
 
 def run_one(task: dict, agent_loop: bool, base_config: str,
-            use_truststore: bool, keep_workdirs: bool) -> dict:
+            use_truststore: bool, keep_workdirs: bool,
+            plan_mode: str | None = None) -> dict:
     mode = "on" if agent_loop else "off"
+    label = mode + (f"-{plan_mode}" if plan_mode else "")
     workdir = Path(tempfile.mkdtemp(
-        prefix=f"ab_{task['id']}_{mode}_"))
+        prefix=f"ab_{task['id']}_{label}_"))
     for rel, content in task["files"].items():
         dest = workdir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
     (workdir / ".agentchanti.yaml").write_text(
-        _build_config(base_config, agent_loop), encoding="utf-8")
+        _build_config(base_config, agent_loop, plan_mode), encoding="utf-8")
 
-    print(f"  [{task['id']} / loop={mode}] running in {workdir} ...",
+    print(f"  [{task['id']} / loop={mode}"
+          f"{f' / plan={plan_mode}' if plan_mode else ''}] "
+          f"running in {workdir} ...",
           flush=True)
     started = time.monotonic()
     timed_out = False
@@ -157,6 +168,7 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
     result = {
         "task": task["id"],
         "agent_loop": agent_loop,
+        "plan_mode": plan_mode or "(config default)",
         "ground_truth": ground_truth,
         "pipeline_claim": parse_pipeline_claim(log_text),
         "tokens": parse_total_tokens(log_text),
@@ -175,12 +187,16 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
 
 
 def print_table(results: list[dict]) -> None:
-    hdr = (f"{'task':<20} {'loop':<5} {'truth':<6} {'claim':<6} "
+    hdr = (f"{'task':<20} {'loop':<5} {'plan':<9} {'truth':<6} {'claim':<6} "
            f"{'tokens':>8} {'time_s':>7}  loop_stats")
     print("\n" + hdr)
     print("-" * len(hdr))
     for r in results:
+        plan = r.get("plan_mode") or "-"
+        if plan == "(config default)":
+            plan = "-"
         print(f"{r['task']:<20} {'on' if r['agent_loop'] else 'off':<5} "
+              f"{plan:<9} "
               f"{'PASS' if r['ground_truth'] else 'FAIL':<6} "
               f"{str(r['pipeline_claim']):<6} "
               f"{str(r['tokens'] or '-'):>8} {r['wall_s']:>7}  "
@@ -195,6 +211,9 @@ def main() -> None:
                     help="Comma-separated task ids (default: all)")
     ap.add_argument("--modes", default="on,off",
                     help="Which agent_loop modes to run: on, off, or on,off")
+    ap.add_argument("--plan-modes", default="",
+                    help="Optional plan_mode axis: content, intent, or "
+                         "content,intent (empty = use the config's value)")
     ap.add_argument("--truststore", action="store_true",
                     help="Inject truststore into child runs (TLS-intercepted "
                          "environments)")
@@ -206,13 +225,22 @@ def main() -> None:
     wanted = {t.strip() for t in args.tasks.split(",") if t.strip()}
     tasks = [t for t in TASKS if not wanted or t["id"] in wanted]
     modes = [m.strip() == "on" for m in args.modes.split(",") if m.strip()]
+    plan_modes: list[str | None] = [
+        p.strip() for p in args.plan_modes.split(",") if p.strip()
+    ] or [None]
+    for p in plan_modes:
+        if p is not None and p not in ("content", "intent"):
+            ap.error(f"invalid --plan-modes value: {p}")
 
-    print(f"Running {len(tasks)} task(s) x {len(modes)} mode(s)")
+    print(f"Running {len(tasks)} task(s) x {len(modes)} loop mode(s) x "
+          f"{len(plan_modes)} plan mode(s)")
     results = []
     for task in tasks:
         for agent_loop in modes:
-            results.append(run_one(task, agent_loop, base_config,
-                                   args.truststore, args.keep_workdirs))
+            for plan_mode in plan_modes:
+                results.append(run_one(task, agent_loop, base_config,
+                                       args.truststore, args.keep_workdirs,
+                                       plan_mode=plan_mode))
 
     out_dir = REPO_ROOT / "benchmarks" / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
