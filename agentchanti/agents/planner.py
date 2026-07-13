@@ -240,7 +240,8 @@ class PlannerAgent(Agent):
                     search_agent=None,
                     intent_agent=None,
                     cli_display=None,
-                    subproject_cwd: str | None = None) -> str:
+                    subproject_cwd: str | None = None,
+                    executor=None) -> str:
         """Analyze the task and project to build enriched planner context.
 
         Runs BEFORE process(). Returns a context string to prepend to
@@ -301,6 +302,24 @@ class PlannerAgent(Agent):
                 elif intent == "feature":
                     parts.append(f"  ^ This file may need modification for the new feature")
 
+        # 2a-bis. Page grounding — render the CURRENT app and locate the
+        # lines the task quotes on the live pages. Users paste the broken
+        # screen into the task; matching those lines against a real render
+        # tells the intent/briefing stage WHAT produces the text (observed
+        # without this: form help_text misread as validation errors, the
+        # plan gated errors on is_bound, and the text the user wanted gone
+        # kept rendering on load while the pipeline finished green).
+        page_grounding = ""
+        if executor is not None:
+            try:
+                from ..orchestrator.page_grounding import build_page_grounding
+                page_grounding = build_page_grounding(
+                    task, executor, subproject_cwd=subproject_cwd)
+            except Exception as _pg_exc:
+                _logger.debug("[PageGrounding] Skipped: %s", _pg_exc)
+        if page_grounding:
+            parts.append("\n" + page_grounding)
+
         # 2b. Intent Analysis — runs BEFORE task briefing so the enriched
         # task is available for the briefing LLM call.
         # For blank folders: IntentAgent runs in "scaffold mode" — skips
@@ -352,6 +371,11 @@ class PlannerAgent(Agent):
                 _semantic_kb.append("Relevant Files Current State:\n" + "\n".join(
                     f"[{fpath}] {skeleton}" for fpath, _, skeleton in relevant
                 ))
+
+            # Live render of the current pages — lets the IntentAgent map
+            # the text the user is describing to what actually produces it.
+            if page_grounding:
+                _semantic_kb.append(page_grounding)
 
             _full_semantic_context = "\n\n".join(_semantic_kb)
 
@@ -499,6 +523,7 @@ class PlannerAgent(Agent):
                     failing_files=baseline_failing_files,
                     editable_contracts=_contracts,
                     package_docs=_pre_pkg_context,
+                    page_grounding=page_grounding,
                 )
                 if _briefing:
                     parts.insert(
@@ -1470,6 +1495,17 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
       ```
       ---file-content-end---
 
+21. **Tests import ONLY frameworks the environment will have**: Every
+    package a test file imports must either appear in the installed
+    packages of the project knowledge or be installed by an earlier CMD
+    step of THIS plan. In a Django project the suite runs via
+    `python manage.py test`, so write `django.test.TestCase` /
+    `unittest` tests — do NOT `import pytest` (it is not installed by
+    `pip install django`). Match the installed framework VERSION: with
+    Django >= 5, `LogoutView` rejects GET, so logout tests must use
+    `self.client.post(...)` and views/templates must log out via a POST
+    form, not a link.
+
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
@@ -1483,5 +1519,6 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] Config/tooling steps come BEFORE code that depends on them
 - [ ] Leaf components created BEFORE parent components
 - [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
+- [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
 """
         return self.llm_client.generate_response(prompt)

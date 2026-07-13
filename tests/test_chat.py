@@ -426,5 +426,98 @@ class TestOpenAIChat(unittest.TestCase):
         self.assertTrue(self._client().supports_tools())
 
 
+# ---------------------------------------------------------------------------
+# Token-limit burn: empty response with finish_reason "length"
+# ---------------------------------------------------------------------------
+
+class _BurnClient(LLMClient):
+    """Native-chat client scripted with canned ChatResponses."""
+
+    NATIVE_CHAT = True
+
+    def __init__(self, responses, **kwargs):
+        kwargs.setdefault("max_retries", 3)
+        kwargs.setdefault("retry_delay", 0)
+        super().__init__(**kwargs)
+        self._responses = list(responses)
+        self.token_limit_retries = 0
+
+    def _chat(self, messages, tools=None):
+        return self._responses.pop(0)
+
+    def _prepare_token_limit_retry(self):
+        self.token_limit_retries += 1
+
+    def _generate(self, prompt):
+        return ""
+
+    def _generate_stream(self, prompt):
+        return ""
+
+    def generate_embedding(self, text, model=None, **kwargs):
+        return []
+
+
+class TestTokenLimitBurn(unittest.TestCase):
+    """Reasoning models can burn the whole completion budget on hidden
+    reasoning tokens: empty text, zero tool calls, finish_reason "length"
+    (observed live: 16384 tokens, ~110s, nothing visible). The retry must
+    invoke the provider hook so the next attempt dials reasoning down."""
+
+    def test_length_empty_arms_hook_then_retry_succeeds(self):
+        client = _BurnClient([
+            ChatResponse(text="", stop_reason="length"),
+            ChatResponse(text="answer", stop_reason="stop"),
+        ])
+        with patch.object(LLMClient, "_backoff"):
+            result = client.chat([Message(role="user", content="hi")])
+        self.assertEqual(result.text, "answer")
+        self.assertEqual(client.token_limit_retries, 1)
+
+    def test_generic_empty_does_not_arm_hook(self):
+        client = _BurnClient([
+            ChatResponse(text="", stop_reason="stop"),
+            ChatResponse(text="answer", stop_reason="stop"),
+        ])
+        with patch.object(LLMClient, "_backoff"):
+            result = client.chat([Message(role="user", content="hi")])
+        self.assertEqual(result.text, "answer")
+        self.assertEqual(client.token_limit_retries, 0)
+
+    def test_anthropic_style_max_tokens_also_detected(self):
+        client = _BurnClient([
+            ChatResponse(text="", stop_reason="max_tokens"),
+            ChatResponse(text="answer", stop_reason="end_turn"),
+        ])
+        with patch.object(LLMClient, "_backoff"):
+            client.chat([Message(role="user", content="hi")])
+        self.assertEqual(client.token_limit_retries, 1)
+
+    def test_openai_arms_low_effort_for_reasoning_models_only(self):
+        reasoning = OpenAIClient("https://api.test", "gpt-5-mini", "key")
+        reasoning._prepare_token_limit_retry()
+        self.assertEqual(reasoning._retry_reasoning_effort, "low")
+
+        classic = OpenAIClient("https://api.test", "gpt-4o", "key")
+        classic._prepare_token_limit_retry()
+        self.assertIsNone(classic._retry_reasoning_effort)
+
+    def test_openai_chat_consumes_effort_downgrade_once(self):
+        client = OpenAIClient("https://api.test", "gpt-5-mini", "key")
+        client._retry_reasoning_effort = "low"
+        resp = _mock_response({
+            "choices": [{"message": {"content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        with patch("agentchanti.llm.openai_client.requests.post",
+                   return_value=resp) as post:
+            client._chat([Message(role="user", content="q")])
+            self.assertEqual(
+                post.call_args[1]["json"]["reasoning_effort"], "low")
+            client._chat([Message(role="user", content="q")])
+            self.assertNotIn("reasoning_effort", post.call_args[1]["json"])
+
+
 if __name__ == "__main__":
     unittest.main()

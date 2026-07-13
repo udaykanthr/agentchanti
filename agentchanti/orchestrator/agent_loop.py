@@ -16,13 +16,33 @@ prefix.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from threading import Lock
 
 from ..agent_tools import AgentTools
-from ..llm.chat_types import Message
+from ..llm.chat_types import Message, ToolCall
 
 _logger = logging.getLogger(__name__)
+
+
+def truncate_middle(text: str, limit: int) -> str:
+    """Length-cap *text* while keeping BOTH ends.
+
+    Error output puts the conclusion at the end — a Python traceback names
+    the exception on its last line — so a plain ``text[:limit]`` slice
+    hands the model everything EXCEPT the actual error (observed: a
+    recovery loop spent its whole budget on read-only turns hunting for a
+    ``NoReverseMatch`` that the head-slice had cut off). Keeps ~1/4 head
+    for the command/context and ~3/4 tail for the failure itself.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    tail = limit - head
+    return (text[:head]
+            + f"\n... [{len(text) - limit} chars truncated] ...\n"
+            + text[-tail:])
 
 
 # ── Telemetry ─────────────────────────────────────────────────────────
@@ -109,6 +129,60 @@ def _build_user_message(step_text: str, task: str, language: str | None,
     return "\n\n".join(parts)
 
 
+def _cd_prefix(cmd: str | None) -> str:
+    """The ``cd <dir> && `` prefix of *cmd* when it has one, else ``""``.
+
+    Verify commands for sub-project layouts arrive as ``cd app && npm
+    test``; an install that heals that verify must run in the same
+    directory or it lands in the wrong package/venv.
+    """
+    if cmd:
+        m = re.match(r"^(cd\s+\S+\s*&&\s*)", cmd)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def attempt_env_self_heal(tools: AgentTools, verify_output: str,
+                          language: str | None, healed: set[str],
+                          verify_cmd: str | None = None) -> bool:
+    """Install a missing third-party dependency named in failing output.
+
+    ``No module named X`` / ``Cannot find package 'X'`` are environment
+    problems that editing project files can never fix — the loop that hit
+    them burned its whole turn budget while the real fix was one pip
+    install (mirrors the BulkTest self-heal, which the agent-loop path
+    bypasses). *healed* accumulates already-attempted names so a dep that
+    keeps failing is only installed once per loop.
+
+    Returns True when an install succeeded and the caller should re-run
+    verification.
+    """
+    lang = (language or "python").lower()
+    from .pipeline import _missing_js_packages, _missing_third_party_module
+    if lang in ("javascript", "typescript"):
+        pkgs = [p for p in _missing_js_packages(verify_output)
+                if p not in healed]
+        if not pkgs:
+            return False
+        healed.update(pkgs)
+        install_cmd = "npm install -D " + " ".join(pkgs)
+    else:
+        memory = getattr(tools, "_memory", None)
+        project_files = list(memory.all_files()) if memory is not None else []
+        mod = _missing_third_party_module(verify_output, project_files)
+        if not mod or mod in healed:
+            return False
+        healed.add(mod)
+        install_cmd = f"python -m pip install {mod}"
+    install_cmd = _cd_prefix(verify_cmd) + install_cmd
+    _logger.info("[AgentLoop] env self-heal: %s", install_cmd)
+    result = tools.execute(ToolCall(name="run_command",
+                                    arguments={"command": install_cmd},
+                                    id="env-heal"))
+    return result.startswith("exit: success")
+
+
 def run_agent_loop(
     llm_client,
     tools: AgentTools,
@@ -142,13 +216,24 @@ def run_agent_loop(
                 content=_build_user_message(step_text, task, language, context)),
     ]
     definitions = tools.definitions()
+    action_definitions = [d for d in definitions
+                          if d.name not in _READ_ONLY_TOOLS]
     any_tool_used = False
     tool_counts: Counter = Counter()
     read_only_streak = 0
+    healed: set[str] = set()
 
     def _finish(outcome: str, turns: int,
                 result: tuple[bool, str]) -> tuple[bool, str]:
         _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
+        return result
+
+    def _run_verify() -> str:
+        result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+        while (not result.startswith("exit: success")
+               and attempt_env_self_heal(tools, result, language, healed,
+                                         verify_cmd)):
+            result = tools.execute_all([_verify_call(verify_cmd)])[0].content
         return result
 
     for turn in range(1, max_turns + 1):
@@ -160,8 +245,15 @@ def run_agent_loop(
                 "Turn budget exhausted — tools are no longer available. "
                 "Reply now with a short summary of what you completed and "
                 "whether it was verified.")))
-        response = llm_client.chat(
-            messages, tools=None if final_turn else definitions)
+        if final_turn:
+            tools_for_turn = None
+        elif read_only_streak >= 4:
+            # The act-now nudge was ignored — withhold inspection tools so
+            # the only moves left are the ones that change something.
+            tools_for_turn = action_definitions
+        else:
+            tools_for_turn = definitions
+        response = llm_client.chat(messages, tools=tools_for_turn)
 
         if response.has_tool_calls:
             any_tool_used = True
@@ -192,6 +284,16 @@ def run_agent_loop(
                     "fix with edit_file or write_file, or run the command "
                     "that completes this step. "
                     f"{max_turns - turn} turn(s) remain.")))
+            elif read_only_streak == 4:
+                # Nudge ignored (observed twice in one run: the model went
+                # straight back to read_file). Escalate: from the next
+                # turn only acting tools are offered.
+                _logger.info("[AgentLoop] step %d: nudge ignored — "
+                             "withholding read-only tools", step_idx + 1)
+                messages.append(Message(role="user", content=(
+                    "Inspection tools are now disabled. Only write_file, "
+                    "edit_file and run_command are available — apply the "
+                    "fix or run the completing command now.")))
             continue
 
         # Model stopped calling tools — it believes the step is done.
@@ -206,8 +308,7 @@ def run_agent_loop(
         if verify_cmd:
             if display is not None:
                 display.step_info(step_idx, f"Verifying: {verify_cmd}")
-            result = tools.execute_all(
-                [_verify_call(verify_cmd)])[0].content
+            result = _run_verify()
             if result.startswith("exit: success"):
                 _logger.info("[AgentLoop] step %d verified in %d turn(s)",
                              step_idx + 1, turn)
@@ -215,7 +316,7 @@ def run_agent_loop(
             if final_turn:
                 return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
-                    f"{result[:1000]}")))
+                    f"{truncate_middle(result, 1000)}")))
             _logger.info("[AgentLoop] step %d: verification failed on "
                          "turn %d — feeding back", step_idx + 1, turn)
             messages.append(response.to_message())
@@ -232,7 +333,7 @@ def run_agent_loop(
     # the no-tools instruction). The work may still be done — let the
     # deterministic check have the last word.
     if verify_cmd and any_tool_used:
-        result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+        result = _run_verify()
         if result.startswith("exit: success"):
             _logger.info("[AgentLoop] step %d: turns exhausted but "
                          "verification passes — accepting", step_idx + 1)
@@ -287,6 +388,37 @@ def verify_cmd_for_language(language: str | None,
     return None
 
 
+# One-shot scaffolding commands fail on a SECOND invocation precisely when
+# the first one (or the recovery) succeeded: mkdir → "already exists",
+# django-admin startproject → "conflicts with existing", npm create →
+# refuses a non-empty directory, python -m venv → half-usable dir. Any
+# compound command containing one of these is excluded whole — planned
+# commands routinely chain scaffold + install with `&&`.
+_NON_REVERIFIABLE_RE = re.compile(
+    r"\b(?:mkdir|venv|virtualenv|startproject|startapp"
+    r"|git\s+init|npm\s+(?:create|init)|npx\s+create-|yarn\s+create"
+    r"|cargo\s+(?:new|init)|rails\s+new|dotnet\s+new)\b",
+    re.IGNORECASE,
+)
+
+
+def reverifiable_cmd(cmd: str | None) -> str | None:
+    """Return *cmd* when re-running it is a safe deterministic verify gate
+    for the recovery loop, else ``None``.
+
+    A failed CMD step's own command is the natural ground truth for "did
+    the recovery actually work" — without it the loop accepts the model's
+    final summary on faith (observed: `npm run build:css` exited 1 twice,
+    the model summarized what it had attempted, and the step was logged
+    as recovered while the CSS was never built). Only commands that are
+    not one-shot scaffolding qualify; for the rest, ``None`` keeps the
+    summary-based exit (with its blocked-admission check).
+    """
+    if not cmd or _NON_REVERIFIABLE_RE.search(cmd):
+        return None
+    return cmd
+
+
 def build_step_tools(executor, memory, kb_context_builder=None,
                      project_root: str = ".") -> AgentTools:
     """Assemble :class:`AgentTools` from the objects a step handler holds."""
@@ -308,6 +440,10 @@ def agent_loop_enabled(cfg, llm_client) -> bool:
 # pipeline's diagnosis stage doesn't launch a second (redundant) loop.
 RECOVERY_FAILED_MARKER = "[agent-loop-recovery-failed]"
 
+# Exact line the recovery prompt asks the model to end with when it could
+# NOT recover the step. Checked case-insensitively on the summary.
+RECOVERY_BLOCKED_MARKER = "RECOVERY: blocked"
+
 
 def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
                       task: str, error_info: str,
@@ -320,16 +456,35 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     Replaces the diagnose → fix → re-run machinery: the model gets the
     real error, inspects the actual project state with tools, fixes the
     cause and completes the step in place.
+
+    Without a ``verify_cmd`` the loop's exit rests on the model's final
+    summary, so the prompt asks for an explicit verdict line and a
+    summary that admits the blocker is treated as a failure — previously
+    an honest "the build still fails" summary was logged as a recovery.
     """
     context = (
         "A previous attempt at this step FAILED. Error:\n"
-        f"{error_info[:4000]}\n\n"
+        f"{truncate_middle(error_info, 4000)}\n\n"
         "Investigate the actual state of the project, fix the cause, and "
         "complete the step. If the failure is an environment limitation "
         "you cannot fix (e.g. a required tool is not installed and cannot "
-        "be installed), say so clearly in your summary.")
-    return run_agent_loop(
+        "be installed), say so clearly in your summary and end it with "
+        f"the exact line: {RECOVERY_BLOCKED_MARKER}")
+    if verify_cmd:
+        context += (
+            f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
+            "successfully — it will be run to verify your work.")
+    success, info = run_agent_loop(
         llm_client, tools, step_text, task,
         display=display, step_idx=step_idx, language=language,
         max_turns=max_turns, verify_cmd=verify_cmd, context=context,
         _recovery=True)
+    # Only meaningful when no verify_cmd gated the exit — a passing
+    # deterministic check outranks the model's own pessimism.
+    if success and not verify_cmd \
+            and RECOVERY_BLOCKED_MARKER.lower() in info.lower():
+        _logger.warning(
+            "[AgentLoop] step %d: recovery summary admits the step is "
+            "still blocked — not counting it as recovered", step_idx + 1)
+        return False, f"Recovery loop reported itself blocked: {info[:800]}"
+    return success, info

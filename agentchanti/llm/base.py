@@ -177,9 +177,24 @@ class LLMClient(ABC):
                     result.text = _strip_reasoning(result.text)
 
                 if result.is_empty:
-                    log.warning(
-                        f"[LLM] Empty chat response on attempt "
-                        f"{attempt}/{self.max_retries}")
+                    if self._hit_token_limit(result):
+                        # The entire output budget was consumed with
+                        # nothing visible — reasoning models can burn
+                        # every completion token "thinking" (observed:
+                        # 16384 tokens, ~110s, empty text, zero tool
+                        # calls). A verbatim retry is a coin flip; let
+                        # the provider dial reasoning down first.
+                        log.warning(
+                            f"[LLM] Chat hit the output-token limit "
+                            f"({self.max_output_tokens}) with no visible "
+                            f"output on attempt {attempt}/"
+                            f"{self.max_retries} — reasoning burn; "
+                            f"requesting reduced effort for the retry")
+                        self._prepare_token_limit_retry()
+                    else:
+                        log.warning(
+                            f"[LLM] Empty chat response on attempt "
+                            f"{attempt}/{self.max_retries}")
                     if attempt < self.max_retries:
                         self._backoff(attempt)
                         continue
@@ -207,6 +222,20 @@ class LLMClient(ABC):
 
         raise LLMError(
             f"LLM chat failed after {self.max_retries} retries: {last_error}")
+
+    @staticmethod
+    def _hit_token_limit(result: ChatResponse) -> bool:
+        """True when the provider stopped the response at the output-token
+        cap (OpenAI ``length``, Anthropic ``max_tokens``, Ollama
+        ``length``)."""
+        return (result.stop_reason or "").lower() in (
+            "length", "max_tokens", "max_output_tokens")
+
+    def _prepare_token_limit_retry(self) -> None:
+        """Hook invoked before retrying a chat whose response consumed the
+        entire output budget with no visible text or tool calls (reasoning
+        burn). Providers that can lower reasoning effort for the next
+        request override this; the default retries unchanged."""
 
     def _backoff(self, attempt: int, error: Exception | None = None) -> None:
         """Sleep with jittered exponential backoff before a retry."""

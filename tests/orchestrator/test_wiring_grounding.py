@@ -9,7 +9,10 @@ always present.
 """
 
 from agentchanti.executor import Executor
-from agentchanti.orchestrator.pipeline import run_wiring_verification
+from agentchanti.orchestrator.pipeline import (
+    _resolve_fix_scope_files,
+    run_wiring_verification,
+)
 
 
 class _FakeMemory:
@@ -86,3 +89,58 @@ class TestWiringGrounding:
         assert ok
         assert "pytest==" in coder.prompts[0]
         assert "EXACT versions" in coder.prompts[0]
+
+
+class TestWiringScopeGuard:
+    """Fixes touching files outside the verification context are rejected
+    whole — the LLM otherwise invents entire files it never saw (observed:
+    core/urls.py rewritten blind with a new app_name namespace)."""
+
+    def test_out_of_scope_rewrite_rejects_whole_set(self, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        memory = _FakeMemory({"main.py": SRC})
+        stray = (
+            "#### [FILE]: main.py\n```python\nimport json\n"
+            "print(json.load)\n```\n\n"
+            "#### [FILE]: core/urls.py\n```python\napp_name = 'core'\n```"
+        )
+        ok, err = _run(_Coder(stray), memory, tmp_path)
+        assert ok and err == ""  # rejection is non-fatal
+        # nothing was written — not even the in-scope rewrite, which may
+        # depend on the invented file
+        assert memory.all_files()["main.py"] == SRC
+        assert not (tmp_path / "main.py").exists()
+        assert not (tmp_path / "core" / "urls.py").exists()
+
+    def test_prompt_forbids_inventing_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        coder = _Coder("NO_ISSUES_FOUND")
+        ok, _ = _run(coder, _FakeMemory({"main.py": SRC}), tmp_path)
+        assert ok
+        assert "NEVER invent new" in coder.prompts[0]
+
+
+class TestResolveFixScopeFiles:
+    """Suffix matches must not be shadowed by a basename hit on an
+    earlier same-named file (observed: core/urls.py and config/urls.py
+    both resolving to accounts/urls.py, written first)."""
+
+    _MEMORY = {
+        "spacious_site/accounts/urls.py": "accounts urlconf",
+        "spacious_site/core/urls.py": "core urlconf",
+        "spacious_site/config/urls.py": "config urlconf",
+    }
+
+    def test_suffix_match_beats_basename_shadow(self):
+        result = _resolve_fix_scope_files(
+            ["core/urls.py", "config/urls.py"], [],
+            _FakeMemory(self._MEMORY))
+        assert result.get("spacious_site/core/urls.py") == "core urlconf"
+        assert result.get("spacious_site/config/urls.py") == "config urlconf"
+        assert "spacious_site/accounts/urls.py" not in result
+
+    def test_bare_basename_collects_all_matches(self):
+        result = _resolve_fix_scope_files(
+            ["urls.py"], [], _FakeMemory(self._MEMORY))
+        assert set(result) == set(self._MEMORY)

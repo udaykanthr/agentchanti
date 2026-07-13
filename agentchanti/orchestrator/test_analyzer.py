@@ -425,6 +425,7 @@ def analyze_task_for_planner(
     failing_files: list[str] | None = None,
     editable_contracts: dict[str, dict] | None = None,
     package_docs: str | None = None,
+    page_grounding: str | None = None,
 ) -> str:
     """LLM-based pre-planning analysis grounded in actual project files and test state.
 
@@ -531,7 +532,8 @@ def analyze_task_for_planner(
         contract_section = "\n".join(contract_parts)
 
     sections = "\n\n".join(
-        s for s in [file_section, test_section, contract_section] if s)
+        s for s in [file_section, test_section, page_grounding or "",
+                    contract_section] if s)
 
     # Inject pre-fetched package docs so the briefing's Agent directive
     # uses the correct current API rather than LLM training-data guesses.
@@ -625,6 +627,19 @@ Answer these questions concisely and precisely:
    (e.g. "add 'mx-auto max-w-7xl' to the className of the <div> wrapping <Routes>
    in App.jsx" rather than "potentially adjust the flex container").
    The coder must make ONLY this change and nothing else.
+10. If the task's outcome is visible on a server-rendered web page (Django/
+   Flask templates): write up to 5 machine-checkable assertions on the RAW
+   HTML of a plain GET of the affected page(s). These WILL be executed
+   after the work is done and the task fails if any assertion fails, so:
+   - Use exact substrings — quote text straight from the task (e.g. lines
+     the user pasted from the current screen that must disappear from page
+     load, or text that must appear).
+   - Use the real URL path of the page (derive it from the URLconf files).
+   - MUST_NOT_CONTAIN means the text must be absent from the server-rendered
+     HTML itself — a fix that merely hides it with CSS/JS does NOT pass.
+     Only write assertions the correct fix genuinely satisfies.
+   - If the outcome is not observable on a plain GET (client-only behavior,
+     API change, CLI task), write NONE.
 
 Respond in this EXACT format — no extra text, no markdown outside the block:
 TASK BRIEFING:
@@ -637,6 +652,9 @@ Key constraint: <the one rule the agent must not break>
 Preserve: <concrete list of existing behaviors/APIs the coder must not break>
 Agent directive: <the exact minimal change required — specific attribute/class/value, not a general approach>
 New packages: <comma-separated package names, or NONE>
+Acceptance: <NONE, or one assertion per line, each on its own line in exactly this form:>
+- GET <url-path> MUST_NOT_CONTAIN "<exact text>"
+- GET <url-path> MUST_CONTAIN "<exact text>"
 """
     try:
         response = llm_client.generate_response(prompt)

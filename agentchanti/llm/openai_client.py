@@ -17,11 +17,26 @@ class OpenAIClient(LLMClient):
 
     NATIVE_CHAT = True
 
+    # Models whose completion budget is shared with hidden reasoning
+    # tokens and that accept the ``reasoning_effort`` parameter.
+    _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+
     def __init__(self, base_url: str, model: str, api_key: str, **kwargs):
         super().__init__(**kwargs)
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        # One-shot reasoning-effort downgrade: armed by
+        # _prepare_token_limit_retry, consumed by the next _chat call.
+        self._retry_reasoning_effort: Optional[str] = None
+
+    def _prepare_token_limit_retry(self) -> None:
+        """Reasoning models can burn the whole completion budget on hidden
+        reasoning tokens, returning an empty response with
+        ``finish_reason: length``. Retrying verbatim is a coin flip —
+        request low reasoning effort for the retry instead."""
+        if self.model.lower().startswith(self._REASONING_MODEL_PREFIXES):
+            self._retry_reasoning_effort = "low"
 
     def _headers(self) -> dict:
         return {
@@ -189,6 +204,10 @@ class OpenAIClient(LLMClient):
             "stream": False,
             "max_completion_tokens": self.max_output_tokens,
         }
+        if self._retry_reasoning_effort:
+            # Consume the one-shot downgrade armed after a reasoning burn.
+            payload["reasoning_effort"] = self._retry_reasoning_effort
+            self._retry_reasoning_effort = None
         if tools:
             payload["tools"] = [
                 {"type": "function",

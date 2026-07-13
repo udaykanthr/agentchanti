@@ -11,14 +11,17 @@ from agentchanti.config import Config
 from agentchanti.llm.chat_types import ChatResponse, ToolCall
 from agentchanti.orchestrator.agent_loop import (
     AGENT_LOOP_SYSTEM_PROMPT,
+    RECOVERY_BLOCKED_MARKER,
     RECOVERY_FAILED_MARKER,
     agent_loop_enabled,
     build_step_tools,
     get_loop_stats,
     loop_stats_summary,
     reset_loop_stats,
+    reverifiable_cmd,
     run_agent_loop,
     run_recovery_loop,
+    truncate_middle,
     verify_cmd_for_language,
 )
 
@@ -195,6 +198,31 @@ class TestRunAgentLoop(AgentLoopTestCase):
                 if msg.role == "user":
                     self.assertNotIn("ACT now", msg.content)
 
+    def test_nudge_ignored_withholds_read_only_tools(self):
+        # 4 read-only turns: nudge fires after the 3rd, is ignored on the
+        # 4th → the 5th call must offer only acting tools.
+        read = _tool_response(ToolCall(name="read_file",
+                                       arguments={"path": "a.txt"}, id="c"))
+        write = _tool_response(ToolCall(
+            name="write_file",
+            arguments={"path": "b.txt", "content": "x"}, id="w"))
+        llm = self._llm(read, read, read, read, write, _final("done"))
+        self._write_helper()
+        success, _ = run_agent_loop(
+            llm, self.tools, "fix the tests", "task", max_turns=8)
+        self.assertTrue(success)
+        fifth_tools = llm.chat.call_args_list[4][1]["tools"]
+        self.assertEqual({t.name for t in fifth_tools},
+                         {"write_file", "edit_file", "run_command"})
+        # Escalation message present exactly once
+        messages = llm.chat.call_args_list[-1][0][0]
+        escalations = [m for m in messages if m.role == "user"
+                       and "Inspection tools are now disabled" in m.content]
+        self.assertEqual(len(escalations), 1)
+        # Acting restores the full toolset on the following call
+        sixth_tools = llm.chat.call_args_list[5][1]["tools"]
+        self.assertIn("read_file", {t.name for t in sixth_tools})
+
     def _write_helper(self):
         with open(os.path.join(self.root, "a.txt"), "w") as f:
             f.write("data")
@@ -306,6 +334,124 @@ class TestLoopTelemetry(AgentLoopTestCase):
         self.assertEqual(get_loop_stats()[0]["outcome"], "exhausted")
 
 
+class TestEnvSelfHeal(AgentLoopTestCase):
+    """Missing-dependency verify failures are healed with one install
+    instead of being fed to the model (the observed run burned 16 turns
+    while the fix was `pip install pytest`)."""
+
+    def test_missing_python_module_installed_and_reverified(self):
+        self.executor.run_command.side_effect = [
+            (True, "edited"),                                # model tool call
+            (False, "ModuleNotFoundError: No module named 'pytest'"),  # verify
+            (True, "Successfully installed pytest"),         # self-heal
+            (True, "12 passed"),                             # re-verify
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "apply fix"},
+                                    id="c1")),
+            _final("done"),
+        )
+        success, info = run_agent_loop(
+            llm, self.tools, "step", "task", max_turns=6,
+            verify_cmd="python manage.py test --noinput")
+        self.assertTrue(success)
+        self.assertEqual(info, "done")
+        install_cmd = self.executor.run_command.call_args_list[2][0][0]
+        self.assertEqual(install_cmd, "python -m pip install pytest")
+
+    def test_heal_keeps_cd_prefix_of_verify_cmd(self):
+        self.executor.run_command.side_effect = [
+            (True, "edited"),
+            (False, "No module named 'pytest'"),
+            (True, "installed"),
+            (True, "ok"),
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "step", "task", max_turns=6,
+            verify_cmd="cd app && python manage.py test --noinput")
+        self.assertTrue(success)
+        install_cmd = self.executor.run_command.call_args_list[2][0][0]
+        self.assertEqual(install_cmd, "cd app && python -m pip install pytest")
+
+    def test_module_healed_only_once_per_loop(self):
+        # Install "succeeds" but the error persists → the second verify
+        # failure must NOT trigger another install of the same module.
+        self.executor.run_command.side_effect = [
+            (True, "edited"),
+            (False, "No module named 'pytest'"),   # verify 1
+            (True, "installed"),                   # heal (once)
+            (False, "No module named 'pytest'"),   # re-verify → feedback
+            (False, "No module named 'pytest'"),   # final-turn verify
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("claim 1"),
+            _final("claim 2"),
+        )
+        success, info = run_agent_loop(
+            llm, self.tools, "step", "task", max_turns=3,
+            verify_cmd="python -m pytest -q")
+        self.assertFalse(success)
+        installs = [c[0][0] for c in self.executor.run_command.call_args_list
+                    if "pip install" in c[0][0]]
+        self.assertEqual(installs, ["python -m pip install pytest"])
+
+    def test_missing_npm_package_installed(self):
+        self.executor.run_command.side_effect = [
+            (True, "edited"),
+            (False, "Cannot find package '@testing-library/react' "
+                    "imported from App.test.jsx"),
+            (True, "added 1 package"),
+            (True, "3 passed"),
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "step", "task", language="javascript",
+            max_turns=6, verify_cmd="npm test --silent")
+        self.assertTrue(success)
+        install_cmd = self.executor.run_command.call_args_list[2][0][0]
+        self.assertEqual(install_cmd,
+                         "npm install -D @testing-library/react")
+
+    def test_local_module_not_pip_installed(self):
+        # `No module named 'main'` where main/ is a project package is a
+        # code problem — installing "main" from PyPI would be wrong (and
+        # a supply-chain risk). The failure goes to the model instead.
+        memory = MagicMock()
+        memory.all_files.return_value = {"main/views.py": "", "manage.py": ""}
+        tools = AgentTools(project_root=self.root, executor=self.executor,
+                           memory=memory)
+        self.executor.run_command.side_effect = [
+            (True, "edited"),
+            (False, "ModuleNotFoundError: No module named 'main'"),  # verify
+            (False, "ModuleNotFoundError: No module named 'main'"),  # final
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("claim 1"),
+            _final("claim 2"),
+        )
+        success, _ = run_agent_loop(
+            llm, tools, "step", "task", max_turns=3,
+            verify_cmd="python -m pytest -q")
+        self.assertFalse(success)
+        installs = [c[0][0] for c in self.executor.run_command.call_args_list
+                    if "pip install" in c[0][0]]
+        self.assertEqual(installs, [])
+
+
 class TestVerifyCmdForLanguage(unittest.TestCase):
 
     def test_python_default(self):
@@ -361,6 +507,56 @@ class TestVerifyCmdForLanguage(unittest.TestCase):
         self.assertIsNone(verify_cmd_for_language("rust"))
 
 
+class TestTruncateMiddle(unittest.TestCase):
+
+    def test_short_text_unchanged(self):
+        self.assertEqual(truncate_middle("abc", 100), "abc")
+
+    def test_keeps_head_and_tail_with_marker(self):
+        text = ("Command `npm run build` failed\n"
+                + "frame line\n" * 500
+                + "TypeError: x is not a function")
+        out = truncate_middle(text, 400)
+        self.assertLess(len(out), len(text))
+        self.assertIn("Command `npm run build` failed", out)
+        self.assertIn("TypeError: x is not a function", out)
+        self.assertIn("chars truncated", out)
+
+    def test_traceback_exception_survives_the_observed_case(self):
+        # The observed failure: a ~5000-char Django probe output whose
+        # LAST line names the exception, sliced to 4000. A head slice
+        # dropped the exception entirely.
+        text = ("Internal Server Error: /\n" + "x" * 4900
+                + "\nNoReverseMatch: Reverse for 'home' not found.")
+        self.assertIn("NoReverseMatch", truncate_middle(text, 4000))
+
+
+class TestReverifiableCmd(unittest.TestCase):
+
+    def test_idempotent_commands_pass_through(self):
+        for cmd in ("npm run build:css",
+                    "pip install django",
+                    "python -m pytest -q",
+                    "cd site && npm test --silent"):
+            self.assertEqual(reverifiable_cmd(cmd), cmd)
+
+    def test_one_shot_scaffold_commands_excluded(self):
+        for cmd in (
+            "mkdir site && cd site && python -m venv venv && pip install x",
+            "django-admin startproject config .",
+            "python manage.py startapp core",
+            "npm create vite@latest my-app",
+            "npx create-react-app app",
+            "git init",
+            "cargo new hello",
+        ):
+            self.assertIsNone(reverifiable_cmd(cmd), cmd)
+
+    def test_empty_and_none(self):
+        self.assertIsNone(reverifiable_cmd(None))
+        self.assertIsNone(reverifiable_cmd(""))
+
+
 class TestRunRecoveryLoop(AgentLoopTestCase):
 
     def test_error_context_reaches_model(self):
@@ -376,6 +572,101 @@ class TestRunRecoveryLoop(AgentLoopTestCase):
         user_msg = llm.chat.call_args_list[0][0][0][1]
         self.assertIn("previous attempt at this step FAILED", user_msg.content)
         self.assertIn("g++", user_msg.content)
+
+    def test_error_tail_survives_truncation(self):
+        # Long tracebacks name the exception on the LAST line; the model
+        # must see it or it spends the whole budget hunting for the error.
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "fix"}, id="c")),
+            _final("recovered"),
+        )
+        error = ("Internal Server Error: /\n"
+                 + "  File django/template/base.py, in render\n" * 300
+                 + "NoReverseMatch: Reverse for 'home' not found.")
+        run_recovery_loop(llm, self.tools, "step", "task", error)
+        user_msg = llm.chat.call_args_list[0][0][0][1]
+        self.assertIn("NoReverseMatch", user_msg.content)
+        self.assertIn("Internal Server Error", user_msg.content)
+
+    def test_blocked_admission_is_not_a_recovery(self):
+        # Without a verify_cmd the exit rests on the summary — one that
+        # admits the blocker must not count as recovered.
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("The required tool cannot be installed.\n"
+                   f"{RECOVERY_BLOCKED_MARKER} — tailwindcss CLI missing"),
+        )
+        ok, info = run_recovery_loop(llm, self.tools, "step", "task", "err")
+        self.assertFalse(ok)
+        self.assertIn("blocked", info)
+
+    def test_passing_verify_outranks_blocked_admission(self):
+        self.executor.run_command.side_effect = [
+            (True, "did something"),   # model's tool call
+            (True, "built fine"),      # deterministic verify → pass
+        ]
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final(f"{RECOVERY_BLOCKED_MARKER} (model is wrong)"),
+        )
+        ok, _ = run_recovery_loop(
+            llm, self.tools, "step", "task", "err",
+            verify_cmd="npm run build:css")
+        self.assertTrue(ok)
+
+    def test_verify_criterion_grounded_in_context(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "x"}, id="c")),
+            _final("done"),
+        )
+        run_recovery_loop(
+            llm, self.tools, "step", "task", "err",
+            verify_cmd="npm run build:css")
+        user_msg = llm.chat.call_args_list[0][0][0][1]
+        self.assertIn("complete ONLY when", user_msg.content)
+        self.assertIn("npm run build:css", user_msg.content)
+
+
+class TestCmdStepRecoveryVerify(unittest.TestCase):
+    """_handle_cmd_step hands the failed command to the recovery loop as
+    its deterministic verify gate — when the command is safe to re-run."""
+
+    def _run_failed_cmd(self, command):
+        from agentchanti.orchestrator.step_handlers import _handle_cmd_step
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        llm = MagicMock()
+        llm.supports_tools.return_value = True
+        memory = MagicMock()
+        memory.summary.return_value = ""
+        memory._scaffolded_subproject = None
+        memory.all_files.return_value = {}
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "boom")
+        plan_step = MagicMock()
+        plan_step.command = command
+        return _handle_cmd_step(
+            f"Run: {command}", executor, llm, memory, MagicMock(), 0,
+            plan_step=plan_step, cfg=cfg)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_failed_cmd_becomes_verify_cmd(self, mock_rec):
+        ok, _ = self._run_failed_cmd("npm run build:css")
+        self.assertTrue(ok)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"],
+                         "npm run build:css")
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_scaffold_cmd_gets_no_verify(self, mock_rec):
+        self._run_failed_cmd("django-admin startproject config .")
+        self.assertIsNone(mock_rec.call_args[1]["verify_cmd"])
 
 
 class TestDiagnosisLoopRecovery(unittest.TestCase):

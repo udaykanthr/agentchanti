@@ -3132,6 +3132,37 @@ class MyModelTest(TestCase):
         self.assertEqual(obj.name, "test")
 ```
 
+## Rule 7: Import ONLY test frameworks that are actually installed
+
+The Django suite runs via `python manage.py test` (stdlib unittest runner).
+`pip install django` does NOT install pytest — an `import pytest` line makes
+the whole test module fail collection with
+`ImportError: Failed to import test module ... No module named 'pytest'`.
+
+Write `django.test.TestCase` / `unittest` style tests by default. Only use
+pytest idioms (`pytest.raises`, fixtures, `@pytest.mark.django_db`) when
+pytest and pytest-django appear in the installed packages or an explicit
+install step.
+
+## Rule 7b: Django >= 5 removed GET logout
+
+`LogoutView` returns **405 Method Not Allowed** for GET requests since
+Django 5.0. Tests must log out with a POST:
+
+```python
+response = self.client.post(reverse("logout"))
+self.assertEqual(response.status_code, 302)
+```
+
+And templates must render logout as a POST form — a plain
+`<a href="{% url 'logout' %}">` link no longer works:
+
+```html
+<form method="post" action="{% url 'logout' %}">{% csrf_token %}
+  <button type="submit">Log out</button>
+</form>
+```
+
 ## Rule 8: NEVER import test classes into production files
 
 Production files (`views.py`, `models.py`, `urls.py`, `admin.py`, `serializers.py`)

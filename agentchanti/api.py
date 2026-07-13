@@ -341,6 +341,7 @@ def _run_task_impl(
         intent_agent=intent_agent,
         search_agent=search_agent,
         subproject_cwd=_api_subproject,
+        executor=executor,
     )
     if analysis_context:
         planner_context = analysis_context + "\n\n" + planner_context

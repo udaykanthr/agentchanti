@@ -309,9 +309,10 @@ def _attempt_fix(
 #
 # Executed with the project venv's interpreter inside the Django root.
 # argv: 1=settings module, 2=json file of [template_name, expected_path]
-# pairs, 3=comma-separated URLs to render. Exits non-zero on failures so
-# it doubles as the recovery loop's verify_cmd. ASCII-only: this source
-# is written to disk and parsed by an arbitrary interpreter.
+# pairs, 3=comma-separated URLs to render, 4=(optional) json file of
+# acceptance checks [{"url", "kind", "needle"}]. Exits non-zero on
+# failures so it doubles as the recovery loop's verify_cmd. ASCII-only:
+# this source is written to disk and parsed by an arbitrary interpreter.
 _DJANGO_PROBE = '''\
 import json
 import os
@@ -326,6 +327,7 @@ django.setup()
 from django.conf import settings
 from django.template.loader import get_template
 from django.test import Client
+from django.urls import NoReverseMatch, get_resolver, reverse
 
 failures = []
 
@@ -348,7 +350,23 @@ for name, expected in checks:
 if "testserver" not in settings.ALLOWED_HOSTS:
     settings.ALLOWED_HOSTS.append("testserver")
 client = Client()
-for url in [u for u in sys.argv[3].split(",") if u]:
+
+# Every no-argument named route is cheap ground truth -- render them all,
+# not just the explicit list (observed: a task modified signup.html and
+# the probe never rendered /accounts/signup/). reverse_dict only lists
+# non-namespaced names, which conveniently excludes the admin.
+urls = [u for u in sys.argv[3].split(",") if u]
+for key in list(get_resolver().reverse_dict.keys()):
+    if not isinstance(key, str) or "logout" in key:
+        continue
+    try:
+        u = reverse(key)
+    except NoReverseMatch:
+        continue
+    if u not in urls:
+        urls.append(u)
+
+for url in urls[:20]:
     try:
         resp = client.get(url)
         if resp.status_code >= 500:
@@ -357,6 +375,38 @@ for url in [u for u in sys.argv[3].split(",") if u]:
     except Exception as e:
         failures.append("RENDER_CRASH: GET %s raised %s: %s"
                         % (url, type(e).__name__, e))
+
+# Acceptance checks from the task briefing: raw-HTML substring
+# assertions on a plain GET (redirects followed). These encode the
+# task's requirements -- a green run that fails one of these did not
+# accomplish what the user asked for.
+if len(sys.argv) > 4 and sys.argv[4]:
+    with open(sys.argv[4], encoding="utf-8") as f:
+        acceptance = json.load(f)
+    for chk in acceptance:
+        try:
+            resp = client.get(chk["url"], follow=True)
+            html = resp.content.decode("utf-8", "replace")
+            status = resp.status_code
+        except Exception as e:
+            failures.append("ACCEPTANCE_FAILED: GET %s raised %s: %s"
+                            % (chk["url"], type(e).__name__, e))
+            continue
+        if status != 200:
+            failures.append(
+                "ACCEPTANCE_FAILED: GET %s -> HTTP %s (cannot check %r)"
+                % (chk["url"], status, chk["needle"]))
+            continue
+        present = chk["needle"] in html
+        if chk["kind"] == "must_contain" and not present:
+            failures.append(
+                "ACCEPTANCE_FAILED: GET %s response HTML must contain %r "
+                "but it is MISSING" % (chk["url"], chk["needle"]))
+        elif chk["kind"] == "must_not_contain" and present:
+            failures.append(
+                "ACCEPTANCE_FAILED: GET %s response HTML must NOT contain "
+                "%r but it is PRESENT (it still renders on a plain GET)"
+                % (chk["url"], chk["needle"]))
 
 for line in failures:
     print(line)
@@ -425,27 +475,37 @@ def _run_django_verification(memory, executor, coder, display,
     import json as _json
     import tempfile as _tempfile
 
+    from .page_grounding import parse_acceptance_checks
+
     settings_module = _django_settings_module(django_dir)
     if settings_module is None:
         _logger.info("[SmokeTest] Django settings module not found — skipping")
         return True, ""
     checks = _django_template_checks(memory.all_files(), django_dir)
+    # Requirement-derived assertions from the task briefing — the piece
+    # that catches "everything renders but the task wasn't accomplished".
+    acceptance = parse_acceptance_checks(
+        getattr(memory, "_task_briefing", "") or "")
 
     tmp_dir = _tempfile.mkdtemp(prefix="agentchanti_django_probe_")
     script = os.path.join(tmp_dir, "django_probe.py")
     checks_file = os.path.join(tmp_dir, "checks.json")
+    acceptance_file = os.path.join(tmp_dir, "acceptance.json")
     try:
         with open(script, "w", encoding="utf-8") as f:
             f.write(_DJANGO_PROBE)
         with open(checks_file, "w", encoding="utf-8") as f:
             _json.dump(checks, f)
+        with open(acceptance_file, "w", encoding="utf-8") as f:
+            _json.dump(acceptance, f)
 
         probe_cmd = (f'python "{script}" {settings_module} '
-                     f'"{checks_file}" /')
+                     f'"{checks_file}" / "{acceptance_file}"')
         verify_cmd = (probe_cmd if django_dir == "."
                       else f"cd {django_dir} && {probe_cmd}")
         _logger.info("[SmokeTest] Django verification: %d template check(s) "
-                     "+ page render (cwd=%s)", len(checks), django_dir)
+                     "+ page render + %d acceptance check(s) (cwd=%s)",
+                     len(checks), len(acceptance), django_dir)
         _show_status = getattr(display, "show_status", None)
         if callable(_show_status):
             _show_status("Verifying Django templates and page render...")
@@ -460,19 +520,23 @@ def _run_django_verification(memory, executor, coder, display,
             _logger.info("[SmokeTest] Django verification passed")
             return True, ""
 
-        _logger.warning("[SmokeTest] Django verification FAILED:\n%s",
-                        (out or "")[:1500])
         from .agent_loop import (
             agent_loop_enabled, build_step_tools, run_recovery_loop,
+            truncate_middle,
         )
+        _logger.warning("[SmokeTest] Django verification FAILED:\n%s",
+                        truncate_middle(out or "", 1500))
         llm_client = getattr(coder, "llm_client", None)
         if agent_loop_enabled(cfg, llm_client):
             tools = build_step_tools(executor, memory)
             recovered, info = run_recovery_loop(
                 llm_client, tools,
-                step_text=("Make the created Django templates reachable by "
-                           "the template loader and the pages render "
-                           "without errors."),
+                step_text=("Make the Django verification pass: created "
+                           "templates reachable by the template loader, "
+                           "every page renders without errors, and all "
+                           "ACCEPTANCE checks derived from the task hold "
+                           "(they assert what the task requires on the "
+                           "rendered HTML)."),
                 task=task,
                 error_info=f"Django verification failed:\n{out}",
                 display=display, step_idx=0, language=language,
@@ -482,10 +546,12 @@ def _run_django_verification(memory, executor, coder, display,
                 _logger.info("[SmokeTest] Django verification recovered: %s",
                              info[:200])
                 return True, ""
-            return False, f"Django verification failing: {info[:600]}"
-        return False, f"Django verification failed: {(out or '')[:800]}"
+            return False, ("Django verification failing: "
+                           f"{truncate_middle(info, 600)}")
+        return False, ("Django verification failed: "
+                       f"{truncate_middle(out or '', 800)}")
     finally:
-        for p in (script, checks_file):
+        for p in (script, checks_file, acceptance_file):
             try:
                 os.unlink(p)
             except OSError:

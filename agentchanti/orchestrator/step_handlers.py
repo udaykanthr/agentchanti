@@ -1994,17 +1994,22 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # a missing dependency) or report the blocker in plain terms.
     from .agent_loop import (
         RECOVERY_FAILED_MARKER, agent_loop_enabled, build_step_tools,
-        run_recovery_loop,
+        reverifiable_cmd, run_recovery_loop,
     )
     if agent_loop_enabled(cfg, llm_client):
         display.step_info(step_idx, "Command failed — agent loop recovery")
         tools = build_step_tools(executor, memory)
         _task_goal = (getattr(project_context, "goal_summary", "")
                       if project_context else "") or step_text
+        # The failed command itself is the ground truth for the recovery
+        # when it is safe to re-run — without it the loop exits on the
+        # model's word alone (observed: a summary describing a still-
+        # failing `npm run build:css` was logged as "recovered").
         recovered, info = run_recovery_loop(
             llm_client, tools, step_text, _task_goal, error_info,
             display=display, step_idx=step_idx, language=language,
-            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8))
+            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+            verify_cmd=reverifiable_cmd(cmd))
         if recovered:
             log.info(f"Step {step_idx+1}: Agent loop recovered failed "
                      f"command: {info[:200]}")
@@ -4788,6 +4793,16 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
         loop_context = memory.summary()
         if verify_cmd:
             _pre_ok, _pre_out = executor.run_command(verify_cmd, timeout=300)
+            # Missing-dependency failures are environment problems the
+            # loop's file edits can never fix — heal them before the loop
+            # so its turns go to real test work (mirrors BulkTest).
+            if not _pre_ok:
+                from .agent_loop import attempt_env_self_heal
+                _healed: set = set()
+                while not _pre_ok and attempt_env_self_heal(
+                        tools, _pre_out or "", language, _healed, verify_cmd):
+                    _pre_ok, _pre_out = executor.run_command(
+                        verify_cmd, timeout=300)
             _status = "PASSING" if _pre_ok else "FAILING"
             loop_context += (
                 f"\n\nCurrent test status ({_status}) from `{verify_cmd}`:\n"

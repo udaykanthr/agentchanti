@@ -755,6 +755,7 @@ def _main_impl():
             intent_agent=intent_agent,
             cli_display=display,
             subproject_cwd=_intent_subproject,
+            executor=executor,
         )
         if analysis_context:
             planner_context = analysis_context + "\n\n" + planner_context

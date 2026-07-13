@@ -5434,48 +5434,63 @@ def _resolve_fix_scope_files(
             result[path] = content
             continue
 
-        # 2. FileMemory basename / suffix match
-        for stored_path, stored_content in memory.all_files().items():
-            sp_norm = stored_path.replace("\\", "/")
-            p_norm = path.replace("\\", "/")
-            if (sp_norm.endswith(p_norm)
-                    or _os.path.basename(stored_path) == basename):
-                result[stored_path] = stored_content
-                break
-        else:
-            # 3. Disk read
-            content = _read_disk(path)
-            if content is not None:
-                result[path] = content
-            else:
-                # 4. Glob
-                found = _glob_search(path)
-                if found:
-                    result[found[0]] = found[1]
-                else:
-                    # 5. KB semantic search
-                    resolved_via_kb = False
-                    if kb_context_builder is not None:
-                        try:
-                            relevant = kb_context_builder.get_relevant_files(
-                                task_description=f"file {path} {basename}",
-                                max_files=1,
-                            )
-                            for r_path in relevant:
-                                r_content = memory.get(r_path) or _read_disk(r_path)
-                                if r_content:
-                                    result[r_path] = r_content
-                                    resolved_via_kb = True
-                                    break
-                        except Exception as kb_exc:
-                            _logger.debug(
-                                "[WiringVerification] KB search failed for %s: %s",
-                                path, kb_exc,
-                            )
-                    if not resolved_via_kb:
-                        _logger.warning(
-                            "[WiringVerification] Could not resolve: %s — skipping", path
-                        )
+        # 2. FileMemory suffix match, THEN basename match — two separate
+        #    passes over ALL files. A single combined pass let a basename
+        #    hit on an earlier file shadow the exact suffix match on a
+        #    later one: `core/urls.py` and `config/urls.py` both resolved
+        #    to accounts/urls.py (written first), so the files that
+        #    actually needed review never entered the verification prompt
+        #    while the LLM still "fixed" them blind. Every match is kept —
+        #    same-named files are exactly the ones the wiring check must
+        #    see side by side.
+        stored = memory.all_files()
+        p_norm = path.replace("\\", "/").lstrip("./")
+        matches = [sp for sp in stored
+                   if sp.replace("\\", "/") == p_norm
+                   or sp.replace("\\", "/").endswith("/" + p_norm)]
+        if not matches:
+            matches = [sp for sp in stored
+                       if _os.path.basename(sp) == basename]
+        if matches:
+            for sp in matches:
+                result[sp] = stored[sp]
+            continue
+
+        # 3. Disk read
+        content = _read_disk(path)
+        if content is not None:
+            result[path] = content
+            continue
+
+        # 4. Glob
+        found = _glob_search(path)
+        if found:
+            result[found[0]] = found[1]
+            continue
+
+        # 5. KB semantic search
+        resolved_via_kb = False
+        if kb_context_builder is not None:
+            try:
+                relevant = kb_context_builder.get_relevant_files(
+                    task_description=f"file {path} {basename}",
+                    max_files=1,
+                )
+                for r_path in relevant:
+                    r_content = memory.get(r_path) or _read_disk(r_path)
+                    if r_content:
+                        result[r_path] = r_content
+                        resolved_via_kb = True
+                        break
+            except Exception as kb_exc:
+                _logger.debug(
+                    "[WiringVerification] KB search failed for %s: %s",
+                    path, kb_exc,
+                )
+        if not resolved_via_kb:
+            _logger.warning(
+                "[WiringVerification] Could not resolve: %s — skipping", path
+            )
 
     # Natural-language queries → KB semantic search (top-3 files each)
     for nl_query in nl_queries:
@@ -5651,6 +5666,10 @@ def run_wiring_verification(
         "  • Module not found (package not imported / wrong casing)\n"
         "  • Duplicate context/provider wrappers (e.g. Router, ThemeProvider, "
         "Store) in both entry-point AND child — causes nested provider errors\n"
+        "  • Route/URL name mismatch — a template or view references a "
+        "named route (e.g. Django `{% url 'name' %}` / `reverse('name')`) "
+        "that no URLconf in scope defines under that exact name; mind "
+        "`app_name` namespacing\n"
         "  • Any other wiring issue that prevents the UI from rendering\n\n"
         f"Files in scope:\n{context_block}\n\n"
         "RESPONSE FORMAT:\n"
@@ -5662,7 +5681,10 @@ def run_wiring_verification(
         "    // complete file content — never abbreviate\n"
         "    ```\n"
         "CRITICAL: Never use `// existing code` or `/* unchanged */` — "
-        "write the full file content or your fix will delete existing code."
+        "write the full file content or your fix will delete existing code.\n"
+        "CRITICAL: Only rewrite files from the list above. NEVER invent new "
+        "files or rewrite files that are not shown — a fix touching an "
+        "unlisted file will be discarded in its entirety."
     )
 
     display.show_status("Verifying cross-file wiring...")
@@ -5703,6 +5725,29 @@ def run_wiring_verification(
             _logger.warning(
                 "[WiringVerification] LLM reported issues but no code "
                 "blocks found; review manually:\n%s", response[:400],
+            )
+            return True, ""
+
+        # Ground the fix set in the files the model actually saw. The
+        # wiring LLM sometimes "fixes" files that never entered the
+        # prompt, inventing their entire content from references it saw
+        # elsewhere (observed: core/urls.py — absent from the scope —
+        # rewritten with a new `app_name` namespace that broke every
+        # un-namespaced {% url %} tag in templates it also invented).
+        # In-scope rewrites may depend on the invented files (a base
+        # template including a new partial), so the whole set is rejected
+        # rather than filtered: the files on disk have already passed
+        # their own step checks.
+        _allowed = set(verification_context.keys())
+        _strays = [p for p in fix_files
+                   if p.replace("\\", "/").lstrip("./") not in _allowed]
+        if _strays:
+            _logger.warning(
+                "[WiringVerification] Rejecting fix — it rewrites file(s) "
+                "outside the verification scope: %s", _strays)
+            print(
+                "  [WiringVerify] Proposed fix rejected (touches files not "
+                "in the reviewed scope) — keeping existing files."
             )
             return True, ""
 

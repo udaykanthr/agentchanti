@@ -29,6 +29,11 @@ class TesterAgent(Agent):
 
         prompt = self._build_prompt(task, context, language=language)
         fw = get_test_framework(language, test_runner=test_runner)
+        # Django projects test through manage.py, not pytest — announcing
+        # pytest here contradicts the Django rules appended below.
+        if (language in (None, "python")
+                and self._is_django_project(context)):
+            fw = dict(fw, command="python manage.py test")
         lang_tag = get_code_block_lang(language)
         lang_name = get_language_name(language)
         # Use detected test_root from project analysis when available,
@@ -67,7 +72,7 @@ Language: {lang_name}
             prompt += self._js_test_rules(language, fw, env_info=env_info,
                                           test_runner=test_runner)
         elif language == "python" or language is None:
-            prompt += self._python_test_rules()
+            prompt += self._python_test_rules(django=self._is_django_project(context))
         else:
             from ..language_backend import get_backend
             _test_backend = get_backend(language)
@@ -313,8 +318,40 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
 """
 
     @staticmethod
-    def _python_test_rules() -> str:
+    def _is_django_project(context: str) -> bool:
+        """Django leaves unambiguous fingerprints in the file listing or on
+        disk (manage.py); the context alone is enough when the pipeline
+        wrote the project files itself."""
+        import os
+        paths = TesterAgent._extract_file_paths(context)
+        if any(p.replace("\\", "/").endswith(("manage.py", "/settings.py"))
+               for p in paths):
+            return True
+        return os.path.isfile("manage.py")
+
+    @staticmethod
+    def _python_test_rules(django: bool = False) -> str:
         """Return Python-specific test guidance."""
+        if django:
+            # Django suites run through `manage.py test` (stdlib unittest
+            # runner) — pytest is usually NOT installed, and an
+            # `import pytest` line fails collection of the whole module.
+            return """
+PYTHON TEST RULES (critical — Django project, run via `python manage.py test`):
+1. Use `django.test.TestCase` (or `SimpleTestCase` when no DB is needed)
+   with `self.assert*` methods. Do NOT import pytest — it is NOT installed;
+   the suite runs on the stdlib unittest runner via manage.py.
+2. Do NOT create or modify source files — ONLY write test files.
+3. Use `self.client` for requests and `reverse('name')` for URLs.
+4. For exceptions, use `self.assertRaises(ExceptionType)`.
+5. Do NOT install packages or modify requirements.txt / settings.py.
+6. Django >= 5 removed GET logout: `LogoutView` returns 405 for GET.
+   Test logout with `self.client.post(reverse('logout'))`, never GET.
+7. Login-protected views redirect (302) to the login URL with `?next=` —
+   assert the redirect, not a 200.
+8. Read the actual templates before asserting response content; never
+   assume rendered text.
+"""
         return """
 PYTHON TEST RULES (critical for pytest):
 1. Use `from <module_path> import <name>` matching the EXACT source file path.

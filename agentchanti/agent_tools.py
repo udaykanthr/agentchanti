@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from typing import Optional
 
 from .cli_display import log
@@ -28,6 +29,11 @@ _IGNORED_DIRS = frozenset({
 _MAX_READ_CHARS = 40_000
 _MAX_CMD_OUTPUT_CHARS = 8_000
 _MAX_LIST_ENTRIES = 300
+
+# POSIX heredoc (`python - << 'PY' ... PY`). cmd.exe parses `<<` as two
+# redirects, so on Windows the command exits 1 with no useful output and
+# the model retries variations of the same broken syntax.
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?\w+['\"]?")
 
 
 def _truncate(text: str, limit: int, what: str = "output") -> str:
@@ -296,6 +302,11 @@ class AgentTools:
         return f"OK: replaced 1 occurrence in {path}"
 
     def _tool_run_command(self, command: str) -> str:
+        if os.name == "nt" and _HEREDOC_RE.search(command):
+            return ("ERROR: POSIX heredoc syntax (<<) does not work on "
+                    "Windows cmd — the command would fail without a useful "
+                    "error. Write the script to a file with write_file and "
+                    "run that file, or use python -c \"...\" for one-liners.")
         if self._executor is None:
             from .executor import Executor
             self._executor = Executor()

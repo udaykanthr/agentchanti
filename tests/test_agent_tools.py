@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agentchanti.agent_tools import AgentTools
 from agentchanti.llm.chat_types import ToolCall
@@ -192,6 +192,47 @@ class TestSearchCode(AgentToolsTestCase):
         self.assertIn("src/auth.py:10-20", result)
         self.assertIn("check_auth", result)
         searcher.search.assert_called_once_with("auth", top_k=5)
+
+
+class TestHeredocGuard(AgentToolsTestCase):
+    """POSIX heredocs cannot work on Windows cmd — the guard must return
+    an instructive error instead of a bare exit-1 (observed: an agent
+    loop burned a turn on `python - << 'PY'` that failed with 33 chars
+    of noise)."""
+
+    HEREDOC_CMD = "python - << 'PY'\nprint('hi')\nPY"
+
+    def test_heredoc_rejected_on_windows(self):
+        executor = MagicMock()
+        tools = AgentTools(project_root=self.root, executor=executor)
+        with patch("agentchanti.agent_tools.os.name", "nt"):
+            result = tools.execute(ToolCall(
+                name="run_command",
+                arguments={"command": self.HEREDOC_CMD}))
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("write_file", result)
+        executor.run_command.assert_not_called()
+
+    def test_heredoc_allowed_on_posix(self):
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "hi")
+        tools = AgentTools(project_root=self.root, executor=executor)
+        with patch("agentchanti.agent_tools.os.name", "posix"):
+            result = tools.execute(ToolCall(
+                name="run_command",
+                arguments={"command": self.HEREDOC_CMD}))
+        self.assertIn("exit: success", result)
+        executor.run_command.assert_called_once()
+
+    def test_plain_command_unaffected_on_windows(self):
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "ok")
+        tools = AgentTools(project_root=self.root, executor=executor)
+        with patch("agentchanti.agent_tools.os.name", "nt"):
+            result = tools.execute(ToolCall(
+                name="run_command",
+                arguments={"command": "python -m pytest -q"}))
+        self.assertIn("exit: success", result)
 
 
 if __name__ == "__main__":
