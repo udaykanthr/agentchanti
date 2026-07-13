@@ -130,6 +130,69 @@ class TestLoadStaticLint(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+SETTINGS_NO_LOGIN_URL = "INSTALLED_APPS = ['main']\nDEBUG = True\n"
+VIEWS_PROTECTED = ("from django.contrib.auth.decorators import login_required\n"
+                   "@login_required\n"
+                   "def dashboard_view(request):\n    return render(...)\n")
+
+
+class TestLoginUrlLint(unittest.TestCase):
+
+    def test_run3_repro_login_required_without_login_url(self):
+        errors = check_django_project({
+            "spacious_site/config/settings.py": SETTINGS_NO_LOGIN_URL,
+            "spacious_site/main/urls.py": URLS_PLAIN.replace(
+                "path('health/', health, name='health')",
+                "path('login/', login_view, name='login')"),
+            "spacious_site/main/views.py": VIEWS_PROTECTED,
+        })
+        self.assertEqual(len(errors), 1)
+        self.assertIn("LOGIN_URL = 'login'", errors[0])
+        self.assertIn("settings.py", errors[0])
+
+    def test_login_url_set_is_clean(self):
+        errors = check_django_project({
+            "config/settings.py": SETTINGS_NO_LOGIN_URL + "LOGIN_URL = 'login'\n",
+            "main/views.py": VIEWS_PROTECTED,
+        })
+        self.assertEqual(errors, [])
+
+    def test_auth_urls_mounted_is_clean(self):
+        # include('django.contrib.auth.urls') serves /accounts/login/
+        errors = check_django_project({
+            "config/settings.py": SETTINGS_NO_LOGIN_URL,
+            "config/urls.py": ("urlpatterns = [path('accounts/', "
+                               "include('django.contrib.auth.urls'))]"),
+            "main/views.py": VIEWS_PROTECTED,
+        })
+        self.assertEqual(errors, [])
+
+    def test_no_protected_views_is_clean(self):
+        errors = check_django_project({
+            "config/settings.py": SETTINGS_NO_LOGIN_URL,
+            "main/views.py": "def home(request):\n    return render(...)\n",
+        })
+        self.assertEqual(errors, [])
+
+    def test_no_settings_file_is_silent(self):
+        errors = check_django_project({
+            "main/views.py": VIEWS_PROTECTED,
+        })
+        self.assertEqual(errors, [])
+
+    def test_namespaced_login_suggested(self):
+        errors = check_django_project({
+            "config/settings.py": SETTINGS_NO_LOGIN_URL,
+            "sitepages/urls.py": URLS_NAMESPACED,
+            "sitepages/views.py": VIEWS_PROTECTED.replace(
+                "dashboard_view", "dashboard"),
+        })
+        # One LOGIN_URL error (the namespaced urls carry a 'login' route)
+        login_errors = [e for e in errors if "LOGIN_URL" in e]
+        self.assertEqual(len(login_errors), 1)
+        self.assertIn("LOGIN_URL = 'sitepages:login'", login_errors[0])
+
+
 class TestLintScope(unittest.TestCase):
 
     def test_non_django_project_is_clean(self):
