@@ -51,3 +51,5 @@ agentchanti/kb/global_kb/core/global_kb.db
 agentchanti/kb/global_kb/core/manifest.json
 agentchanti/kb/global_kb/registry/
 agentchanti/kb/global_kb/store.py
+*.db-shm
+*.db-wal
