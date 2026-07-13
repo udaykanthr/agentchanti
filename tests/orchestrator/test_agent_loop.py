@@ -240,6 +240,31 @@ class TestRunAgentLoop(AgentLoopTestCase):
         self.assertIn("python", user_msg.content)
         self.assertIn("3 files tracked", user_msg.content)
 
+    def test_windows_platform_note_in_user_message(self):
+        # On Windows the user message must warn off POSIX text tools
+        # (observed: a loop burned a turn on `sed` before finding
+        # read_file); the system prompt must stay byte-identical.
+        llm = self._llm(
+            _tool_response(ToolCall(name="list_files", arguments={}, id="c")),
+            _final(),
+        )
+        with patch("os.name", "nt"):
+            run_agent_loop(llm, self.tools, "the step", "the task")
+        messages = llm.chat.call_args_list[0][0][0]
+        self.assertEqual(messages[0].content, AGENT_LOOP_SYSTEM_PROMPT)
+        self.assertIn("sed", messages[1].content)
+        self.assertIn("Windows", messages[1].content)
+
+    def test_no_platform_note_on_posix(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="list_files", arguments={}, id="c")),
+            _final(),
+        )
+        with patch("os.name", "posix"):
+            run_agent_loop(llm, self.tools, "the step", "the task")
+        user_msg = llm.chat.call_args_list[0][0][0][1]
+        self.assertNotIn("Windows", user_msg.content)
+
 
 class TestGating(unittest.TestCase):
 

@@ -392,6 +392,48 @@ def _is_additive_source_fix(file_path: str, new_content: str,
     return True
 
 
+def _is_safe_source_fix(file_path: str, new_content: str, memory) -> bool:
+    """Relaxed gate for source fixes that fail the strict additive check.
+
+    Full-file responses from smaller models rarely reproduce untouched
+    lines byte-for-byte, so a one-line intended fix can arrive as a
+    "large" diff and :func:`_is_additive_source_fix` vetoes it (observed:
+    a correct one-line ``{% load static %}`` fix was blocked on five
+    consecutive rounds while the run failed around it). Judge the change
+    itself, not the response format: accept when the file already
+    exists, every top-level export survives, and the line-level diff
+    stays under the escape hatch's relaxed cap.
+    """
+    orig = memory.get(file_path)
+    if orig is None:
+        try:
+            with open(file_path, 'r', encoding='utf-8',
+                      errors='replace') as f:
+                orig = f.read()
+        except OSError:
+            return False
+    if not orig or not new_content.strip():
+        return False
+
+    dropped = (_extract_top_level_exports(orig)
+               - _extract_top_level_exports(new_content))
+    if dropped:
+        _logger.warning(
+            "[BulkTest] Source fix for %s drops top-level exports %s "
+            "— rejected", file_path, sorted(dropped))
+        return False
+
+    stats = _diff_stats(orig, new_content)
+    if stats['ratio'] > _ESCAPE_HATCH_DIFF_RATIO:
+        return False
+    _logger.info(
+        "[BulkTest] Source fix for %s within hatch cap "
+        "(added=%d removed=%d changed=%d ratio=%.0f%%)",
+        file_path, stats['added'], stats['removed'], stats['changed'],
+        stats['ratio'] * 100)
+    return True
+
+
 # ── Escape hatch: targeted source-file fix helpers ────────────────────────
 # When test-only retries can't resolve a BulkTest failure (same error
 # signature across consecutive attempts), the escape hatch allows ONE
@@ -4729,6 +4771,11 @@ def run_bulk_test_execution_and_fix(
                             _logger.info(
                                 "[BulkTest] Allowed small additive "
                                 "source fix for %s", _bt_fp)
+                        elif _is_safe_source_fix(_bt_fp, _bt_fc, memory):
+                            _bt_filtered[_bt_fp] = _bt_fc
+                            _logger.info(
+                                "[BulkTest] Allowed bounded source fix "
+                                "for %s (diff within hatch cap)", _bt_fp)
                         else:
                             _logger.warning(
                                 "[BulkTest] Blocked fix for source file "
@@ -5159,6 +5206,13 @@ def run_bulk_test_execution_and_fix(
                                 _logger.info(
                                     "[BulkTest] Allowed small additive "
                                     "source fix for %s", _bt2_fp)
+                            elif _is_safe_source_fix(
+                                    _bt2_fp, _bt2_fc, memory):
+                                _bt2_filtered[_bt2_fp] = _bt2_fc
+                                _logger.info(
+                                    "[BulkTest] Allowed bounded source "
+                                    "fix for %s (diff within hatch cap)",
+                                    _bt2_fp)
                             else:
                                 _logger.warning(
                                     "[BulkTest] Blocked fix for source "

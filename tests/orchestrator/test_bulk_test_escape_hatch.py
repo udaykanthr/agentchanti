@@ -22,6 +22,7 @@ from agentchanti.orchestrator.pipeline import (
     _extract_stack_trace_files,
     _extract_top_level_exports,
     _is_additive_source_fix,
+    _is_safe_source_fix,
     _should_trigger_escape_hatch,
 )
 
@@ -225,6 +226,75 @@ class TestIsAdditiveSourceFix(unittest.TestCase):
         new = orig + "\nA\nB\nC\nD"
         mem = self._make_memory({"f.js": orig})
         self.assertFalse(_is_additive_source_fix("f.js", new, mem))
+
+
+class TestIsSafeSourceFix(unittest.TestCase):
+    """The relaxed BulkTest gate: judges the diff, not the response
+    format, so full-file responses carrying a small real fix pass while
+    wholesale rewrites and export-dropping changes stay blocked."""
+
+    def _make_memory(self, files):
+        mem = MagicMock()
+        mem.get.side_effect = lambda fp: files.get(fp)
+        return mem
+
+    def test_one_line_insert_passes(self):
+        # The observed case: {% load static %} added to a template —
+        # blocked by the additive gate only because the model responded
+        # in full-file format.
+        orig = "\n".join(f"<div>line{i}</div>" for i in range(20))
+        new = "{% load static %}\n" + orig
+        mem = self._make_memory({"base.html": orig})
+        self.assertTrue(_is_safe_source_fix("base.html", new, mem))
+
+    def test_moderate_replace_passes_where_additive_blocks(self):
+        # 4 of 20 lines rewritten (20%) — additive gate rejects
+        # (delta > 10%), the relaxed gate accepts (≤30%).
+        orig_lines = [f"line{i}" for i in range(20)]
+        new_lines = list(orig_lines)
+        for i in range(4):
+            new_lines[i] = f"fixed{i}"
+        orig, new = "\n".join(orig_lines), "\n".join(new_lines)
+        mem = self._make_memory({"f.py": orig})
+        self.assertFalse(_is_additive_source_fix("f.py", new, mem))
+        self.assertTrue(_is_safe_source_fix("f.py", new, mem))
+
+    def test_wholesale_rewrite_blocked(self):
+        orig = "\n".join(f"line{i}" for i in range(20))
+        new = "\n".join(f"other{i}" for i in range(20))
+        mem = self._make_memory({"f.py": orig})
+        self.assertFalse(_is_safe_source_fix("f.py", new, mem))
+
+    def test_dropped_export_blocked(self):
+        orig = ("def home(request):\n    return 1\n\n"
+                + "\n".join(f"# pad{i}" for i in range(20)))
+        new = ("def dashboard(request):\n    return 1\n\n"
+               + "\n".join(f"# pad{i}" for i in range(20)))
+        mem = self._make_memory({"views.py": orig})
+        self.assertFalse(_is_safe_source_fix("views.py", new, mem))
+
+    def test_new_file_blocked(self):
+        mem = self._make_memory({})
+        self.assertFalse(_is_safe_source_fix(
+            "no/such/file_xyz.py", "def f():\n    pass", mem))
+
+    def test_empty_new_content_blocked(self):
+        orig = "\n".join(f"line{i}" for i in range(10))
+        mem = self._make_memory({"f.py": orig})
+        self.assertFalse(_is_safe_source_fix("f.py", "   \n", mem))
+
+    def test_disk_fallback_when_memory_misses(self):
+        import os
+        import tempfile
+        orig = "\n".join(f"line{i}" for i in range(20))
+        fd, path = tempfile.mkstemp(suffix=".py")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(orig)
+            mem = self._make_memory({})  # not tracked by this run
+            self.assertTrue(_is_safe_source_fix(path, orig + "\nextra", mem))
+        finally:
+            os.unlink(path)
 
 
 # ── Escape-hatch helper ───────────────────────────────────────────────────

@@ -119,11 +119,32 @@ summary (no tool calls). If you cannot complete it, explain what is blocking.
 """
 
 
+def _platform_note() -> str:
+    """Environment line for the loop's user message.
+
+    Lives in the user message, not the system prompt, so the system
+    prompt stays byte-identical across platforms (see module docstring).
+    Windows needs it spelled out: an observed loop burned a turn on
+    ``sed -n '1,200p' file`` (exit 1 — no sed on Windows) instead of
+    calling read_file.
+    """
+    import os
+    if os.name == "nt":
+        return ("Environment: Windows (cmd.exe shell). POSIX text tools "
+                "(sed, awk, grep, cat, head, tail, ls) are NOT available "
+                "in run_command — use read_file / edit_file / search_code "
+                "for file inspection and changes.")
+    return ""
+
+
 def _build_user_message(step_text: str, task: str, language: str | None,
                         context: str) -> str:
     parts = [f"Overall task: {task}", f"Current step: {step_text}"]
     if language:
         parts.append(f"Project language: {language}")
+    note = _platform_note()
+    if note:
+        parts.append(note)
     if context:
         parts.append(f"Project state:\n{context}")
     return "\n\n".join(parts)
