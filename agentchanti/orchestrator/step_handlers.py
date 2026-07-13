@@ -1771,7 +1771,8 @@ def _handle_cmd_step(step_text: str, executor: Executor,
     # ── Resolve LLM placeholders ──
     # Dumb/small LLMs sometimes output <project-name> instead of the real name.
     _task_desc = getattr(project_context, 'goal_summary', '') if project_context else ''
-    cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=_task_desc)
+    cmd = resolve_cmd_placeholders(cmd, step_text=step_text, task=_task_desc,
+                                   language=language)
 
     # ── Strip dead `cd <dir> &&` before scaffold commands ──
     # LLMs often generate `cd <name> && npm create vite@latest <name>` but the
@@ -3538,17 +3539,52 @@ def _api_grounding_context(
     return [], verified_ctx
 
 
-def _declared_verify_cmd(plan_step, memory: FileMemory) -> str | None:
+# Venv-activation segment inside a && chain — `call venv\Scripts\activate`,
+# `source .venv/bin/activate`, `. venv/bin/activate` and bare-path variants.
+_VENV_ACTIVATE_RE = re.compile(
+    r'^(?:call\s+|source\s+|\.\s+)?\S*(?:venv|env)[\\/]+(?:Scripts|bin)'
+    r'[\\/]+activate(?:\.bat|\.ps1)?$',
+    re.IGNORECASE,
+)
+
+
+def _declared_verify_cmd(plan_step, memory: FileMemory,
+                         task: str = "") -> str | None:
     """The plan-declared acceptance command for a step, or None.
 
-    Prefixes ``cd <subproject> && `` when the project lives in a
-    scaffolded subdirectory so manage.py / package.json are found.
-    One-shot scaffolding commands are rejected — a verify gate must be
-    safely re-runnable (same rule as the recovery loop's verifier).
+    Sanitised before use — planners emit gates wrapped in scaffolding
+    noise (observed: `cd <project_name> && call venv\\Scripts\\activate
+    && python manage.py check` on every step):
+
+      * ``<placeholder>`` tokens are resolved like CMD commands are.
+      * Venv-activation segments are dropped — the gate runs with the
+        pipeline's own Python, and the segment used to disqualify the
+        whole command via the scaffold filter.
+      * A leading ``cd`` into a directory that does not exist is dropped
+        (the detected subproject prefix below re-adds the real one).
+
+    One-shot scaffolding commands are still rejected — a verify gate
+    must be safely re-runnable (same rule as the recovery verifier).
     """
     cmd = getattr(plan_step, "verify_cmd", None) if plan_step is not None else None
     if not cmd:
         return None
+
+    cmd = resolve_cmd_placeholders(
+        cmd, step_text=getattr(plan_step, "description", "") or "",
+        task=task)
+
+    segments = [s.strip() for s in cmd.split("&&")]
+    segments = [s for s in segments
+                if s and not _VENV_ACTIVATE_RE.match(s)]
+    if segments and segments[0].lower().startswith("cd "):
+        _dir = segments[0][3:].strip().strip('"\'')
+        if _dir and not os.path.isdir(_dir):
+            segments = segments[1:]
+    cmd = " && ".join(segments)
+    if not cmd:
+        return None
+
     from .agent_loop import reverifiable_cmd
     if reverifiable_cmd(cmd) is None:
         return None
@@ -3561,7 +3597,7 @@ def _declared_verify_cmd(plan_step, memory: FileMemory) -> str | None:
 def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
                              executor: Executor, memory: FileMemory,
                              display: CLIDisplay,
-                             step_idx: int) -> tuple[bool, str]:
+                             step_idx: int, task: str = "") -> tuple[bool, str]:
     """Deterministic per-step acceptance gate for the classic path.
 
     A handler's own success claim is only accepted once the step's
@@ -3572,7 +3608,7 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
     """
     if not success:
         return success, error_info
-    cmd = _declared_verify_cmd(plan_step, memory)
+    cmd = _declared_verify_cmd(plan_step, memory, task=task)
     if not cmd:
         return success, error_info
     display.step_info(step_idx, f"Step gate: {cmd}")
@@ -3583,6 +3619,31 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
     return False, (
         f"Step acceptance command failed: `{cmd}`\n"
         f"{(out or '(no output)')[-2000:]}")
+
+
+def _django_lint_gate(success: bool, error_info: str, memory: FileMemory,
+                      display: CLIDisplay, step_idx: int) -> tuple[bool, str]:
+    """Fail a "successful" step whose files carry deterministic Django
+    wiring bugs (namespace mismatches, missing {% load %} lines).
+
+    These bugs pass ``manage.py check`` and only explode at request
+    time; two consecutive benchmark runs died on them. The lint runs on
+    both the loop and classic paths — it costs microseconds — and its
+    error strings name the exact fix, so the recovery loop gets a
+    mechanical instruction instead of a mystery traceback.
+    """
+    if not success:
+        return success, error_info
+    from .django_lint import check_django_project
+    errors = check_django_project(memory.all_files())
+    if not errors:
+        return success, error_info
+    display.step_info(
+        step_idx, f"Django lint: {len(errors)} wiring error(s) — step gated")
+    log.warning("[DjangoLint] step %d gated on %d wiring error(s)",
+                step_idx + 1, len(errors))
+    return False, ("Django wiring lint failed — fix these exactly as "
+                   "stated:\n" + "\n".join(errors[:10]))
 
 
 def _plan_step_brief(plan_step) -> str:
@@ -3612,7 +3673,8 @@ def _plan_step_brief(plan_step) -> str:
     return "\n".join(lines)
 
 
-def _record_passed_gate(success: bool, plan_step, memory: FileMemory) -> None:
+def _record_passed_gate(success: bool, plan_step, memory: FileMemory,
+                        task: str = "") -> None:
     """Add a step's declared verify to the monotonic gate ledger.
 
     Only called with the step's final verdict: by then the gate has been
@@ -3623,7 +3685,7 @@ def _record_passed_gate(success: bool, plan_step, memory: FileMemory) -> None:
     """
     if not success:
         return
-    cmd = _declared_verify_cmd(plan_step, memory)
+    cmd = _declared_verify_cmd(plan_step, memory, task=task)
     if not cmd:
         return
     from .wave_snapshots import get_gate_ledger
@@ -3651,8 +3713,10 @@ def _handle_code_step(step_text: str, coder: CoderAgent,
                               getattr(coder, "llm_client", None)):
         success, error_info = _gate_on_declared_verify(
             success, error_info, kwargs.get("plan_step"), executor, memory,
-            display, step_idx)
-    _record_passed_gate(success, kwargs.get("plan_step"), memory)
+            display, step_idx, task=task)
+    success, error_info = _django_lint_gate(
+        success, error_info, memory, display, step_idx)
+    _record_passed_gate(success, kwargs.get("plan_step"), memory, task=task)
     return success, error_info
 
 
@@ -3690,7 +3754,7 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
         # Plan-declared acceptance command becomes the loop's exit gate:
         # the model's "done" claim is only accepted once it exits 0, and
         # failures feed back as fix turns.
-        verify_cmd = _declared_verify_cmd(plan_step, memory)
+        verify_cmd = _declared_verify_cmd(plan_step, memory, task=task)
         if verify_cmd:
             loop_context += (
                 f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
@@ -4905,8 +4969,10 @@ def _handle_test_step(step_text: str, tester: TesterAgent, coder: CoderAgent,
                               getattr(tester, "llm_client", None)):
         success, error_info = _gate_on_declared_verify(
             success, error_info, kwargs.get("plan_step"), executor, memory,
-            display, step_idx)
-    _record_passed_gate(success, kwargs.get("plan_step"), memory)
+            display, step_idx, task=task)
+    success, error_info = _django_lint_gate(
+        success, error_info, memory, display, step_idx)
+    _record_passed_gate(success, kwargs.get("plan_step"), memory, task=task)
     return success, error_info
 
 
@@ -4943,7 +5009,7 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
         # Plan-declared acceptance command wins (it names the exact
         # suite/app this step must satisfy); the language-level default
         # is the fallback when the plan declared nothing.
-        verify_cmd = _declared_verify_cmd(plan_step, memory)
+        verify_cmd = _declared_verify_cmd(plan_step, memory, task=task)
         if not verify_cmd:
             verify_cmd = verify_cmd_for_language(language, _vsub or ".")
             if verify_cmd and _vsub:

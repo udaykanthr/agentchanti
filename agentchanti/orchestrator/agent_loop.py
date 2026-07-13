@@ -444,8 +444,13 @@ def verify_cmd_for_language(language: str | None,
 # refuses a non-empty directory, python -m venv → half-usable dir. Any
 # compound command containing one of these is excluded whole — planned
 # commands routinely chain scaffold + install with `&&`.
+# Venv must match CREATION invocations only — a bare `venv` alternative
+# also matched the harmless activation path `venv\Scripts\activate`,
+# which silently disqualified every plan-declared verify: that carried
+# the planner's activation prefix (observed: all 12 CODE gates dropped).
 _NON_REVERIFIABLE_RE = re.compile(
-    r"\b(?:mkdir|venv|virtualenv|startproject|startapp"
+    r"\b(?:mkdir|(?:python3?|py)\s+-m\s+venv|virtualenv\s+\S+"
+    r"|startproject|startapp"
     r"|git\s+init|npm\s+(?:create|init)|npx\s+create-|yarn\s+create"
     r"|cargo\s+(?:new|init)|rails\s+new|dotnet\s+new)\b",
     re.IGNORECASE,
@@ -516,7 +521,11 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
         "A previous attempt at this step FAILED. Error:\n"
         f"{truncate_middle(error_info, 4000)}\n\n"
         "Investigate the actual state of the project, fix the cause, and "
-        "complete the step. If the failure is an environment limitation "
+        "complete the step. If the step is a failed shell command, prefer "
+        "correcting and re-running that command (fix the path, drop a bad "
+        "`cd`, adjust a flag) over recreating its effects by hand — do NOT "
+        "hand-write the files a scaffolder would have generated. "
+        "If the failure is an environment limitation "
         "you cannot fix (e.g. a required tool is not installed and cannot "
         "be installed), say so clearly in your summary and end it with "
         f"the exact line: {RECOVERY_BLOCKED_MARKER}")

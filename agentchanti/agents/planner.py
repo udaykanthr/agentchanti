@@ -1421,7 +1421,7 @@ content:                               ← CODE/TEST steps that CREATE new files
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 """) + """produces: <file1>, <file2>             ← CMD steps. Files created by the command.
-verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). Must be runnable from the project root and re-runnable (no scaffolding). Example: python manage.py test main --noinput
+verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). Must be runnable from the project root and re-runnable (no scaffolding). It runs with the pipeline's own Python — NEVER activate a virtualenv in it, never use placeholders, and never cd into a folder that does not exist yet. Example: python manage.py test main --noinput
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 """ + ("""
 DO NOT include file contents anywhere in the plan. No content: blocks,
@@ -1486,8 +1486,12 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 11. **Shell commands are non-interactive**: Always include --yes, -y, or
     --defaults flags for tools that prompt for input.
 
-12. **Sub-project paths**: Use the EXACT SAME folder name in ALL steps.
-    CMD steps must include `cd <name> &&` before the command.
+12. **Sub-project paths — concrete names only**: Choose ONE concrete
+    lowercase folder name for the project (e.g. `spacious_site`) and use
+    that EXACT name in ALL steps. NEVER emit angle-bracket placeholders
+    like <project_name> or <app-name> — every command must be literally
+    runnable as written. Only `cd` into a folder in steps that run AFTER
+    the step that creates it.
 
 13. **SKIP already-installed packages**: If the project knowledge lists
     packages as already installed, do NOT add install steps for them.

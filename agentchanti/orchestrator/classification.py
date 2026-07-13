@@ -200,7 +200,8 @@ def _extract_project_name_from_text(text: str) -> str | None:
     return None
 
 
-def resolve_cmd_placeholders(cmd: str, step_text: str = '', task: str = '') -> str:
+def resolve_cmd_placeholders(cmd: str, step_text: str = '', task: str = '',
+                             language: str | None = None) -> str:
     """Replace unresolved <placeholder> tokens left by small/dumb LLMs.
 
     Only touches name-like placeholders (project-name, app-name, dir, …).
@@ -223,25 +224,41 @@ def resolve_cmd_placeholders(cmd: str, step_text: str = '', task: str = '') -> s
     )
 
     if not resolved:
+        # Backend frameworks are checked FIRST and with word boundaries:
+        # enriched task text routinely name-drops frontend libraries
+        # (KB doc titles, "no React needed"), and a substring table with
+        # 'react' before 'django' resolved a Django task to 'react-app'
+        # — a directory nothing ever created, failing every CMD step.
         combined = (task + ' ' + step_text).lower()
-        if 'next' in combined:
-            resolved = 'next-app'
-        elif 'vite' in combined and 'react' in combined:
-            resolved = 'vite-react-app'
-        elif 'react' in combined:
-            resolved = 'react-app'
-        elif 'vue' in combined:
-            resolved = 'vue-app'
-        elif 'angular' in combined:
-            resolved = 'angular-app'
-        elif 'svelte' in combined:
-            resolved = 'svelte-app'
-        elif 'nuxt' in combined:
-            resolved = 'nuxt-app'
-        elif 'django' in combined:
+
+        def _has(word: str) -> bool:
+            return re.search(r'\b' + word + r'\b', combined) is not None
+
+        _lang = (language or '').lower()
+        if _has('django'):
             resolved = 'django-project'
-        elif 'rails' in combined:
+        elif _has('rails'):
             resolved = 'rails-app'
+        elif _has('flask'):
+            resolved = 'flask-app'
+        elif _has('fastapi'):
+            resolved = 'fastapi-app'
+        elif _lang == 'python':
+            resolved = 'python-app'
+        elif _has('next') or _has('nextjs'):
+            resolved = 'next-app'
+        elif _has('vite') and _has('react'):
+            resolved = 'vite-react-app'
+        elif _has('react'):
+            resolved = 'react-app'
+        elif _has('vue'):
+            resolved = 'vue-app'
+        elif _has('angular'):
+            resolved = 'angular-app'
+        elif _has('svelte'):
+            resolved = 'svelte-app'
+        elif _has('nuxt'):
+            resolved = 'nuxt-app'
         else:
             resolved = 'my-app'
 

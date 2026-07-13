@@ -72,6 +72,14 @@ class TestPlannerPromptModes(unittest.TestCase):
             self.assertIn("verify: <shell command>", prompt)
             self.assertIn("imported_by:", prompt)
 
+    def test_no_placeholder_rule_in_both_modes(self):
+        # Regression: a plan emitted `cd <project_name>` in every CMD and
+        # verify line; the resolver guessed 'react-app' for a Django task.
+        for mode in ("content", "intent"):
+            prompt = _captured_prompt(mode)
+            self.assertIn("NEVER emit angle-bracket placeholders", prompt)
+            self.assertIn("NEVER activate a virtualenv", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

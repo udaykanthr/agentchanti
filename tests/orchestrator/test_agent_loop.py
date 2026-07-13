@@ -581,8 +581,42 @@ class TestReverifiableCmd(unittest.TestCase):
         self.assertIsNone(reverifiable_cmd(None))
         self.assertIsNone(reverifiable_cmd(""))
 
+    def test_venv_activation_is_not_scaffolding(self):
+        # Regression: a bare `venv` alternative matched the activation
+        # path and silently dropped every plan-declared verify gate.
+        for cmd in (
+            r"cd site && call venv\Scripts\activate && python manage.py check",
+            "source venv/bin/activate && pytest -q",
+            r".venv\Scripts\python.exe -m pytest",
+        ):
+            self.assertEqual(reverifiable_cmd(cmd), cmd, cmd)
+
+    def test_venv_creation_still_excluded(self):
+        for cmd in (
+            "python -m venv venv && pip install django",
+            "python3 -m venv .venv",
+            "py -m venv env",
+            "virtualenv venv",
+        ):
+            self.assertIsNone(reverifiable_cmd(cmd), cmd)
+
 
 class TestRunRecoveryLoop(AgentLoopTestCase):
+
+    def test_recovery_prefers_rerunning_commands(self):
+        # Regression: a scaffold-command recovery hand-wrote the 13 files
+        # startproject would have generated. The context must steer the
+        # model toward correcting and re-running the command instead.
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "fix"}, id="c")),
+            _final("recovered"),
+        )
+        run_recovery_loop(llm, self.tools, "scaffold the project", "task",
+                          "cd nope && django-admin startproject failed")
+        user_msg = llm.chat.call_args_list[0][0][0][1]
+        self.assertIn("re-running that command", user_msg.content)
+        self.assertIn("do NOT hand-write the files", user_msg.content)
 
     def test_error_context_reaches_model(self):
         llm = self._llm(
@@ -1042,6 +1076,34 @@ class TestDeclaredVerifyGate(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("python manage.py test", err)
         self.assertIn("FAILED (errors=2)", err)
+
+    def test_activation_and_placeholder_sanitised(self):
+        # The observed plan: every verify wrapped in cd <placeholder> +
+        # venv activation. The gate must survive as the bare command.
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(
+            id="2.1", step_type="CODE",
+            verify_cmd=(r"cd <project_name> && call venv\Scripts\activate "
+                        r"&& python manage.py check"))
+        cmd = _declared_verify_cmd(ps, self._memory(),
+                                   task="create a django application")
+        self.assertEqual(cmd, "python manage.py check")
+
+    def test_existing_cd_kept(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(id="2.1", step_type="CODE",
+                      verify_cmd="cd . && python manage.py check")
+        cmd = _declared_verify_cmd(ps, self._memory())
+        self.assertEqual(cmd, "cd . && python manage.py check")
+
+    def test_activation_only_command_is_none(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(id="2.1", step_type="CODE",
+                      verify_cmd=r"call venv\Scripts\activate")
+        self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
 
     def test_gate_pass_and_noop_cases(self):
         from agentchanti.orchestrator.plan_step import PlanStep
