@@ -99,6 +99,29 @@ class TestPlannerPromptModes(unittest.TestCase):
             self.assertIn("NEVER activate a virtualenv", prompt)
 
 
+class TestAgentModelOverrides(unittest.TestCase):
+    """Regression: a hardcoded allowlist dropped models.escalation —
+    the user configured it correctly and it silently never fired."""
+
+    def test_escalation_key_survives_load(self):
+        cfg = Config({"models": {"escalation": "gpt-5.4"}})
+        self.assertEqual(cfg.get_agent_model("escalation"), "gpt-5.4")
+
+    def test_intent_and_analyser_survive(self):
+        cfg = Config({"models": {"intent": "a", "analyser": "b",
+                                 "coder": "c"}})
+        self.assertEqual(cfg.get_agent_model("intent"), "a")
+        self.assertEqual(cfg.get_agent_model("analyser"), "b")
+        self.assertEqual(cfg.get_agent_model("coder"), "c")
+
+    def test_case_insensitive_keys(self):
+        cfg = Config({"models": {"Escalation": "gpt-5.4"}})
+        self.assertEqual(cfg.get_agent_model("escalation"), "gpt-5.4")
+
+    def test_unconfigured_returns_none(self):
+        self.assertIsNone(Config({}).get_agent_model("escalation"))
+
+
 class TestDoneContradictionGuard(unittest.TestCase):
     """Deterministic ==DONE== rejection — prompt rules lost this fight
     twice (the DONE reason literally described the required fix)."""

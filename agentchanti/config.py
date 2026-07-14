@@ -214,13 +214,17 @@ class Config:
         self.ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or anthropic_section.get(
             "base_url", _DEFAULTS["anthropic_base_url"])
 
-        # Per-agent model overrides
+        # Per-agent model overrides. Accept every key: a hardcoded
+        # allowlist here silently dropped `escalation` (and `intent` /
+        # `analyser`), so a correctly configured escalation model never
+        # fired — the loop failed at its turn budget with the stronger
+        # model sitting unused. Lowercased to match get_agent_model().
         self._agent_models: dict[str, str] = {}
         models_section = yd.get("models", {})
         if isinstance(models_section, dict):
-            for agent_name in ("planner", "coder", "reviewer", "tester"):
-                if agent_name in models_section:
-                    self._agent_models[agent_name] = str(models_section[agent_name])
+            self._agent_models = {
+                str(k).lower(): str(v) for k, v in models_section.items()
+            }
 
         # Custom agent prompt suffixes
         self.PROMPT_SUFFIXES: dict[str, str] = {}
