@@ -168,6 +168,24 @@ def _read_run_log(workdir: Path) -> str:
                      for p in logs)
 
 
+def _seed_workdir(workdir: Path, task: dict, config_text: str) -> None:
+    """(Re)create a pristine workdir: task seed files + harness config.
+
+    Called again before each crash retry — a crashed attempt leaves a
+    partially built project behind, and retrying on top of it produces
+    resume-flavoured results whose tokens/loop stats measure only the
+    finishing attempt (observed: an 'intent PASS' at 25k tokens that
+    was really attempt 3 completing attempts 1-2's leftovers).
+    """
+    shutil.rmtree(workdir, ignore_errors=True)
+    workdir.mkdir(parents=True, exist_ok=True)
+    for rel, content in task["files"].items():
+        dest = workdir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+    (workdir / ".agentchanti.yaml").write_text(config_text, encoding="utf-8")
+
+
 def run_one(task: dict, agent_loop: bool, base_config: str,
             use_truststore: bool, keep_workdirs: bool,
             plan_mode: str | None = None,
@@ -176,12 +194,8 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
     label = mode + (f"-{plan_mode}" if plan_mode else "")
     workdir = Path(tempfile.mkdtemp(
         prefix=f"ab_{task['id']}_{label}_"))
-    for rel, content in task["files"].items():
-        dest = workdir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-    (workdir / ".agentchanti.yaml").write_text(
-        _build_config(base_config, agent_loop, plan_mode), encoding="utf-8")
+    config_text = _build_config(base_config, agent_loop, plan_mode)
+    _seed_workdir(workdir, task, config_text)
 
     print(f"  [{task['id']} / loop={mode}"
           f"{f' / plan={plan_mode}' if plan_mode else ''}] "
@@ -235,7 +249,9 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
         if crashed and crash_retries < 2:
             crash_retries += 1
             print(f"    native crash (rc={returncode:#x}) — "
-                  f"retry {crash_retries}/2 ...", flush=True)
+                  f"retry {crash_retries}/2 in a fresh workdir ...",
+                  flush=True)
+            _seed_workdir(workdir, task, config_text)
             continue
         break
     wall_s = round(time.monotonic() - started, 1)
