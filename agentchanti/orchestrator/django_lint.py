@@ -17,10 +17,14 @@ machine-checkable, yet invisible to ``manage.py check``:
    ``app/tests.py``; a later step creates ``app/tests/`` — Django test
    discovery then dies with "module incorrectly imported". Disk-aware:
    the scaffold stub is rarely in the run's file memory.
+5. **References to routes that exist nowhere**: ``{% url 'logout' %}``
+   with no ``name='logout'`` in any urls.py and contrib.auth urls not
+   mounted — NoReverseMatch on every render of that template. Safe to
+   assert in generated-from-scratch projects, where every route is
+   project-defined; Django's own auth names are exempted whenever
+   ``django.contrib.auth.urls`` is mounted.
 
-The checks are conservative: a bare name is only flagged when it is NOT
-reachable unnamespaced anywhere but IS defined under some ``app_name``
-namespace — so third-party names (admin, auth) never false-positive.
+Namespaced third-party references (``admin:index``) are never flagged.
 """
 
 from __future__ import annotations
@@ -46,6 +50,12 @@ _LOGIN_URL_RE = re.compile(r"^LOGIN_URL\s*=", re.MULTILINE)
 # mounted (include('django.contrib.auth.urls') or an accounts/ path).
 _AUTH_URLS_RE = re.compile(
     r"django\.contrib\.auth\.urls|['\"]accounts/login")
+# Route names provided by django.contrib.auth.urls when mounted.
+_AUTH_URL_NAMES = frozenset({
+    "login", "logout", "password_change", "password_change_done",
+    "password_reset", "password_reset_done", "password_reset_confirm",
+    "password_reset_complete",
+})
 
 
 def _norm(path: str) -> str:
@@ -63,10 +73,12 @@ def check_django_project(files: dict[str, str]) -> list[str]:
     namespaced: dict[str, str] = {}   # route name -> app_name
     plain: set[str] = set()           # names reachable without a namespace
     auth_urls_mounted = False
+    urlconf_seen = False
 
     for path, content in files.items():
         if not content or not _norm(path).endswith("urls.py"):
             continue
+        urlconf_seen = True
         names = set(_URL_NAME_RE.findall(content))
         if _AUTH_URLS_RE.search(content):
             auth_urls_mounted = True
@@ -77,6 +89,16 @@ def check_django_project(files: dict[str, str]) -> list[str]:
                 namespaced.setdefault(name, ns)
         else:
             plain |= names
+
+    def _unknown(name: str) -> bool:
+        """A bare route name that no urls.py defines anywhere."""
+        if not urlconf_seen or ":" in name:
+            return False
+        if name in plain or name in namespaced:
+            return False
+        if auth_urls_mounted and name in _AUTH_URL_NAMES:
+            return False
+        return True
 
     errors: list[str] = []
     for path, content in files.items():
@@ -93,6 +115,13 @@ def check_django_project(files: dict[str, str]) -> list[str]:
                         f"{path}: redirect/reverse('{name}') — this route "
                         f"is namespaced; use "
                         f"'{namespaced[name]}:{name}' instead")
+                elif _unknown(name):
+                    errors.append(
+                        f"{path}: redirect/reverse('{name}') — no route "
+                        f"named '{name}' is defined in any urls.py. Add "
+                        f"path(..., name='{name}') to the app's urls.py "
+                        f"(or mount django.contrib.auth.urls if it is a "
+                        f"Django auth route)")
 
         elif p.endswith(".html"):
             for ref in sorted(set(_TEMPLATE_URL_RE.findall(content))):
@@ -103,6 +132,13 @@ def check_django_project(files: dict[str, str]) -> list[str]:
                         f"{path}: {{% url '{ref}' %}} — this route is "
                         f"namespaced; use "
                         f"'{namespaced[ref]}:{ref}' instead")
+                elif _unknown(ref):
+                    errors.append(
+                        f"{path}: {{% url '{ref}' %}} — no route named "
+                        f"'{ref}' is defined in any urls.py. Add "
+                        f"path(..., name='{ref}') to the app's urls.py "
+                        f"(or mount django.contrib.auth.urls if it is a "
+                        f"Django auth route)")
             if _STATIC_TAG_RE.search(content) \
                     and not _LOAD_STATIC_RE.search(content):
                 errors.append(

@@ -63,13 +63,48 @@ class TestNamespaceLint(unittest.TestCase):
         })
         self.assertEqual(errors, [])
 
-    def test_unknown_name_not_flagged(self):
-        # Names we can't prove wrong (third-party, admin) stay silent
-        views = "def go(request):\n    return redirect('admin:index')\n" \
-                "def go2(request):\n    return redirect('password_reset')\n"
+    def test_namespaced_thirdparty_not_flagged(self):
+        views = "def go(request):\n    return redirect('admin:index')\n"
         errors = check_django_project({
             "sitepages/urls.py": URLS_NAMESPACED,
             "sitepages/views.py": views,
+        })
+        self.assertEqual(errors, [])
+
+    def test_run6_repro_nonexistent_name_flagged(self):
+        # {% url 'logout' %} with no logout route anywhere: NoReverseMatch
+        # on every render — burned 16 recovery turns before this rule.
+        tpl = "<form action=\"{% url 'logout' %}\" method=\"post\">"
+        errors = check_django_project({
+            "accounts/urls.py": URLS_PLAIN,
+            "accounts/templates/accounts/dashboard.html": tpl,
+        })
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no route named 'logout'", errors[0])
+        self.assertIn("django.contrib.auth.urls", errors[0])
+
+    def test_nonexistent_reverse_in_py_flagged(self):
+        views = "def go(request):\n    return redirect('home')\n"
+        errors = check_django_project({
+            "api/urls.py": URLS_PLAIN,  # defines only 'health'
+            "api/views.py": views,
+        })
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no route named 'home'", errors[0])
+
+    def test_auth_names_clean_when_auth_urls_mounted(self):
+        tpl = "<a href=\"{% url 'logout' %}\">out</a>"
+        errors = check_django_project({
+            "config/urls.py": ("urlpatterns = [path('accounts/', "
+                               "include('django.contrib.auth.urls'))]"),
+            "t.html": tpl,
+        })
+        self.assertEqual(errors, [])
+
+    def test_no_urlconf_stays_silent(self):
+        # Without any urls.py we cannot prove anything is missing
+        errors = check_django_project({
+            "t.html": "<a href=\"{% url 'whatever' %}\">x</a>",
         })
         self.assertEqual(errors, [])
 
@@ -285,6 +320,33 @@ class TestLintGateIntegration(unittest.TestCase):
             memory, MagicMock(), 0, cfg=cfg)
         self.assertFalse(success)
         self.assertIn("sitepages:dashboard", error)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
+           return_value=(False, "Verification still failing after 8 turns"))
+    def test_failed_step_gets_lint_findings_appended(self, mock_loop):
+        # A FAILED step's error is annotated with lint findings so the
+        # recovery loop starts from the deterministic diagnosis.
+        from agentchanti.orchestrator.step_handlers import _handle_code_step
+        cfg = MagicMock()
+        cfg.AGENT_LOOP = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        coder = MagicMock()
+        coder.llm_client.supports_tools.return_value = True
+        coder.escalation_client = None
+        memory = MagicMock()
+        memory.summary.return_value = "files"
+        memory._scaffolded_subproject = None
+        memory.all_files.return_value = {
+            "accounts/urls.py": URLS_PLAIN,
+            "accounts/templates/accounts/dashboard.html":
+                "<form action=\"{% url 'logout' %}\">",
+        }
+        success, error = _handle_code_step(
+            "step", coder, MagicMock(), MagicMock(), "task",
+            memory, MagicMock(), 0, cfg=cfg)
+        self.assertFalse(success)
+        self.assertIn("Verification still failing", error)
+        self.assertIn("no route named 'logout'", error)
 
     @patch("agentchanti.orchestrator.agent_loop.run_agent_loop",
            return_value=(True, "loop says done"))

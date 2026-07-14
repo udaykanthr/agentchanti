@@ -3631,19 +3631,30 @@ def _django_lint_gate(success: bool, error_info: str, memory: FileMemory,
     both the loop and classic paths — it costs microseconds — and its
     error strings name the exact fix, so the recovery loop gets a
     mechanical instruction instead of a mystery traceback.
+
+    Failed steps get the findings too, appended to their error: the
+    recovery loop then starts from the deterministic diagnosis instead
+    of rediscovering it (observed: 16 turns spent circling a
+    NoReverseMatch whose one-line cause the lint states outright).
     """
-    if not success:
-        return success, error_info
     from .django_lint import check_django_project
     errors = check_django_project(memory.all_files())
     if not errors:
         return success, error_info
-    display.step_info(
-        step_idx, f"Django lint: {len(errors)} wiring error(s) — step gated")
-    log.warning("[DjangoLint] step %d gated on %d wiring error(s)",
-                step_idx + 1, len(errors))
-    return False, ("Django wiring lint failed — fix these exactly as "
-                   "stated:\n" + "\n".join(errors[:10]))
+    findings = "\n".join(errors[:10])
+    if success:
+        display.step_info(
+            step_idx,
+            f"Django lint: {len(errors)} wiring error(s) — step gated")
+        log.warning("[DjangoLint] step %d gated on %d wiring error(s)",
+                    step_idx + 1, len(errors))
+        return False, ("Django wiring lint failed — fix these exactly as "
+                       "stated:\n" + findings)
+    log.info("[DjangoLint] step %d already failed — %d lint finding(s) "
+             "appended for the recovery loop", step_idx + 1, len(errors))
+    return False, (f"{error_info}\n\n"
+                   "Deterministic Django lint findings — fix these exactly "
+                   "as stated:\n" + findings)
 
 
 def _plan_step_brief(plan_step) -> str:
