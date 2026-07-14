@@ -126,26 +126,45 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
           flush=True)
     started = time.monotonic()
     timed_out = False
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-X", "utf8", "-c",
-             _bootstrap_code(task["task"], use_truststore)],
-            cwd=workdir, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            stdin=subprocess.DEVNULL,
-            timeout=RUN_TIMEOUT_S,
-            env={**__import__("os").environ,
-                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
-        )
-        stdout_tail = (proc.stdout or "")[-2000:]
-        stderr_tail = (proc.stderr or "")[-2000:]
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout_tail = "(timed out)"
-        stderr_tail = ""
-    wall_s = round(time.monotonic() - started, 1)
+    crash_retries = 0
+    returncode = None
+    while True:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-X", "utf8", "-c",
+                 _bootstrap_code(task["task"], use_truststore)],
+                cwd=workdir, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL,
+                timeout=RUN_TIMEOUT_S,
+                env={**__import__("os").environ,
+                     "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            )
+            returncode = proc.returncode
+            stdout_tail = (proc.stdout or "")[-2000:]
+            stderr_tail = (proc.stderr or "")[-2000:]
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stdout_tail = "(timed out)"
+            stderr_tail = ""
 
-    log_text = _read_run_log(workdir)
+        log_text = _read_run_log(workdir)
+
+        # A native hard abort (observed: intermittent 0xC0000409
+        # STATUS_STACK_BUFFER_OVERRUN during KB startup — empty stdout
+        # AND stderr, seconds of wall time, no pipeline verdict in the
+        # log) is an infrastructure flake, not a task result. One retry
+        # keeps the benchmark honest; a repeat is reported as-is.
+        crashed = (not timed_out
+                   and returncode not in (0, 1)
+                   and parse_pipeline_claim(log_text) is None)
+        if crashed and crash_retries < 1:
+            crash_retries += 1
+            print(f"    native crash (rc={returncode:#x}) — "
+                  f"retrying once ...", flush=True)
+            continue
+        break
+    wall_s = round(time.monotonic() - started, 1)
 
     # Ground truth: every success command must pass in the workdir.
     ground_truth = True
@@ -174,6 +193,8 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
         "tokens": parse_total_tokens(log_text),
         "wall_s": wall_s,
         "timed_out": timed_out,
+        "returncode": returncode,
+        "crash_retries": crash_retries,
         "loop_stats": parse_loop_stats(log_text),
         "workdir": str(workdir),
         "check_outputs": check_outputs,
