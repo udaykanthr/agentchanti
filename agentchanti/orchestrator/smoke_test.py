@@ -566,7 +566,8 @@ def _run_django_verification(memory, executor, coder, display,
                 error_info=f"Django verification failed:\n{out}",
                 display=display, step_idx=0, language=language,
                 max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-                verify_cmd=verify_cmd)
+                verify_cmd=verify_cmd,
+                escalation_client=getattr(coder, "escalation_client", None))
             if recovered:
                 _logger.info("[SmokeTest] Django verification recovered: %s",
                              info[:200])
@@ -661,7 +662,8 @@ def _run_js_build_verification(memory, executor, coder, display,
             error_info=f"Command `{build_cmd}` failed.\nOutput:\n{out}",
             display=display, step_idx=0, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-            verify_cmd=build_cmd)
+            verify_cmd=build_cmd,
+            escalation_client=getattr(coder, "escalation_client", None))
         if recovered:
             _logger.info("[SmokeTest] JS build recovered: %s", info[:200])
             return True, ""

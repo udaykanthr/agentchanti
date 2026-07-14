@@ -2862,7 +2862,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             llm_client, _rec_tools, step_text, task, error_info,
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-            verify_cmd=_rec_verify)
+            verify_cmd=_rec_verify,
+            escalation_client=getattr(coder, "escalation_client", None))
         if recovered:
             log.info(f"Task {step_idx+1}: Agent loop recovered the step: "
                      f"{rec_info[:200]}")
@@ -4223,7 +4224,8 @@ def run_bulk_test_execution_and_fix(
             error_info=(output or "")[-4000:],
             display=None, step_idx=0, language=lang,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-            verify_cmd=_bt_verify)
+            verify_cmd=_bt_verify,
+            escalation_client=getattr(coder, "escalation_client", None))
         if recovered:
             _logger.info("[BulkTest] Agent loop fixed the suite: %s",
                          rec_info[:200])

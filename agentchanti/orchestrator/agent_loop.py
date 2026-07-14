@@ -505,7 +505,8 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
                       display=None, step_idx: int = 0,
                       language: str | None = None,
                       max_turns: int = 8,
-                      verify_cmd: str | None = None) -> tuple[bool, str]:
+                      verify_cmd: str | None = None,
+                      escalation_client=None) -> tuple[bool, str]:
     """One bounded loop attempt to recover a failed step.
 
     Replaces the diagnose → fix → re-run machinery: the model gets the
@@ -533,8 +534,12 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
         context += (
             f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
             "successfully — it will be run to verify your work.")
-    success, info = run_agent_loop(
+    # Recovery loops are where turn budgets die (observed repeatedly:
+    # "mid-fix at turn 8") — they deserve the escalation retry as much
+    # as first-attempt loops do.
+    success, info = run_agent_loop_with_escalation(
         llm_client, tools, step_text, task,
+        escalation_client=escalation_client,
         display=display, step_idx=step_idx, language=language,
         max_turns=max_turns, verify_cmd=verify_cmd, context=context,
         _recovery=True)

@@ -603,6 +603,22 @@ class TestReverifiableCmd(unittest.TestCase):
 
 class TestRunRecoveryLoop(AgentLoopTestCase):
 
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_recovery_loop_escalates_on_failure(self, mock_loop):
+        # Recovery loops are where turn budgets die — they get the same
+        # one-shot stronger-model retry as first-attempt loops.
+        mock_loop.side_effect = [(False, "still failing at turn 8"),
+                                 (True, "fixed by stronger model")]
+        escalation = MagicMock()
+        escalation.supports_tools.return_value = True
+        ok, info = run_recovery_loop(
+            MagicMock(name="primary"), MagicMock(), "step", "task", "err",
+            escalation_client=escalation)
+        self.assertTrue(ok)
+        self.assertEqual(mock_loop.call_count, 2)
+        self.assertIs(mock_loop.call_args_list[1][0][0], escalation)
+        self.assertTrue(mock_loop.call_args_list[1][1]["_recovery"])
+
     def test_recovery_prefers_rerunning_commands(self):
         # Regression: a scaffold-command recovery hand-wrote the 13 files
         # startproject would have generated. The context must steer the
