@@ -87,14 +87,76 @@ def _build_config(base_config: str, agent_loop: bool,
     return "\n".join(lines) + "\n"
 
 
-def _bootstrap_code(task_text: str, use_truststore: bool) -> str:
-    ts = ("import truststore; truststore.inject_into_ssl(); "
+# Clears VERIFY_X509_STRICT on urllib3's SSL contexts. Python 3.13-era
+# strictness rejects the TLS-interception root on this class of machine
+# ("Basic Constraints of CA cert not marked critical") even when the CA
+# bundle contains it — Windows' own verifier (and truststore) tolerate
+# the same cert. Patching both binding sites: urllib3.connection
+# from-imports the factory at import time.
+_LAX_TLS_SNIPPET = """\
+import ssl as _ssl
+try:
+    import urllib3.util.ssl_ as _u1
+    import urllib3.connection as _u2
+    _orig_cuc = _u1.create_urllib3_context
+    def _lax_cuc(*a, **k):
+        _c = _orig_cuc(*a, **k)
+        try:
+            _c.verify_flags &= ~_ssl.VERIFY_X509_STRICT
+        except Exception:
+            pass
+        return _c
+    _u1.create_urllib3_context = _lax_cuc
+    if getattr(_u2, 'create_urllib3_context', None) is _orig_cuc:
+        _u2.create_urllib3_context = _lax_cuc
+except Exception:
+    pass
+"""
+
+
+def _bootstrap_code(task_text: str, use_truststore: bool,
+                    lax_tls: bool = False) -> str:
+    ts = ("import truststore; truststore.inject_into_ssl()\n"
           if use_truststore else "")
+    lax = _LAX_TLS_SNIPPET if lax_tls else ""
     return (
-        f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r}); {ts}"
-        f"sys.argv = ['agentchanti', {task_text!r}, '--auto', '--no-report']; "
-        f"from agentchanti.orchestrator.cli import main; main()"
+        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n{ts}{lax}"
+        f"sys.argv = ['agentchanti', {task_text!r}, '--auto', '--no-report']\n"
+        f"from agentchanti.orchestrator.cli import main\nmain()"
     )
+
+
+def _build_ca_bundle() -> str | None:
+    """Combined certifi + Windows system-store CA bundle for child runs.
+
+    Replaces ``truststore.inject_into_ssl()`` in the child process: the
+    injected verification hooks race under concurrent SSL from worker
+    threads (KB embedder + main-thread LLM call) and intermittently
+    hard-abort the whole process with 0xC0000409 — observed as 4-6s
+    "failures" with empty output. A plain CA file handed to `requests`
+    via REQUESTS_CA_BUNDLE trusts the same interception certs with no
+    native hooks in the verification path. Returns the bundle path, or
+    None to fall back to injection.
+    """
+    try:
+        import ssl
+
+        import certifi
+        parts = [Path(certifi.where()).read_text(encoding="utf-8",
+                                                 errors="replace")]
+        if sys.platform == "win32":
+            for store in ("ROOT", "CA"):
+                for cert, enc, _trust in ssl.enum_certificates(store):
+                    if enc == "x509_asn":
+                        parts.append(ssl.DER_cert_to_PEM_cert(cert))
+        out = REPO_ROOT / "benchmarks" / "results" / "ca_bundle.pem"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(parts), encoding="utf-8")
+        return str(out)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        print(f"  (CA bundle build failed: {exc} — falling back to "
+              f"truststore injection)", flush=True)
+        return None
 
 
 def _read_run_log(workdir: Path) -> str:
@@ -108,7 +170,8 @@ def _read_run_log(workdir: Path) -> str:
 
 def run_one(task: dict, agent_loop: bool, base_config: str,
             use_truststore: bool, keep_workdirs: bool,
-            plan_mode: str | None = None) -> dict:
+            plan_mode: str | None = None,
+            ca_bundle: str | None = None) -> dict:
     mode = "on" if agent_loop else "off"
     label = mode + (f"-{plan_mode}" if plan_mode else "")
     workdir = Path(tempfile.mkdtemp(
@@ -128,17 +191,28 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
     timed_out = False
     crash_retries = 0
     returncode = None
+    child_env = {**__import__("os").environ,
+                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    inject_truststore = use_truststore
+    if use_truststore and ca_bundle:
+        # Env-var CA bundle instead of in-process injection (see
+        # _build_ca_bundle for why injection is not thread-safe here).
+        inject_truststore = False
+        child_env["REQUESTS_CA_BUNDLE"] = ca_bundle
+        child_env["SSL_CERT_FILE"] = ca_bundle
+        child_env["CURL_CA_BUNDLE"] = ca_bundle
     while True:
         try:
             proc = subprocess.run(
                 [sys.executable, "-X", "utf8", "-c",
-                 _bootstrap_code(task["task"], use_truststore)],
+                 _bootstrap_code(task["task"], inject_truststore,
+                                 lax_tls=not inject_truststore
+                                 and ca_bundle is not None)],
                 cwd=workdir, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 stdin=subprocess.DEVNULL,
                 timeout=RUN_TIMEOUT_S,
-                env={**__import__("os").environ,
-                     "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+                env=child_env,
             )
             returncode = proc.returncode
             stdout_tail = (proc.stdout or "")[-2000:]
@@ -158,10 +232,10 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
         crashed = (not timed_out
                    and returncode not in (0, 1)
                    and parse_pipeline_claim(log_text) is None)
-        if crashed and crash_retries < 1:
+        if crashed and crash_retries < 2:
             crash_retries += 1
             print(f"    native crash (rc={returncode:#x}) — "
-                  f"retrying once ...", flush=True)
+                  f"retry {crash_retries}/2 ...", flush=True)
             continue
         break
     wall_s = round(time.monotonic() - started, 1)
@@ -253,6 +327,10 @@ def main() -> None:
         if p is not None and p not in ("content", "intent"):
             ap.error(f"invalid --plan-modes value: {p}")
 
+    ca_bundle = _build_ca_bundle() if args.truststore else None
+    if ca_bundle:
+        print(f"TLS via CA bundle: {ca_bundle}")
+
     print(f"Running {len(tasks)} task(s) x {len(modes)} loop mode(s) x "
           f"{len(plan_modes)} plan mode(s)")
     results = []
@@ -261,7 +339,8 @@ def main() -> None:
             for plan_mode in plan_modes:
                 results.append(run_one(task, agent_loop, base_config,
                                        args.truststore, args.keep_workdirs,
-                                       plan_mode=plan_mode))
+                                       plan_mode=plan_mode,
+                                       ca_bundle=ca_bundle))
 
     out_dir = REPO_ROOT / "benchmarks" / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
