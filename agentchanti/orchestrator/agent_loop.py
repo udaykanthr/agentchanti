@@ -534,21 +534,40 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
         context += (
             f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
             "successfully — it will be run to verify your work.")
+
+    def _attempt(client, ctx: str) -> tuple[bool, str]:
+        s, i = run_agent_loop(
+            client, tools, step_text, task,
+            display=display, step_idx=step_idx, language=language,
+            max_turns=max_turns, verify_cmd=verify_cmd, context=ctx,
+            _recovery=True)
+        # Only meaningful when no verify_cmd gated the exit — a passing
+        # deterministic check outranks the model's own pessimism.
+        if s and not verify_cmd \
+                and RECOVERY_BLOCKED_MARKER.lower() in i.lower():
+            _logger.warning(
+                "[AgentLoop] step %d: recovery summary admits the step is "
+                "still blocked — not counting it as recovered",
+                step_idx + 1)
+            return False, f"Recovery loop reported itself blocked: {i[:800]}"
+        return s, i
+
     # Recovery loops are where turn budgets die (observed repeatedly:
-    # "mid-fix at turn 8") — they deserve the escalation retry as much
-    # as first-attempt loops do.
-    success, info = run_agent_loop_with_escalation(
-        llm_client, tools, step_text, task,
-        escalation_client=escalation_client,
-        display=display, step_idx=step_idx, language=language,
-        max_turns=max_turns, verify_cmd=verify_cmd, context=context,
-        _recovery=True)
-    # Only meaningful when no verify_cmd gated the exit — a passing
-    # deterministic check outranks the model's own pessimism.
-    if success and not verify_cmd \
-            and RECOVERY_BLOCKED_MARKER.lower() in info.lower():
-        _logger.warning(
-            "[AgentLoop] step %d: recovery summary admits the step is "
-            "still blocked — not counting it as recovered", step_idx + 1)
-        return False, f"Recovery loop reported itself blocked: {info[:800]}"
+    # "mid-fix at turn 8"). Escalation is decided AFTER the blocked-
+    # admission check — a "done" summary that admits the blocker is a
+    # failure the stronger model should get a shot at (observed: a
+    # blocked npx-tailwind recovery never escalated because the wrapper
+    # saw the self-reported success).
+    success, info = _attempt(llm_client, context)
+    if (not success and escalation_client is not None
+            and escalation_client is not llm_client
+            and getattr(escalation_client, "supports_tools",
+                        lambda: False)()):
+        _logger.info(
+            "[AgentLoop] step %d: recovery failed — escalating to "
+            "stronger model", step_idx + 1)
+        success, info = _attempt(
+            escalation_client,
+            context + "\n\nA previous recovery attempt by another model "
+            "FAILED:\n" + truncate_middle(info, 2000))
     return success, info

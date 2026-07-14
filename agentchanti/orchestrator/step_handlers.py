@@ -2010,7 +2010,9 @@ def _handle_cmd_step(step_text: str, executor: Executor,
             llm_client, tools, step_text, _task_goal, error_info,
             display=display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-            verify_cmd=reverifiable_cmd(cmd))
+            verify_cmd=reverifiable_cmd(cmd),
+            escalation_client=getattr(llm_client, "escalation_client",
+                                      None))
         if recovered:
             log.info(f"Step {step_idx+1}: Agent loop recovered failed "
                      f"command: {info[:200]}")
@@ -3573,6 +3575,13 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
     cmd = resolve_cmd_placeholders(
         cmd, step_text=getattr(plan_step, "description", "") or "",
         task=task)
+
+    # A heredoc opener (`python - <<PY`) means the planner wrote a
+    # multi-line script: the line parser kept only the first line, and
+    # heredocs are bash-only anyway (cmd.exe runs the gate). A broken
+    # gate is worse than none.
+    if "<<" in cmd:
+        return None
 
     segments = [s.strip() for s in cmd.split("&&")]
     segments = [s for s in segments

@@ -1462,7 +1462,7 @@ content:                               ← CODE/TEST steps that CREATE new files
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 """) + """produces: <file1>, <file2>             ← CMD steps. Files created by the command.
-verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). Must be runnable from the project root and re-runnable (no scaffolding). It runs with the pipeline's own Python — NEVER activate a virtualenv in it, never use placeholders, and never cd into a folder that does not exist yet. Example: python manage.py test main --noinput
+verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). MUST be a single line — no heredocs (<<PY), no line continuations; multi-line scripts silently break (Windows cmd runs it). Must be runnable from the project root and re-runnable (no scaffolding). It runs with the pipeline's own Python — NEVER activate a virtualenv in it, never use placeholders, and never cd into a folder that does not exist yet. Example: python manage.py test main --noinput
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 """ + ("""
 DO NOT include file contents anywhere in the plan. No content: blocks,

@@ -580,6 +580,10 @@ def _main_impl():
         _escalation_client = _make_llm_for_agent("escalation")
         coder.escalation_client = _escalation_client
         tester.escalation_client = _escalation_client
+        # CMD-step recoveries only hold the raw client, not an agent —
+        # attach there too (observed: a failed npx-tailwind CMD recovery
+        # never escalated because this was the one unwired path).
+        llm_client.escalation_client = _escalation_client
         log.info("[AgentLoop] Escalation model configured: %s",
                  cfg.get_agent_model("escalation"))
 

@@ -619,6 +619,26 @@ class TestRunRecoveryLoop(AgentLoopTestCase):
         self.assertIs(mock_loop.call_args_list[1][0][0], escalation)
         self.assertTrue(mock_loop.call_args_list[1][1]["_recovery"])
 
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_blocked_admission_escalates(self, mock_loop):
+        # Regression: a self-reported "done" whose summary admits the
+        # blocker was flipped to failure AFTER the escalation wrapper
+        # returned — the stronger model never got its shot.
+        mock_loop.side_effect = [
+            (True, f"cannot install tailwind. {RECOVERY_BLOCKED_MARKER}"),
+            (True, "fixed: wrote configs manually, build passes"),
+        ]
+        escalation = MagicMock()
+        escalation.supports_tools.return_value = True
+        ok, info = run_recovery_loop(
+            MagicMock(name="primary"), MagicMock(), "step", "task", "err",
+            escalation_client=escalation)
+        self.assertTrue(ok)
+        self.assertEqual(mock_loop.call_count, 2)
+        self.assertIs(mock_loop.call_args_list[1][0][0], escalation)
+        # Escalated context carries the blocked attempt's admission
+        self.assertIn("FAILED", mock_loop.call_args_list[1][1]["context"])
+
     def test_recovery_prefers_rerunning_commands(self):
         # Regression: a scaffold-command recovery hand-wrote the 13 files
         # startproject would have generated. The context must steer the
@@ -1113,6 +1133,15 @@ class TestDeclaredVerifyGate(unittest.TestCase):
                       verify_cmd="cd . && python manage.py check")
         cmd = _declared_verify_cmd(ps, self._memory())
         self.assertEqual(cmd, "cd . && python manage.py check")
+
+    def test_heredoc_verify_rejected(self):
+        # A planner emitted `verify: python - <<PY` (multi-line script);
+        # the parser keeps only the opener and cmd.exe has no heredocs.
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        ps = PlanStep(id="2.1", step_type="CODE",
+                      verify_cmd="python - <<PY")
+        self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
 
     def test_activation_only_command_is_none(self):
         from agentchanti.orchestrator.plan_step import PlanStep
