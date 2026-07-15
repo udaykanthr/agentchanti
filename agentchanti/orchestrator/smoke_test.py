@@ -554,20 +554,30 @@ def _run_django_verification(memory, executor, coder, display,
         llm_client = getattr(coder, "llm_client", None)
         if agent_loop_enabled(cfg, llm_client):
             tools = build_step_tools(executor, memory)
-            recovered, info = run_recovery_loop(
-                llm_client, tools,
-                step_text=("Make the Django verification pass: created "
-                           "templates reachable by the template loader, "
-                           "every page renders without errors, and all "
-                           "ACCEPTANCE checks derived from the task hold "
-                           "(they assert what the task requires on the "
-                           "rendered HTML)."),
-                task=task,
-                error_info=f"Django verification failed:\n{out}",
-                display=display, step_idx=0, language=language,
-                max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-                verify_cmd=verify_cmd,
-                escalation_client=getattr(coder, "escalation_client", None))
+            try:
+                recovered, info = run_recovery_loop(
+                    llm_client, tools,
+                    step_text=("Make the Django verification pass: created "
+                               "templates reachable by the template loader, "
+                               "every page renders without errors, and all "
+                               "ACCEPTANCE checks derived from the task hold "
+                               "(they assert what the task requires on the "
+                               "rendered HTML)."),
+                    task=task,
+                    error_info=f"Django verification failed:\n{out}",
+                    display=display, step_idx=0, language=language,
+                    max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+                    verify_cmd=verify_cmd,
+                    escalation_client=getattr(coder, "escalation_client", None))
+            except Exception as rec_exc:
+                # Recovery is best-effort. A dead LLM endpoint (e.g. a
+                # misrouted escalation model 404ing) must not crash the
+                # whole run — report the original verification failure.
+                _logger.warning(
+                    "[SmokeTest] Django recovery loop errored (non-fatal): %s",
+                    rec_exc)
+                return False, ("Django verification failed: "
+                               f"{truncate_middle(out or '', 800)}")
             if recovered:
                 _logger.info("[SmokeTest] Django verification recovered: %s",
                              info[:200])
