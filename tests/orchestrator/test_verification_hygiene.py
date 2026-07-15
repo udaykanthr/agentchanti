@@ -422,6 +422,50 @@ class TestStepVerifyDjangoInconclusive(unittest.TestCase):
         self.assertIn("fails to load", errors[0])
 
 
+class TestDjangoizeImportProbe(unittest.TestCase):
+    """A bare `python -c "import app.module"` gate is unsatisfiable in a Django
+    project unless Django is set up first — pressure that led the model to inject
+    an illegal `django.setup()` into the module. The gate is rewritten to
+    bootstrap Django inside the probe instead."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        with open(os.path.join(self.root, "manage.py"), "w", encoding="utf-8") as f:
+            f.write("os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'proj.settings')\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_probe_is_bootstrapped(self):
+        from agentchanti.orchestrator.step_handlers import _djangoize_import_probe
+        out = _djangoize_import_probe(
+            'python -c "import core.forms as f; assert f.SignUpForm"', self.root)
+        self.assertIn("django.setup()", out)
+        self.assertIn("DJANGO_SETTINGS_MODULE", out)
+        self.assertIn("proj.settings", out)
+        self.assertIn("import core.forms as f", out)
+
+    def test_non_probe_unchanged(self):
+        from agentchanti.orchestrator.step_handlers import _djangoize_import_probe
+        for cmd in ("python manage.py check",
+                    'if exist core\\forms.py (exit 0) else (exit 1)'):
+            self.assertEqual(_djangoize_import_probe(cmd, self.root), cmd)
+
+    def test_non_django_project_unchanged(self):
+        from agentchanti.orchestrator.step_handlers import _djangoize_import_probe
+        empty = tempfile.mkdtemp()
+        try:
+            cmd = 'python -c "import pkg.mod"'
+            self.assertEqual(_djangoize_import_probe(cmd, empty), cmd)
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+
+    def test_already_bootstrapped_not_double_wrapped(self):
+        from agentchanti.orchestrator.step_handlers import _djangoize_import_probe
+        pre = 'python -c "import django; django.setup(); import core.forms"'
+        self.assertEqual(_djangoize_import_probe(pre, self.root), pre)
+
+
 class TestDjangoTestsPyRecognized(unittest.TestCase):
 
     def test_tests_py_is_a_test_file(self):

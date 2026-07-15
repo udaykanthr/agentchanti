@@ -3550,6 +3550,50 @@ _VENV_ACTIVATE_RE = re.compile(
 )
 
 
+def _discover_django_settings(project_root: str = ".") -> str | None:
+    """Return the project's DJANGO_SETTINGS_MODULE by reading manage.py, or None."""
+    try:
+        with open(os.path.join(project_root, "manage.py"),
+                  "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+    m = re.search(
+        r"DJANGO_SETTINGS_MODULE['\"]\s*,\s*['\"]([\w.]+)['\"]", content)
+    return m.group(1) if m else None
+
+
+def _djangoize_import_probe(cmd: str, project_root: str = ".") -> str:
+    """Make a bare ``python -c "import app.module"`` gate Django-aware.
+
+    A first-party import probe fails in a Django project unless the app
+    registry is populated (``from django.contrib.auth.models import User``
+    raises ``AppRegistryNotReady``). Planners emit these probes anyway, and
+    to satisfy them the model injects ``django.setup()`` into the module
+    itself — illegal in code Django imports during ``apps.populate()`` and
+    the direct cause of a ``populate() isn't reentrant`` crash that broke
+    ``manage.py check`` project-wide.
+
+    Bootstrapping Django *inside the probe* makes the gate pass on correct
+    code, so no source-level hack is needed. Non-probes and non-Django
+    projects are returned unchanged.
+    """
+    m = re.match(r'^\s*(?:python3?|py)\s+-c\s+(["\'])(.*)\1\s*$', cmd, re.DOTALL)
+    if not m:
+        return cmd
+    quote, body = m.group(1), m.group(2)
+    if "import" not in body:
+        return cmd
+    if "django.setup" in body or "DJANGO_SETTINGS_MODULE" in body:
+        return cmd  # already bootstraps Django itself
+    settings = _discover_django_settings(project_root)
+    if not settings:
+        return cmd  # not a Django project — leave the probe alone
+    prefix = (f"import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', "
+              f"'{settings}'); import django; django.setup(); ")
+    return f"python -c {quote}{prefix}{body}{quote}"
+
+
 def _declared_verify_cmd(plan_step, memory: FileMemory,
                          task: str = "") -> str | None:
     """The plan-declared acceptance command for a step, or None.
@@ -3598,6 +3642,12 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
     if reverifiable_cmd(cmd) is None:
         return None
     sub = _detect_subproject_root(memory)
+    # Bootstrap Django inside bare import-probe gates so they're satisfiable
+    # by correct code (manage.py may live at the root or under a subproject).
+    django_root = "."
+    if sub and os.path.isfile(os.path.join(sub, "manage.py")):
+        django_root = sub
+    cmd = _djangoize_import_probe(cmd, django_root)
     if sub and not cmd.lstrip().startswith("cd "):
         cmd = f"cd {sub} && {cmd}"
     return cmd
