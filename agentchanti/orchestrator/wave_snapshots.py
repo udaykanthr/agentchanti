@@ -130,6 +130,59 @@ class ProjectSnapshots:
     def _marker_path(self) -> str:
         return os.path.join(self.root, ".git", _MARKER_NAME)
 
+    def _ensure_gitignore(self) -> None:
+        """Make sure every default ignore rule is present in .gitignore.
+
+        Appends missing rules instead of overwriting, so a user-authored
+        .gitignore is preserved. Idempotent on both fresh and resumed repos.
+        """
+        path = os.path.join(self.root, ".gitignore")
+        existing = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except OSError:
+                return
+        present = {ln.strip() for ln in existing.splitlines()}
+        missing = [ln for ln in _DEFAULT_GITIGNORE.splitlines()
+                   if ln.strip() and ln.strip() not in present]
+        if not missing:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write("\n".join(missing) + "\n")
+        except OSError:
+            pass
+
+    def _is_tracked(self, path: str) -> bool:
+        ok, out = self._git("ls-files", "--", path)
+        return ok and bool(out.strip())
+
+    def _purge_tracked_volatile(self) -> None:
+        """Untrack volatile runtime dirs that an earlier run may have committed.
+
+        `.gitignore` never untracks already-committed files, so a stale
+        `.agentchanti/` (live logs, cache) stays tracked and every
+        `reset --hard` tries to restore/unlink the log file the running
+        process holds open — on Windows that fails with "Invalid argument"
+        and disables rollback. Dropping them from the index (working tree
+        untouched) removes that hazard.
+        """
+        removed: list[str] = []
+        for rel in (".agentchanti", "venv", ".venv", "node_modules",
+                    "__pycache__"):
+            if self._is_tracked(rel):
+                self._git("rm", "-r", "--cached", "--ignore-unmatch", "--", rel)
+                removed.append(rel)
+        if removed:
+            self._commit("agentchanti: stop tracking volatile runtime state")
+            _logger.info("[Snapshots] Untracked volatile dir(s) so rollback "
+                         "can't be blocked by open handles: %s",
+                         ", ".join(removed))
+
     def _head_sha(self) -> str | None:
         ok, out = self._git("rev-parse", "HEAD")
         return out.strip() if ok else None
@@ -144,6 +197,12 @@ class ProjectSnapshots:
         if os.path.isfile(self._marker_path()):
             # Resumed run inside a repo this tool created earlier.
             self.managed = True
+            # Older runs may have committed .agentchanti/ (logs, cache) before
+            # the ignore rule existed; while those stay tracked, reset --hard
+            # tries to unlink the live log Windows holds open and rollback
+            # dies. Re-assert the ignore rules and untrack volatile state.
+            self._ensure_gitignore()
+            self._purge_tracked_volatile()
             self._last_sha = self._head_sha()
             _logger.info("[Snapshots] Resuming managed snapshot repo at %s",
                          self.root)
@@ -165,13 +224,7 @@ class ProjectSnapshots:
                             "disabled: %s", out[:200])
             return False
 
-        gitignore = os.path.join(self.root, ".gitignore")
-        if not os.path.exists(gitignore):
-            try:
-                with open(gitignore, "w", encoding="utf-8") as f:
-                    f.write(_DEFAULT_GITIGNORE)
-            except OSError:
-                pass
+        self._ensure_gitignore()
 
         try:
             with open(self._marker_path(), "w", encoding="utf-8") as f:

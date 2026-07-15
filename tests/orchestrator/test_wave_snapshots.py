@@ -156,13 +156,30 @@ class TestProjectSnapshots(unittest.TestCase):
         self.assertFalse(snaps.start())
         self.assertFalse(os.path.isdir(os.path.join(self.root, ".git")))
 
-    def test_existing_gitignore_not_clobbered(self):
+    def test_existing_gitignore_preserved_and_augmented(self):
+        # A user-authored .gitignore must be preserved (not clobbered), but the
+        # default rules — critically `.agentchanti/` — must be appended so the
+        # tool's volatile state never gets tracked and blocks rollback.
         self._write(".gitignore", "custom-entry/\n")
         snaps = ProjectSnapshots(self.root)
         snaps.start()
         with open(os.path.join(self.root, ".gitignore"),
                   encoding="utf-8") as f:
-            self.assertEqual(f.read(), "custom-entry/\n")
+            content = f.read()
+        self.assertIn("custom-entry/", content)   # preserved
+        self.assertIn(".agentchanti/", content)   # augmented
+        self.assertIn("venv/", content)
+
+    def test_gitignore_augment_is_idempotent(self):
+        # Re-running start() on the same repo must not duplicate default rules.
+        snaps = ProjectSnapshots(self.root)
+        snaps.start()
+        again = ProjectSnapshots(self.root)
+        again.start()
+        with open(os.path.join(self.root, ".gitignore"),
+                  encoding="utf-8") as f:
+            content = f.read()
+        self.assertEqual(content.count(".agentchanti/"), 1)
 
 
 if __name__ == "__main__":
