@@ -518,25 +518,34 @@ def _main_impl():
 
     # ── 5. Init agents (with per-agent model support) ──
     def _make_llm_for_agent(agent_name: str):
-        """Create an LLM client for a specific agent, using per-agent model if configured."""
+        """Create an LLM client for a specific agent, honouring per-agent
+        model and (optionally) per-agent provider overrides.
+
+        A `<agent>_provider` config key routes the override to a different
+        backend than the run's provider — e.g. an ollama run can escalate
+        to `escalation: gpt-5.4` + `escalation_provider: openai`. Without
+        the provider override the model inherits the run provider and a
+        cross-provider model 404s against the wrong endpoint.
+        """
         agent_model = cfg.get_agent_model(agent_name) or model
-        if agent_model == model:
-            return llm_client  # reuse the main client
-        # Create a separate client with the agent-specific model
-        if provider == "ollama":
+        agent_provider = cfg.get_agent_provider(agent_name) or provider
+        if agent_model == model and agent_provider == provider:
+            return llm_client  # reuse the main client — nothing overridden
+        # Create a separate client with the agent-specific provider + model
+        if agent_provider == "ollama":
             return OllamaClient(
                 base_url=cfg.OLLAMA_BASE_URL, model=agent_model, **llm_kwargs)
-        elif provider == "openai":
+        elif agent_provider == "openai":
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
                 base_url=cfg.OPENAI_BASE_URL, model=agent_model,
                 api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
-        elif provider == "gemini":
+        elif agent_provider == "gemini":
             from ..llm.gemini_client import GeminiClient
             return GeminiClient(
                 base_url=cfg.GEMINI_BASE_URL, model=agent_model,
                 api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
-        elif provider == "anthropic":
+        elif agent_provider == "anthropic":
             from ..llm.anthropic_client import AnthropicClient
             return AnthropicClient(
                 base_url=cfg.ANTHROPIC_BASE_URL, model=agent_model,
@@ -584,8 +593,9 @@ def _main_impl():
         # attach there too (observed: a failed npx-tailwind CMD recovery
         # never escalated because this was the one unwired path).
         llm_client.escalation_client = _escalation_client
-        log.info("[AgentLoop] Escalation model configured: %s",
-                 cfg.get_agent_model("escalation"))
+        log.info("[AgentLoop] Escalation model configured: %s (provider: %s)",
+                 cfg.get_agent_model("escalation"),
+                 cfg.get_agent_provider("escalation") or provider)
 
     executor = Executor()
 

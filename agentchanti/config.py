@@ -219,12 +219,25 @@ class Config:
         # `analyser`), so a correctly configured escalation model never
         # fired — the loop failed at its turn budget with the stronger
         # model sitting unused. Lowercased to match get_agent_model().
+        #
+        # A `<agent>_provider` key overrides the provider used to build
+        # that agent's client, e.g.:
+        #     models:
+        #       escalation: gpt-5.4
+        #       escalation_provider: openai
+        # Without it a per-agent model inherits the run provider, so a
+        # cross-provider escalation model (gpt-5.4 on an ollama run) is
+        # POSTed to the wrong endpoint and 404s on every attempt.
         self._agent_models: dict[str, str] = {}
+        self._agent_providers: dict[str, str] = {}
         models_section = yd.get("models", {})
         if isinstance(models_section, dict):
-            self._agent_models = {
-                str(k).lower(): str(v) for k, v in models_section.items()
-            }
+            for k, v in models_section.items():
+                key = str(k).lower()
+                if key.endswith("_provider"):
+                    self._agent_providers[key[:-len("_provider")]] = str(v).lower()
+                else:
+                    self._agent_models[key] = str(v)
 
         # Custom agent prompt suffixes
         self.PROMPT_SUFFIXES: dict[str, str] = {}
@@ -491,7 +504,10 @@ class Config:
                 "api_key": self.ANTHROPIC_API_KEY,
                 "base_url": self.ANTHROPIC_BASE_URL,
             },
-            "models": self._agent_models,
+            "models": {
+                **self._agent_models,
+                **{f"{k}_provider": v for k, v in self._agent_providers.items()},
+            },
             "prompts": self.PROMPT_SUFFIXES,
             "embedding_cache_dir": self.EMBEDDING_CACHE_DIR,
             "report_dir": self.REPORT_DIR,
@@ -556,6 +572,10 @@ class Config:
     def get_agent_model(self, agent_name: str) -> str | None:
         """Return the per-agent model override, or None to use the default."""
         return self._agent_models.get(agent_name.lower())
+
+    def get_agent_provider(self, agent_name: str) -> str | None:
+        """Return the per-agent provider override, or None to use the run provider."""
+        return self._agent_providers.get(agent_name.lower())
 
     @classmethod
     def load(cls, config_path: str | None = None) -> "Config":
