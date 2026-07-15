@@ -441,6 +441,48 @@ class TestFindGaps:
         orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
         assert len(orphan) == 0
 
+    def test_django_app_module_not_flagged_as_orphan(self):
+        """A Django app's forms.py is wired by the framework (settings/URLconf),
+        not imported by sibling files. Flagging it as an orphaned export led the
+        auto-fix to re-export it from __init__.py, which crashed manage.py check
+        with 'populate() isn't reentrant'. It must never be flagged."""
+        after_files = {
+            "spacious_site/settings.py": "INSTALLED_APPS = ['core']",
+            "core/apps.py": "from django.apps import AppConfig\nclass CoreConfig(AppConfig): pass",
+            "core/forms.py": (
+                "from django.contrib.auth.forms import UserCreationForm\n"
+                "class SignUpForm(UserCreationForm): pass"
+            ),
+        }
+        before = DependencySnapshot()
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["core/forms.py"],
+            step_text="Create core/forms.py",
+            memory_files=after_files,
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert orphan == []
+
+    def test_plain_python_forms_still_flagged_outside_django(self):
+        """The Django skip must be Django-specific: a forms.py in a non-Django
+        project (no manage.py/settings.py, no apps.py) is still a normal module."""
+        after_files = {
+            "pkg/main.py": "print('hi')",
+            "pkg/forms.py": "class SignUpForm: pass",
+        }
+        before = DependencySnapshot()
+        after = build_snapshot(after_files)
+        gaps = find_gaps(
+            before, after,
+            new_files=["pkg/forms.py"],
+            step_text="Create forms",
+            memory_files=after_files,
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert len(orphan) == 1
+
     def test_no_false_positive_when_same_basename_imported_from_different_path(self):
         """App.jsx imports './components/Homepage' — creating pages/Homepage.jsx
         should NOT be flagged as orphaned since the same basename is already wired."""

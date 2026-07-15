@@ -128,6 +128,53 @@ def _is_tool_config_file(file_path: str) -> bool:
     return name in _TOOL_CONFIG_STEMS
 
 
+# Django app modules are discovered by the framework — via INSTALLED_APPS,
+# the URLconf (`include('app.urls')`), admin autodiscover, and app configs —
+# not by sibling Python files importing them.  Flagging them as "orphaned
+# exports" is a false positive, and the auto-fix (re-exporting them from the
+# package `__init__.py`) is actively harmful: `forms.py` / `models.py` import
+# the auth User model, so importing them at package-init time runs *during*
+# `apps.populate()` and raises "RuntimeError: populate() isn't reentrant",
+# breaking `manage.py check` for the whole project.
+_DJANGO_APP_MODULES = frozenset({
+    "models", "views", "forms", "admin", "apps", "urls", "serializers",
+    "signals", "middleware", "tasks", "consumers", "routing", "managers",
+    "permissions", "filters", "viewsets", "api", "context_processors",
+})
+
+
+def _django_markers_present(known_files) -> bool:
+    """True if the file set looks like a Django project (manage.py/settings.py)."""
+    for f in known_files:
+        if os.path.basename(f.replace("\\", "/")) in ("manage.py", "settings.py"):
+            return True
+    return False
+
+
+def _has_django_app_sibling(file_path: str, known_files) -> bool:
+    """True if *file_path*'s directory contains an ``apps.py`` — the definitive
+    marker of a Django app package."""
+    directory = os.path.dirname(file_path.replace("\\", "/"))
+    for f in known_files:
+        norm = f.replace("\\", "/")
+        if os.path.dirname(norm) == directory and os.path.basename(norm) == "apps.py":
+            return True
+    return False
+
+
+def _is_django_app_module(file_path: str, known_files) -> bool:
+    """Return True if *file_path* is a Django app module wired by the framework
+    rather than imported by sibling source files (so never an orphaned export).
+    """
+    if not file_path.endswith(".py"):
+        return False
+    stem = os.path.splitext(os.path.basename(file_path.replace("\\", "/")))[0].lower()
+    if stem not in _DJANGO_APP_MODULES:
+        return False
+    return _django_markers_present(known_files) or _has_django_app_sibling(
+        file_path, known_files)
+
+
 # ── Data structures ──────────────────────────────────────────────
 
 @dataclass
@@ -1140,6 +1187,12 @@ def find_gaps(
             continue
         if _is_tool_config_file(nf):
             continue  # config files are read by tools, never imported
+        if _is_django_app_module(nf, all_known_files):
+            _logger.info(
+                "[DepCheck] Skipping orphaned_export for '%s': Django app "
+                "module (framework-wired via settings/URLconf, not "
+                "sibling-imported)", nf)
+            continue
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
             continue
