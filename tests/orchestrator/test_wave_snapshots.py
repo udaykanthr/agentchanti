@@ -43,6 +43,30 @@ class TestGateLedger(unittest.TestCase):
         self.assertEqual((cmd, label), ("bad-cmd", "2.1"))
         self.assertIn("FAILED", out)
 
+    def test_recheck_skips_harness_errors(self):
+        """A gate that can no longer launch (missing interpreter / wrong
+        cwd) is inconclusive — it must NOT be reported as a code
+        regression (which would roll back good code)."""
+        ledger = GateLedger()
+        ledger.record("cd sub && venv\\Scripts\\python.exe -c \"import x\"",
+                      "2.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (
+            False, "The system cannot find the path specified.")
+        regressions = ledger.recheck(executor)
+        self.assertEqual(regressions, [])
+
+    def test_recheck_real_failure_still_regresses(self):
+        """A genuine code failure (assertion / non-zero test exit) is still
+        a regression even alongside the harness-error guard."""
+        ledger = GateLedger()
+        ledger.record("pytest -q", "3.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "1 failed, 0 passed")
+        regressions = ledger.recheck(executor)
+        self.assertEqual(len(regressions), 1)
+        self.assertEqual(regressions[0][1], "3.1")
+
     def test_reset(self):
         ledger = GateLedger()
         ledger.record("x", "1.1")

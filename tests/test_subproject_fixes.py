@@ -414,6 +414,40 @@ class TestNonSubprojectDirsBlocklist:
             result = _detect_subproject_root(memory)
         assert result == "my-app"
 
+    def test_bare_package_dir_is_not_subproject(self):
+        """A plain directory holding source with NO manifest and no own
+        venv is a package under the repo-root project, not a sub-project.
+
+        Regression guard for the brick-breaker failure: classifying
+        ``brick_breaker/`` as a sub-project prepended ``cd brick_breaker``
+        to its gate, which broke the root-relative venv path and the
+        ``import brick_breaker.main`` probe, producing a false monotonic
+        regression that rolled back working code.
+        """
+        memory = _make_memory({
+            "brick_breaker/main.py": "import pygame",
+            "brick_breaker/test_main.py": "import brick_breaker.main",
+        })
+        # Dir exists on disk; no manifest, no __init__.py, no own venv.
+        with patch("os.path.isdir", return_value=True), \
+             patch("os.path.isfile", return_value=False), \
+             patch("os.path.exists", return_value=False):
+            result = _detect_subproject_root(memory)
+        assert result is None
+
+    def test_memory_manifest_marks_subproject(self):
+        """A manifest tracked in memory (not yet visible on the disk check)
+        is sufficient self-containment evidence to detect the sub-project."""
+        memory = _make_memory({
+            "svc/main.py": "x = 1",
+            "svc/pyproject.toml": "[project]",
+        })
+        with patch("os.path.isdir", return_value=True), \
+             patch("os.path.isfile", return_value=False), \
+             patch("os.path.exists", return_value=False):
+            result = _detect_subproject_root(memory)
+        assert result == "svc"
+
 
 # ─── Coder prompt file extension ────────────────────────────────────
 

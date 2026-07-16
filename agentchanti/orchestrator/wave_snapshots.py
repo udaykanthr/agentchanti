@@ -49,6 +49,31 @@ db.sqlite3
 # ── Gate ledger ───────────────────────────────────────────────────────
 
 
+# Signatures of a gate command that could not even launch — the
+# interpreter/executable was not found or the cwd was wrong. These mean
+# the recorded command is un-runnable in the current environment, NOT
+# that the project's code regressed, so they must never trigger a
+# rollback of otherwise-green code. Genuine code failures (assertion
+# errors, ImportError/ModuleNotFoundError from the project's own modules,
+# non-zero test exits) are deliberately excluded.
+_HARNESS_ERROR_SIGNATURES = (
+    "the system cannot find the path specified",
+    "the system cannot find the file specified",
+    "is not recognized as an internal or external command",
+    "no such file or directory",
+    "command not found",
+    "can't open file",
+    "cannot open file",
+)
+
+
+def _is_harness_error(out: str | None) -> bool:
+    """True when *out* shows the gate command failed to launch (env/cwd),
+    rather than the project's code failing the check."""
+    low = (out or "").lower()
+    return any(sig in low for sig in _HARNESS_ERROR_SIGNATURES)
+
+
 class GateLedger:
     """Acceptance commands that have passed at least once this run.
 
@@ -87,11 +112,23 @@ class GateLedger:
         regressions: list[tuple[str, str, str]] = []
         for cmd, label in self.gates().items():
             ok, out = executor.run_command(cmd, timeout=timeout)
-            if not ok:
+            if ok:
+                continue
+            if _is_harness_error(out):
+                # The command can no longer launch (missing interpreter /
+                # wrong cwd) — inconclusive, not a code regression. Rolling
+                # back over this would discard good code (observed: a
+                # `cd sub && venv\Scripts\python.exe ...` gate whose venv
+                # path stopped resolving from the sub-dir).
                 _logger.warning(
-                    "[GateLedger] REGRESSION — previously-passing gate "
-                    "now fails (%s): %s", label or "?", cmd)
-                regressions.append((cmd, label, (out or "")[-1500:]))
+                    "[GateLedger] gate no longer launches — harness/env "
+                    "error, treating as inconclusive rather than a "
+                    "regression (%s): %s", label or "?", cmd)
+                continue
+            _logger.warning(
+                "[GateLedger] REGRESSION — previously-passing gate "
+                "now fails (%s): %s", label or "?", cmd)
+            regressions.append((cmd, label, (out or "")[-1500:]))
         return regressions
 
 

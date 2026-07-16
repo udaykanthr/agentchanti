@@ -16,6 +16,7 @@ prefix.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections import Counter
 from threading import Lock
@@ -164,6 +165,25 @@ def _cd_prefix(cmd: str | None) -> str:
     return ""
 
 
+def _venv_python(project_root: str) -> str | None:
+    """Absolute path to the project's own venv interpreter, or None.
+
+    Dependency installs must land in the interpreter the gates run under
+    (``venv\\Scripts\\python.exe``), not whatever bare ``python`` resolves
+    to on PATH — installing into the system interpreter leaves the venv
+    (and therefore the verify gate) still missing the package, while the
+    test command run under system Python "passes" in the wrong place.
+    """
+    for rel in (os.path.join("venv", "Scripts", "python.exe"),
+                os.path.join(".venv", "Scripts", "python.exe"),
+                os.path.join("venv", "bin", "python"),
+                os.path.join(".venv", "bin", "python")):
+        cand = os.path.join(project_root, rel)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 def attempt_env_self_heal(tools: AgentTools, verify_output: str,
                           language: str | None, healed: set[str],
                           verify_cmd: str | None = None) -> bool:
@@ -195,7 +215,12 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
         if not mod or mod in healed:
             return False
         healed.add(mod)
-        install_cmd = f"python -m pip install {mod}"
+        # Install into the venv the gates use, not bare `python`. The
+        # absolute interpreter path also survives the `cd {sub} &&` prefix
+        # added below.
+        py = _venv_python(getattr(tools, "project_root", ".")) or "python"
+        py_tok = f'"{py}"' if py != "python" else py
+        install_cmd = f"{py_tok} -m pip install {mod}"
     install_cmd = _cd_prefix(verify_cmd) + install_cmd
     _logger.info("[AgentLoop] env self-heal: %s", install_cmd)
     result = tools.execute(ToolCall(name="run_command",

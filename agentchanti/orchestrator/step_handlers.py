@@ -1049,6 +1049,59 @@ def _build_prior_steps_context(memory: FileMemory, step_idx: int) -> str:
     return "Previously executed steps:\n" + "\n\n".join(parts) + "\n\n"
 
 
+_MANIFEST_NAMES = (
+    'package.json', 'Cargo.toml', 'go.mod', 'requirements.txt', 'Gemfile',
+    'pyproject.toml', 'composer.json', 'manage.py', 'setup.py', 'setup.cfg',
+)
+
+# Directory names that mark a directory as its OWN build/runtime context.
+_OWN_ENV_MARKERS = ('venv', '.venv', 'node_modules', 'Pipfile', '.python-version')
+
+
+def _memory_has_manifest(all_files, subproject: str) -> bool:
+    """True when a project manifest is tracked under *subproject* in memory.
+
+    Protected files (package.json, etc.) are frequently absent from the
+    on-disk check at detection time but present in memory, so this is an
+    equally valid self-containment signal.
+    """
+    prefix = subproject.replace('\\', '/').rstrip('/') + '/'
+    for p in all_files:
+        norm = p.replace('\\', '/')
+        if norm.startswith(prefix) and os.path.basename(norm) in _MANIFEST_NAMES:
+            return True
+    return False
+
+
+def _dir_has_own_env(subproject: str) -> bool:
+    """True when *subproject* holds its own venv/interpreter/deps on disk."""
+    for marker in _OWN_ENV_MARKERS:
+        if os.path.exists(os.path.join(subproject, marker)):
+            return True
+    return False
+
+
+def _dir_imported_as_package(all_files, subproject: str) -> bool:
+    """True when files under *subproject* import it as a top-level package.
+
+    ``brick_breaker/test_main.py`` doing ``import brick_breaker.main`` means
+    the directory must sit on ``sys.path`` via its PARENT (the repo root) —
+    i.e. it is a package under the root project, not a self-contained
+    sub-project. Treating it as one prepends ``cd {sub}`` to its gates,
+    which breaks that very import and the root-relative venv path.
+    """
+    pkg = subproject.replace('\\', '/').rstrip('/').split('/')[-1]
+    if not pkg.isidentifier():
+        return False
+    prefix = subproject.replace('\\', '/').rstrip('/') + '/'
+    pat = re.compile(rf"(?m)^\s*(?:from|import)\s+{re.escape(pkg)}\b")
+    for p, content in all_files.items():
+        norm = p.replace('\\', '/')
+        if norm.startswith(prefix) and content and pat.search(content):
+            return True
+    return False
+
+
 def _detect_subproject_root(memory: FileMemory) -> str | None:
     """Detect if all project files share a common subdirectory prefix.
 
@@ -1223,12 +1276,34 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
                              f"{manifest}): {subproject}/")
                     return subproject
 
-            if _is_python_package and not _has_manifest:
+            # A manifest recorded in memory, or the directory's OWN
+            # virtualenv/interpreter, is strong positive evidence of a
+            # self-contained sub-project (as the on-disk manifest above).
+            _self_contained = (
+                _memory_has_manifest(all_files, subproject)
+                or _dir_has_own_env(subproject))
+            # Counter-evidence: the dir is imported as a top-level package
+            # by its own files, so it lives under the root project.
+            _imported_as_pkg = _dir_imported_as_package(all_files, subproject)
+
+            if _is_python_package and not _self_contained:
                 log.debug(
                     f"[SubProject] '{subproject}/' has __init__.py but no "
                     f"project manifest — treating as Python package, not "
                     f"sub-project")
-            elif not is_blocked_name:
+            elif is_blocked_name:
+                pass  # common source-dir name with no manifest — not a root
+            elif _imported_as_pkg and not _self_contained:
+                # Imported as a package from the repo root and no manifest
+                # of its own — a package dir, not a sub-project. Treating it
+                # as one prepends `cd {sub}` to its gates, breaking the very
+                # import being probed and the root-relative venv path: a
+                # false monotonic regression that rolls back working code.
+                log.debug(
+                    f"[SubProject] '{subproject}/' is imported as a top-level "
+                    f"package by its own files and has no manifest — treating "
+                    f"as a package under the project root, not a sub-project")
+            else:
                 log.info(f"[SubProject] Detected sub-project root: {subproject}/")
                 return subproject
 
@@ -3649,7 +3724,20 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
         django_root = sub
     cmd = _djangoize_import_probe(cmd, django_root)
     if sub and not cmd.lstrip().startswith("cd "):
-        cmd = f"cd {sub} && {cmd}"
+        # A `cd {sub}` prefix is only safe when the command is written to
+        # run from inside the subproject. Two shapes are written for the
+        # repo root and become self-contradictory once cwd changes:
+        #   * a root-relative interpreter path (venv\Scripts\python.exe /
+        #     venv/bin/python) no longer resolves from inside {sub};
+        #   * `import {sub}.x` / `from {sub}.x` requires {sub}'s PARENT on
+        #     sys.path — cd-ing into {sub} breaks the very import it probes.
+        _root_relative_venv = re.search(r"(?:^|[\s\"'])\.?[\\/]?venv[\\/]",
+                                        cmd) is not None
+        _sub_re = re.escape(sub.rstrip("/\\"))
+        _imports_sub = re.search(rf"\b(?:import|from)\s+{_sub_re}\b",
+                                 cmd) is not None
+        if not (_root_relative_venv or _imports_sub):
+            cmd = f"cd {sub} && {cmd}"
     return cmd
 
 
@@ -3674,6 +3762,10 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
     ok, out = executor.run_command(cmd, timeout=300)
     if ok:
         display.step_info(step_idx, "Step gate passed ✔")
+        # Stash the exact command that passed so _record_passed_gate logs
+        # this form (not a re-derivation) into the monotonic ledger.
+        if plan_step is not None:
+            setattr(plan_step, "_verified_gate_cmd", cmd)
         return success, error_info
     return False, (
         f"Step acceptance command failed: `{cmd}`\n"
@@ -3752,10 +3844,23 @@ def _record_passed_gate(success: bool, plan_step, memory: FileMemory,
     :func:`_gate_on_declared_verify`, so a successful step means the
     command passed. Later fix rounds are rechecked against the ledger
     and rolled back if they break it.
+
+    The ledger's invariant is "this exact string previously exited 0", so
+    we record the command the gate ACTUALLY executed (stashed on the step
+    as ``_verified_gate_cmd``), never a freshly re-derived one.
+    ``_declared_verify_cmd`` calls ``_detect_subproject_root(memory)``,
+    whose result flips once the step writes files — the loop evaluated the
+    gate before those writes (no subproject → repo-root form) while a
+    re-derivation here runs after (subproject → ``cd sub &&`` form). The
+    re-derived command was never run, can be self-contradictory, and then
+    "regresses" on the monotonic recheck, rolling back working code.
     """
     if not success:
         return
-    cmd = _declared_verify_cmd(plan_step, memory, task=task)
+    cmd = getattr(plan_step, "_verified_gate_cmd", None) \
+        if plan_step is not None else None
+    if not cmd:
+        cmd = _declared_verify_cmd(plan_step, memory, task=task)
     if not cmd:
         return
     from .wave_snapshots import get_gate_ledger
@@ -3829,7 +3934,7 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             loop_context += (
                 f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
                 "successfully — it will be run to verify your work.")
-        return run_agent_loop_with_escalation(
+        loop_result = run_agent_loop_with_escalation(
             coder.llm_client, tools, step_text, task,
             escalation_client=getattr(coder, "escalation_client", None),
             display=display, step_idx=step_idx, language=language,
@@ -3837,6 +3942,13 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             verify_cmd=verify_cmd,
             context=loop_context,
         )
+        # Record the gate exactly as the loop enforced it, so the monotonic
+        # ledger rechecks the command that actually passed (see
+        # _record_passed_gate) — not a re-derivation whose subproject
+        # prefix can diverge after this step's writes.
+        if loop_result[0] and verify_cmd and plan_step is not None:
+            setattr(plan_step, "_verified_gate_cmd", verify_cmd)
+        return loop_result
 
     # --- Proactive pre-install: ensure all required packages are installed ---
     # CMD steps scaffold the project first (e.g. npm create vite@latest).
@@ -5113,7 +5225,7 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                 f"This step is complete ONLY when `{verify_cmd}` exits "
                 f"successfully — it will be run to verify your work.")
 
-        return run_agent_loop_with_escalation(
+        loop_result = run_agent_loop_with_escalation(
             tester.llm_client, tools, step_text, task,
             escalation_client=getattr(tester, "escalation_client", None),
             display=display, step_idx=step_idx, language=language,
@@ -5121,6 +5233,12 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             verify_cmd=verify_cmd,
             context=loop_context,
         )
+        # Record the gate exactly as the loop enforced it (see
+        # _record_passed_gate) so the monotonic recheck can never diverge
+        # from what actually ran green.
+        if loop_result[0] and verify_cmd and plan_step is not None:
+            setattr(plan_step, "_verified_gate_cmd", verify_cmd)
+        return loop_result
 
     # Detect sub-project (if the test targets a nested folder)
     subproject_cwd = _detect_subproject_root(memory)
