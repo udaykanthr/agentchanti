@@ -8,7 +8,36 @@ from agentchanti.orchestrator.plan_step import (
     parse_structured_plan, PlanStep, validate_plan,
     fix_import_dependencies,
     is_structured_plan, build_waves,
+    plan_looks_truncated,
 )
+
+
+class TestPlanLooksTruncated(unittest.TestCase):
+
+    def test_missing_end_marker_is_truncated(self):
+        text = ("==PLAN==\n\n--STEP 1.1 [CMD] depends:none\nInstall\n"
+                "> npm i\nproduces: package.json\n\n"
+                "--STEP 2.1 [CODE] depends:1.1\nCreate the server and (")
+        truncated, reason = plan_looks_truncated(text)
+        self.assertTrue(truncated)
+        self.assertIn("==END==", reason)
+
+    def test_complete_plan_not_truncated(self):
+        text = ("==PLAN==\n\n--STEP 1.1 [CMD] depends:none\nInstall\n"
+                "> npm i\nproduces: package.json\n==END==\n")
+        steps = parse_structured_plan(text)
+        truncated, _ = plan_looks_truncated(text, steps)
+        self.assertFalse(truncated)
+
+    def test_last_step_without_body_is_truncated(self):
+        # Parses to a CODE step carrying no target/verify/inline body.
+        step = PlanStep(id="2.1", step_type="CODE", description="Create X")
+        truncated, reason = plan_looks_truncated("some plan ==END==", [step])
+        self.assertTrue(truncated)
+        self.assertIn("2.1", reason)
+
+    def test_empty_text_not_truncated(self):
+        self.assertEqual(plan_looks_truncated(""), (False, ""))
 
 
 class TestParseStructuredPlan(unittest.TestCase):

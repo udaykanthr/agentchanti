@@ -448,6 +448,20 @@ def _run_task_impl(
             return TaskResult(success=False, error="Could not parse any steps from the plan.")
         steps, dependencies = executor.parse_step_dependencies(raw_steps)
 
+    # ── Truncation guard ──
+    # A plan can parse cleanly yet be a stub (planner ran out of output
+    # tokens mid-plan). The library path is single-shot, so surface it
+    # loudly rather than shipping the stub silently. (The CLI re-plans.)
+    from .orchestrator.plan_step import plan_looks_truncated as _plan_truncated
+    _prov_trunc = getattr(getattr(planner, "llm_client", None),
+                          "_last_truncated", False)
+    _struct_trunc, _trunc_why = _plan_truncated(plan, plan_steps)
+    if _struct_trunc or (_prov_trunc and "==END==" not in (plan or "")):
+        _logger.warning(
+            "[Plan] Plan looks truncated (%s) — proceeding, but it may be "
+            "incomplete; downstream recovery will have to backfill missing "
+            "files", _trunc_why or "planner hit its output-token limit")
+
     # Post-plan optimization
     from .orchestrator.plan_optimizer import optimize_plan, optimize_structured_plan
 

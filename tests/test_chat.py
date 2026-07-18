@@ -519,5 +519,67 @@ class TestTokenLimitBurn(unittest.TestCase):
             self.assertNotIn("reasoning_effort", post.call_args[1]["json"])
 
 
+class _GenBurnClient(LLMClient):
+    """Text-path client scripted with (text, stop_reason) pairs."""
+
+    def __init__(self, script, **kwargs):
+        kwargs.setdefault("max_retries", 3)
+        kwargs.setdefault("retry_delay", 0)
+        kwargs.setdefault("stream", False)
+        super().__init__(**kwargs)
+        self._script = list(script)
+        self.token_limit_retries = 0
+
+    def _chat(self, messages, tools=None):
+        raise NotImplementedError
+
+    def _generate(self, prompt):
+        text, reason = self._script.pop(0)
+        self._last_stop_reason = reason
+        return text
+
+    def _generate_stream(self, prompt):
+        return self._generate(prompt)
+
+    def _prepare_token_limit_retry(self):
+        self.token_limit_retries += 1
+
+    def generate_embedding(self, text, model=None, **kwargs):
+        return []
+
+
+class TestGeneratePathTokenLimit(unittest.TestCase):
+    """The text/generate path (used by the planner) must recover from a
+    reasoning burn and flag a truncated non-empty result."""
+
+    def test_empty_at_cap_arms_hook_then_succeeds(self):
+        client = _GenBurnClient([("", "length"), ("the plan", "stop")])
+        with patch.object(LLMClient, "_backoff"):
+            out = client.generate_response("hi")
+        self.assertEqual(out, "the plan")
+        self.assertEqual(client.token_limit_retries, 1)
+        self.assertFalse(client._last_truncated)
+
+    def test_generic_empty_does_not_arm_hook(self):
+        client = _GenBurnClient([("", "stop"), ("answer", "stop")])
+        with patch.object(LLMClient, "_backoff"):
+            out = client.generate_response("hi")
+        self.assertEqual(out, "answer")
+        self.assertEqual(client.token_limit_retries, 0)
+
+    def test_nonempty_at_cap_flags_truncated(self):
+        client = _GenBurnClient([("partial plan cut off", "length")])
+        with patch.object(LLMClient, "_backoff"):
+            out = client.generate_response("hi")
+        self.assertEqual(out, "partial plan cut off")
+        self.assertTrue(client._last_truncated)
+
+    def test_clean_stop_not_truncated(self):
+        client = _GenBurnClient([("complete", "stop")])
+        out = client.generate_response("hi")
+        self.assertEqual(out, "complete")
+        self.assertFalse(client._last_truncated)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,10 @@ class LLMClient(ABC):
     #: text-flattening fallback automatically.
     NATIVE_CHAT = False
 
+    #: Provider stop-reason strings meaning "stopped at the output-token
+    #: cap" (OpenAI ``length``, Anthropic ``max_tokens``, Ollama ``length``).
+    _TOKEN_LIMIT_REASONS = ("length", "max_tokens", "max_output_tokens")
+
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
                  stream: bool = True, max_output_tokens: int = 16384):
         self.max_retries = max_retries
@@ -78,6 +82,15 @@ class LLMClient(ABC):
         # Flipped off when the active model rejects native tool calling,
         # so we don't re-attempt (and re-fail) on every subsequent call.
         self._native_tools_ok = True
+        # Side-channel for the text path: providers set this to their raw
+        # stop reason on every ``_generate``/``_generate_stream`` so
+        # ``generate_response`` can tell an empty/short answer that hit the
+        # output-token cap (reasoning burn / truncation) from a clean stop.
+        self._last_stop_reason: str = ""
+        # True when the last ``generate_response`` returned NON-empty text
+        # that was cut at the token cap — a truncated result the caller
+        # (e.g. the planner) should treat as incomplete.
+        self._last_truncated: bool = False
 
     def set_stream_callback(self, callback: Callable[[int], None]) -> None:
         """Set a callback that receives ``(tokens_generated)`` during streaming."""
@@ -100,34 +113,60 @@ class LLMClient(ABC):
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                self._last_stop_reason = ""
                 if use_stream:
                     result = self._generate_stream(active_prompt)
                 else:
                     result = self._generate(active_prompt)
 
                 result = _strip_reasoning(result) if result else result
+                hit_cap = self._generate_hit_token_limit()
 
                 if not result or not result.strip():
-                    log.warning(
-                        f"[LLM] Empty response on attempt {attempt}/{self.max_retries}")
                     if attempt < self.max_retries:
-                        # Prefix the prompt with an explicit instruction to
-                        # suppress reasoning-only output.  Some models (e.g.
-                        # deepseek-r1 variants) emit all tokens inside <think>
-                        # blocks that get stripped, leaving an empty response.
-                        # Telling the model to skip the thinking step on retry
-                        # is the most reliable way to get visible output.
-                        active_prompt = (
-                            "[IMPORTANT: Your previous response was empty. "
-                            "Do NOT use <think> tags, reasoning blocks, or any "
-                            "XML-style wrapper tags. Output your answer directly "
-                            "with no preamble.]\n\n"
-                            + prompt
-                        )
+                        if hit_cap:
+                            # The whole output budget was spent with nothing
+                            # visible — a reasoning model burned every token
+                            # thinking (observed: minimax planner, 16384
+                            # tokens, empty text). A verbatim retry is a coin
+                            # flip; let the provider dial reasoning down.
+                            log.warning(
+                                f"[LLM] Empty response at the output-token "
+                                f"limit on attempt {attempt}/{self.max_retries}"
+                                f" — reasoning burn; requesting reduced effort")
+                            self._prepare_token_limit_retry()
+                        else:
+                            log.warning(
+                                f"[LLM] Empty response on attempt "
+                                f"{attempt}/{self.max_retries}")
+                            # Some models (e.g. deepseek-r1 variants) emit all
+                            # tokens inside <think> blocks that get stripped,
+                            # leaving an empty response. Telling the model to
+                            # skip the thinking step is the most reliable way
+                            # to get visible output.
+                            active_prompt = (
+                                "[IMPORTANT: Your previous response was empty. "
+                                "Do NOT use <think> tags, reasoning blocks, or "
+                                "any XML-style wrapper tags. Output your answer "
+                                "directly with no preamble.]\n\n"
+                                + prompt
+                            )
                         self._backoff(attempt)
                         continue
+                    log.warning(
+                        f"[LLM] Empty response on attempt "
+                        f"{attempt}/{self.max_retries}")
                     raise LLMError("LLM returned empty response after all retries")
 
+                # Non-empty. Flag truncation (cut at the token cap) so callers
+                # that need a complete answer — the planner — can detect a
+                # partial result instead of running with a silent stub.
+                self._last_truncated = hit_cap
+                if hit_cap:
+                    log.warning(
+                        "[LLM] Response hit the output-token limit — result "
+                        "is likely truncated (%d tokens)",
+                        self.max_output_tokens)
                 return result
 
             except LLMError:
@@ -223,13 +262,17 @@ class LLMClient(ABC):
         raise LLMError(
             f"LLM chat failed after {self.max_retries} retries: {last_error}")
 
-    @staticmethod
-    def _hit_token_limit(result: ChatResponse) -> bool:
+    @classmethod
+    def _hit_token_limit(cls, result: ChatResponse) -> bool:
         """True when the provider stopped the response at the output-token
         cap (OpenAI ``length``, Anthropic ``max_tokens``, Ollama
         ``length``)."""
-        return (result.stop_reason or "").lower() in (
-            "length", "max_tokens", "max_output_tokens")
+        return (result.stop_reason or "").lower() in cls._TOKEN_LIMIT_REASONS
+
+    def _generate_hit_token_limit(self) -> bool:
+        """Text-path counterpart of :meth:`_hit_token_limit`, reading the
+        stop reason the provider stashed during the last generate call."""
+        return (self._last_stop_reason or "").lower() in self._TOKEN_LIMIT_REASONS
 
     def _prepare_token_limit_retry(self) -> None:
         """Hook invoked before retrying a chat whose response consumed the

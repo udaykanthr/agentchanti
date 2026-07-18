@@ -16,11 +16,29 @@ class OllamaClient(LLMClient):
         super().__init__(**kwargs)
         self.base_url = base_url
         self.model = model
+        # One-shot: armed by _prepare_token_limit_retry after a reasoning
+        # burn, consumed by the next generate call to disable thinking.
+        self._retry_disable_think = False
         # Derive the API root for endpoints like /api/embed
         if "/api/" in base_url:
             self._api_root = base_url.rsplit("/api/", 1)[0]
         else:
             self._api_root = base_url.rstrip("/")
+
+    def _prepare_token_limit_retry(self) -> None:
+        """Reasoning models can spend the whole /api/generate completion
+        budget on hidden thinking, returning empty/truncated text with
+        ``done_reason: length``. Disable thinking for the one-shot retry so
+        the budget goes to visible output instead."""
+        self._retry_disable_think = True
+
+    def _apply_generate_options(self, payload: dict) -> None:
+        """Fold per-request generation controls into *payload* (one-shot)."""
+        if self._retry_disable_think:
+            # Ollama ignores unknown fields on models without a thinking
+            # mode, so this is safe to send unconditionally when armed.
+            payload["think"] = False
+            self._retry_disable_think = False
 
     # ── Non-streaming generation ──
 
@@ -36,10 +54,12 @@ class OllamaClient(LLMClient):
             "stream": False,
             "options": {"num_predict": self.max_output_tokens},
         }
+        self._apply_generate_options(payload)
         response = requests.post(self.base_url, json=payload, timeout=(10, 300))
         response.raise_for_status()
         data = response.json()
         result = data.get("response", "")
+        self._last_stop_reason = data.get("done_reason", "") or ""
 
         prompt_tokens = data.get("prompt_eval_count", est_tokens)
         completion_tokens = data.get("eval_count", 0)
@@ -65,9 +85,11 @@ class OllamaClient(LLMClient):
             "stream": True,
             "options": {"num_predict": self.max_output_tokens},
         }
+        self._apply_generate_options(payload)
         content_parts: list[str] = []
         tokens_generated = 0
         prompt_tokens = est_tokens
+        self._last_stop_reason = ""
 
         response = requests.post(self.base_url, json=payload,
                                  stream=True, timeout=(10, 120))
@@ -87,11 +109,12 @@ class OllamaClient(LLMClient):
                         if self._stream_callback and tokens_generated % 10 == 0:
                             self._stream_callback(tokens_generated)
 
-                    # Final chunk contains token counts
+                    # Final chunk contains token counts + stop reason
                     if chunk.get("done", False):
                         prompt_tokens = chunk.get("prompt_eval_count", est_tokens)
                         eval_count = chunk.get("eval_count", tokens_generated)
                         tokens_generated = eval_count if isinstance(eval_count, int) else tokens_generated
+                        self._last_stop_reason = chunk.get("done_reason", "") or ""
                 except (json.JSONDecodeError, KeyError):
                     continue
 

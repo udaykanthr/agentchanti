@@ -899,7 +899,7 @@ def _main_impl():
                 fix_import_dependencies,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
-                reclassify_manifest_steps,
+                reclassify_manifest_steps, plan_looks_truncated,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -951,6 +951,42 @@ def _main_impl():
                 log.error("Could not parse any steps from the plan.")
                 print("\n  [ERROR] Could not parse any steps. Check the log file.\n")
                 return
+
+            # ── Truncation guard ──
+            # A plan can parse cleanly yet be a stub: the planner ran out of
+            # output tokens mid-plan (observed: a 6-step plan for a ~15-file
+            # task, cut mid-step, that ran only because downstream recovery
+            # backfilled the missing files). Detect it and re-plan for a
+            # complete plan rather than shipping the stub silently. A
+            # structured plan that DID close with ==END== is trusted even if
+            # the cap flag fired (the cap likely hit trailing whitespace).
+            _prov_truncated = getattr(
+                getattr(planner, "llm_client", None), "_last_truncated", False)
+            _struct_truncated, _trunc_reason = plan_looks_truncated(
+                plan, plan_steps_parsed)
+            _has_end = "==END==" in (plan or "")
+            if _struct_truncated or (_prov_truncated and not _has_end):
+                _reason = _trunc_reason or "the planner hit its output-token limit"
+                if plan_attempt < MAX_PLAN_RETRIES:
+                    log.warning(
+                        "[Plan] Plan looks truncated (%s) — re-planning for a "
+                        "complete plan", _reason)
+                    display.show_status(
+                        "Plan was cut off — requesting a complete plan...")
+                    planner_context += (
+                        "\n\n[PLANNER CORRECTION] Your previous plan was CUT "
+                        f"OFF ({_reason}) and is INCOMPLETE. Produce the "
+                        "COMPLETE plan this time: keep each step description "
+                        "terse, include a step for every file the requirements "
+                        "name, and finish with the ==END== marker.")
+                    continue
+                log.error(
+                    "[Plan] Plan still truncated after %d attempts — proceeding "
+                    "with a possibly-incomplete plan (%s)",
+                    MAX_PLAN_RETRIES, _reason)
+                display.show_status(
+                    "Warning: plan may be incomplete (planner output was "
+                    "truncated).")
 
             # Validate plan quality — skip for structured plans, which are
             # already validated by validate_plan() above and whose step

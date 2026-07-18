@@ -111,6 +111,40 @@ class PlanStep:
         )
 
 
+def plan_looks_truncated(plan_text: str,
+                         steps: Optional[list["PlanStep"]] = None
+                         ) -> tuple[bool, str]:
+    """Heuristically detect a plan whose generation was cut off mid-way.
+
+    Returns ``(True, reason)`` when the plan is very likely incomplete. A
+    truncated plan can still parse cleanly and run (observed: a 6-step stub
+    for a ~15-file task, cut mid-step, that shipped only because downstream
+    recovery backfilled the missing files) — so it must be caught before
+    execution rather than trusted.
+
+    Mechanical signals only; the caller folds in the provider's
+    ``_last_truncated`` (output-token-cap) flag separately:
+
+      * a structured plan opened with ``==PLAN==`` but never closed with
+        the mandatory ``==END==`` marker;
+      * the last parsed CODE/TEST step has no body at all (no target,
+        inline code/edit, verify, or command) — its content block was cut.
+    """
+    text = (plan_text or "").rstrip()
+    if not text:
+        return False, ""
+    if "==PLAN==" in text and "==END==" not in text:
+        return True, "structured plan was cut off before the ==END== marker"
+    if steps:
+        last = steps[-1]
+        if last.step_type in ("CODE", "TEST") and not (
+                last.target_files or last.inline_code or last.inline_edits
+                or last.verify_cmd or last.command):
+            return True, (f"last step {last.id} has no body — its content "
+                          f"block appears truncated")
+    return False, ""
+
+
 # ---------------------------------------------------------------------------
 # Echo command parser
 # ---------------------------------------------------------------------------

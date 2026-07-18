@@ -65,6 +65,10 @@ class OpenAIClient(LLMClient):
         # max_tokens.  Try the new name first, fall back on 400 error.
         _tok_key = "max_completion_tokens"
         payload[_tok_key] = self.max_output_tokens
+        if self._retry_reasoning_effort:
+            # Consume the one-shot downgrade armed after a reasoning burn.
+            payload["reasoning_effort"] = self._retry_reasoning_effort
+            self._retry_reasoning_effort = None
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
@@ -88,6 +92,7 @@ class OpenAIClient(LLMClient):
         log.debug(f"[OpenAI] Usage: prompt={prompt_tokens} completion={completion_tokens}")
 
         response_text = data["choices"][0]["message"]["content"]
+        self._last_stop_reason = data["choices"][0].get("finish_reason", "") or ""
         log.debug(f"[OpenAI] Response:\n{completion_tokens}")
         return response_text
 
@@ -109,12 +114,17 @@ class OpenAIClient(LLMClient):
             "stream_options": {"include_usage": True},
             "max_completion_tokens": self.max_output_tokens,
         }
+        if self._retry_reasoning_effort:
+            # Consume the one-shot downgrade armed after a reasoning burn.
+            payload["reasoning_effort"] = self._retry_reasoning_effort
+            self._retry_reasoning_effort = None
         url = f"{self.base_url}/chat/completions"
 
         content_parts: list[str] = []
         tokens_generated = 0
         prompt_tokens = est_tokens
         completion_tokens = 0
+        self._last_stop_reason = ""
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
@@ -142,7 +152,11 @@ class OpenAIClient(LLMClient):
                         if usage:
                             prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                             completion_tokens = usage.get("completion_tokens", completion_tokens)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        _choice0 = chunk.get("choices", [{}])[0]
+                        _fr = _choice0.get("finish_reason")
+                        if _fr:
+                            self._last_stop_reason = _fr
+                        delta = _choice0.get("delta", {})
                         token = delta.get("content", "")
                         if token:
                             content_parts.append(token)
