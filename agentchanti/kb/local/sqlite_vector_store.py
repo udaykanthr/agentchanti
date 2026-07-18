@@ -132,7 +132,14 @@ class SQLiteVectorStore:
             db_path = os.path.join(kb_dir, "vectors.db")
         self._db_path = db_path
         self._lock = threading.Lock()
-        self._conn: sqlite3.Connection | None = None
+        # Each thread gets its own connection (thread-local). A single
+        # connection shared across threads with check_same_thread=False is
+        # officially unsupported and can corrupt the interpreter heap — a
+        # Windows fast-fail (0xc0000409) that faulthandler cannot catch.
+        # WAL + busy_timeout let per-thread connections coordinate safely,
+        # and the default check_same_thread=True turns accidental
+        # cross-thread use into a loud Python error, not a native crash.
+        self._local = threading.local()
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -153,23 +160,29 @@ class SQLiteVectorStore:
         conn.commit()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Thread-safe lazy connection."""
-        if self._conn is None:
-            self._conn = sqlite3.connect(
-                self._db_path, check_same_thread=False
-            )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+        """Return this thread's own SQLite connection (lazily opened)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        """Close the database connection."""
-        if self._conn is not None:
+        """Close this thread's database connection.
+
+        Only the calling thread's connection is closed; connections owned
+        by other (daemon) threads are released when the process exits.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
             try:
-                self._conn.close()
+                conn.close()
             except sqlite3.Error:
                 pass
-            self._conn = None
+            self._local.conn = None
 
     # ------------------------------------------------------------------
     # Public API

@@ -45,20 +45,38 @@ class SQLiteEmbeddingStore(EmbeddingStore):
         super().__init__(llm_client, embed_model)
         self._db_path = db_path
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        # One shared connection used from several threads: FileMemory's
+        # This store is touched from several threads: FileMemory's
         # background _bg_embed workers write while pipeline wave threads
-        # read. sqlite3 connections are NOT thread-safe — unsynchronized
-        # use first surfaces as "bad parameter or other API misuse" and
-        # can hard-crash the interpreter (observed: silent process exit
-        # mid-run). Every connection touch must hold _db_lock.
+        # read. A single sqlite3 connection shared across threads (even
+        # with check_same_thread=False) is officially unsupported and can
+        # corrupt the interpreter heap — a Windows fast-fail (0xc0000409)
+        # that faulthandler cannot catch, seen as a silent mid-run exit.
+        #
+        # Instead each thread gets its OWN connection via thread-local
+        # storage. WAL mode + busy_timeout let independent connections
+        # coordinate safely at the SQLite level, and the default
+        # check_same_thread=True turns any accidental cross-thread use
+        # into a loud Python exception rather than a native crash.
+        # _db_lock still serialises writers to avoid SQLITE_BUSY churn
+        # and to keep the in-memory _vectors dict consistent.
         self._db_lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._local = threading.local()
+        conn = self._get_conn()
         with self._db_lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute(_CREATE_TABLE)
-            self._conn.commit()
+            conn.execute(_CREATE_TABLE)
+            conn.commit()
         log.debug(f"[SQLiteEmbeddingStore] Opened {db_path}")
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Return this thread's own SQLite connection (lazily opened)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     def add(self, key: str, text: str) -> bool:
         """Embed text and cache persistently. Skips API call if cached."""
@@ -99,7 +117,7 @@ class SQLiteEmbeddingStore(EmbeddingStore):
         """Load cached embedding vectors from SQLite."""
         try:
             with self._db_lock:
-                cursor = self._conn.execute(_SELECT, (key, content_hash))
+                cursor = self._get_conn().execute(_SELECT, (key, content_hash))
                 rows = cursor.fetchall()
             if not rows:
                 return None
@@ -113,19 +131,26 @@ class SQLiteEmbeddingStore(EmbeddingStore):
         """Persist embedding vectors to SQLite, replacing stale entries."""
         try:
             with self._db_lock:
-                self._conn.execute(_DELETE_STALE, (key, content_hash))
+                conn = self._get_conn()
+                conn.execute(_DELETE_STALE, (key, content_hash))
                 for chunk_idx, vec in vectors:
                     vec_json = json.dumps(vec)
-                    self._conn.execute(
+                    conn.execute(
                         _INSERT, (key, content_hash, chunk_idx, vec_json))
-                self._conn.commit()
+                conn.commit()
         except sqlite3.Error as e:
             log.warning(f"[SQLiteEmbeddingStore] Cache write error: {e}")
 
     def close(self):
-        """Close the SQLite connection."""
-        try:
-            with self._db_lock:
-                self._conn.close()
-        except sqlite3.Error:
-            pass
+        """Close this thread's SQLite connection.
+
+        Only the calling thread's connection is closed; connections owned
+        by other (daemon) threads are released when the process exits.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None

@@ -36,6 +36,7 @@ from ..report import generate_html_report, StepReport
 from ..plugins.registry import PluginRegistry
 
 from .memory import FileMemory
+from .crash_diagnostics import install_crash_diagnostics, set_activity
 from .pipeline import (
     build_step_waves, _execute_step, _run_diagnosis_loop,
     run_wiring_verification,
@@ -231,6 +232,7 @@ def _arm_faulthandler() -> None:
 def main():
     install_sigint_handler()
     _arm_faulthandler()
+    install_crash_diagnostics()
     try:
         _main_impl()
     except KeyboardInterrupt:
@@ -1258,6 +1260,10 @@ def _main_impl():
             continue
 
         log.info(f"Wave {wave_idx+1}: executing steps {[i+1 for i in pending]}")
+        set_activity(
+            f"wave {wave_idx+1}/{len(waves)} steps {[i+1 for i in pending]}: "
+            + "; ".join(steps[i].splitlines()[0][:60] for i in pending)
+        )
 
         if len(pending) == 1:
             # Single step — execute directly
