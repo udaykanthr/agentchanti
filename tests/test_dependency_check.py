@@ -1,5 +1,7 @@
 """Tests for the post-step dependency validation system."""
 
+from unittest.mock import patch
+
 import pytest
 
 from agentchanti.orchestrator.dependency_check import (
@@ -544,12 +546,23 @@ class TestFindGaps:
             ),
         }
         after = build_snapshot(after_files)
-        gaps = find_gaps(
-            before, after,
-            new_files=["spacious_site/sitepages/urls.py"],
-            step_text="Create app URL router",
-            memory_files=after_files,
-        )
+        # In production `django` resolves as external via the target
+        # project's own venv (a Django task pip-installs it there). This
+        # test must not depend on Django being installed in agentchanti's
+        # env — CI runs a clean interpreter where `django.urls` would
+        # otherwise be misflagged as a broken local import. Patch the
+        # venv check to reflect the production guarantee.
+        with patch(
+            "agentchanti.orchestrator.dependency_check."
+            "_project_has_installed_package",
+            side_effect=lambda mod: mod == "django",
+        ):
+            gaps = find_gaps(
+                before, after,
+                new_files=["spacious_site/sitepages/urls.py"],
+                step_text="Create app URL router",
+                memory_files=after_files,
+            )
         broken = [g for g in gaps if g.gap_type == "broken_import"]
         assert broken == []
 
