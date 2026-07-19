@@ -175,8 +175,9 @@ class TestRunAgentLoop(AgentLoopTestCase):
             llm, self.tools, "fix the tests", "task", max_turns=8)
         self.assertTrue(success)
         # The conversation contains exactly one act-now nudge, placed
-        # right after the 3rd read-only turn's tool result. (call_args
-        # holds a reference to the mutated list — inspect the final state.)
+        # right after the 2nd read-only turn's tool result (threshold
+        # lowered 3 → 2). (call_args holds a reference to the mutated
+        # list — inspect the final state.)
         messages = llm.chat.call_args_list[-1][0][0]
         nudges = [i for i, m in enumerate(messages)
                   if m.role == "user" and "ACT now" in m.content]
@@ -189,30 +190,33 @@ class TestRunAgentLoop(AgentLoopTestCase):
         write = _tool_response(ToolCall(
             name="write_file",
             arguments={"path": "b.txt", "content": "x"}, id="w"))
-        llm = self._llm(read, read, write, read, _final("done"))
+        # read, write, read: the write resets the streak so it never
+        # reaches the (now 2) nudge threshold.
+        llm = self._llm(read, write, read, _final("done"))
         self._write_helper()
         run_agent_loop(llm, self.tools, "step", "task", max_turns=8)
-        # No nudge anywhere: streak never reached 3
+        # No nudge anywhere: streak never reached 2
         for call in llm.chat.call_args_list:
             for msg in call[0][0]:
                 if msg.role == "user":
                     self.assertNotIn("ACT now", msg.content)
 
     def test_nudge_ignored_withholds_read_only_tools(self):
-        # 4 read-only turns: nudge fires after the 3rd, is ignored on the
-        # 4th → the 5th call must offer only acting tools.
+        # 3 read-only turns: nudge fires after the 2nd, is ignored on the
+        # 3rd → the 4th call must offer only acting tools (thresholds
+        # lowered 3/4 → 2/3).
         read = _tool_response(ToolCall(name="read_file",
                                        arguments={"path": "a.txt"}, id="c"))
         write = _tool_response(ToolCall(
             name="write_file",
             arguments={"path": "b.txt", "content": "x"}, id="w"))
-        llm = self._llm(read, read, read, read, write, _final("done"))
+        llm = self._llm(read, read, read, write, _final("done"))
         self._write_helper()
         success, _ = run_agent_loop(
             llm, self.tools, "fix the tests", "task", max_turns=8)
         self.assertTrue(success)
-        fifth_tools = llm.chat.call_args_list[4][1]["tools"]
-        self.assertEqual({t.name for t in fifth_tools},
+        fourth_tools = llm.chat.call_args_list[3][1]["tools"]
+        self.assertEqual({t.name for t in fourth_tools},
                          {"write_file", "edit_file", "run_command"})
         # Escalation message present exactly once
         messages = llm.chat.call_args_list[-1][0][0]
@@ -220,12 +224,53 @@ class TestRunAgentLoop(AgentLoopTestCase):
                        and "Inspection tools are now disabled" in m.content]
         self.assertEqual(len(escalations), 1)
         # Acting restores the full toolset on the following call
-        sixth_tools = llm.chat.call_args_list[5][1]["tools"]
-        self.assertIn("read_file", {t.name for t in sixth_tools})
+        fifth_tools = llm.chat.call_args_list[4][1]["tools"]
+        self.assertIn("read_file", {t.name for t in fifth_tools})
 
     def _write_helper(self):
         with open(os.path.join(self.root, "a.txt"), "w") as f:
             f.write("data")
+
+    def test_preload_injects_existing_target_file_into_opening_message(self):
+        with open(os.path.join(self.root, "app.py"), "w") as f:
+            f.write("def existing():\n    return 42\n")
+        llm = self._llm(
+            _tool_response(ToolCall(name="write_file",
+                                    arguments={"path": "app.py",
+                                               "content": "x\n"}, id="c")),
+            _final(),
+        )
+        run_agent_loop(llm, self.tools, "edit app.py", "task",
+                       preload_files=["app.py"])
+        opening = llm.chat.call_args_list[0][0][0][1]
+        # Existing content is handed over up front so the model needn't
+        # spend a turn on read_file, and it's marked do-not-re-read.
+        self.assertIn("do NOT call read_file", opening.content)
+        self.assertIn("def existing():", opening.content)
+
+    def test_preload_skips_missing_and_empty_files(self):
+        # A file the step will create doesn't exist yet; an empty file has
+        # nothing to hand over. Neither should produce a preload block.
+        open(os.path.join(self.root, "empty.py"), "w").close()
+        llm = self._llm(
+            _tool_response(ToolCall(name="write_file",
+                                    arguments={"path": "new.py",
+                                               "content": "x\n"}, id="c")),
+            _final(),
+        )
+        run_agent_loop(llm, self.tools, "create files", "task",
+                       preload_files=["new.py", "empty.py"])
+        opening = llm.chat.call_args_list[0][0][0][1]
+        self.assertNotIn("already read for you", opening.content)
+
+    def test_preload_none_leaves_message_unchanged(self):
+        llm = self._llm(
+            _tool_response(ToolCall(name="list_files", arguments={}, id="c")),
+            _final(),
+        )
+        run_agent_loop(llm, self.tools, "step", "task", preload_files=None)
+        opening = llm.chat.call_args_list[0][0][0][1]
+        self.assertNotIn("already read for you", opening.content)
 
     def test_user_message_contains_step_task_and_context(self):
         llm = self._llm(

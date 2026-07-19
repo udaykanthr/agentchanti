@@ -3941,6 +3941,7 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
+            preload_files=getattr(plan_step, "target_files", None),
         )
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
@@ -5232,6 +5233,7 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
+            preload_files=getattr(plan_step, "target_files", None),
         )
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge
