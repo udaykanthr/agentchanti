@@ -262,6 +262,10 @@ def _main_impl():
         return
 
     parser = argparse.ArgumentParser(description="AgentChanti — Multi-Agent Local Coder")
+    from .. import __version__ as _agentchanti_version
+    parser.add_argument("--version", action="version",
+                        version=f"agentchanti {_agentchanti_version}",
+                        help="Print the installed agentchanti version and exit")
     parser.add_argument("task", nargs="?", help="The coding task to perform")
     parser.add_argument("--prompt-from-file", help="Read prompt from a text file")
     parser.add_argument("--provider", choices=["ollama", "lm_studio", "openai", "gemini", "anthropic"],
