@@ -1573,8 +1573,18 @@ def _main_impl():
         _als = _als_fn()
         if _als:
             log.info(_als)
+        _cached = token_tracker.total_cached_tokens
+        _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
+        if _cached > 0:
+            # Show gross vs. cached-net so the prompt-cache discount is
+            # visible: of the tokens sent, how many were cache hits (billed
+            # at a discount) vs. full-price.
+            _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
+            _sent_breakdown += (
+                f" [cached={_cached} ({_pct}%), "
+                f"full-price={token_tracker.full_price_prompt_tokens}]")
         log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
-                 f"(sent={token_tracker.total_prompt_tokens}, "
+                 f"({_sent_breakdown}, "
                  f"recv={token_tracker.total_completion_tokens})")
 
         # Generate HTML report

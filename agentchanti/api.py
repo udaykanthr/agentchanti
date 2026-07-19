@@ -730,6 +730,7 @@ def _run_task_impl(
             "total": token_tracker.total_tokens,
             "prompt": token_tracker.total_prompt_tokens,
             "completion": token_tracker.total_completion_tokens,
+            "cached": token_tracker.total_cached_tokens,
         },
         log_file=log.handlers[0].baseFilename if log.handlers else "",
     )
