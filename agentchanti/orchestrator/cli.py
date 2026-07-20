@@ -805,10 +805,11 @@ def _main_impl():
 
         # Record whether the RAW task asks for tests before enrichment
         # replaces it — the enriched spec routinely adds testing language,
-        # so this must be decided now. Rides on memory (like _kb_context)
-        # so the coverage-generation gate deep in the pipeline can see it.
+        # so this must be decided now. Parked on args because memory does
+        # not exist yet on the fresh path (it is created after planning);
+        # it is copied onto memory at creation time below.
         from ..language import task_requests_tests
-        memory._task_requests_tests = task_requests_tests(args.task)
+        args._raw_task_requests_tests = task_requests_tests(args.task)
 
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
@@ -1168,6 +1169,10 @@ def _main_impl():
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
         if kb_runtime_watcher is not None:
             memory.watcher_created_files = kb_runtime_watcher.created_files
+        # Raw-task test-request flag, computed before enrichment (see above).
+        # Gates unsolicited auto-coverage generation in the pipeline.
+        memory._task_requests_tests = getattr(
+            args, '_raw_task_requests_tests', True)
         # Propagate task briefing to memory so all downstream agents can use it
         _briefing_text = getattr(planner, '_task_briefing', '')
         if _briefing_text:
