@@ -145,6 +145,28 @@ def plan_looks_truncated(plan_text: str,
     return False, ""
 
 
+def plan_salvageable(steps: Optional[list["PlanStep"]]) -> bool:
+    """True when a plan flagged truncated only by the missing ``==END==``
+    marker is safe to run anyway.
+
+    A full re-plan costs a complete second generation and churns every
+    path in the plan (observed: a re-plan renamed the project dir, so
+    steps from the two plans referenced different trees). When every
+    parsed step is structurally complete — the cut, if any, landed on the
+    marker itself — the plan is almost certainly whole and salvaging it
+    is cheaper and safer than regenerating. Callers must still require
+    that the provider's output-token-cap flag did NOT fire: a genuine cap
+    hit means later steps may be missing entirely.
+    """
+    if not steps or len(steps) < 3:
+        return False
+    last = steps[-1]
+    # Mirrors the bodyless-last-step truncation signal above: a complete
+    # final step means the generation reached a step boundary.
+    return bool(last.target_files or last.inline_code or last.inline_edits
+                or last.verify_cmd or last.command)
+
+
 # ---------------------------------------------------------------------------
 # Echo command parser
 # ---------------------------------------------------------------------------

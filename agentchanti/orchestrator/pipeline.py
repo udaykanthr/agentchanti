@@ -158,6 +158,28 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+_TEST_INFRA_STEMS = (
+    "vitest.config", "vitest.setup", "jest.config", "jest.setup",
+    "setuptests", "conftest",
+)
+
+
+def _is_test_infra_file(file_path: str) -> bool:
+    """True for test *infrastructure* files (vitest/jest config + setup).
+
+    The BulkTest source-protection guard exists to stop the fix loop from
+    rewriting production code, but these files serve the tests themselves
+    — and the guard's existing-file requirement made it impossible to
+    CREATE a missing vitest.config.js at all (observed: the fix loop was
+    blocked on it three times in one run while the suite failed around
+    it). Treat them like test files: the fix loop may create or modify
+    them freely.
+    """
+    import os
+    stem = os.path.basename(file_path).lower()
+    return stem.startswith(_TEST_INFRA_STEMS)
+
+
 # ── Router-mount mismatch detection ───────────────────────────────────────
 # Production source files that use react-router primitives (Link,
 # NavLink, useNavigate, …) require a Router (BrowserRouter, HashRouter,
@@ -4092,6 +4114,14 @@ def run_bulk_test_execution_and_fix(
     if "pytest" in base_cmd:
         _ensure_pytest_available(executor, cwd=subproject_cwd)
 
+    # Deterministic vitest environment: DOM-testing suites need jsdom, the
+    # testing-library packages, and a jsdom-enabled config. Planners emit
+    # this setup unreliably (or not at all) — bootstrap it here so the
+    # first run doesn't fail on a missing environment.
+    if "vitest" in base_cmd.lower():
+        from .step_handlers import ensure_vitest_env
+        ensure_vitest_env(executor, subproject_cwd, test_files, memory=memory)
+
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
     if ok:
@@ -4767,6 +4797,11 @@ def run_bulk_test_execution_and_fix(
                     for _bt_fp, _bt_fc in fix_files.items():
                         if _is_test_file(_bt_fp):
                             _bt_filtered[_bt_fp] = _bt_fc
+                        elif _is_test_infra_file(_bt_fp):
+                            _bt_filtered[_bt_fp] = _bt_fc
+                            _logger.info(
+                                "[BulkTest] Allowed test-infra fix "
+                                "for %s", _bt_fp)
                         elif _is_additive_source_fix(
                                 _bt_fp, _bt_fc, memory):
                             _bt_filtered[_bt_fp] = _bt_fc
@@ -5202,6 +5237,11 @@ def run_bulk_test_execution_and_fix(
                         for _bt2_fp, _bt2_fc in fix_files.items():
                             if _is_test_file(_bt2_fp):
                                 _bt2_filtered[_bt2_fp] = _bt2_fc
+                            elif _is_test_infra_file(_bt2_fp):
+                                _bt2_filtered[_bt2_fp] = _bt2_fc
+                                _logger.info(
+                                    "[BulkTest] Allowed test-infra fix "
+                                    "for %s", _bt2_fp)
                             elif _is_additive_source_fix(
                                     _bt2_fp, _bt2_fc, memory):
                                 _bt2_filtered[_bt2_fp] = _bt2_fc

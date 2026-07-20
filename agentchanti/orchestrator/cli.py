@@ -906,6 +906,7 @@ def _main_impl():
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
+                plan_salvageable,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -973,7 +974,19 @@ def _main_impl():
             _has_end = "==END==" in (plan or "")
             if _struct_truncated or (_prov_truncated and not _has_end):
                 _reason = _trunc_reason or "the planner hit its output-token limit"
-                if plan_attempt < MAX_PLAN_RETRIES:
+                # Salvage: only the ==END== marker is missing, the provider's
+                # output cap did NOT fire, and every parsed step is
+                # structurally complete — the plan is almost certainly whole.
+                # Re-planning here costs a full second generation and churns
+                # paths (an observed re-plan renamed the project directory).
+                if (not _prov_truncated and "==END==" in _reason
+                        and plan_salvageable(plan_steps_parsed)):
+                    log.warning(
+                        "[Plan] ==END== marker missing but all %d parsed "
+                        "steps are structurally complete — salvaging plan "
+                        "instead of re-planning",
+                        len(plan_steps_parsed or []))
+                elif plan_attempt < MAX_PLAN_RETRIES:
                     log.warning(
                         "[Plan] Plan looks truncated (%s) — re-planning for a "
                         "complete plan", _reason)
@@ -986,13 +999,14 @@ def _main_impl():
                         "terse, include a step for every file the requirements "
                         "name, and finish with the ==END== marker.")
                     continue
-                log.error(
-                    "[Plan] Plan still truncated after %d attempts — proceeding "
-                    "with a possibly-incomplete plan (%s)",
-                    MAX_PLAN_RETRIES, _reason)
-                display.show_status(
-                    "Warning: plan may be incomplete (planner output was "
-                    "truncated).")
+                else:
+                    log.error(
+                        "[Plan] Plan still truncated after %d attempts — "
+                        "proceeding with a possibly-incomplete plan (%s)",
+                        MAX_PLAN_RETRIES, _reason)
+                    display.show_status(
+                        "Warning: plan may be incomplete (planner output was "
+                        "truncated).")
 
             # Validate plan quality — skip for structured plans, which are
             # already validated by validate_plan() above and whose step

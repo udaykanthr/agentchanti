@@ -446,6 +446,109 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
     return env
 
 
+# ── Deterministic vitest environment bootstrap ────────────────────────────
+# The planner handles vitest setup inconsistently (observed across runs:
+# a Windows-broken echo chain, then omitting it entirely) and the BulkTest
+# fix loop's destructive-change guard used to block the LLM from creating
+# the missing config. The environment is the same ~10 lines every time —
+# write it deterministically, no LLM involved.
+
+_VITEST_SETUP_FILE = "vitest.setup.js"
+
+_VITEST_SETUP_TEMPLATE = "import '@testing-library/jest-dom/vitest'\n"
+
+_VITEST_DOM_DEPS = ("vitest", "jsdom", "@testing-library/react",
+                    "@testing-library/dom", "@testing-library/jest-dom")
+
+
+def _vitest_config_template(with_react_plugin: bool) -> str:
+    plugin_import = ("import react from '@vitejs/plugin-react'\n"
+                     if with_react_plugin else "")
+    plugins_line = "  plugins: [react()],\n" if with_react_plugin else ""
+    return (
+        "import { defineConfig } from 'vitest/config'\n"
+        f"{plugin_import}"
+        "\n"
+        "export default defineConfig({\n"
+        f"{plugins_line}"
+        "  test: {\n"
+        "    environment: 'jsdom',\n"
+        "    globals: true,\n"
+        f"    setupFiles: './{_VITEST_SETUP_FILE}',\n"
+        "  },\n"
+        "})\n"
+    )
+
+
+def ensure_vitest_env(executor, cwd: str | None,
+                      test_files: dict[str, str],
+                      memory=None) -> None:
+    """Make a vitest run actually possible: install the DOM-testing deps
+    and write a jsdom-enabled ``vitest.config.js`` + setup file when the
+    project has neither. Idempotent; no LLM calls.
+
+    Only acts when the tests need a DOM (they import @testing-library) —
+    pure-logic vitest suites run fine without any of this.
+    """
+    root = cwd or "."
+    pkg_path = os.path.join(root, "package.json")
+    if not os.path.isfile(pkg_path):
+        return
+    needs_dom = any("@testing-library" in (c or "")
+                    for c in test_files.values())
+    if not needs_dom:
+        return
+
+    try:
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    deps = {}
+    deps.update(pkg.get("dependencies", {}))
+    deps.update(pkg.get("devDependencies", {}))
+
+    missing = [p for p in _VITEST_DOM_DEPS if p not in deps]
+    if missing:
+        log.info("[VitestEnv] Installing missing test deps: %s", missing)
+        ok, out = executor.run_command(
+            "npm install -D " + " ".join(missing), cwd=root)
+        if not ok:
+            log.warning("[VitestEnv] Dep install failed: %s", (out or "")[:300])
+
+    env = _read_js_project_env(root)
+    if env["has_vitest_config"]:
+        return
+
+    cfg_rel = os.path.join(cwd, "vitest.config.js") if cwd \
+        else "vitest.config.js"
+    setup_rel = os.path.join(cwd, _VITEST_SETUP_FILE) if cwd \
+        else _VITEST_SETUP_FILE
+    written: dict[str, str] = {}
+    cfg_content = _vitest_config_template(
+        with_react_plugin="@vitejs/plugin-react" in deps)
+    try:
+        with open(os.path.join(root, "vitest.config.js"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write(cfg_content)
+        written[cfg_rel.replace("\\", "/")] = cfg_content
+        setup_abs = os.path.join(root, _VITEST_SETUP_FILE)
+        if not os.path.isfile(setup_abs):
+            with open(setup_abs, "w", encoding="utf-8", newline="\n") as f:
+                f.write(_VITEST_SETUP_TEMPLATE)
+            written[setup_rel.replace("\\", "/")] = _VITEST_SETUP_TEMPLATE
+    except OSError as e:
+        log.warning("[VitestEnv] Could not write config: %s", e)
+        return
+    log.info("[VitestEnv] Bootstrapped vitest environment: %s",
+             list(written))
+    if memory is not None:
+        try:
+            memory.update(written)
+        except Exception as e:
+            log.debug("[VitestEnv] memory update failed: %s", e)
+
+
 import platform
 
 
