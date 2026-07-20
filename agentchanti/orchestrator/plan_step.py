@@ -149,8 +149,11 @@ def plan_looks_truncated(plan_text: str,
 # Echo command parser
 # ---------------------------------------------------------------------------
 
-# Regex for redirect operators in echo commands
-_ECHO_REDIR_RE = re.compile(r'\s+(>{1,2})\s+([^>]+)$')
+# Regex for redirect operators in echo commands. Whitespace around the
+# operator is optional: planners emit both ``echo x > f`` and the compact
+# ``echo x>f`` / ``echo x>>f`` forms (the latter is what Windows one-liners
+# use).
+_ECHO_REDIR_RE = re.compile(r'\s*(>{1,2})\s*([^>]+)$')
 # Regex for "type nul > file" (Windows) or "touch file" (Unix)
 _NUL_RE = re.compile(r'^(?:type\s+nul|touch)\s+>\s+(.+)$')
 _TOUCH_RE = re.compile(r'^touch\s+(.+)$')
@@ -280,6 +283,12 @@ def _fix_dot_paths(fpath: str) -> str:
 
 def _unescape_echo(content: str) -> str:
     """Unescape echo content: strip surrounding quotes and decode escapes."""
+    # cmd.exe caret escapes: ``^X`` → ``X`` (used to preserve leading
+    # spaces / escape special chars in one-line echo redirections, e.g.
+    # ``echo ^  plugins:``). Do this first so the quote/whitespace handling
+    # below sees the real content.
+    if '^' in content:
+        content = re.sub(r'\^(.)', r'\1', content)
     if content.startswith('"') and content.endswith('"'):
         content = content[1:-1]
         content = content.replace('\\"', '"')
