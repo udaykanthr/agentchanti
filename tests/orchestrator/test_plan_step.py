@@ -366,6 +366,71 @@ exports: app
         steps = parse_structured_plan(text)
         self.assertEqual(steps[0].inline_code, {})
 
+    def test_parenthesized_echo_cmd_reclassified_to_code(self):
+        # Regression: the planner emitted a file as a Windows-broken
+        # (echo ... > f) && (echo ... >> f) CMD chain. It must be rescued
+        # into a CODE step that writes the file directly, not run as a
+        # shell chain (which dies on the '[' / '{' in the content).
+        text = """
+==PLAN==
+--STEP 1.3 [CMD] depends:1.2
+Create the Vitest config and setup files.
+> cd bootstrap-homepage && (echo import { defineConfig } from 'vitest/config' > vitest.config.js) && (echo.>> vitest.config.js) && (echo export default defineConfig({ >> vitest.config.js) && (echo   plugins: [react()], >> vitest.config.js) && (echo }) >> vitest.config.js) && (echo import '@testing-library/jest-dom/vitest' > vitest.setup.js)
+produces: bootstrap-homepage\\vitest.config.js, bootstrap-homepage\\vitest.setup.js
+==END==
+"""
+        step = parse_structured_plan(text)[0]
+        self.assertEqual(step.step_type, "CODE")
+        self.assertIsNone(step.command)  # the broken chain is gone
+        # Paths carry the cd'd subdir prefix.
+        self.assertIn("bootstrap-homepage/vitest.config.js", step.inline_code)
+        self.assertIn("bootstrap-homepage/vitest.setup.js", step.inline_code)
+        self.assertEqual(set(step.target_files), set(step.inline_code))
+        cfg = step.inline_code["bootstrap-homepage/vitest.config.js"]
+        self.assertIn("defineConfig", cfg)
+        self.assertIn("plugins: [react()]", cfg)
+        setup = step.inline_code["bootstrap-homepage/vitest.setup.js"]
+        self.assertIn("@testing-library/jest-dom/vitest", setup)
+
+    def test_unspaced_and_caret_echo_cmd_reclassified_to_code(self):
+        # Second observed variant: compact redirects with NO spaces around
+        # `>`/`>>` (echo x>f) and cmd.exe caret escapes for indentation
+        # (echo ^  plugins:). Must still be rescued to CODE, and the caret
+        # escapes should restore the leading indentation.
+        text = """
+==PLAN==
+--STEP 1.2 [CMD] depends:1.1
+Create the Vitest configuration and setup file.
+> cd bootstrap_homepage && (echo import { defineConfig } from 'vitest/config'>vitest.config.js) && (echo.>>vitest.config.js) && (echo export default defineConfig({>>vitest.config.js) && (echo ^  plugins: [react()],>>vitest.config.js) && (echo })>>vitest.config.js) && (echo import '@testing-library/jest-dom/vitest'>vitest.setup.js)
+produces: bootstrap_homepage\\vitest.config.js, bootstrap_homepage\\vitest.setup.js
+==END==
+"""
+        step = parse_structured_plan(text)[0]
+        self.assertEqual(step.step_type, "CODE")
+        self.assertIsNone(step.command)
+        cfg = step.inline_code["bootstrap_homepage/vitest.config.js"]
+        self.assertIn("defineConfig", cfg)
+        # Caret escape restored the indentation on the plugins line.
+        self.assertIn("  plugins: [react()],", cfg)
+        self.assertIn("@testing-library/jest-dom/vitest",
+                      step.inline_code["bootstrap_homepage/vitest.setup.js"])
+
+    def test_mixed_cmd_with_real_command_stays_cmd(self):
+        # A chain that also runs a real command (npm install) must NOT be
+        # converted — losing the install would break the build.
+        text = """
+==PLAN==
+--STEP 1.1 [CMD] depends:none
+Install then write a config.
+> cd app && npm install left-pad && (echo module.exports = {} > app.config.js)
+produces: app/app.config.js
+==END==
+"""
+        step = parse_structured_plan(text)[0]
+        self.assertEqual(step.step_type, "CMD")
+        self.assertIsNotNone(step.command)
+        self.assertIn("npm install", step.command)
+
     def test_inline_code_preserves_indentation(self):
         text = """
 ==PLAN==

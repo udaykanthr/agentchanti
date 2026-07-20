@@ -30,6 +30,19 @@ class OpenAIClient(LLMClient):
         # _prepare_token_limit_retry, consumed by the next _chat call.
         self._retry_reasoning_effort: Optional[str] = None
 
+    @staticmethod
+    def _cached_tokens(usage: dict) -> int:
+        """Extract cache-hit prompt tokens from an OpenAI usage block.
+
+        OpenAI reports automatic prompt-cache hits at
+        ``usage.prompt_tokens_details.cached_tokens`` (a subset of
+        ``prompt_tokens``, billed at a discount). Returns 0 when the field
+        is absent, so non-OpenAI compatible backends stay unaffected.
+        """
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens", 0)
+        return cached if isinstance(cached, int) else 0
+
     def _prepare_token_limit_retry(self) -> None:
         """Reasoning models can burn the whole completion budget on hidden
         reasoning tokens, returning an empty response with
@@ -84,12 +97,15 @@ class OpenAIClient(LLMClient):
         usage = data.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", est_tokens)
         completion_tokens = usage.get("completion_tokens", 0)
+        cached_tokens = self._cached_tokens(usage)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
-            model_name=self.model
+            model_name=self.model,
+            cached_tokens=cached_tokens,
         )
-        log.debug(f"[OpenAI] Usage: prompt={prompt_tokens} completion={completion_tokens}")
+        log.debug(f"[OpenAI] Usage: prompt={prompt_tokens} "
+                  f"(cached={cached_tokens}) completion={completion_tokens}")
 
         response_text = data["choices"][0]["message"]["content"]
         self._last_stop_reason = data["choices"][0].get("finish_reason", "") or ""
@@ -124,6 +140,7 @@ class OpenAIClient(LLMClient):
         tokens_generated = 0
         prompt_tokens = est_tokens
         completion_tokens = 0
+        cached_tokens = 0
         self._last_stop_reason = ""
 
         response = requests.post(url, headers=self._headers(), json=payload,
@@ -152,6 +169,7 @@ class OpenAIClient(LLMClient):
                         if usage:
                             prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                             completion_tokens = usage.get("completion_tokens", completion_tokens)
+                            cached_tokens = self._cached_tokens(usage)
                         _choice0 = chunk.get("choices", [{}])[0]
                         _fr = _choice0.get("finish_reason")
                         if _fr:
@@ -171,8 +189,10 @@ class OpenAIClient(LLMClient):
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
             model_name=self.model,
+            cached_tokens=cached_tokens,
         )
-        log.debug(f"[OpenAI] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
+        log.debug(f"[OpenAI] Streamed usage: prompt={prompt_tokens} "
+                  f"(cached={cached_tokens}) completion={completion_tokens}")
         log.debug(f"[OpenAI] Response:\n{completion_tokens}")
 
         if self._stream_callback:
@@ -245,10 +265,12 @@ class OpenAIClient(LLMClient):
         usage = data.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", est_tokens)
         completion_tokens = usage.get("completion_tokens", 0)
+        cached_tokens = self._cached_tokens(usage)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
             model_name=self.model,
+            cached_tokens=cached_tokens,
         )
 
         choice = (data.get("choices") or [{}])[0]
@@ -267,7 +289,8 @@ class OpenAIClient(LLMClient):
                 id=tc.get("id", "")))
 
         log.debug(f"[OpenAI] Chat usage: prompt={prompt_tokens} "
-                  f"completion={completion_tokens} tool_calls={len(tool_calls)}")
+                  f"(cached={cached_tokens}) completion={completion_tokens} "
+                  f"tool_calls={len(tool_calls)}")
         return ChatResponse(text=text, tool_calls=tool_calls,
                             stop_reason=choice.get("finish_reason", "") or "")
 

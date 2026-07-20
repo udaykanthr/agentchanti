@@ -262,6 +262,10 @@ def _main_impl():
         return
 
     parser = argparse.ArgumentParser(description="AgentChanti — Multi-Agent Local Coder")
+    from .. import __version__ as _agentchanti_version
+    parser.add_argument("--version", action="version",
+                        version=f"agentchanti {_agentchanti_version}",
+                        help="Print the installed agentchanti version and exit")
     parser.add_argument("task", nargs="?", help="The coding task to perform")
     parser.add_argument("--prompt-from-file", help="Read prompt from a text file")
     parser.add_argument("--provider", choices=["ollama", "lm_studio", "openai", "gemini", "anthropic"],
@@ -799,6 +803,14 @@ def _main_impl():
             display.finish()
             return
 
+        # Record whether the RAW task asks for tests before enrichment
+        # replaces it — the enriched spec routinely adds testing language,
+        # so this must be decided now. Parked on args because memory does
+        # not exist yet on the fresh path (it is created after planning);
+        # it is copied onto memory at creation time below.
+        from ..language import task_requests_tests
+        args._raw_task_requests_tests = task_requests_tests(args.task)
+
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
         intent_spec = parse_intent_spec(args.task)
@@ -902,6 +914,7 @@ def _main_impl():
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
+                plan_salvageable, route_blind_edits,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -923,6 +936,9 @@ def _main_impl():
                     dep_fixes = fix_import_dependencies(plan_steps_parsed)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
+                    blind_fixes = route_blind_edits(plan_steps_parsed)
+                    if blind_fixes:
+                        log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")
@@ -969,7 +985,19 @@ def _main_impl():
             _has_end = "==END==" in (plan or "")
             if _struct_truncated or (_prov_truncated and not _has_end):
                 _reason = _trunc_reason or "the planner hit its output-token limit"
-                if plan_attempt < MAX_PLAN_RETRIES:
+                # Salvage: only the ==END== marker is missing, the provider's
+                # output cap did NOT fire, and every parsed step is
+                # structurally complete — the plan is almost certainly whole.
+                # Re-planning here costs a full second generation and churns
+                # paths (an observed re-plan renamed the project directory).
+                if (not _prov_truncated and "==END==" in _reason
+                        and plan_salvageable(plan_steps_parsed)):
+                    log.warning(
+                        "[Plan] ==END== marker missing but all %d parsed "
+                        "steps are structurally complete — salvaging plan "
+                        "instead of re-planning",
+                        len(plan_steps_parsed or []))
+                elif plan_attempt < MAX_PLAN_RETRIES:
                     log.warning(
                         "[Plan] Plan looks truncated (%s) — re-planning for a "
                         "complete plan", _reason)
@@ -982,13 +1010,14 @@ def _main_impl():
                         "terse, include a step for every file the requirements "
                         "name, and finish with the ==END== marker.")
                     continue
-                log.error(
-                    "[Plan] Plan still truncated after %d attempts — proceeding "
-                    "with a possibly-incomplete plan (%s)",
-                    MAX_PLAN_RETRIES, _reason)
-                display.show_status(
-                    "Warning: plan may be incomplete (planner output was "
-                    "truncated).")
+                else:
+                    log.error(
+                        "[Plan] Plan still truncated after %d attempts — "
+                        "proceeding with a possibly-incomplete plan (%s)",
+                        MAX_PLAN_RETRIES, _reason)
+                    display.show_status(
+                        "Warning: plan may be incomplete (planner output was "
+                        "truncated).")
 
             # Validate plan quality — skip for structured plans, which are
             # already validated by validate_plan() above and whose step
@@ -1143,6 +1172,10 @@ def _main_impl():
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
         if kb_runtime_watcher is not None:
             memory.watcher_created_files = kb_runtime_watcher.created_files
+        # Raw-task test-request flag, computed before enrichment (see above).
+        # Gates unsolicited auto-coverage generation in the pipeline.
+        memory._task_requests_tests = getattr(
+            args, '_raw_task_requests_tests', True)
         # Propagate task briefing to memory so all downstream agents can use it
         _briefing_text = getattr(planner, '_task_briefing', '')
         if _briefing_text:
@@ -1573,8 +1606,18 @@ def _main_impl():
         _als = _als_fn()
         if _als:
             log.info(_als)
+        _cached = token_tracker.total_cached_tokens
+        _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
+        if _cached > 0:
+            # Show gross vs. cached-net so the prompt-cache discount is
+            # visible: of the tokens sent, how many were cache hits (billed
+            # at a discount) vs. full-price.
+            _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
+            _sent_breakdown += (
+                f" [cached={_cached} ({_pct}%), "
+                f"full-price={token_tracker.full_price_prompt_tokens}]")
         log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
-                 f"(sent={token_tracker.total_prompt_tokens}, "
+                 f"({_sent_breakdown}, "
                  f"recv={token_tracker.total_completion_tokens})")
 
         # Generate HTML report

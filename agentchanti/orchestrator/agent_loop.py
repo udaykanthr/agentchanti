@@ -99,6 +99,18 @@ def loop_stats_summary() -> str | None:
 # stuck in analysis mode.
 _READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 
+# Read-only intervention thresholds (consecutive inspection-only turns).
+# Lowered from 3/4 → 2/3: with the step's target files pre-loaded into the
+# opening message, the model rarely needs several read_file turns, so nudge
+# it to act one turn sooner and stop paying to re-send inspection output on
+# every subsequent turn.
+_ACT_NOW_NUDGE_AT = 2
+_WITHHOLD_READONLY_AT = 3
+
+# Pre-load caps: keep the injected file bundle from dominating the prompt.
+_PRELOAD_MAX_FILES = 6
+_PRELOAD_MAX_CHARS = 12_000
+
 # Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
 # message, never here.
@@ -139,7 +151,7 @@ def _platform_note() -> str:
 
 
 def _build_user_message(step_text: str, task: str, language: str | None,
-                        context: str) -> str:
+                        context: str, preloaded: str = "") -> str:
     parts = [f"Overall task: {task}", f"Current step: {step_text}"]
     if language:
         parts.append(f"Project language: {language}")
@@ -148,7 +160,51 @@ def _build_user_message(step_text: str, task: str, language: str | None,
         parts.append(note)
     if context:
         parts.append(f"Project state:\n{context}")
+    if preloaded:
+        parts.append(preloaded)
     return "\n\n".join(parts)
+
+
+def _preload_target_files(tools: AgentTools,
+                          paths: list[str] | None) -> str:
+    """Read the step's existing target files up front so the loop doesn't
+    burn its first turns on read_file round-trips — whose output then rides
+    along, re-sent, in every later turn.
+
+    Only existing, non-empty files inside the project root are included;
+    files the step will *create* are skipped (nothing to read yet). The
+    bundle goes into the opening user message so it lands in the cacheable
+    prefix instead of growing the conversation mid-loop.
+    """
+    if not paths:
+        return ""
+    seen: set[str] = set()
+    blocks: list[str] = []
+    total = 0
+    for path in paths:
+        rel = str(path).replace("\\", "/")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        try:
+            full = tools._resolve(path)
+        except (ValueError, TypeError):
+            continue  # outside the project root — skip
+        if not os.path.isfile(full) or os.path.getsize(full) == 0:
+            continue
+        body = tools._tool_read_file(path)
+        if body.startswith("ERROR"):
+            continue
+        if total + len(body) > _PRELOAD_MAX_CHARS:
+            break
+        total += len(body)
+        blocks.append(body)
+        if len(blocks) >= _PRELOAD_MAX_FILES:
+            break
+    if not blocks:
+        return ""
+    return ("Relevant existing files (already read for you — do NOT call "
+            "read_file on these again):\n\n" + "\n\n".join(blocks))
 
 
 def _cd_prefix(cmd: str | None) -> str:
@@ -240,6 +296,7 @@ def run_agent_loop(
     max_turns: int = 8,
     verify_cmd: str | None = None,
     context: str = "",
+    preload_files: list[str] | None = None,
     _recovery: bool = False,
 ) -> tuple[bool, str]:
     """Run one step as a capped tool-calling loop.
@@ -256,10 +313,12 @@ def run_agent_loop(
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
     """
+    preloaded = _preload_target_files(tools, preload_files)
     messages = [
         Message(role="system", content=AGENT_LOOP_SYSTEM_PROMPT),
         Message(role="user",
-                content=_build_user_message(step_text, task, language, context)),
+                content=_build_user_message(step_text, task, language,
+                                            context, preloaded)),
     ]
     definitions = tools.definitions()
     action_definitions = [d for d in definitions
@@ -293,7 +352,7 @@ def run_agent_loop(
                 "whether it was verified.")))
         if final_turn:
             tools_for_turn = None
-        elif read_only_streak >= 4:
+        elif read_only_streak >= _WITHHOLD_READONLY_AT:
             # The act-now nudge was ignored — withhold inspection tools so
             # the only moves left are the ones that change something.
             tools_for_turn = action_definitions
@@ -315,22 +374,23 @@ def run_agent_loop(
             # Read-only intervention: some models settle into inspecting
             # file after file without ever acting (observed: whole 8-turn
             # budgets of read_file, twice in one run, even with the
-            # failing output already in context). After three consecutive
-            # inspection-only turns, tell the model to act.
+            # failing output already in context). After a couple of
+            # consecutive inspection-only turns, tell the model to act.
             if all(tc.name in _READ_ONLY_TOOLS for tc in response.tool_calls):
                 read_only_streak += 1
             else:
                 read_only_streak = 0
-            if read_only_streak == 3 and turn <= max_turns - 2:
-                _logger.info("[AgentLoop] step %d: 3 read-only turns — "
-                             "injecting act-now nudge", step_idx + 1)
+            if read_only_streak == _ACT_NOW_NUDGE_AT and turn <= max_turns - 2:
+                _logger.info("[AgentLoop] step %d: %d read-only turns — "
+                             "injecting act-now nudge", step_idx + 1,
+                             _ACT_NOW_NUDGE_AT)
                 messages.append(Message(role="user", content=(
-                    "You have spent 3 consecutive turns only inspecting "
-                    "files. You have enough context — ACT now: apply the "
-                    "fix with edit_file or write_file, or run the command "
-                    "that completes this step. "
+                    f"You have spent {_ACT_NOW_NUDGE_AT} consecutive turns "
+                    "only inspecting files. You have enough context — ACT "
+                    "now: apply the fix with edit_file or write_file, or run "
+                    "the command that completes this step. "
                     f"{max_turns - turn} turn(s) remain.")))
-            elif read_only_streak == 4:
+            elif read_only_streak == _WITHHOLD_READONLY_AT:
                 # Nudge ignored (observed twice in one run: the model went
                 # straight back to read_file). Escalate: from the next
                 # turn only acting tools are offered.

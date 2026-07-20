@@ -145,15 +145,42 @@ def plan_looks_truncated(plan_text: str,
     return False, ""
 
 
+def plan_salvageable(steps: Optional[list["PlanStep"]]) -> bool:
+    """True when a plan flagged truncated only by the missing ``==END==``
+    marker is safe to run anyway.
+
+    A full re-plan costs a complete second generation and churns every
+    path in the plan (observed: a re-plan renamed the project dir, so
+    steps from the two plans referenced different trees). When every
+    parsed step is structurally complete — the cut, if any, landed on the
+    marker itself — the plan is almost certainly whole and salvaging it
+    is cheaper and safer than regenerating. Callers must still require
+    that the provider's output-token-cap flag did NOT fire: a genuine cap
+    hit means later steps may be missing entirely.
+    """
+    if not steps or len(steps) < 3:
+        return False
+    last = steps[-1]
+    # Mirrors the bodyless-last-step truncation signal above: a complete
+    # final step means the generation reached a step boundary.
+    return bool(last.target_files or last.inline_code or last.inline_edits
+                or last.verify_cmd or last.command)
+
+
 # ---------------------------------------------------------------------------
 # Echo command parser
 # ---------------------------------------------------------------------------
 
-# Regex for redirect operators in echo commands
-_ECHO_REDIR_RE = re.compile(r'\s+(>{1,2})\s+([^>]+)$')
+# Regex for redirect operators in echo commands. Whitespace around the
+# operator is optional: planners emit both ``echo x > f`` and the compact
+# ``echo x>f`` / ``echo x>>f`` forms (the latter is what Windows one-liners
+# use).
+_ECHO_REDIR_RE = re.compile(r'\s*(>{1,2})\s*([^>]+)$')
 # Regex for "type nul > file" (Windows) or "touch file" (Unix)
 _NUL_RE = re.compile(r'^(?:type\s+nul|touch)\s+>\s+(.+)$')
 _TOUCH_RE = re.compile(r'^touch\s+(.+)$')
+# Regex for a cmd.exe blank-line echo: ``echo.>> file`` / ``echo. > file``
+_ECHO_DOT_RE = re.compile(r'^echo\.\s*(>{1,2})\s*(.+)$')
 
 
 def _parse_echo_commands(lines: list[str]) -> dict[str, str]:
@@ -191,8 +218,24 @@ def _parse_echo_commands(lines: list[str]) -> dict[str, str]:
         parts = raw_line.split(' && ')
         for part in parts:
             part = part.strip()
+            # Planners often wrap each redirection in parentheses, e.g.
+            # ``(echo import x > f)`` — strip one wrapping pair so the
+            # ``echo``/redirect matching below still fires.
+            if part.startswith('(') and part.endswith(')'):
+                part = part[1:-1].strip()
             # Skip bare 'cd' commands and 'mkdir' commands
             if not part or part.startswith('cd ') or part.startswith('mkdir '):
+                continue
+
+            # ── Blank line: cmd.exe ``echo.>> f`` / ``echo. > f`` ──
+            m_blank = _ECHO_DOT_RE.match(part)
+            if m_blank:
+                operator = m_blank.group(1)
+                fpath = _fix_dot_paths(m_blank.group(2).strip().strip('"\''))
+                if operator == '>':
+                    files[fpath] = "\n"
+                else:
+                    files[fpath] = files.get(fpath, "") + "\n"
                 continue
 
             # ── Empty file creation: type nul > file / touch file ──
@@ -262,6 +305,12 @@ def _fix_dot_paths(fpath: str) -> str:
 
 def _unescape_echo(content: str) -> str:
     """Unescape echo content: strip surrounding quotes and decode escapes."""
+    # cmd.exe caret escapes: ``^X`` → ``X`` (used to preserve leading
+    # spaces / escape special chars in one-line echo redirections, e.g.
+    # ``echo ^  plugins:``). Do this first so the quote/whitespace handling
+    # below sees the real content.
+    if '^' in content:
+        content = re.sub(r'\^(.)', r'\1', content)
     if content.startswith('"') and content.endswith('"'):
         content = content[1:-1]
         content = content.replace('\\"', '"')
@@ -286,6 +335,161 @@ def _flush_echo_inline(step: PlanStep, cmd_lines: list[str]) -> None:
     echo_files = _parse_echo_commands(cmd_lines)
     if echo_files:
         step.inline_code.update(echo_files)
+
+
+def _looks_like_file_write_segment(seg: str) -> bool:
+    """True if *seg* is a single file-creation redirection segment."""
+    seg = seg.strip()
+    if seg.startswith('(') and seg.endswith(')'):
+        seg = seg[1:-1].strip()
+    if _NUL_RE.match(seg) or _TOUCH_RE.match(seg) or _ECHO_DOT_RE.match(seg):
+        return True
+    return bool(seg.startswith('echo ') and _ECHO_REDIR_RE.search(seg))
+
+
+def _cmd_is_pure_file_creation(command: str) -> tuple[bool, Optional[str]]:
+    """Return ``(True, cd_dir)`` when *command* does nothing but write file
+    content via shell redirection (``echo``/``type nul``/``touch``), aside
+    from ``cd``/``mkdir`` preamble.
+
+    A single real command anywhere in the chain (``npm``, ``node``, ...)
+    returns ``(False, None)`` — such steps must keep running as CMD.
+    ``cd_dir`` is the directory a leading ``cd`` switched to, so the
+    reconstructed relative paths can be re-prefixed.
+    """
+    cd_dir: Optional[str] = None
+    saw_write = False
+    for seg in command.split('&&'):
+        s = seg.strip()
+        if s.startswith('(') and s.endswith(')'):
+            s = s[1:-1].strip()
+        if not s:
+            continue
+        if s.startswith('cd '):
+            if cd_dir is None:
+                cd_dir = s[3:].strip().strip('"\'')
+            continue
+        if s.startswith('mkdir '):
+            continue
+        if _looks_like_file_write_segment(s):
+            saw_write = True
+            continue
+        return False, None  # a genuine command — leave the step as CMD
+    return saw_write, cd_dir
+
+
+_JS_LIKE_EXTS = ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts')
+
+_BARE_CD_RE = re.compile(r'^cd\s+("[^"]+"|\S+)$')
+
+
+def dedupe_redundant_cd(command: Optional[str]) -> Optional[str]:
+    """Drop `cd X` segments that re-enter the directory the chain is
+    already in.
+
+    Multi-line CMD steps are written by the planner as independent lines,
+    each assuming the project root — but they are joined into one
+    ``&&`` chain where the cwd persists. The second ``cd app`` then runs
+    from *inside* ``app`` and fails with "The system cannot find the path
+    specified", killing an otherwise-correct install chain.
+    """
+    if not command or "&&" not in command:
+        return command
+    segments = [s.strip() for s in command.split("&&")]
+    current: Optional[str] = None
+    kept: list[str] = []
+    dropped = 0
+    for seg in segments:
+        m = _BARE_CD_RE.match(seg)
+        if m:
+            target = m.group(1).strip('"')
+            if current is not None and target == current:
+                dropped += 1
+                continue  # already effectively in this directory
+            current = target
+        kept.append(seg)
+    if not dropped:
+        return command
+    return " && ".join(kept)
+
+
+def route_blind_edits(steps: list[PlanStep],
+                      project_root: str = ".") -> list[str]:
+    """Neutralize ``edit:`` blocks written against files that do not exist
+    at plan time (they will be created by an earlier step, e.g. a scaffold
+    command) — their FIND text is a guess that cannot be trusted.
+
+    Called by the CLI after parsing (not inside the parser, whose other
+    callers run outside the project directory). Per edit target that is
+    absent on disk:
+
+      * exactly one substantial REPLACE that looks like a complete file
+        (JS-likes must carry an export) → promoted to ``inline_code`` as a
+        deterministic full-file overwrite;
+      * anything else → the pairs are dropped, so the step reaches the
+        grounded coder/agent-loop path instead of attempting doomed FIND
+        matching against content the planner never saw.
+
+    Existing files are left alone — their edits are legitimately grounded
+    in the [FILES TO MODIFY] source the planner was shown. Returns a list
+    of human-readable notes for logging.
+    """
+    import os
+    notes: list[str] = []
+    for step in steps:
+        if not step.inline_edits:
+            continue
+        for path in list(step.inline_edits):
+            if os.path.exists(os.path.join(project_root, path)):
+                continue  # grounded edit — planner saw this file
+            pairs = step.inline_edits.pop(path)
+            substantial = [r.strip() for _, r in pairs if len(r.strip()) > 50]
+            _ext = os.path.splitext(path)[1].lower()
+            complete = (
+                len(substantial) == 1
+                and (_ext not in _JS_LIKE_EXTS
+                     or 'export ' in substantial[0]
+                     or 'module.exports' in substantial[0])
+            )
+            if complete and path not in step.inline_code:
+                step.inline_code[path] = substantial[0] + "\n"
+                notes.append(
+                    f"Step {step.id}: edit on plan-created file {path} — "
+                    "converted single complete REPLACE to full-file write")
+            else:
+                notes.append(
+                    f"Step {step.id}: dropped {len(pairs)} blind edit "
+                    f"pair(s) for plan-created file {path} — step will be "
+                    "implemented against the real file")
+    return notes
+
+
+def _reclassify_file_creation_cmds(steps: list[PlanStep]) -> None:
+    """Convert CMD steps that only write file *content* via echo/redirect
+    chains into CODE steps.
+
+    Planners sometimes emit a source file as ``(echo ... > f) && (echo ...
+    >> f)``. On Windows cmd.exe this dies on the first ``[``/``{``/``(`` in
+    the content (``] was unexpected at this time``), and it is brittle even
+    on POSIX. The file content is already reconstructed into ``inline_code``
+    by :func:`_flush_echo_inline`, so writing it directly as a CODE step is
+    reliable and cross-platform.
+    """
+    for step in steps:
+        if step.step_type != "CMD" or not step.command or not step.inline_code:
+            continue
+        ok, cd_dir = _cmd_is_pure_file_creation(step.command)
+        if not ok:
+            continue
+        # Reconstructed paths are relative to any leading ``cd`` dir.
+        prefix = f"{cd_dir}/" if cd_dir else ""
+        step.inline_code = {
+            _norm_target_path(prefix + p): c
+            for p, c in step.inline_code.items()
+        }
+        step.target_files = list(step.inline_code.keys())
+        step.step_type = "CODE"
+        step.command = None
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +562,18 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     _edit_find_lines: list[str] = []
     _edit_replace_lines: list[str] = []
     _edit_target: Optional[str] = None  # file path for current edit block
+    # Ordinal of the current bare `edit:` block within the step. Multi-target
+    # steps emit one bare `edit:` block per target file, in target order —
+    # defaulting every block to target_files[0] mis-keyed the 2nd file's
+    # edits onto the 1st (observed: main.jsx's REPLACE merged into App.jsx,
+    # producing a duplicate `App` declaration that broke the build).
+    _edit_block_ord = -1
+
+    def _default_edit_target() -> str:
+        if current is None or not current.target_files:
+            return ""
+        idx = min(max(_edit_block_ord, 0), len(current.target_files) - 1)
+        return current.target_files[idx]
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -380,6 +596,21 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 _edit_replace_lines = []
                 _edit_target = None
                 # Fall through to process this line as a step header / ==END==
+            elif line.lower().startswith("edit:"):
+                # A new edit: header while already inside an edit block —
+                # the planner emits one bare block per target file. Without
+                # this, the header is swallowed as FIND content and every
+                # pair defaults to target_files[0].
+                _rest = line[5:].strip()
+                if _rest and not _rest.startswith("<<<"):
+                    _edit_target = _rest
+                else:
+                    _edit_target = None
+                    _edit_block_ord += 1
+                _edit_section = "find"
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                continue
             elif _lnorm in ("<<<FIND>>>", "<<FIND>>", "<FIND>"):
                 _edit_section = "find"
                 _edit_find_lines = []
@@ -394,8 +625,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                     _find_str = "\n".join(_edit_find_lines)
                     _repl_str = "\n".join(_edit_replace_lines)
                     _tgt = _norm_target_path(
-                        _edit_target or (current.target_files[0]
-                                         if current.target_files else ""))
+                        _edit_target or _default_edit_target())
                     if _tgt:
                         current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
                 # Stay in edit block — there may be more <<<FIND>>>...<<<END>>> pairs.
@@ -499,6 +729,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
             current = PlanStep(id=step_id, step_type=step_type, depends_on=depends)
             desc_lines = []
+            _edit_block_ord = -1  # per-step ordinal for bare edit: blocks
             cmd_lines = []
             continue
 
@@ -653,12 +884,14 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Supports optional "edit: path/to/file" to specify a different target.
         elif line.lower().startswith("edit:"):
             rest = line[5:].strip()
-            # If a file path is given on the same line, use it; otherwise use
-            # the step's first target file (resolved when <<<END>>> is hit).
+            # If a file path is given on the same line, use it; otherwise the
+            # ordinal-th target file is used (resolved when <<<END>>> is hit):
+            # one bare edit: block per target, in target order.
             if rest and not rest.startswith("<<<"):
                 _edit_target = rest
             else:
                 _edit_target = None
+                _edit_block_ord += 1
             in_edit_block = True
             _edit_section = "find"
             _edit_find_lines = []
@@ -714,8 +947,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         ]
         if _find_meaningful:
             _tgt = _norm_target_path(
-                _edit_target or (current.target_files[0]
-                                 if current.target_files else ""))
+                _edit_target or _default_edit_target())
             if _tgt:
                 current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
 
@@ -736,6 +968,17 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     # Assign 0-based indices
     for idx, step in enumerate(steps):
         step.index = idx
+
+    # Multi-line CMD steps: drop `cd X` segments that re-enter the
+    # directory the joined && chain is already in (each plan line was
+    # written assuming the project root).
+    for _step in steps:
+        _step.command = dedupe_redundant_cd(_step.command)
+
+    # Rescue CMD steps that only write file content via echo/redirect
+    # chains — run them as CODE so the file is written directly instead of
+    # through a fragile (and on Windows, broken) shell chain.
+    _reclassify_file_creation_cmds(steps)
 
     # Derive imported_by from imports_from relationships across all steps.
     # This is free (no LLM cost) and ensures that when step B declares
@@ -1210,10 +1453,20 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
                         # Rust: mod X → X/mod.rs
                         if pattern_key == "rs":
                             candidates.append(resolved + "/mod.rs")
+                    # Scaffold CMD steps declare globs (`produces: app/src/*`)
+                    # — match candidates against those patterns too, or every
+                    # import of a scaffold-created file (./index.css) reads as
+                    # dangling and nukes perfectly good inline code (observed:
+                    # a correct main.jsx cleared, costing an 8-turn loop).
+                    import fnmatch as _fnmatch
+                    _wild_produced = [tf for tf in produced_files
+                                      if "*" in tf or "?" in tf]
                     is_produced = any(
                         c in produced_files or any(
                             c == tf or tf.endswith("/" + _os.path.basename(c))
                             for tf in produced_files
+                        ) or any(
+                            _fnmatch.fnmatch(c, w) for w in _wild_produced
                         )
                         for c in candidates
                     )
@@ -2057,6 +2310,9 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
                 step.step_type = "CMD"
             elif step.target_files:
                 step.step_type = "CODE"
+
+    for s in steps:
+        s.command = dedupe_redundant_cd(s.command)
 
     # Only return steps that have at least a description or target/command
     return [s for s in steps if s.description or s.target_files or s.command]

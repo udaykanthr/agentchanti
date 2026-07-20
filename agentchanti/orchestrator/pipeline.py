@@ -158,6 +158,62 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+def _syntax_gate(path: str, content: str) -> str | None:
+    """Cheap syntactic validity check before content reaches disk.
+
+    Returns an error string when *content* is not valid for *path*'s file
+    type, else None. Python → ast.parse, JSON → json.loads (a minimal-diff
+    patch once wrote a trailing comma into package.json — valid-looking
+    text that broke every subsequent npm/vitest invocation), other code
+    files → the offline tree-sitter lint.
+    """
+    import os
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".py", ".pyw"):
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            return f"python syntax error: {exc}"
+        return None
+    if ext == ".json":
+        # tsconfig*.json is JSONC (comments/trailing commas allowed) —
+        # strict parsing would reject legitimate content.
+        if os.path.basename(path).lower().startswith("tsconfig"):
+            return None
+        import json
+        try:
+            json.loads(content)
+        except ValueError as exc:
+            return f"invalid JSON: {exc}"
+        return None
+    from .step_handlers import _quick_offline_lint
+    errs = _quick_offline_lint({path: content})
+    return errs or None
+
+
+_TEST_INFRA_STEMS = (
+    "vitest.config", "vitest.setup", "jest.config", "jest.setup",
+    "setuptests", "conftest",
+)
+
+
+def _is_test_infra_file(file_path: str) -> bool:
+    """True for test *infrastructure* files (vitest/jest config + setup).
+
+    The BulkTest source-protection guard exists to stop the fix loop from
+    rewriting production code, but these files serve the tests themselves
+    — and the guard's existing-file requirement made it impossible to
+    CREATE a missing vitest.config.js at all (observed: the fix loop was
+    blocked on it three times in one run while the suite failed around
+    it). Treat them like test files: the fix loop may create or modify
+    them freely.
+    """
+    import os
+    stem = os.path.basename(file_path).lower()
+    return stem.startswith(_TEST_INFRA_STEMS)
+
+
 # ── Router-mount mismatch detection ───────────────────────────────────────
 # Production source files that use react-router primitives (Link,
 # NavLink, useNavigate, …) require a Router (BrowserRouter, HashRouter,
@@ -1741,17 +1797,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                     # Reject syntactically broken patches before promotion —
                     # the fuzzy/minimal-diff fallbacks can mangle docstrings
                     # (observed: an unterminated triple-quote written to
-                    # disk, poisoning the base file for every later edit
-                    # tier). Fall through to the coder instead.
-                    if _resolved.endswith((".py", ".pyw")):
-                        try:
-                            import ast as _ast_inline
-                            _ast_inline.parse(_patched)
-                        except SyntaxError as _syn_exc:
+                    # disk; a trailing comma minimal-diffed into
+                    # package.json). Fall through to the coder instead.
+                    if _resolved.endswith((".py", ".pyw", ".json")):
+                        _gate_err = _syntax_gate(_resolved, _patched)
+                        if _gate_err:
                             _logger.warning(
-                                "[InlineEdit] Patched %s has a syntax error "
+                                "[InlineEdit] Patched %s failed validation "
                                 "(%s) — falling through to coder",
-                                _resolved, _syn_exc)
+                                _resolved, _gate_err)
                             _edit_all_ok = False
                             break
                     # Promote the patched content into inline_code so the
@@ -1812,10 +1866,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                                         "REPLACE (would create a dead file at "
                                         "a phantom path)", _ie_resolved)
                                     continue
-                            # Collect ALL REPLACE blocks for this file and
-                            # concatenate them in order.  Plans often split
-                            # a file into multiple FIND/REPLACE pairs (e.g.
-                            # imports in pair 1, function body in pair 2).
+                            # Collect substantial REPLACE blocks for this
+                            # file. Promotion is only safe with EXACTLY ONE:
+                            # concatenating multiple blocks into one file
+                            # merged a second file's content into the first
+                            # (observed: main.jsx's REPLACE appended to
+                            # App.jsx → duplicate `App` declaration that was
+                            # valid syntax but broke the build). Multi-block
+                            # edits fall through to the coder/agent loop,
+                            # which works from the real file.
                             _repl_parts: list[str] = []
                             for _, _repl in _ie_pairs:
                                 _repl_stripped = _repl.strip()
@@ -1830,8 +1889,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 _is_substantial = len(_repl_stripped) > 50
                                 if _has_structure and _is_substantial:
                                     _repl_parts.append(_repl_stripped)
+                            if len(_repl_parts) > 1:
+                                _logger.warning(
+                                    "[InlineEdit] %d REPLACE blocks for %s — "
+                                    "refusing to merge-promote (risks fusing "
+                                    "two files' content); falling through to "
+                                    "coder", len(_repl_parts), _ie_resolved)
+                                _repl_parts = []
                             if _repl_parts:
-                                _combined = "\n\n".join(_repl_parts)
+                                _combined = _repl_parts[0]
                                 # Safety check: verify the combined REPLACE
                                 # text looks like a complete file, not a
                                 # fragment from an incremental edit.
@@ -1853,7 +1919,6 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 # let syntactically-broken concatenations (e.g.
                                 # dangling methods missing their class header)
                                 # through to disk.
-                                from .step_handlers import _quick_offline_lint
                                 _ext = _os_inline_fb.path.splitext(_ie_resolved)[1].lower()
                                 _js_like = _ext in {
                                     '.js', '.jsx', '.ts', '.tsx', '.mjs',
@@ -1869,9 +1934,9 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     if not _has_export:
                                         _is_complete = False
                                 _lint_errs = ""
-                                if _is_complete and len(_repl_parts) > 1:
-                                    _lint_errs = _quick_offline_lint(
-                                        {_ie_resolved: _combined})
+                                if _is_complete:
+                                    _lint_errs = _syntax_gate(
+                                        _ie_resolved, _combined) or ""
                                     if _lint_errs:
                                         _is_complete = False
                                 if _is_complete:
@@ -2298,7 +2363,19 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 for cfg in _CONFIG_SKIP
                             )
                         ]
-                        if _uncovered:
+                        if _uncovered and not getattr(
+                                memory, '_task_requests_tests', True):
+                            # The user never asked for tests. Auto-generated
+                            # per-file coverage tests on such tasks only add
+                            # failure surface (observed: 3 unsolicited
+                            # component tests turned a passing build into an
+                            # 8-turn BulkTest fix cycle over duplicate text).
+                            # Plan-declared TEST steps still run — this skips
+                            # only the unsolicited extras.
+                            _logger.info(
+                                "[Inline] Skipping auto test coverage for %s "
+                                "— task does not request tests", _uncovered)
+                        elif _uncovered:
                             _logger.info(
                                 "[Inline] Source files with no TEST-step coverage: %s",
                                 _uncovered,
@@ -4092,6 +4169,14 @@ def run_bulk_test_execution_and_fix(
     if "pytest" in base_cmd:
         _ensure_pytest_available(executor, cwd=subproject_cwd)
 
+    # Deterministic vitest environment: DOM-testing suites need jsdom, the
+    # testing-library packages, and a jsdom-enabled config. Planners emit
+    # this setup unreliably (or not at all) — bootstrap it here so the
+    # first run doesn't fail on a missing environment.
+    if "vitest" in base_cmd.lower():
+        from .step_handlers import ensure_vitest_env
+        ensure_vitest_env(executor, subproject_cwd, test_files, memory=memory)
+
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
     if ok:
@@ -4767,6 +4852,11 @@ def run_bulk_test_execution_and_fix(
                     for _bt_fp, _bt_fc in fix_files.items():
                         if _is_test_file(_bt_fp):
                             _bt_filtered[_bt_fp] = _bt_fc
+                        elif _is_test_infra_file(_bt_fp):
+                            _bt_filtered[_bt_fp] = _bt_fc
+                            _logger.info(
+                                "[BulkTest] Allowed test-infra fix "
+                                "for %s", _bt_fp)
                         elif _is_additive_source_fix(
                                 _bt_fp, _bt_fc, memory):
                             _bt_filtered[_bt_fp] = _bt_fc
@@ -5202,6 +5292,11 @@ def run_bulk_test_execution_and_fix(
                         for _bt2_fp, _bt2_fc in fix_files.items():
                             if _is_test_file(_bt2_fp):
                                 _bt2_filtered[_bt2_fp] = _bt2_fc
+                            elif _is_test_infra_file(_bt2_fp):
+                                _bt2_filtered[_bt2_fp] = _bt2_fc
+                                _logger.info(
+                                    "[BulkTest] Allowed test-infra fix "
+                                    "for %s", _bt2_fp)
                             elif _is_additive_source_fix(
                                     _bt2_fp, _bt2_fc, memory):
                                 _bt2_filtered[_bt2_fp] = _bt2_fc

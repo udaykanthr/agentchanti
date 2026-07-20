@@ -295,6 +295,17 @@ class AgentTools:
             except SyntaxError as e:
                 return (f"ERROR: edit rejected — resulting Python has a "
                         f"syntax error at line {e.lineno}: {e.msg}")
+        # Same for JSON: a structurally broken package.json breaks every
+        # subsequent npm/node invocation with a confusing downstream error.
+        # tsconfig*.json is JSONC (comments/trailing commas allowed) — skip.
+        if (full.endswith(".json")
+                and not os.path.basename(full).startswith("tsconfig")):
+            import json as _json
+            try:
+                _json.loads(updated)
+            except ValueError as e:
+                return (f"ERROR: edit rejected — resulting JSON is invalid: "
+                        f"{e}. Re-read the file and fix commas/braces.")
 
         with open(full, "w", encoding="utf-8", newline="\n") as f:
             f.write(updated)

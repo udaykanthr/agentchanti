@@ -59,9 +59,18 @@ _CLR = {
 class TokenTracker:
     """Global tracker for token usage and cost across all LLM calls."""
 
+    # Fraction of the full input rate that providers charge for a cached
+    # prompt-prefix hit when the model's pricing entry doesn't override it.
+    # OpenAI's automatic prompt caching bills cached input at ~50%.
+    DEFAULT_CACHED_INPUT_MULTIPLIER = 0.5
+
     def __init__(self, pricing: dict | None = None):
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Subset of total_prompt_tokens that the provider served from a
+        # cache (billed at a discount). Populated by providers that report
+        # it — currently OpenAI via usage.prompt_tokens_details.cached_tokens.
+        self.total_cached_tokens = 0
         self.total_cost = 0.0
         self.call_count = 0
         self.pricing = pricing or {}
@@ -72,35 +81,56 @@ class TokenTracker:
         with self._lock:
             self.current_context_size = tokens
 
-    def record(self, prompt_tokens: int, completion_tokens: int, model_name: str | None = None):
+    def record(self, prompt_tokens: int, completion_tokens: int,
+               model_name: str | None = None, cached_tokens: int = 0):
+        # cached_tokens is a subset of prompt_tokens (not additive) — the
+        # portion the provider served from its prompt cache at a discount.
+        cached_tokens = max(0, min(cached_tokens, prompt_tokens))
         with self._lock:
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
+            self.total_cached_tokens += cached_tokens
             self.call_count += 1
             self.current_context_size = prompt_tokens
 
         if model_name:
-            self._calculate_cost(model_name, prompt_tokens, completion_tokens)
+            self._calculate_cost(model_name, prompt_tokens, completion_tokens,
+                                 cached_tokens)
 
     def snapshot(self) -> tuple[int, int]:
         with self._lock:
             return self.total_prompt_tokens, self.total_completion_tokens
 
-    def _calculate_cost(self, model_name: str, prompt: int, completion: int):
+    def _calculate_cost(self, model_name: str, prompt: int, completion: int,
+                        cached: int = 0):
         price_entry = None
         for pattern, prices in self.pricing.items():
             if pattern in model_name.lower():
                 price_entry = prices
                 break
         if price_entry:
-            cost = (prompt * price_entry["input"] / 1_000_000) + \
-                   (completion * price_entry["output"] / 1_000_000)
+            input_rate = price_entry["input"] / 1_000_000
+            output_rate = price_entry["output"] / 1_000_000
+            # Cached prompt tokens are a subset of `prompt` billed at a
+            # discount; charge the cached slice at the reduced rate and the
+            # remaining (full-price) input at the normal rate.
+            cached = max(0, min(cached, prompt))
+            cached_mult = price_entry.get(
+                "cached_input", self.DEFAULT_CACHED_INPUT_MULTIPLIER)
+            cost = ((prompt - cached) * input_rate
+                    + cached * input_rate * cached_mult
+                    + completion * output_rate)
             with self._lock:
                 self.total_cost += cost
 
     @property
     def total_tokens(self):
         return self.total_prompt_tokens + self.total_completion_tokens
+
+    @property
+    def full_price_prompt_tokens(self):
+        """Prompt tokens billed at full rate (gross minus cache hits)."""
+        return self.total_prompt_tokens - self.total_cached_tokens
 
 
 # Global singleton
@@ -981,6 +1011,8 @@ class CLIDisplay:
             metrics.append(f"{t.total_tokens:,}", style="bold cyan")
             metrics.append("  ·  ↑ ", style="dim")
             metrics.append(f"{t.total_prompt_tokens:,}", style="cyan")
+            if t.total_cached_tokens > 0:
+                metrics.append(f" (cached {t.total_cached_tokens:,})", style="green")
             metrics.append("  ↓ ", style="dim")
             metrics.append(f"{t.total_completion_tokens:,}", style="cyan")
 

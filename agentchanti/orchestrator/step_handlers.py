@@ -446,6 +446,109 @@ def _read_js_project_env(cwd: str | None = None) -> dict:
     return env
 
 
+# ── Deterministic vitest environment bootstrap ────────────────────────────
+# The planner handles vitest setup inconsistently (observed across runs:
+# a Windows-broken echo chain, then omitting it entirely) and the BulkTest
+# fix loop's destructive-change guard used to block the LLM from creating
+# the missing config. The environment is the same ~10 lines every time —
+# write it deterministically, no LLM involved.
+
+_VITEST_SETUP_FILE = "vitest.setup.js"
+
+_VITEST_SETUP_TEMPLATE = "import '@testing-library/jest-dom/vitest'\n"
+
+_VITEST_DOM_DEPS = ("vitest", "jsdom", "@testing-library/react",
+                    "@testing-library/dom", "@testing-library/jest-dom")
+
+
+def _vitest_config_template(with_react_plugin: bool) -> str:
+    plugin_import = ("import react from '@vitejs/plugin-react'\n"
+                     if with_react_plugin else "")
+    plugins_line = "  plugins: [react()],\n" if with_react_plugin else ""
+    return (
+        "import { defineConfig } from 'vitest/config'\n"
+        f"{plugin_import}"
+        "\n"
+        "export default defineConfig({\n"
+        f"{plugins_line}"
+        "  test: {\n"
+        "    environment: 'jsdom',\n"
+        "    globals: true,\n"
+        f"    setupFiles: './{_VITEST_SETUP_FILE}',\n"
+        "  },\n"
+        "})\n"
+    )
+
+
+def ensure_vitest_env(executor, cwd: str | None,
+                      test_files: dict[str, str],
+                      memory=None) -> None:
+    """Make a vitest run actually possible: install the DOM-testing deps
+    and write a jsdom-enabled ``vitest.config.js`` + setup file when the
+    project has neither. Idempotent; no LLM calls.
+
+    Only acts when the tests need a DOM (they import @testing-library) —
+    pure-logic vitest suites run fine without any of this.
+    """
+    root = cwd or "."
+    pkg_path = os.path.join(root, "package.json")
+    if not os.path.isfile(pkg_path):
+        return
+    needs_dom = any("@testing-library" in (c or "")
+                    for c in test_files.values())
+    if not needs_dom:
+        return
+
+    try:
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    deps = {}
+    deps.update(pkg.get("dependencies", {}))
+    deps.update(pkg.get("devDependencies", {}))
+
+    missing = [p for p in _VITEST_DOM_DEPS if p not in deps]
+    if missing:
+        log.info("[VitestEnv] Installing missing test deps: %s", missing)
+        ok, out = executor.run_command(
+            "npm install -D " + " ".join(missing), cwd=root)
+        if not ok:
+            log.warning("[VitestEnv] Dep install failed: %s", (out or "")[:300])
+
+    env = _read_js_project_env(root)
+    if env["has_vitest_config"]:
+        return
+
+    cfg_rel = os.path.join(cwd, "vitest.config.js") if cwd \
+        else "vitest.config.js"
+    setup_rel = os.path.join(cwd, _VITEST_SETUP_FILE) if cwd \
+        else _VITEST_SETUP_FILE
+    written: dict[str, str] = {}
+    cfg_content = _vitest_config_template(
+        with_react_plugin="@vitejs/plugin-react" in deps)
+    try:
+        with open(os.path.join(root, "vitest.config.js"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write(cfg_content)
+        written[cfg_rel.replace("\\", "/")] = cfg_content
+        setup_abs = os.path.join(root, _VITEST_SETUP_FILE)
+        if not os.path.isfile(setup_abs):
+            with open(setup_abs, "w", encoding="utf-8", newline="\n") as f:
+                f.write(_VITEST_SETUP_TEMPLATE)
+            written[setup_rel.replace("\\", "/")] = _VITEST_SETUP_TEMPLATE
+    except OSError as e:
+        log.warning("[VitestEnv] Could not write config: %s", e)
+        return
+    log.info("[VitestEnv] Bootstrapped vitest environment: %s",
+             list(written))
+    if memory is not None:
+        try:
+            memory.update(written)
+        except Exception as e:
+            log.debug("[VitestEnv] memory update failed: %s", e)
+
+
 import platform
 
 
@@ -1762,6 +1865,40 @@ def _make_cmd_idempotent(
     return cmd, ""
 
 
+_NOOP_SEGMENT_RE = re.compile(r'^(?:cd\s+\S.*|mkdir\b.*|[()\s]*)$',
+                              re.IGNORECASE)
+
+
+def _cmd_is_noop(cmd: str) -> bool:
+    """True when every ``&&`` segment of *cmd* is cd/mkdir/blank/stray
+    parens — a command that cannot create any file.
+
+    Observed: a multi-line parenthesized echo block parsed down to
+    ``cd app && (`` which exited 0 having written nothing; the missing
+    vitest config only surfaced much later in BulkTest.
+    """
+    segs = [s.strip() for s in (cmd or "").split("&&")]
+    return bool(segs) and all(_NOOP_SEGMENT_RE.match(s) for s in segs)
+
+
+def _concrete_produces(plan_step) -> list[str]:
+    """Declared produces that are literal checkable paths.
+
+    Globs, entries with spaces/parens (planner annotations like
+    ``vitest-report (console output only)``), and empties are skipped —
+    planners routinely fabricate produces for real commands, so only a
+    no-op command combined with missing concrete produces is proof of a
+    silent failure.
+    """
+    out = []
+    for pf in (getattr(plan_step, "target_files", None) or []):
+        p = str(pf).replace("\\", "/").strip()
+        if not p or "*" in p or "?" in p or " " in p or "(" in p:
+            continue
+        out.append(p)
+    return out
+
+
 def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
@@ -2055,6 +2192,28 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                         log.info(f"[Scaffold] Marked '{_marker}' as freshly "
                                  f"scaffolded — hazard check skipped on first write")
                 break
+
+    # ── Silent no-op guard ──
+    # A command that reduces to cd/mkdir/parens cannot have created the
+    # files the plan declares it produces. Exit code 0 there is a silent
+    # failure — surface it now, at the step where it happened, instead of
+    # letting a later phase trip over the missing files.
+    if success and plan_step is not None and _cmd_is_noop(cmd):
+        _missing_products = [
+            p for p in _concrete_produces(plan_step)
+            if not os.path.exists(p)
+        ]
+        if _missing_products:
+            log.warning(
+                f"Step {step_idx+1}: command is a no-op ('{cmd}') but the "
+                f"plan declares produces that don't exist: "
+                f"{_missing_products} — treating as failure.")
+            success = False
+            output = (output or "") + (
+                "\n[NoopCmd] The command had no effect (only cd/mkdir/"
+                "parens) yet this step must create: "
+                f"{', '.join(_missing_products)}. Create the file(s) with "
+                "the correct content.")
 
     if success:
         display.step_info(step_idx, "Command succeeded.")
@@ -3941,6 +4100,7 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
+            preload_files=getattr(plan_step, "target_files", None),
         )
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
@@ -5232,6 +5392,7 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
+            preload_files=getattr(plan_step, "target_files", None),
         )
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge

@@ -4,6 +4,74 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.5.0 — 2026-07-20
+
+A token-efficiency and reliability release, hardened through ten
+consecutive benchmark runs on a real scaffold-and-build task. Best-case
+cost dropped ~5× (13.9k tokens sent, zero recovery loops, tests passing
+first try — parity with single-shot editors while keeping the full
+test + build verification pipeline). Every failure class encountered is
+now covered by a deterministic guard plus a regression test.
+
+### Added
+
+- **Prompt-cache accounting.** OpenAI cache hits are read from
+  `usage.prompt_tokens_details.cached_tokens` and reported everywhere:
+  the final log line shows gross vs cached vs full-price input
+  (`sent=X [cached=Y (Z%), full-price=W]`), the live panel shows the
+  cached share, cost estimates bill cached input at the discounted rate
+  (override per model via `pricing.cached_input`), and the library's
+  `TaskResult.token_usage` gains a `"cached"` field.
+- **`agentchanti --version`** — reports the actually-installed
+  distribution version via `importlib.metadata`.
+- **Agent-loop preload + earlier nudge.** The loop's opening message
+  pre-loads the step's existing target files (capped) so models stop
+  burning turns on `read_file` round-trips; the read-only "act now"
+  nudge fires after 2 idle turns instead of 3.
+- **Adaptive inline-code budget.** Content-mode plans cap total inline
+  code (~150 lines); beyond it, steps carry descriptions + `verify:`
+  and are implemented against the real project state. Truncated plans
+  whose parsed steps are structurally complete are salvaged instead of
+  triggering a full re-plan.
+- **Deterministic vitest bootstrap.** DOM test suites about to run
+  without a vitest config get a jsdom-enabled `vitest.config.js` +
+  setup file written from a fixed template (no LLM), with missing
+  testing deps installed. Test-infra files (vitest/jest config + setup)
+  are exempt from the fix loop's source-protection guard.
+- **Unsolicited-test gating.** When the raw task doesn't ask for tests,
+  the pipeline no longer auto-generates per-file coverage tests
+  (plan-declared TEST steps still run).
+- **Silent no-op CMD guard.** A command that reduces to
+  cd/mkdir/parens while the plan declares concrete `produces:` files is
+  failed at that step, so recovery runs where the problem is.
+- **Repeated-text test-query rules.** Planner and tester prompts now
+  require landmark-scoped Testing Library queries
+  (`within(getByRole('banner'/'contentinfo'))` / `getAllBy*`) — brand
+  text legitimately appears in header and footer, and singular queries
+  were the most frequent self-inflicted test failure.
+
+### Fixed
+
+- File-creation `echo`-chain CMD steps (all observed Windows variants:
+  spaced, compact `>`/`>>`, caret-escaped, parenthesized) are
+  reclassified into CODE steps that write the file directly — cmd.exe
+  chokes on `[`/`{` in echoed content.
+- Multi-target `edit:` steps: the i-th bare `edit:` block now maps to
+  the i-th target file (previously all blocks landed on the first
+  target, fusing two files' content); full-file promotion accepts
+  exactly one REPLACE block, never a merge.
+- Edits targeting files that don't exist at plan time are converted to
+  full-file writes (single complete REPLACE) or routed to the grounded
+  path — no more FIND-matching against content the planner never saw.
+- JSON syntax gates on inline patches, promotions, and the agent-tool
+  `edit_file` (tsconfig JSONC exempt) — a trailing comma minimal-diffed
+  into `package.json` previously broke every later npm invocation.
+- Multi-line CMD steps joined with `&&` no longer fail on repeated
+  `cd <dir>` segments (each plan line assumed the project root).
+- `validate_plan` matches imports against glob `produces:` entries
+  (`app/src/*`), so inline code importing scaffold-created files is no
+  longer cleared as dangling.
+
 ## 0.4.0 — 2026-07-18
 
 A verification-first release: steps now prove themselves against the
