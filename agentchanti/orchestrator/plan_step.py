@@ -154,6 +154,8 @@ _ECHO_REDIR_RE = re.compile(r'\s+(>{1,2})\s+([^>]+)$')
 # Regex for "type nul > file" (Windows) or "touch file" (Unix)
 _NUL_RE = re.compile(r'^(?:type\s+nul|touch)\s+>\s+(.+)$')
 _TOUCH_RE = re.compile(r'^touch\s+(.+)$')
+# Regex for a cmd.exe blank-line echo: ``echo.>> file`` / ``echo. > file``
+_ECHO_DOT_RE = re.compile(r'^echo\.\s*(>{1,2})\s*(.+)$')
 
 
 def _parse_echo_commands(lines: list[str]) -> dict[str, str]:
@@ -191,8 +193,24 @@ def _parse_echo_commands(lines: list[str]) -> dict[str, str]:
         parts = raw_line.split(' && ')
         for part in parts:
             part = part.strip()
+            # Planners often wrap each redirection in parentheses, e.g.
+            # ``(echo import x > f)`` — strip one wrapping pair so the
+            # ``echo``/redirect matching below still fires.
+            if part.startswith('(') and part.endswith(')'):
+                part = part[1:-1].strip()
             # Skip bare 'cd' commands and 'mkdir' commands
             if not part or part.startswith('cd ') or part.startswith('mkdir '):
+                continue
+
+            # ── Blank line: cmd.exe ``echo.>> f`` / ``echo. > f`` ──
+            m_blank = _ECHO_DOT_RE.match(part)
+            if m_blank:
+                operator = m_blank.group(1)
+                fpath = _fix_dot_paths(m_blank.group(2).strip().strip('"\''))
+                if operator == '>':
+                    files[fpath] = "\n"
+                else:
+                    files[fpath] = files.get(fpath, "") + "\n"
                 continue
 
             # ── Empty file creation: type nul > file / touch file ──
@@ -286,6 +304,75 @@ def _flush_echo_inline(step: PlanStep, cmd_lines: list[str]) -> None:
     echo_files = _parse_echo_commands(cmd_lines)
     if echo_files:
         step.inline_code.update(echo_files)
+
+
+def _looks_like_file_write_segment(seg: str) -> bool:
+    """True if *seg* is a single file-creation redirection segment."""
+    seg = seg.strip()
+    if seg.startswith('(') and seg.endswith(')'):
+        seg = seg[1:-1].strip()
+    if _NUL_RE.match(seg) or _TOUCH_RE.match(seg) or _ECHO_DOT_RE.match(seg):
+        return True
+    return bool(seg.startswith('echo ') and _ECHO_REDIR_RE.search(seg))
+
+
+def _cmd_is_pure_file_creation(command: str) -> tuple[bool, Optional[str]]:
+    """Return ``(True, cd_dir)`` when *command* does nothing but write file
+    content via shell redirection (``echo``/``type nul``/``touch``), aside
+    from ``cd``/``mkdir`` preamble.
+
+    A single real command anywhere in the chain (``npm``, ``node``, ...)
+    returns ``(False, None)`` — such steps must keep running as CMD.
+    ``cd_dir`` is the directory a leading ``cd`` switched to, so the
+    reconstructed relative paths can be re-prefixed.
+    """
+    cd_dir: Optional[str] = None
+    saw_write = False
+    for seg in command.split('&&'):
+        s = seg.strip()
+        if s.startswith('(') and s.endswith(')'):
+            s = s[1:-1].strip()
+        if not s:
+            continue
+        if s.startswith('cd '):
+            if cd_dir is None:
+                cd_dir = s[3:].strip().strip('"\'')
+            continue
+        if s.startswith('mkdir '):
+            continue
+        if _looks_like_file_write_segment(s):
+            saw_write = True
+            continue
+        return False, None  # a genuine command — leave the step as CMD
+    return saw_write, cd_dir
+
+
+def _reclassify_file_creation_cmds(steps: list[PlanStep]) -> None:
+    """Convert CMD steps that only write file *content* via echo/redirect
+    chains into CODE steps.
+
+    Planners sometimes emit a source file as ``(echo ... > f) && (echo ...
+    >> f)``. On Windows cmd.exe this dies on the first ``[``/``{``/``(`` in
+    the content (``] was unexpected at this time``), and it is brittle even
+    on POSIX. The file content is already reconstructed into ``inline_code``
+    by :func:`_flush_echo_inline`, so writing it directly as a CODE step is
+    reliable and cross-platform.
+    """
+    for step in steps:
+        if step.step_type != "CMD" or not step.command or not step.inline_code:
+            continue
+        ok, cd_dir = _cmd_is_pure_file_creation(step.command)
+        if not ok:
+            continue
+        # Reconstructed paths are relative to any leading ``cd`` dir.
+        prefix = f"{cd_dir}/" if cd_dir else ""
+        step.inline_code = {
+            _norm_target_path(prefix + p): c
+            for p, c in step.inline_code.items()
+        }
+        step.target_files = list(step.inline_code.keys())
+        step.step_type = "CODE"
+        step.command = None
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +823,11 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     # Assign 0-based indices
     for idx, step in enumerate(steps):
         step.index = idx
+
+    # Rescue CMD steps that only write file content via echo/redirect
+    # chains — run them as CODE so the file is written directly instead of
+    # through a fragile (and on Windows, broken) shell chain.
+    _reclassify_file_creation_cmds(steps)
 
     # Derive imported_by from imports_from relationships across all steps.
     # This is free (no LLM cost) and ensures that when step B declares
