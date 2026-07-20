@@ -380,6 +380,38 @@ def _cmd_is_pure_file_creation(command: str) -> tuple[bool, Optional[str]]:
 
 _JS_LIKE_EXTS = ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts')
 
+_BARE_CD_RE = re.compile(r'^cd\s+("[^"]+"|\S+)$')
+
+
+def dedupe_redundant_cd(command: Optional[str]) -> Optional[str]:
+    """Drop `cd X` segments that re-enter the directory the chain is
+    already in.
+
+    Multi-line CMD steps are written by the planner as independent lines,
+    each assuming the project root — but they are joined into one
+    ``&&`` chain where the cwd persists. The second ``cd app`` then runs
+    from *inside* ``app`` and fails with "The system cannot find the path
+    specified", killing an otherwise-correct install chain.
+    """
+    if not command or "&&" not in command:
+        return command
+    segments = [s.strip() for s in command.split("&&")]
+    current: Optional[str] = None
+    kept: list[str] = []
+    dropped = 0
+    for seg in segments:
+        m = _BARE_CD_RE.match(seg)
+        if m:
+            target = m.group(1).strip('"')
+            if current is not None and target == current:
+                dropped += 1
+                continue  # already effectively in this directory
+            current = target
+        kept.append(seg)
+    if not dropped:
+        return command
+    return " && ".join(kept)
+
 
 def route_blind_edits(steps: list[PlanStep],
                       project_root: str = ".") -> list[str]:
@@ -937,6 +969,12 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     for idx, step in enumerate(steps):
         step.index = idx
 
+    # Multi-line CMD steps: drop `cd X` segments that re-enter the
+    # directory the joined && chain is already in (each plan line was
+    # written assuming the project root).
+    for _step in steps:
+        _step.command = dedupe_redundant_cd(_step.command)
+
     # Rescue CMD steps that only write file content via echo/redirect
     # chains — run them as CODE so the file is written directly instead of
     # through a fragile (and on Windows, broken) shell chain.
@@ -1415,10 +1453,20 @@ def validate_plan(steps: list[PlanStep], working_dir: Optional[str] = None) -> l
                         # Rust: mod X → X/mod.rs
                         if pattern_key == "rs":
                             candidates.append(resolved + "/mod.rs")
+                    # Scaffold CMD steps declare globs (`produces: app/src/*`)
+                    # — match candidates against those patterns too, or every
+                    # import of a scaffold-created file (./index.css) reads as
+                    # dangling and nukes perfectly good inline code (observed:
+                    # a correct main.jsx cleared, costing an 8-turn loop).
+                    import fnmatch as _fnmatch
+                    _wild_produced = [tf for tf in produced_files
+                                      if "*" in tf or "?" in tf]
                     is_produced = any(
                         c in produced_files or any(
                             c == tf or tf.endswith("/" + _os.path.basename(c))
                             for tf in produced_files
+                        ) or any(
+                            _fnmatch.fnmatch(c, w) for w in _wild_produced
                         )
                         for c in candidates
                     )
@@ -2262,6 +2310,9 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
                 step.step_type = "CMD"
             elif step.target_files:
                 step.step_type = "CODE"
+
+    for s in steps:
+        s.command = dedupe_redundant_cd(s.command)
 
     # Only return steps that have at least a description or target/command
     return [s for s in steps if s.description or s.target_files or s.command]

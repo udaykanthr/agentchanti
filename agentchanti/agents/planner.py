@@ -1620,6 +1620,11 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
       ---file-content-end---
     The code must be COMPLETE — every import, every function, every line.
     Do NOT write a stub or partial implementation.
+    When a step declares MULTIPLE target files, emit one content: block
+    PER FILE, in the same order as the target: list, each closed with its
+    own ---file-content-end--- marker. A single block for several targets
+    gets written to only the FIRST file — the others silently end up
+    empty.
 
     **Inline code budget (HARD LIMIT)**: Keep the TOTAL inline code across
     ALL content: and edit: blocks in the plan under ~150 lines. A plan
@@ -1662,6 +1667,7 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] Every CODE step that modifies a file shown in [FILES TO MODIFY] uses an edit: block (NOT content:)
 - [ ] NO edit: block targets a file created by an earlier step of this plan (scaffold output) — those use content: or a precise description
 - [ ] Every CODE/TEST step that creates a new file has a content: block with complete source
+- [ ] Steps with multiple target: files have one content: block per file, in target order
 - [ ] Total inline code across the whole plan stays under ~150 lines — further steps carry descriptions + verify: instead of bodies
 - [ ] No two steps have the same target: file (consolidate into one step)
 - [ ] If step B imports from step A's target file, B depends on A

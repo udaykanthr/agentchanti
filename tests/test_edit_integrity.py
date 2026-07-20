@@ -15,8 +15,10 @@ from unittest.mock import MagicMock
 from agentchanti.agent_tools import AgentTools
 from agentchanti.orchestrator.pipeline import _syntax_gate
 from agentchanti.orchestrator.plan_step import (
+    dedupe_redundant_cd,
     parse_structured_plan,
     route_blind_edits,
+    validate_plan,
 )
 
 
@@ -154,6 +156,79 @@ class TestAgentToolsJsonGate(unittest.TestCase):
             '"build": "vite build"',
             '"build": "vite build",\n    "test": "vitest"')
         self.assertTrue(result.startswith("OK"), result)
+
+
+class TestDedupeRedundantCd(unittest.TestCase):
+
+    def test_repeated_cd_dropped(self):
+        # Exact shape from the failing run: four plan lines each assuming
+        # the project root, joined into one && chain.
+        cmd = ("npm create vite@latest app -- --template react --yes"
+               " && cd app && npm install"
+               " && cd app && npm install bootstrap"
+               " && cd app && npm install --save-dev vitest")
+        out = dedupe_redundant_cd(cmd)
+        self.assertEqual(out.count("cd app"), 1)
+        self.assertIn("npm install bootstrap", out)
+        self.assertIn("npm install --save-dev vitest", out)
+
+    def test_distinct_cds_kept(self):
+        cmd = "cd app && npm install && cd docs && npm run build"
+        self.assertEqual(dedupe_redundant_cd(cmd), cmd)
+
+    def test_single_and_none_unchanged(self):
+        self.assertEqual(dedupe_redundant_cd("npm install"), "npm install")
+        self.assertIsNone(dedupe_redundant_cd(None))
+
+    def test_parsed_multiline_cmd_step_deduped(self):
+        plan = """
+==PLAN==
+--STEP 1.1 [CMD] depends:none
+Scaffold and install.
+> npm create vite@latest app -- --template react --yes
+> cd app && npm install
+> cd app && npm install bootstrap
+produces: app/package.json
+==END==
+"""
+        step = parse_structured_plan(plan)[0]
+        self.assertEqual(step.command.count("cd app"), 1)
+
+
+class TestGlobProducesValidation(unittest.TestCase):
+
+    def test_scaffold_glob_covers_imported_files(self):
+        # A CMD step produces `app/src/*` (glob). Inline code importing
+        # scaffold-created files (./index.css) must NOT be treated as
+        # dangling — that false positive cleared a correct main.jsx and
+        # cost an 8-turn loop.
+        plan = """
+==PLAN==
+--STEP 1.1 [CMD] depends:none
+Scaffold the app.
+> npm create vite@latest app -- --template react --yes
+produces: app/package.json, app/src/*
+
+--STEP 1.2 [CODE] depends:1.1
+Wire the entry point.
+target: app/src/main.jsx
+exports: none
+imports: none
+content:
+```jsx
+import 'bootstrap/dist/css/bootstrap.min.css'
+import './index.css'
+import App from './App.jsx'
+```
+---file-content-end---
+==END==
+"""
+        steps = parse_structured_plan(plan)
+        errors = validate_plan(steps)
+        dangling = [e for e in errors if "no step produces" in e]
+        self.assertEqual(dangling, [])
+        # Inline code survived validation.
+        self.assertIn("app/src/main.jsx", steps[1].inline_code)
 
 
 if __name__ == "__main__":
