@@ -2320,7 +2320,19 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 for cfg in _CONFIG_SKIP
                             )
                         ]
-                        if _uncovered:
+                        if _uncovered and not getattr(
+                                memory, '_task_requests_tests', True):
+                            # The user never asked for tests. Auto-generated
+                            # per-file coverage tests on such tasks only add
+                            # failure surface (observed: 3 unsolicited
+                            # component tests turned a passing build into an
+                            # 8-turn BulkTest fix cycle over duplicate text).
+                            # Plan-declared TEST steps still run — this skips
+                            # only the unsolicited extras.
+                            _logger.info(
+                                "[Inline] Skipping auto test coverage for %s "
+                                "— task does not request tests", _uncovered)
+                        elif _uncovered:
                             _logger.info(
                                 "[Inline] Source files with no TEST-step coverage: %s",
                                 _uncovered,

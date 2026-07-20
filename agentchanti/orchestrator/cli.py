@@ -803,6 +803,13 @@ def _main_impl():
             display.finish()
             return
 
+        # Record whether the RAW task asks for tests before enrichment
+        # replaces it — the enriched spec routinely adds testing language,
+        # so this must be decided now. Rides on memory (like _kb_context)
+        # so the coverage-generation gate deep in the pipeline can see it.
+        from ..language import task_requests_tests
+        memory._task_requests_tests = task_requests_tests(args.task)
+
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
         intent_spec = parse_intent_spec(args.task)

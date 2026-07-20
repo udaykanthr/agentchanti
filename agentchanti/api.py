@@ -352,6 +352,11 @@ def _run_task_impl(
         _answer = getattr(planner, '_question_answer', '')
         return TaskResult(success=True, answer=_answer)
 
+    # Record whether the RAW task asks for tests before enrichment replaces
+    # it (see cli.py — the enriched spec routinely adds testing language).
+    from .language import task_requests_tests
+    memory._task_requests_tests = task_requests_tests(task)
+
     # Update task if IntentAgent enriched it during pre_analyze
     task = getattr(planner, '_enriched_task', task)
     intent_spec = parse_intent_spec(task)

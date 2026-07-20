@@ -918,10 +918,9 @@ class PlannerAgent(Agent):
                                 # Check the RAW task: by this point `task` has
                                 # been replaced by the enriched spec, which
                                 # routinely mentions testing on its own.
-                                _task_wants_tests = bool(re.search(
-                                    r'\btest(s|ing|case|cases)?\b'
-                                    r'|pytest|vitest|jest|coverage',
-                                    _raw_task, re.IGNORECASE))
+                                from ..language import task_requests_tests
+                                _task_wants_tests = task_requests_tests(
+                                    _raw_task)
                                 _TEST_GUIDE_KWS = (
                                     "test", "vitest", "jest", "pytest")
                                 for _t in _blank_titles:

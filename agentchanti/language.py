@@ -4,6 +4,7 @@ Language detection and test framework mapping for multi-language support.
 
 import json
 import os
+import re
 from collections import Counter
 
 
@@ -298,6 +299,25 @@ def get_language_name(language: str) -> str:
 def get_code_block_lang(language: str) -> str:
     """Markdown fence language tag for a language key."""
     return _CODE_BLOCK_LANGS.get(language, language)
+
+
+_TASK_TESTS_RE = re.compile(
+    r'\btest(s|ing|case|cases)?\b|pytest|vitest|jest|coverage',
+    re.IGNORECASE,
+)
+
+
+def task_requests_tests(task: str) -> bool:
+    """True when the user's task text actually asks for tests.
+
+    Must be called on the RAW task, never the enriched REQUIREMENTS_SPEC —
+    enrichment routinely adds testing language on its own, which would make
+    this always-True. Consumers use it to skip test-flavoured work the user
+    never asked for (forcing testing KB guides on the planner, generating
+    per-file coverage tests) — extra tests on an untested-by-request task
+    only add failure surface.
+    """
+    return bool(_TASK_TESTS_RE.search(task or ""))
 
 
 def detect_language_from_files(file_paths: list[str]) -> str | None:
