@@ -378,6 +378,60 @@ def _cmd_is_pure_file_creation(command: str) -> tuple[bool, Optional[str]]:
     return saw_write, cd_dir
 
 
+_JS_LIKE_EXTS = ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts')
+
+
+def route_blind_edits(steps: list[PlanStep],
+                      project_root: str = ".") -> list[str]:
+    """Neutralize ``edit:`` blocks written against files that do not exist
+    at plan time (they will be created by an earlier step, e.g. a scaffold
+    command) — their FIND text is a guess that cannot be trusted.
+
+    Called by the CLI after parsing (not inside the parser, whose other
+    callers run outside the project directory). Per edit target that is
+    absent on disk:
+
+      * exactly one substantial REPLACE that looks like a complete file
+        (JS-likes must carry an export) → promoted to ``inline_code`` as a
+        deterministic full-file overwrite;
+      * anything else → the pairs are dropped, so the step reaches the
+        grounded coder/agent-loop path instead of attempting doomed FIND
+        matching against content the planner never saw.
+
+    Existing files are left alone — their edits are legitimately grounded
+    in the [FILES TO MODIFY] source the planner was shown. Returns a list
+    of human-readable notes for logging.
+    """
+    import os
+    notes: list[str] = []
+    for step in steps:
+        if not step.inline_edits:
+            continue
+        for path in list(step.inline_edits):
+            if os.path.exists(os.path.join(project_root, path)):
+                continue  # grounded edit — planner saw this file
+            pairs = step.inline_edits.pop(path)
+            substantial = [r.strip() for _, r in pairs if len(r.strip()) > 50]
+            _ext = os.path.splitext(path)[1].lower()
+            complete = (
+                len(substantial) == 1
+                and (_ext not in _JS_LIKE_EXTS
+                     or 'export ' in substantial[0]
+                     or 'module.exports' in substantial[0])
+            )
+            if complete and path not in step.inline_code:
+                step.inline_code[path] = substantial[0] + "\n"
+                notes.append(
+                    f"Step {step.id}: edit on plan-created file {path} — "
+                    "converted single complete REPLACE to full-file write")
+            else:
+                notes.append(
+                    f"Step {step.id}: dropped {len(pairs)} blind edit "
+                    f"pair(s) for plan-created file {path} — step will be "
+                    "implemented against the real file")
+    return notes
+
+
 def _reclassify_file_creation_cmds(steps: list[PlanStep]) -> None:
     """Convert CMD steps that only write file *content* via echo/redirect
     chains into CODE steps.
@@ -476,6 +530,18 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     _edit_find_lines: list[str] = []
     _edit_replace_lines: list[str] = []
     _edit_target: Optional[str] = None  # file path for current edit block
+    # Ordinal of the current bare `edit:` block within the step. Multi-target
+    # steps emit one bare `edit:` block per target file, in target order —
+    # defaulting every block to target_files[0] mis-keyed the 2nd file's
+    # edits onto the 1st (observed: main.jsx's REPLACE merged into App.jsx,
+    # producing a duplicate `App` declaration that broke the build).
+    _edit_block_ord = -1
+
+    def _default_edit_target() -> str:
+        if current is None or not current.target_files:
+            return ""
+        idx = min(max(_edit_block_ord, 0), len(current.target_files) - 1)
+        return current.target_files[idx]
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -498,6 +564,21 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                 _edit_replace_lines = []
                 _edit_target = None
                 # Fall through to process this line as a step header / ==END==
+            elif line.lower().startswith("edit:"):
+                # A new edit: header while already inside an edit block —
+                # the planner emits one bare block per target file. Without
+                # this, the header is swallowed as FIND content and every
+                # pair defaults to target_files[0].
+                _rest = line[5:].strip()
+                if _rest and not _rest.startswith("<<<"):
+                    _edit_target = _rest
+                else:
+                    _edit_target = None
+                    _edit_block_ord += 1
+                _edit_section = "find"
+                _edit_find_lines = []
+                _edit_replace_lines = []
+                continue
             elif _lnorm in ("<<<FIND>>>", "<<FIND>>", "<FIND>"):
                 _edit_section = "find"
                 _edit_find_lines = []
@@ -512,8 +593,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                     _find_str = "\n".join(_edit_find_lines)
                     _repl_str = "\n".join(_edit_replace_lines)
                     _tgt = _norm_target_path(
-                        _edit_target or (current.target_files[0]
-                                         if current.target_files else ""))
+                        _edit_target or _default_edit_target())
                     if _tgt:
                         current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
                 # Stay in edit block — there may be more <<<FIND>>>...<<<END>>> pairs.
@@ -617,6 +697,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
 
             current = PlanStep(id=step_id, step_type=step_type, depends_on=depends)
             desc_lines = []
+            _edit_block_ord = -1  # per-step ordinal for bare edit: blocks
             cmd_lines = []
             continue
 
@@ -771,12 +852,14 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         # Supports optional "edit: path/to/file" to specify a different target.
         elif line.lower().startswith("edit:"):
             rest = line[5:].strip()
-            # If a file path is given on the same line, use it; otherwise use
-            # the step's first target file (resolved when <<<END>>> is hit).
+            # If a file path is given on the same line, use it; otherwise the
+            # ordinal-th target file is used (resolved when <<<END>>> is hit):
+            # one bare edit: block per target, in target order.
             if rest and not rest.startswith("<<<"):
                 _edit_target = rest
             else:
                 _edit_target = None
+                _edit_block_ord += 1
             in_edit_block = True
             _edit_section = "find"
             _edit_find_lines = []
@@ -832,8 +915,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         ]
         if _find_meaningful:
             _tgt = _norm_target_path(
-                _edit_target or (current.target_files[0]
-                                 if current.target_files else ""))
+                _edit_target or _default_edit_target())
             if _tgt:
                 current.inline_edits.setdefault(_tgt, []).append((_find_str, _repl_str))
 

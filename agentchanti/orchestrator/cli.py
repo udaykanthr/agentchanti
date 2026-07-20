@@ -914,7 +914,7 @@ def _main_impl():
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
-                plan_salvageable,
+                plan_salvageable, route_blind_edits,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -936,6 +936,9 @@ def _main_impl():
                     dep_fixes = fix_import_dependencies(plan_steps_parsed)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
+                    blind_fixes = route_blind_edits(plan_steps_parsed)
+                    if blind_fixes:
+                        log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")

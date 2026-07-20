@@ -158,6 +158,40 @@ def _is_test_file(file_path: str) -> bool:
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 
+def _syntax_gate(path: str, content: str) -> str | None:
+    """Cheap syntactic validity check before content reaches disk.
+
+    Returns an error string when *content* is not valid for *path*'s file
+    type, else None. Python → ast.parse, JSON → json.loads (a minimal-diff
+    patch once wrote a trailing comma into package.json — valid-looking
+    text that broke every subsequent npm/vitest invocation), other code
+    files → the offline tree-sitter lint.
+    """
+    import os
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".py", ".pyw"):
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            return f"python syntax error: {exc}"
+        return None
+    if ext == ".json":
+        # tsconfig*.json is JSONC (comments/trailing commas allowed) —
+        # strict parsing would reject legitimate content.
+        if os.path.basename(path).lower().startswith("tsconfig"):
+            return None
+        import json
+        try:
+            json.loads(content)
+        except ValueError as exc:
+            return f"invalid JSON: {exc}"
+        return None
+    from .step_handlers import _quick_offline_lint
+    errs = _quick_offline_lint({path: content})
+    return errs or None
+
+
 _TEST_INFRA_STEMS = (
     "vitest.config", "vitest.setup", "jest.config", "jest.setup",
     "setuptests", "conftest",
@@ -1763,17 +1797,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                     # Reject syntactically broken patches before promotion —
                     # the fuzzy/minimal-diff fallbacks can mangle docstrings
                     # (observed: an unterminated triple-quote written to
-                    # disk, poisoning the base file for every later edit
-                    # tier). Fall through to the coder instead.
-                    if _resolved.endswith((".py", ".pyw")):
-                        try:
-                            import ast as _ast_inline
-                            _ast_inline.parse(_patched)
-                        except SyntaxError as _syn_exc:
+                    # disk; a trailing comma minimal-diffed into
+                    # package.json). Fall through to the coder instead.
+                    if _resolved.endswith((".py", ".pyw", ".json")):
+                        _gate_err = _syntax_gate(_resolved, _patched)
+                        if _gate_err:
                             _logger.warning(
-                                "[InlineEdit] Patched %s has a syntax error "
+                                "[InlineEdit] Patched %s failed validation "
                                 "(%s) — falling through to coder",
-                                _resolved, _syn_exc)
+                                _resolved, _gate_err)
                             _edit_all_ok = False
                             break
                     # Promote the patched content into inline_code so the
@@ -1834,10 +1866,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                                         "REPLACE (would create a dead file at "
                                         "a phantom path)", _ie_resolved)
                                     continue
-                            # Collect ALL REPLACE blocks for this file and
-                            # concatenate them in order.  Plans often split
-                            # a file into multiple FIND/REPLACE pairs (e.g.
-                            # imports in pair 1, function body in pair 2).
+                            # Collect substantial REPLACE blocks for this
+                            # file. Promotion is only safe with EXACTLY ONE:
+                            # concatenating multiple blocks into one file
+                            # merged a second file's content into the first
+                            # (observed: main.jsx's REPLACE appended to
+                            # App.jsx → duplicate `App` declaration that was
+                            # valid syntax but broke the build). Multi-block
+                            # edits fall through to the coder/agent loop,
+                            # which works from the real file.
                             _repl_parts: list[str] = []
                             for _, _repl in _ie_pairs:
                                 _repl_stripped = _repl.strip()
@@ -1852,8 +1889,15 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 _is_substantial = len(_repl_stripped) > 50
                                 if _has_structure and _is_substantial:
                                     _repl_parts.append(_repl_stripped)
+                            if len(_repl_parts) > 1:
+                                _logger.warning(
+                                    "[InlineEdit] %d REPLACE blocks for %s — "
+                                    "refusing to merge-promote (risks fusing "
+                                    "two files' content); falling through to "
+                                    "coder", len(_repl_parts), _ie_resolved)
+                                _repl_parts = []
                             if _repl_parts:
-                                _combined = "\n\n".join(_repl_parts)
+                                _combined = _repl_parts[0]
                                 # Safety check: verify the combined REPLACE
                                 # text looks like a complete file, not a
                                 # fragment from an incremental edit.
@@ -1875,7 +1919,6 @@ def _execute_step(step_idx: int, step_text: str, *,
                                 # let syntactically-broken concatenations (e.g.
                                 # dangling methods missing their class header)
                                 # through to disk.
-                                from .step_handlers import _quick_offline_lint
                                 _ext = _os_inline_fb.path.splitext(_ie_resolved)[1].lower()
                                 _js_like = _ext in {
                                     '.js', '.jsx', '.ts', '.tsx', '.mjs',
@@ -1891,9 +1934,9 @@ def _execute_step(step_idx: int, step_text: str, *,
                                     if not _has_export:
                                         _is_complete = False
                                 _lint_errs = ""
-                                if _is_complete and len(_repl_parts) > 1:
-                                    _lint_errs = _quick_offline_lint(
-                                        {_ie_resolved: _combined})
+                                if _is_complete:
+                                    _lint_errs = _syntax_gate(
+                                        _ie_resolved, _combined) or ""
                                     if _lint_errs:
                                         _is_complete = False
                                 if _is_complete:
