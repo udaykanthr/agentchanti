@@ -1195,6 +1195,47 @@ class TestDeclaredVerifyGate(unittest.TestCase):
                       verify_cmd=r"call venv\Scripts\activate")
         self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
 
+    def test_no_cd_prefix_when_cmd_references_subproject_path(self):
+        # Regression (pygame run): the plan's root-relative gate
+        # `unittest discover -s game` was prefixed to `cd game && ... -s
+        # game`, which looks for game/game/ — unpassable by correct code.
+        # The loop burned 8 turns and the escalation model "fixed" it by
+        # creating a duplicate nested game/game/ package.
+        from unittest.mock import patch
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        cases = [
+            'python -m unittest discover -s game -p "test_*.py" -v',
+            "pytest game/tests -q",
+            "python -m game.main",
+            r"python game\test_main.py",
+        ]
+        with patch("agentchanti.orchestrator.step_handlers."
+                   "_detect_subproject_root", return_value="game"):
+            for verify in cases:
+                ps = PlanStep(id="3.1", step_type="TEST", verify_cmd=verify)
+                cmd = _declared_verify_cmd(ps, self._memory())
+                self.assertEqual(cmd, verify, verify)  # unprefixed, as written
+
+    def test_cd_prefix_still_added_for_inside_style_commands(self):
+        # Commands that don't reference the subproject are written to run
+        # inside it — the prefix must survive this fix.
+        from unittest.mock import patch
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        with patch("agentchanti.orchestrator.step_handlers."
+                   "_detect_subproject_root", return_value="app"):
+            ps = PlanStep(id="3.1", step_type="TEST", verify_cmd="npm test")
+            self.assertEqual(_declared_verify_cmd(ps, self._memory()),
+                             "cd app && npm test")
+            # Substring of another word is not a reference — still prefixed.
+            ps2 = PlanStep(id="3.2", step_type="TEST",
+                           verify_cmd="pytest webapp/tests -q")
+            with patch("agentchanti.orchestrator.step_handlers."
+                       "_detect_subproject_root", return_value="web"):
+                self.assertEqual(_declared_verify_cmd(ps2, self._memory()),
+                                 "cd web && pytest webapp/tests -q")
+
     def test_gate_pass_and_noop_cases(self):
         from agentchanti.orchestrator.plan_step import PlanStep
         from agentchanti.orchestrator.step_handlers import (
