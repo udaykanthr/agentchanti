@@ -1660,6 +1660,18 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     Django >= 5, `LogoutView` rejects GET, so logout tests must use
     `self.client.post(...)` and views/templates must log out via a POST
     form, not a link.
+
+22. **Testing Library queries must tolerate repeated text**: Brand names
+    and nav labels legitimately appear in BOTH the header and the footer
+    of the same page. Singular queries THROW on a second match —
+    `getByText('Brand')` and `getByRole('link', {name: 'Home'})` are the
+    most common self-inflicted test failures. Scope every query for text
+    that could repeat to a landmark:
+    `within(screen.getByRole('banner')).getByText('Brand')` for the
+    header, `within(screen.getByRole('contentinfo')).getByRole('link',
+    {name: 'Home'})` for the footer (import `within` from
+    '@testing-library/react'), or use `getAllByText(...)` and assert the
+    count. Never assert a brand name with a singular query.
 """ + (_CHECKLIST_INTENT if plan_mode == "intent" else """
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths

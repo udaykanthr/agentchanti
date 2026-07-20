@@ -315,6 +315,14 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
      `screen.getByText((content, el) => el?.textContent === 'expected')`
    - NEVER assume element counts — check the source data/props to determine expected counts.
    - Verify callback prop names match the EXACT prop name in the component (e.g. onClick vs onCtaClick).
+14. CRITICAL — repeated text: brand names and nav labels legitimately appear in BOTH
+   the header and the footer. Singular queries THROW on the second match
+   ("Found multiple elements with the text ...").
+   - Scope queries to a landmark: `within(screen.getByRole('banner')).getByText('Brand')`
+     for the header, `within(screen.getByRole('contentinfo'))...` for the footer
+     (import `within` from '@testing-library/react').
+   - Or use `getAllByText(...)` / `getAllByRole(...)` and assert the count.
+   - NEVER assert a brand/nav string with a singular query on the whole page.
 """
 
     @staticmethod

@@ -231,5 +231,54 @@ import App from './App.jsx'
         self.assertIn("app/src/main.jsx", steps[1].inline_code)
 
 
+class TestNoopCmdGuard(unittest.TestCase):
+
+    def test_noop_shapes(self):
+        from agentchanti.orchestrator.step_handlers import _cmd_is_noop
+        # The exact observed silent failure: parenthesized echo block
+        # parsed down to `cd app && (` — exit 0, wrote nothing.
+        self.assertTrue(_cmd_is_noop("cd bootstrap-homepage && ("))
+        self.assertTrue(_cmd_is_noop("cd app"))
+        self.assertTrue(_cmd_is_noop("mkdir src && cd src"))
+        # Real commands are never no-ops.
+        self.assertFalse(_cmd_is_noop("cd app && npm install"))
+        self.assertFalse(_cmd_is_noop("npm test"))
+        self.assertFalse(_cmd_is_noop(
+            "cd app && (echo x > f.js)"))
+
+    def test_concrete_produces_filters_annotations(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _concrete_produces
+        step = PlanStep(id="1", step_type="CMD", target_files=[
+            "app\\vitest.config.js",          # concrete (normalized)
+            "app/src/*",                       # glob — skipped
+            "app/vitest-report (console output only)",  # annotation — skipped
+            "",                                # empty — skipped
+        ])
+        self.assertEqual(_concrete_produces(step), ["app/vitest.config.js"])
+
+
+class TestRepeatedTextQueryRules(unittest.TestCase):
+
+    def test_planner_rule_in_both_modes(self):
+        from agentchanti.agents.planner import PlannerAgent
+        for mode in ("content", "intent"):
+            planner = PlannerAgent("P", "Architect", "Plan", MagicMock())
+            planner.llm_client.generate_response = lambda prompt: prompt
+            prompt = planner.process("build a page", context="ctx",
+                                     plan_mode=mode)
+            self.assertIn("tolerate repeated text", prompt, mode)
+            self.assertIn("getByRole('banner')", prompt, mode)
+            self.assertIn("contentinfo", prompt, mode)
+
+    def test_tester_vitest_rules_include_landmark_scoping(self):
+        from agentchanti.agents.tester import TesterAgent
+        rules = TesterAgent._vitest_test_rules("javascript", ".jsx",
+                                               {"has_jsx": True})
+        self.assertIn("within(screen.getByRole('banner'))", rules)
+        self.assertIn("contentinfo", rules)
+        self.assertIn("getAllByText", rules)
+
+
 if __name__ == "__main__":
     unittest.main()

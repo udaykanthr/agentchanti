@@ -1865,6 +1865,40 @@ def _make_cmd_idempotent(
     return cmd, ""
 
 
+_NOOP_SEGMENT_RE = re.compile(r'^(?:cd\s+\S.*|mkdir\b.*|[()\s]*)$',
+                              re.IGNORECASE)
+
+
+def _cmd_is_noop(cmd: str) -> bool:
+    """True when every ``&&`` segment of *cmd* is cd/mkdir/blank/stray
+    parens — a command that cannot create any file.
+
+    Observed: a multi-line parenthesized echo block parsed down to
+    ``cd app && (`` which exited 0 having written nothing; the missing
+    vitest config only surfaced much later in BulkTest.
+    """
+    segs = [s.strip() for s in (cmd or "").split("&&")]
+    return bool(segs) and all(_NOOP_SEGMENT_RE.match(s) for s in segs)
+
+
+def _concrete_produces(plan_step) -> list[str]:
+    """Declared produces that are literal checkable paths.
+
+    Globs, entries with spaces/parens (planner annotations like
+    ``vitest-report (console output only)``), and empties are skipped —
+    planners routinely fabricate produces for real commands, so only a
+    no-op command combined with missing concrete produces is proof of a
+    silent failure.
+    """
+    out = []
+    for pf in (getattr(plan_step, "target_files", None) or []):
+        p = str(pf).replace("\\", "/").strip()
+        if not p or "*" in p or "?" in p or " " in p or "(" in p:
+            continue
+        out.append(p)
+    return out
+
+
 def _handle_cmd_step(step_text: str, executor: Executor,
                      llm_client, memory: FileMemory,
                      display: CLIDisplay, step_idx: int,
@@ -2158,6 +2192,28 @@ def _handle_cmd_step(step_text: str, executor: Executor,
                         log.info(f"[Scaffold] Marked '{_marker}' as freshly "
                                  f"scaffolded — hazard check skipped on first write")
                 break
+
+    # ── Silent no-op guard ──
+    # A command that reduces to cd/mkdir/parens cannot have created the
+    # files the plan declares it produces. Exit code 0 there is a silent
+    # failure — surface it now, at the step where it happened, instead of
+    # letting a later phase trip over the missing files.
+    if success and plan_step is not None and _cmd_is_noop(cmd):
+        _missing_products = [
+            p for p in _concrete_produces(plan_step)
+            if not os.path.exists(p)
+        ]
+        if _missing_products:
+            log.warning(
+                f"Step {step_idx+1}: command is a no-op ('{cmd}') but the "
+                f"plan declares produces that don't exist: "
+                f"{_missing_products} — treating as failure.")
+            success = False
+            output = (output or "") + (
+                "\n[NoopCmd] The command had no effect (only cd/mkdir/"
+                "parens) yet this step must create: "
+                f"{', '.join(_missing_products)}. Create the file(s) with "
+                "the correct content.")
 
     if success:
         display.step_info(step_idx, "Command succeeded.")
