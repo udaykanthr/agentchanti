@@ -4,6 +4,33 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.5.1 — 2026-07-21
+
+Fixes for a shared failure theme found by running 0.5.0 on a fresh
+Python/pygame task: acceptance gates that no amount of correct work
+could turn green.
+
+### Fixed
+
+- **Subproject prefix no longer breaks root-relative verify gates.**
+  A gate like `python -m unittest discover -s game` was prefixed with
+  `cd game && `, making its path argument resolve to `game/game/` —
+  unpassable by correct code (the escalation model "satisfied" it by
+  creating a duplicate nested test package). Commands that reference
+  the subproject itself by path or module (`-s {sub}`, `{sub}/tests`,
+  `python -m {sub}.main`) now run from the repo root as written.
+- **`pip install --yes` is sanitized.** Planners hallucinate the
+  apt/conda flag onto pip, which rejects it (exit 2). The flag is
+  stripped from pip-install segments before the first run; apt/conda
+  segments keep their legitimate `-y`.
+- **Recovery gates accept a flag-variant success.** A failed CMD step's
+  recovery gate re-runs the original command verbatim; when that
+  command is malformed, the gate stayed red even after the loop ran the
+  corrected command successfully (observed: pygame installed twice,
+  run still failed). Recovery loops now accept a success of the same
+  command differing only in flag tokens. CODE/TEST verify semantics
+  are unchanged.
+
 ## 0.5.0 — 2026-07-20
 
 A token-efficiency and reliability release, hardened through ten
