@@ -269,6 +269,30 @@ def resolve_cmd_placeholders(cmd: str, step_text: str = '', task: str = '',
     return cmd
 
 
+_PIP_INSTALL_SEG_RE = re.compile(r'\bpip3?\s+install\b')
+_PIP_YES_FLAG_RE = re.compile(r'\s+(?:--yes|-y)\b')
+
+
+def _strip_invalid_pip_flags(cmd: str) -> str:
+    """Remove ``--yes``/``-y`` from pip-install segments.
+
+    pip has no confirmation prompt and rejects the flag outright
+    (``no such option: --yes``, exit 2) — it's apt/conda vocabulary that
+    planners hallucinate onto pip. Observed: a planned install died on
+    it, the recovery loops installed the package correctly twice, and
+    the run still failed because the acceptance gate re-ran the original
+    flagged command. Only pip-install segments are touched — ``-y`` is
+    legitimate for apt/conda and stays intact there.
+    """
+    if 'pip' not in cmd or 'install' not in cmd:
+        return cmd
+    return '&&'.join(
+        _PIP_YES_FLAG_RE.sub('', seg) if _PIP_INSTALL_SEG_RE.search(seg)
+        else seg
+        for seg in cmd.split('&&')
+    )
+
+
 def _cleanup_shell_command(cmd: str) -> str:
     """Clean up dangling operators and whitespace from a shell command."""
     cmd = cmd.strip()
@@ -277,6 +301,7 @@ def _cleanup_shell_command(cmd: str) -> str:
     cmd = re.sub(r'(&&|\|\||\\)\s*$', '', cmd).strip()
     # Second pass in case there were multiple (e.g. "&& \")
     cmd = re.sub(r'(&&|\|\||\\)\s*$', '', cmd).strip()
+    cmd = _strip_invalid_pip_flags(cmd)
     return cmd
 
 

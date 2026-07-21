@@ -183,3 +183,38 @@ def test_looks_like_command_accepts_windows_call():
     """
     assert _looks_like_command(
         r"call venv\Scripts\activate && python -m pip install pytest")
+
+
+# ── pip flag sanitization ────────────────────────────────────
+
+
+def test_pip_yes_flag_stripped():
+    # Replay: planner emitted `pip install --yes pygame` (apt/conda
+    # vocabulary — pip rejects it with exit 2), which also poisoned the
+    # recovery gate that re-runs the original command verbatim.
+    from agentchanti.orchestrator.classification import _cleanup_shell_command
+    cmd = (r"cd brick_breaker && call venv\Scripts\activate "
+           r"&& pip install --yes pygame")
+    assert _cleanup_shell_command(cmd) == (
+        r"cd brick_breaker && call venv\Scripts\activate "
+        r"&& pip install pygame")
+
+
+def test_pip_short_y_flag_stripped():
+    from agentchanti.orchestrator.classification import _cleanup_shell_command
+    assert _cleanup_shell_command("python -m pip install -y requests") == \
+        "python -m pip install requests"
+
+
+def test_apt_and_conda_yes_flags_untouched():
+    from agentchanti.orchestrator.classification import _cleanup_shell_command
+    for cmd in ("apt-get install -y curl",
+                "conda install --yes numpy",
+                "sudo apt install -y build-essential && pip install flask"):
+        assert _cleanup_shell_command(cmd) == cmd
+
+
+def test_pip_legit_flags_untouched():
+    from agentchanti.orchestrator.classification import _cleanup_shell_command
+    cmd = "pip install --upgrade --no-cache-dir pygame"
+    assert _cleanup_shell_command(cmd) == cmd

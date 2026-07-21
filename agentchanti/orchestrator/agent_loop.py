@@ -240,6 +240,33 @@ def _venv_python(project_root: str) -> str | None:
     return None
 
 
+def _flagless_tokens(cmd: str) -> list[str]:
+    """Lower-cased non-flag tokens of a shell command, `&&` flattened."""
+    toks: list[str] = []
+    for seg in (cmd or "").split("&&"):
+        for t in seg.split():
+            t = t.strip("\"'")
+            if t and not t.startswith("-"):
+                toks.append(t.lower())
+    return toks
+
+
+def commands_equivalent_modulo_flags(candidate: str | None,
+                                     original: str | None) -> bool:
+    """True when *candidate* is *original* with only flag tokens changed.
+
+    Same executables, same non-flag arguments, in the same order —
+    differing only in ``-``/``--`` tokens (e.g. ``pip install pygame``
+    vs ``pip install --yes pygame``). Identical strings return False:
+    the gate already ran that exact command itself, so an earlier
+    success proves nothing new.
+    """
+    if not candidate or not original or candidate.strip() == original.strip():
+        return False
+    a, b = _flagless_tokens(candidate), _flagless_tokens(original)
+    return bool(a) and a == b
+
+
 def attempt_env_self_heal(tools: AgentTools, verify_output: str,
                           language: str | None, healed: set[str],
                           verify_cmd: str | None = None) -> bool:
@@ -328,10 +355,28 @@ def run_agent_loop(
     read_only_streak = 0
     healed: set[str] = set()
 
+    # Last run_command the model executed that exited 0 — evidence for
+    # the unpassable-gate escape below (recovery loops only).
+    last_ok_cmd: str | None = None
+
     def _finish(outcome: str, turns: int,
                 result: tuple[bool, str]) -> tuple[bool, str]:
         _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
         return result
+
+    def _variant_gate_ok() -> bool:
+        """Escape hatch for gates no correct work can pass.
+
+        A failed CMD step's recovery gate is the original command
+        verbatim; when that command is malformed (observed:
+        `pip install --yes pygame` — pip has no --yes), the gate stays
+        red forever even though the loop already ran the corrected
+        command successfully. Accept a same-command-modulo-flags success
+        the loop itself produced. Recovery loops only — CODE/TEST gates
+        keep strict semantics.
+        """
+        return (_recovery and verify_cmd is not None
+                and commands_equivalent_modulo_flags(last_ok_cmd, verify_cmd))
 
     def _run_verify() -> str:
         result = tools.execute_all([_verify_call(verify_cmd)])[0].content
@@ -370,7 +415,12 @@ def run_agent_loop(
                 display.step_info(step_idx,
                                   f"Agent loop {turn}/{max_turns}: {names}")
             messages.append(response.to_message())
-            messages.extend(tools.execute_all(response.tool_calls))
+            _tool_msgs = tools.execute_all(response.tool_calls)
+            messages.extend(_tool_msgs)
+            for _tc, _tm in zip(response.tool_calls, _tool_msgs):
+                if (_tc.name == "run_command"
+                        and (_tm.content or "").startswith("exit: success")):
+                    last_ok_cmd = _tc.arguments.get("command", "")
             # Read-only intervention: some models settle into inspecting
             # file after file without ever acting (observed: whole 8-turn
             # budgets of read_file, twice in one run, even with the
@@ -419,6 +469,13 @@ def run_agent_loop(
                 _logger.info("[AgentLoop] step %d verified in %d turn(s)",
                              step_idx + 1, turn)
                 return _finish("verified", turn, (True, summary))
+            if _variant_gate_ok():
+                _logger.info(
+                    "[AgentLoop] step %d: gate command fails but the loop "
+                    "ran a flag-variant of it successfully (%r) — "
+                    "accepting the variant as the gate", step_idx + 1,
+                    last_ok_cmd)
+                return _finish("verified-variant", turn, (True, summary))
             if final_turn:
                 return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
@@ -446,6 +503,14 @@ def run_agent_loop(
             return _finish("exhausted-verified", max_turns, (True, (
                 "Step verified complete (turn budget exhausted "
                 "before the model summarized).")))
+        if _variant_gate_ok():
+            _logger.info(
+                "[AgentLoop] step %d: turns exhausted, gate command fails "
+                "but a successful flag-variant ran (%r) — accepting",
+                step_idx + 1, last_ok_cmd)
+            return _finish("exhausted-verified-variant", max_turns, (True, (
+                "Step complete: the gate command is malformed but the loop "
+                f"ran an equivalent command successfully: {last_ok_cmd}")))
 
     return _finish("exhausted", max_turns, (False, (
         f"Agent loop exhausted {max_turns} turns without completing the "

@@ -3884,18 +3884,26 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
     cmd = _djangoize_import_probe(cmd, django_root)
     if sub and not cmd.lstrip().startswith("cd "):
         # A `cd {sub}` prefix is only safe when the command is written to
-        # run from inside the subproject. Two shapes are written for the
+        # run from inside the subproject. Three shapes are written for the
         # repo root and become self-contradictory once cwd changes:
         #   * a root-relative interpreter path (venv\Scripts\python.exe /
         #     venv/bin/python) no longer resolves from inside {sub};
         #   * `import {sub}.x` / `from {sub}.x` requires {sub}'s PARENT on
-        #     sys.path — cd-ing into {sub} breaks the very import it probes.
+        #     sys.path — cd-ing into {sub} breaks the very import it probes;
+        #   * any other path/module reference to {sub} itself (`-s {sub}`,
+        #     `{sub}/tests`, `python -m {sub}.main`) points at {sub}/{sub}
+        #     once cwd is {sub} — an unpassable gate. Observed: the loop
+        #     burned its budget against `cd game && unittest discover -s
+        #     game`, and the escalation model then "satisfied" it by
+        #     creating a duplicate nested game/game/ package.
         _root_relative_venv = re.search(r"(?:^|[\s\"'])\.?[\\/]?venv[\\/]",
                                         cmd) is not None
         _sub_re = re.escape(sub.rstrip("/\\"))
         _imports_sub = re.search(rf"\b(?:import|from)\s+{_sub_re}\b",
                                  cmd) is not None
-        if not (_root_relative_venv or _imports_sub):
+        _references_sub = re.search(
+            rf"(?:^|[\s\"'=]){_sub_re}(?:[\\/.\s\"']|$)", cmd) is not None
+        if not (_root_relative_venv or _imports_sub or _references_sub):
             cmd = f"cd {sub} && {cmd}"
     return cmd
 

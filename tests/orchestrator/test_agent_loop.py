@@ -1111,6 +1111,84 @@ class TestPlanStepBrief(unittest.TestCase):
         self.assertIn("Must export: home", ctx)
 
 
+class TestVariantGateEscape(AgentLoopTestCase):
+    """Unpassable-gate escape: a recovery gate that re-runs a malformed
+    original command accepts a flag-variant success the loop produced.
+
+    Replay: `pip install --yes pygame` (invalid flag, exit 2 forever) —
+    both recovery loops installed pygame correctly and the run still
+    failed on the gate."""
+
+    _GATE = r"cd app && call venv\Scripts\activate && pip install --yes pygame"
+    _FIXED = r"cd app && call venv\Scripts\activate && pip install pygame"
+
+    def _executor_rejecting_yes(self):
+        def _run(cmd, **kw):
+            if "--yes" in cmd:
+                return (False, "no such option: --yes")
+            return (True, "Successfully installed pygame")
+        self.executor.run_command.side_effect = _run
+
+    def test_recovery_accepts_flag_variant_success(self):
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": self._FIXED},
+                                    id="c1")),
+            _final("installed pygame"),
+        )
+        success, info = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=True)
+        self.assertTrue(success)
+        self.assertEqual(info, "installed pygame")
+
+    def test_non_recovery_keeps_strict_gate(self):
+        # CODE/TEST loops keep strict verify semantics — no escape.
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": self._FIXED},
+                                    id="c1")),
+            _final("done"), _final("done"), _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=False)
+        self.assertFalse(success)
+
+    def test_unrelated_success_not_accepted(self):
+        # A successful but different command is not evidence for the gate.
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "echo hello"},
+                                    id="c1")),
+            _final("done"), _final("done"), _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=True)
+        self.assertFalse(success)
+
+    def test_equivalence_helper(self):
+        from agentchanti.orchestrator.agent_loop import (
+            commands_equivalent_modulo_flags,
+        )
+        self.assertTrue(commands_equivalent_modulo_flags(
+            self._FIXED, self._GATE))
+        self.assertTrue(commands_equivalent_modulo_flags(
+            "pip install pygame", "pip install --yes -q pygame"))
+        # Identical strings prove nothing new — the gate ran it itself.
+        self.assertFalse(commands_equivalent_modulo_flags(
+            self._GATE, self._GATE))
+        # Different non-flag args are different commands.
+        self.assertFalse(commands_equivalent_modulo_flags(
+            "pip install requests", "pip install --yes pygame"))
+        self.assertFalse(commands_equivalent_modulo_flags(None, self._GATE))
+        self.assertFalse(commands_equivalent_modulo_flags("", ""))
+
+
 class TestDeclaredVerifyGate(unittest.TestCase):
     """The classic-path acceptance gate and its command resolution."""
 
@@ -1194,6 +1272,47 @@ class TestDeclaredVerifyGate(unittest.TestCase):
         ps = PlanStep(id="2.1", step_type="CODE",
                       verify_cmd=r"call venv\Scripts\activate")
         self.assertIsNone(_declared_verify_cmd(ps, self._memory()))
+
+    def test_no_cd_prefix_when_cmd_references_subproject_path(self):
+        # Regression (pygame run): the plan's root-relative gate
+        # `unittest discover -s game` was prefixed to `cd game && ... -s
+        # game`, which looks for game/game/ — unpassable by correct code.
+        # The loop burned 8 turns and the escalation model "fixed" it by
+        # creating a duplicate nested game/game/ package.
+        from unittest.mock import patch
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        cases = [
+            'python -m unittest discover -s game -p "test_*.py" -v',
+            "pytest game/tests -q",
+            "python -m game.main",
+            r"python game\test_main.py",
+        ]
+        with patch("agentchanti.orchestrator.step_handlers."
+                   "_detect_subproject_root", return_value="game"):
+            for verify in cases:
+                ps = PlanStep(id="3.1", step_type="TEST", verify_cmd=verify)
+                cmd = _declared_verify_cmd(ps, self._memory())
+                self.assertEqual(cmd, verify, verify)  # unprefixed, as written
+
+    def test_cd_prefix_still_added_for_inside_style_commands(self):
+        # Commands that don't reference the subproject are written to run
+        # inside it — the prefix must survive this fix.
+        from unittest.mock import patch
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _declared_verify_cmd
+        with patch("agentchanti.orchestrator.step_handlers."
+                   "_detect_subproject_root", return_value="app"):
+            ps = PlanStep(id="3.1", step_type="TEST", verify_cmd="npm test")
+            self.assertEqual(_declared_verify_cmd(ps, self._memory()),
+                             "cd app && npm test")
+            # Substring of another word is not a reference — still prefixed.
+            ps2 = PlanStep(id="3.2", step_type="TEST",
+                           verify_cmd="pytest webapp/tests -q")
+            with patch("agentchanti.orchestrator.step_handlers."
+                       "_detect_subproject_root", return_value="web"):
+                self.assertEqual(_declared_verify_cmd(ps2, self._memory()),
+                                 "cd web && pytest webapp/tests -q")
 
     def test_gate_pass_and_noop_cases(self):
         from agentchanti.orchestrator.plan_step import PlanStep
