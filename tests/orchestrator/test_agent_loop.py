@@ -1111,6 +1111,84 @@ class TestPlanStepBrief(unittest.TestCase):
         self.assertIn("Must export: home", ctx)
 
 
+class TestVariantGateEscape(AgentLoopTestCase):
+    """Unpassable-gate escape: a recovery gate that re-runs a malformed
+    original command accepts a flag-variant success the loop produced.
+
+    Replay: `pip install --yes pygame` (invalid flag, exit 2 forever) —
+    both recovery loops installed pygame correctly and the run still
+    failed on the gate."""
+
+    _GATE = r"cd app && call venv\Scripts\activate && pip install --yes pygame"
+    _FIXED = r"cd app && call venv\Scripts\activate && pip install pygame"
+
+    def _executor_rejecting_yes(self):
+        def _run(cmd, **kw):
+            if "--yes" in cmd:
+                return (False, "no such option: --yes")
+            return (True, "Successfully installed pygame")
+        self.executor.run_command.side_effect = _run
+
+    def test_recovery_accepts_flag_variant_success(self):
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": self._FIXED},
+                                    id="c1")),
+            _final("installed pygame"),
+        )
+        success, info = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=True)
+        self.assertTrue(success)
+        self.assertEqual(info, "installed pygame")
+
+    def test_non_recovery_keeps_strict_gate(self):
+        # CODE/TEST loops keep strict verify semantics — no escape.
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": self._FIXED},
+                                    id="c1")),
+            _final("done"), _final("done"), _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=False)
+        self.assertFalse(success)
+
+    def test_unrelated_success_not_accepted(self):
+        # A successful but different command is not evidence for the gate.
+        self._executor_rejecting_yes()
+        llm = self._llm(
+            _tool_response(ToolCall(name="run_command",
+                                    arguments={"command": "echo hello"},
+                                    id="c1")),
+            _final("done"), _final("done"), _final("done"),
+        )
+        success, _ = run_agent_loop(
+            llm, self.tools, "install pygame", "task", max_turns=4,
+            verify_cmd=self._GATE, _recovery=True)
+        self.assertFalse(success)
+
+    def test_equivalence_helper(self):
+        from agentchanti.orchestrator.agent_loop import (
+            commands_equivalent_modulo_flags,
+        )
+        self.assertTrue(commands_equivalent_modulo_flags(
+            self._FIXED, self._GATE))
+        self.assertTrue(commands_equivalent_modulo_flags(
+            "pip install pygame", "pip install --yes -q pygame"))
+        # Identical strings prove nothing new — the gate ran it itself.
+        self.assertFalse(commands_equivalent_modulo_flags(
+            self._GATE, self._GATE))
+        # Different non-flag args are different commands.
+        self.assertFalse(commands_equivalent_modulo_flags(
+            "pip install requests", "pip install --yes pygame"))
+        self.assertFalse(commands_equivalent_modulo_flags(None, self._GATE))
+        self.assertFalse(commands_equivalent_modulo_flags("", ""))
+
+
 class TestDeclaredVerifyGate(unittest.TestCase):
     """The classic-path acceptance gate and its command resolution."""
 
