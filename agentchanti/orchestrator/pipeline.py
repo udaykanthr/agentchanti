@@ -4033,7 +4033,47 @@ def _missing_third_party_module(output: str, project_files) -> str | None:
         pn = p.replace("\\", "/")
         if pn.startswith(f"{mod}/") or f"/{mod}/" in f"/{pn}":
             return None
+        # A bare `import game` that resolves to a project `*/game.py` file is
+        # local: failing to import it is a sys.path problem, never a missing
+        # PyPI package. Pip-installing the name (a real `game` package exists
+        # on PyPI) is a dependency-confusion hazard — observed clobbering a
+        # project's own module with an unrelated download.
+        if pn.rsplit("/", 1)[-1] == f"{mod}.py":
+            return None
     return mod
+
+
+def _plan_declared_suite_cmd(all_plan_steps, test_files) -> str | None:
+    """The single verify command the plan declared for the collected TEST
+    files, or ``None`` when zero / more than one distinct command applies.
+
+    BulkTest otherwise substitutes the framework default runner (pytest for
+    Python), which can resolve imports *differently* than the command the
+    planner declared and the agent loop already passed: bare sibling imports
+    inside a ``src/`` package resolve under ``unittest discover -s src`` but
+    not under ``pytest`` run from the repo root. Preferring the declared
+    command avoids manufacturing an import failure the suite never had.
+
+    Only returned when one command covers *every* collected test file — a
+    single per-file command would silently skip the others.
+    """
+    if not all_plan_steps:
+        return None
+    want = {f.replace("\\", "/") for f in test_files}
+    cmds: set[str] = set()
+    covered: set[str] = set()
+    for ps in all_plan_steps:
+        cmd = getattr(ps, "verify_cmd", None)
+        if not cmd:
+            continue
+        for tf in getattr(ps, "target_files", []):
+            tfn = tf.replace("\\", "/")
+            if tfn in want:
+                cmds.add(" ".join(cmd.split()))
+                covered.add(tfn)
+    if len(cmds) == 1 and covered == want:
+        return next(iter(cmds))
+    return None
 
 
 def run_bulk_test_execution_and_fix(
@@ -4176,6 +4216,31 @@ def run_bulk_test_execution_and_fix(
     if "vitest" in base_cmd.lower():
         from .step_handlers import ensure_vitest_env
         ensure_vitest_env(executor, subproject_cwd, test_files, memory=memory)
+
+    # ── Preflight: honor the plan's declared TEST verify command ─────────
+    # The planner declares an acceptance gate per TEST step and the agent
+    # loop already gated the step on it. Substituting the framework default
+    # runner here can flip a passing suite to failing purely by changing
+    # import roots (e.g. bare `from game import Game` in a src/ package
+    # resolves under `unittest discover -s src` but not `pytest` from the
+    # repo root). Run the declared command first; only fall back to the
+    # framework runner if it genuinely does not pass.
+    _declared_suite = _plan_declared_suite_cmd(all_plan_steps, test_files)
+    if _declared_suite and _declared_suite != " ".join(base_cmd.split()):
+        _logger.info("[BulkTest] Running plan-declared suite gate first: %s",
+                     _declared_suite)
+        _pf_ok, _pf_out = executor.run_command(
+            _declared_suite, cwd=subproject_cwd)
+        if _pf_ok:
+            _logger.info("[BulkTest] Suite passed via plan-declared gate — "
+                         "skipping framework re-run.")
+            print("  [BulkTest] All tests passed (plan-declared gate).")
+            for fpath in test_files:
+                display.record_test_result(
+                    fpath, passed=1, total=1, failures=[])
+            return True, ""
+        _logger.info("[BulkTest] Plan-declared gate did not pass — falling "
+                     "back to framework runner (%s).", base_cmd)
 
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)

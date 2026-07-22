@@ -9,7 +9,52 @@ whose fix was one pip install.
 from agentchanti.orchestrator.pipeline import (
     _ensure_pytest_available,
     _missing_third_party_module,
+    _plan_declared_suite_cmd,
 )
+
+
+class _Step:
+    def __init__(self, target_files, verify_cmd=None):
+        self.target_files = target_files
+        self.verify_cmd = verify_cmd
+
+
+class TestPlanDeclaredSuiteCmd:
+    def test_single_command_covering_all_files(self):
+        steps = [_Step(["src/test_game.py"],
+                       'python -m unittest discover -s src -p "test_*.py" -v')]
+        cmd = _plan_declared_suite_cmd(steps, {"src/test_game.py": ""})
+        assert cmd == 'python -m unittest discover -s src -p "test_*.py" -v'
+
+    def test_normalizes_whitespace(self):
+        steps = [_Step(["t/test_x.py"], "python  -m   unittest  discover")]
+        assert _plan_declared_suite_cmd(
+            steps, {"t/test_x.py": ""}) == "python -m unittest discover"
+
+    def test_uncovered_file_yields_none(self):
+        # A declared command that only covers one of two collected files must
+        # not be used as the suite command (it would skip the other).
+        steps = [_Step(["t/test_a.py"], "pytest t/test_a.py")]
+        assert _plan_declared_suite_cmd(
+            steps, {"t/test_a.py": "", "t/test_b.py": ""}) is None
+
+    def test_conflicting_commands_yield_none(self):
+        steps = [
+            _Step(["t/test_a.py"], "cmd-one"),
+            _Step(["t/test_b.py"], "cmd-two"),
+        ]
+        assert _plan_declared_suite_cmd(
+            steps, {"t/test_a.py": "", "t/test_b.py": ""}) is None
+
+    def test_no_declared_command_yields_none(self):
+        steps = [_Step(["t/test_a.py"], None)]
+        assert _plan_declared_suite_cmd(steps, {"t/test_a.py": ""}) is None
+        assert _plan_declared_suite_cmd(None, {"t/test_a.py": ""}) is None
+
+    def test_matches_across_path_separators(self):
+        steps = [_Step(["src\\test_game.py"], "unittest-cmd")]
+        assert _plan_declared_suite_cmd(
+            steps, {"src/test_game.py": ""}) == "unittest-cmd"
 
 
 class _StubExecutor:
@@ -60,6 +105,14 @@ class TestMissingThirdPartyModule:
     def test_top_level_local_module_not_installable(self):
         out = "ModuleNotFoundError: No module named 'utils'"
         assert _missing_third_party_module(out, self.FILES) is None
+
+    def test_bare_sibling_module_file_not_installable(self):
+        # `import game` resolving to `src/game.py` is a sys.path problem;
+        # pip-installing the (real, unrelated) PyPI `game` package would
+        # clobber the project's own module — a dependency-confusion hazard.
+        files = ["src/game.py", "src/player.py", "src/test_game.py"]
+        out = "ModuleNotFoundError: No module named 'game'"
+        assert _missing_third_party_module(out, files) is None
 
     def test_no_match_returns_none(self):
         assert _missing_third_party_module("2 failed, 1 passed", self.FILES) is None
