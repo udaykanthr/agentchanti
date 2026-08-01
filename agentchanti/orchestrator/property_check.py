@@ -173,8 +173,12 @@ def run_property_check(
     verify_cmd = f"python -m unittest -v {test_file[:-3]}"
     log.info("[PropertyCheck] Simulation detected (%s) — generating "
              "adversarial timing test", ", ".join(sim_files))
-    if display is not None:
-        display.step_info(step_idx, "Property check: adversarial frame timing")
+    # This stage is not a plan step: route its loop progress to the status
+    # footer instead of overwriting the row of whatever step `step_idx`
+    # happens to name.
+    from ..cli_display import set_status, status_only
+    set_status(display, "Property check: adversarial frame timing")
+    loop_display = status_only(display, "Property check")
 
     try:
         # The whole stage sits inside the guard, not just the loop call:
@@ -185,7 +189,7 @@ def run_property_check(
         ok, info = run_agent_loop_with_escalation(
             llm_client, tools, step_text, task,
             escalation_client=getattr(coder, "escalation_client", None),
-            display=display, step_idx=step_idx, language=language,
+            display=loop_display, step_idx=step_idx, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             preload_files=sim_files + [test_file],

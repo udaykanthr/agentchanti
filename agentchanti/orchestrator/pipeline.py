@@ -2927,24 +2927,27 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             return False
         display.step_info(step_idx, "Agent loop: recovering from failure")
         _rec_step_type = display.steps[step_idx].get("type", "CODE")
-        _rec_verify = None
-        if _rec_step_type == "TEST":
+        # The plan-declared gate wins, for every step type. Recovery runs
+        # AFTER the main loop failed its gate, so a recovery held to a
+        # weaker gate does not recover the step — it redefines success.
+        # Observed: a TEST step declaring `python -m unittest -v` (the
+        # task's own stated acceptance criterion) failed, recovery was
+        # handed the language default instead, pip-installed pytest, went
+        # green on `python -m pytest -q`, and the ledger recorded the
+        # SUBSTITUTE. `unittest` was never checked again and the run
+        # reported Finished. CODE steps used to recover with no gate at
+        # all, resting entirely on the model's own summary — an honest
+        # "the verification is still failing" that happened not to end
+        # with the RECOVERY: blocked marker counted as success.
+        from .step_handlers import _declared_verify_cmd
+        _rec_verify = _declared_verify_cmd(plan_step, memory, task=task)
+        if _rec_verify is None and _rec_step_type == "TEST":
+            # No declared gate: fall back to the language-level default so
+            # a TEST recovery is still held to something deterministic.
             _rec_sub = _detect_subproject_root(memory)
             _rec_verify = verify_cmd_for_language(language, _rec_sub or ".")
             if _rec_verify and _rec_sub:
                 _rec_verify = f"cd {_rec_sub} && {_rec_verify}"
-        if _rec_verify is None:
-            # CODE steps used to recover with NO gate at all, so the exit
-            # rested entirely on the model's own summary — and an honest
-            # "the verification is still failing" that happens not to end
-            # with the RECOVERY: blocked marker counted as success. Observed:
-            # a ghost step whose declared gate asserted the ghost moves was
-            # marked recovered while the ghost stayed stationary, its gate
-            # was never recorded, and the run reported Finished over a game
-            # whose ghosts never move. The plan already declares the gate;
-            # hold recovery to it.
-            from .step_handlers import _declared_verify_cmd
-            _rec_verify = _declared_verify_cmd(plan_step, memory, task=task)
         _rec_tools = build_step_tools(
             executor, memory, kb_context_builder=kb_context_builder)
         try:

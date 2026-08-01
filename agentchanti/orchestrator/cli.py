@@ -309,7 +309,7 @@ def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
 
 
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
-                             repair=None) -> bool:
+                             repair=None, display=None) -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
 
     Must be called after **every** stage that can write source files —
@@ -333,6 +333,7 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     so the caller fails the run instead of reporting success over a red
     gate.
     """
+    from ..cli_display import set_status
     from .wave_snapshots import get_gate_ledger
 
     if not snapshots.managed:
@@ -345,9 +346,13 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
         return ", ".join(f"step {label or '?'}: `{cmd}`"
                          for cmd, label, _out in regs)
 
+    _n_gates = len(get_gate_ledger().gates())
+    set_status(display,
+               f"Re-checking {_n_gates} acceptance gate(s) after {stage}...")
     regressions = get_gate_ledger().recheck(executor)
 
     if regressions and repair is not None:
+        set_status(display, f"Gate regression after {stage} — repairing...")
         log.warning(
             "[Monotonic] %s broke %d previously-passing gate(s): %s — "
             "attempting one repair round before rolling back.",
@@ -364,8 +369,10 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     if not regressions:
         snapshots.commit_wave(stage)
         snapshots.mark_green()
+        set_status(display, "")
         return True
 
+    set_status(display, f"Rolling back — {stage} left gate(s) red")
     log.warning("[Monotonic] %s left %d gate(s) red: %s",
                 stage, len(regressions), _names(regressions))
     rb_ok, rb_msg = snapshots.rollback_to_last()
@@ -1683,7 +1690,7 @@ def _main_impl():
         # without this, HEAD (and so the rollback target) silently advances
         # onto the commit that introduced the regression.
         if not _enforce_monotonic_gates(
-                snapshots, executor, f"wave {wave_idx + 1}"):
+                snapshots, executor, f"wave {wave_idx + 1}", display=display):
             pipeline_success = False
             break
 
@@ -1692,9 +1699,11 @@ def _main_impl():
     #   • parallel wave steps don't race to run the full suite simultaneously
     #   • source fixes for one test can't break another before it's verified
     # Run all test files once; fix failing ones one at a time; final run-all.
+    from ..cli_display import set_status
     verif_ok = False
     if pipeline_success:
         from .pipeline import run_bulk_test_execution_and_fix
+        set_status(display, "Running the full test suite...")
         verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
@@ -1717,7 +1726,8 @@ def _main_impl():
         # previously-green per-step gate red is a regression. Re-run the
         # recorded gates and roll the workdir back to the last green
         # snapshot rather than shipping the regression.
-        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes"):
+        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes",
+                                        display=display):
             pipeline_success = False
             verif_ok = False
 
@@ -1761,6 +1771,7 @@ def _main_impl():
     # loop.  Skips silently when there is no runnable entry point.
     if pipeline_success:
         from .smoke_test import run_smoke_verification
+        set_status(display, "Launching the app to check it starts...")
         smoke_ok, smoke_err = run_smoke_verification(
             memory=memory,
             executor=executor,
@@ -1785,6 +1796,8 @@ def _main_impl():
         # skips silently unless the project has an update(dt) loop.
         else:
             from .property_check import run_property_check
+            set_status(display,
+                       "Checking invariants under randomised frame timing...")
             prop_ok, prop_err = run_property_check(
                 memory=memory,
                 executor=executor,
@@ -1834,7 +1847,7 @@ def _main_impl():
 
             if not _enforce_monotonic_gates(
                     snapshots, executor, "smoke-test fixes",
-                    repair=_repair_tests_after_smoke):
+                    repair=_repair_tests_after_smoke, display=display):
                 pipeline_success = False
                 log.warning(
                     "[SmokeTest] The launch fix left a previously-passing "
@@ -1855,11 +1868,15 @@ def _main_impl():
     # Patterns/fixes from completed steps are valuable regardless of
     # overall pipeline outcome — especially fixes learned from failures.
     if knowledge_base:
+        set_status(display, "Extracting learnings from this run...")
         try:
             knowledge_base.extract_from_run(
                 args.task, steps, memory.as_dict(), llm_client)
         except Exception as e:
             log.warning(f"Knowledge extraction failed: {e}")
+    # Every post-wave stage is done; clear the footer so the finish screen
+    # is not printed under a stale "still working" message.
+    set_status(display, "")
 
     # ── 16. Finish ──
     if pipeline_success:

@@ -18,6 +18,8 @@ import logging
 import os
 import re
 
+from ..cli_display import status_only as _status_only
+
 _logger = logging.getLogger(__name__)
 
 # A module with a __main__ guard is a runnable entry point
@@ -565,7 +567,8 @@ def _run_django_verification(memory, executor, coder, display,
                                "rendered HTML)."),
                     task=task,
                     error_info=f"Django verification failed:\n{out}",
-                    display=display, step_idx=0, language=language,
+                    display=_status_only(display, "Django verification"),
+                    step_idx=0, language=language,
                     max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
                     verify_cmd=verify_cmd,
                     escalation_client=getattr(coder, "escalation_client", None))
@@ -670,7 +673,8 @@ def _run_js_build_verification(memory, executor, coder, display,
             step_text=f"Make the production build pass: {build_cmd}",
             task=task,
             error_info=f"Command `{build_cmd}` failed.\nOutput:\n{out}",
-            display=display, step_idx=0, language=language,
+            display=_status_only(display, "Production build"),
+            step_idx=0, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=build_cmd,
             escalation_client=getattr(coder, "escalation_client", None))

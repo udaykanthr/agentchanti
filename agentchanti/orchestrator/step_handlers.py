@@ -5419,7 +5419,8 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                 from .agent_loop import attempt_env_self_heal
                 _healed: set = set()
                 while not _pre_ok and attempt_env_self_heal(
-                        tools, _pre_out or "", language, _healed, verify_cmd):
+                        tools, _pre_out or "", language, _healed, verify_cmd,
+                        planned_files=_loop_preload_paths(plan_step)):
                     _pre_ok, _pre_out = executor.run_command(
                         verify_cmd, timeout=300)
             _status = "PASSING" if _pre_ok else "FAILING"

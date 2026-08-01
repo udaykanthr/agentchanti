@@ -231,6 +231,63 @@ def _format_elapsed(elapsed: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+def set_status(display, message: str) -> None:
+    """Set *display*'s status line, tolerating displays that lack one.
+
+    Post-wave stages (bulk test, smoke test, property check, gate
+    recheck, learning extraction) run for a minute or more after the last
+    step panel goes green. Without a status line the UI shows a finished
+    step list while only the clock and token counters move, which reads
+    as a hang — the run looks frozen at exactly the point where the
+    slowest LLM calls happen.
+
+    Defensive by design: ``display`` is a stub or ``None`` in tests and in
+    the library path, and a missing progress message must never be the
+    thing that fails a run.
+    """
+    fn = getattr(display, "show_status", None)
+    if callable(fn):
+        try:
+            fn(message)
+        except Exception:      # a broken renderer must not kill the run
+            pass
+
+
+class _StatusOnlyDisplay:
+    """Display proxy that routes ``step_info`` to the status footer.
+
+    The post-wave loops (smoke-test repair, property check) are not plan
+    steps, but they call ``run_agent_loop`` / ``run_recovery_loop`` with
+    ``step_idx=0`` — so their per-turn progress was written into the row
+    belonging to step 1, which finished minutes earlier. Observed: step 1
+    ("Create the virtual environment", long green) reading
+    "Agent loop 3/8: edit_file" during the property check.
+
+    Everything else passes straight through to the real display, so token
+    accounting and rendering are unaffected.
+    """
+
+    def __init__(self, display, prefix: str):
+        self._display = display
+        self._prefix = prefix
+
+    def step_info(self, _step_idx, text: str) -> None:
+        set_status(self._display, f"{self._prefix}: {text}")
+
+    def __getattr__(self, name):
+        return getattr(self._display, name)
+
+
+def status_only(display, prefix: str):
+    """Wrap *display* so agent-loop progress shows in the status footer.
+
+    Returns ``None`` unchanged — callers already guard on it.
+    """
+    if display is None:
+        return None
+    return _StatusOnlyDisplay(display, prefix)
+
+
 # ── Main Display Class ────────────────────────────────────────────────────────
 
 class CLIDisplay:

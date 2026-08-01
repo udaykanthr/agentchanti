@@ -488,6 +488,38 @@ class TestEnvSelfHeal(AgentLoopTestCase):
         self.assertFalse(fired)
         self.executor.run_command.assert_not_called()
 
+    def test_a_planned_package_directory_is_never_pip_installed(self):
+        """Same hazard, one level up: the module is a PACKAGE the step makes.
+
+        Observed: a step targeting `tests/__init__.py, tests/test_map.py`
+        failed its gate with "No module named 'tests'" before either file
+        existed, and the pre-loop heal fired
+        `pip install tests` — a real name on PyPI.
+        """
+        healed: set[str] = set()
+        fired = attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'tests'",
+            "python", healed, verify_cmd="python -m unittest -v tests.test_map",
+            planned_files=["tests/__init__.py", "tests/test_map.py"])
+        self.assertFalse(fired)
+        self.executor.run_command.assert_not_called()
+
+    def test_test_step_preloop_heal_passes_the_planned_targets(self):
+        """The guard only works if the call site actually supplies them.
+
+        The in-loop `_run_verify` heal passed `planned_files`; the pre-loop
+        heal in `_handle_test_step` did not, which is how `pip install
+        tests` still reached the network.
+        """
+        import inspect
+
+        from agentchanti.orchestrator import step_handlers
+        src = inspect.getsource(step_handlers)
+        idx = src.find("while not _pre_ok and attempt_env_self_heal(")
+        self.assertGreater(idx, 0, "pre-loop heal call not found")
+        self.assertIn("planned_files=", src[idx:idx + 300],
+                      "the pre-loop heal must pass the step's planned files")
+
     def test_a_real_missing_package_still_heals(self):
         self.executor.run_command.return_value = (True, "installed")
         healed: set[str] = set()
@@ -947,6 +979,49 @@ class TestDiagnosisLoopRecovery(unittest.TestCase):
         _run_diagnosis_loop(0, "step text", "assertion failed",
                             plan_step=step, **kwargs)
         self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_test_step_recovery_keeps_the_declared_gate(self, mock_rec):
+        """A TEST step's recovery used to get the LANGUAGE DEFAULT instead.
+
+        Recovery runs only after the main loop already failed the declared
+        gate, so handing recovery a different command does not recover the
+        step — it redefines success. Observed: a step declaring
+        `python -m unittest -v` (the task's own stated acceptance
+        criterion) failed on a native crash, recovery was gated on
+        `python -m pytest -q`, pip-installed pytest, went green, and the
+        ledger recorded the SUBSTITUTE. `unittest` was never checked again
+        and the run reported Finished.
+        """
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        gate = "python -m unittest -v"
+        step = PlanStep(id="11.1", step_type="TEST", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["display"].steps = [{"type": "TEST"}]
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "suite failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_test_step_recovery_falls_back_when_nothing_declared(
+            self, mock_rec):
+        """With no declared gate, a TEST recovery still gets a real one."""
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        step = PlanStep(id="11.1", step_type="TEST", index=0, verify_cmd=None)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["display"].steps = [{"type": "TEST"}]
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "suite failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"],
+                         "python -m pytest -q")
 
     @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
            return_value=(True, "fixed"))
