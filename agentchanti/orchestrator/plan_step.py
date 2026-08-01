@@ -1929,15 +1929,70 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
 
     # Safety: verify we didn't introduce a cycle
     if fixes and _has_cycle(steps):
-        # Roll back all injected deps (unlikely but safe)
-        _rollback = {f.split(" — ")[0]: f.split("depends:")[1] for f in fixes}
-        for step in steps:
-            for desc, dep_id in _rollback.items():
-                if dep_id in step.depends_on and f"Step {step.id}" in desc:
-                    step.depends_on.remove(dep_id)
-        fixes.append("WARNING: rolled back fixes — injecting deps would create a cycle")
+        # A package initializer that re-exports its siblings is the usual
+        # cause, and the cycle is one-sided: `pacman/__init__.py` genuinely
+        # needs pacman/map.py etc. to exist, but nothing needs the
+        # initializer written before them — Python makes the package from
+        # the directory. Drop the edges INTO the initializer and the order
+        # resolves correctly, with __init__ last.
+        #
+        # Rolling everything back instead left the initializer scheduled
+        # FIRST, which is the one order guaranteed to break. Observed: a
+        # plan where 3.1 declared depends:2.1 and 2.1 imported Game from
+        # 3.1; the rollback ran 2.1 in wave 2, its gate
+        # `from pacman import Player, Ghost, Map, Game` passed against
+        # placeholder classes the model wrote to satisfy it, the real
+        # map.py landed in wave 3, the gate regressed, and the run rolled
+        # back and reported failure having spent 133k tokens.
+        freed = _break_cycle_at_package_inits(steps)
+        if freed:
+            fixes.extend(freed)
+        if _has_cycle(steps):
+            # Still cyclic — fall back to the blunt rollback.
+            _rollback = {f.split(" — ")[0]: f.split("depends:")[1]
+                         for f in fixes if "depends:" in f}
+            for step in steps:
+                for desc, dep_id in _rollback.items():
+                    if dep_id in step.depends_on and f"Step {step.id}" in desc:
+                        step.depends_on.remove(dep_id)
+            fixes.append("WARNING: rolled back fixes — injecting deps "
+                         "would create a cycle")
 
     return fixes
+
+
+def _is_package_init(step: PlanStep) -> bool:
+    """True when *step* only produces package ``__init__`` files."""
+    targets = [t.replace("\\", "/") for t in (step.target_files or [])]
+    return bool(targets) and all(
+        t.rsplit("/", 1)[-1] in ("__init__.py", "index.js", "index.ts")
+        for t in targets
+    )
+
+
+def _break_cycle_at_package_inits(steps: list[PlanStep]) -> list[str]:
+    """Remove dependencies *on* package initializers to break a cycle.
+
+    Returns a description of each edge removed. Only touches steps that
+    produce nothing but ``__init__``-style files, so an ordinary module
+    keeps every edge it declared.
+    """
+    init_ids = {s.id for s in steps if _is_package_init(s)}
+    if not init_ids:
+        return []
+    removed: list[str] = []
+    for step in steps:
+        if step.id in init_ids:
+            continue        # the initializer's own deps are the real ones
+        for dep in list(step.depends_on):
+            if dep in init_ids:
+                step.depends_on.remove(dep)
+                removed.append(
+                    f"Step {step.id} no longer waits on package initializer "
+                    f"step {dep} — nothing needs __init__ written first, and "
+                    f"the reverse edge is real (it re-exports this module)"
+                )
+    return removed
 
 
 def _has_cycle(steps: list[PlanStep]) -> bool:
@@ -1972,6 +2027,34 @@ def _has_cycle(steps: list[PlanStep]) -> bool:
 # Wave builder
 # ---------------------------------------------------------------------------
 
+def _phase_of(step_id: str) -> int:
+    """Primary step number, e.g. 2 for ``2.3``. Non-numeric IDs sort first."""
+    head = (step_id or "").split(".")[0]
+    return int(head) if head.isdigit() else 0
+
+
+def _effective_phases(steps: list[PlanStep]) -> dict[str, int]:
+    """Phase per step, raised so no step precedes something it depends on.
+
+    A step keeps its declared phase unless a dependency sits in a later
+    one, in which case it joins that phase — the intra-phase topological
+    sort then orders the two correctly. Only ever moves steps later, so
+    the "setup phases finish first" guarantee is untouched.
+    """
+    known = {s.id for s in steps}
+    eff = {s.id: _phase_of(s.id) for s in steps}
+    for _ in range(len(steps) + 1):        # fixed point, bounded
+        changed = False
+        for s in steps:
+            for dep in s.depends_on:
+                if dep in known and eff[dep] > eff[s.id]:
+                    eff[s.id] = eff[dep]
+                    changed = True
+        if not changed:
+            break
+    return eff
+
+
 def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
     """Topological sort into parallel execution waves, respecting phase order.
 
@@ -1988,11 +2071,21 @@ def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
     step_map = {s.id: s for s in steps}
 
     # ── Group steps by primary number ──
+    # A step that depends on a LATER phase is promoted to that phase.
+    # Phases are otherwise walked in ID order, so such a dependency could
+    # never be satisfied: the step fell into the "circular or missing
+    # deps" escape hatch below and ran anyway, in the one order guaranteed
+    # to fail. Observed with a package initializer — `pacman/__init__.py`
+    # re-exports Game from a phase-3 step, so it belongs after it, but it
+    # ran in phase 2 against classes that did not exist yet, passed its
+    # gate on placeholders, then regressed when the real module landed and
+    # took the whole run down with it.
+    _eff = _effective_phases(steps)
+
     from collections import OrderedDict
-    phase_groups: OrderedDict[str, list[PlanStep]] = OrderedDict()
-    for s in steps:
-        primary = s.id.split(".")[0] if "." in s.id else s.id
-        phase_groups.setdefault(primary, []).append(s)
+    phase_groups: OrderedDict[int, list[PlanStep]] = OrderedDict()
+    for s in sorted(steps, key=lambda s: (_eff[s.id], s.id)):
+        phase_groups.setdefault(_eff[s.id], []).append(s)
 
     # ── Infer implicit deps: within a phase, steps with no declared deps
     #    should wait for any CMD steps that precede them (by step ID).

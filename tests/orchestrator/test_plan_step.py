@@ -1302,3 +1302,107 @@ verify: python -c "import main"
         files = build_step_context(step6, steps, self._Mem(),
                                    read_from_disk=lambda p: None)
         self.assertEqual(files, {})
+
+
+class TestPackageInitOrdering(unittest.TestCase):
+    """A package initializer that re-exports siblings must be written LAST.
+
+    Observed live: the planner put `pacman/__init__.py` in phase 2 with
+    other steps declaring depends:2.1, while the initializer itself
+    imported Game from a phase-3 step. fix_import_dependencies detected
+    the cycle and rolled back EVERY injected edge, leaving the
+    initializer scheduled first — the one order guaranteed to break. Its
+    gate `from pacman import Player, Ghost, Map, Game` passed against
+    placeholder classes the model wrote to satisfy it, the real modules
+    landed in later waves, the gate regressed, and the run rolled back
+    and reported failure after 133k tokens.
+    """
+
+    PLAN = """==PLAN==
+
+--STEP 2.1 [CODE] depends:none
+Package initializer re-exporting the game classes.
+target: pacman/__init__.py
+exports: Player, Map, Game
+imports: pacman.map:Map, pacman.player:Player, pacman.game:Game
+verify: python -c "from pacman import Player, Map, Game"
+
+--STEP 2.2 [CODE] depends:none
+Map module.
+target: pacman/map.py
+exports: Map
+imports: none
+verify: python -c "import pacman.map"
+
+--STEP 2.3 [CODE] depends:2.2
+Player module.
+target: pacman/player.py
+exports: Player
+imports: pacman.map:Map
+verify: python -c "import pacman.player"
+
+--STEP 3.1 [CODE] depends:2.1, 2.2, 2.3
+Game module.
+target: pacman/game.py
+exports: Game
+imports: pacman.map:Map, pacman.player:Player
+verify: python -c "import pacman.game"
+
+==END==
+"""
+
+    def _ordered(self):
+        steps = parse_structured_plan(self.PLAN)
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        return steps, [s.id for w in waves for s in w]
+
+    def test_the_cycle_is_broken_without_discarding_every_edge(self):
+        steps, _ = self._ordered()
+        from agentchanti.orchestrator.plan_step import _has_cycle
+        self.assertFalse(_has_cycle(steps))
+        init = next(s for s in steps if s.id == "2.1")
+        self.assertIn("2.2", init.depends_on,
+                      "the initializer's real dependencies must survive")
+        self.assertIn("3.1", init.depends_on)
+
+    def test_nothing_waits_on_the_package_initializer(self):
+        steps, _ = self._ordered()
+        game = next(s for s in steps if s.id == "3.1")
+        self.assertNotIn("2.1", game.depends_on,
+                         "Python builds the package from the directory; "
+                         "no module needs __init__ written first")
+
+    def test_the_initializer_is_scheduled_last(self):
+        _, order = self._ordered()
+        self.assertEqual(order[-1], "2.1", f"order was {order}")
+
+    def test_every_reexported_module_precedes_it(self):
+        _, order = self._ordered()
+        init_at = order.index("2.1")
+        for produced in ("2.2", "2.3", "3.1"):
+            self.assertLess(order.index(produced), init_at,
+                            f"{produced} must precede the initializer")
+
+
+class TestEffectivePhases(unittest.TestCase):
+    """Phases are walked in ID order, so a later-phase dependency could
+    never be satisfied — the step hit the missing-deps escape hatch and
+    ran anyway, before the thing it needed."""
+
+    def test_a_later_phase_dependency_promotes_the_step(self):
+        from agentchanti.orchestrator.plan_step import _effective_phases
+        steps = parse_structured_plan(TestPackageInitOrdering.PLAN)
+        fix_import_dependencies(steps)
+        eff = _effective_phases(steps)
+        self.assertEqual(eff["2.1"], 3,
+                         "2.1 depends on the phase-3 step, so it joins it")
+        self.assertEqual(eff["2.2"], 2, "untouched steps keep their phase")
+
+    def test_steps_are_never_promoted_earlier(self):
+        from agentchanti.orchestrator.plan_step import (
+            _effective_phases, _phase_of)
+        steps = parse_structured_plan(TestPackageInitOrdering.PLAN)
+        eff = _effective_phases(steps)
+        for s in steps:
+            self.assertGreaterEqual(eff[s.id], _phase_of(s.id))
