@@ -14,8 +14,12 @@ from agentchanti.orchestrator.agent_loop import (
     RECOVERY_BLOCKED_MARKER,
     RECOVERY_FAILED_MARKER,
     agent_loop_enabled,
+    attempt_env_self_heal,
+    attempt_digest,
     build_step_tools,
     get_loop_stats,
+    record_attempt,
+    reset_attempt_journal,
     loop_stats_summary,
     reset_loop_stats,
     reverifiable_cmd,
@@ -408,6 +412,31 @@ class TestEnvSelfHeal(AgentLoopTestCase):
     """Missing-dependency verify failures are healed with one install
     instead of being fed to the model (the observed run burned 16 turns
     while the fix was `pip install pytest`)."""
+
+    def test_the_step_s_own_target_is_never_pip_installed(self):
+        """A TEST step's gate fails before the test file exists.
+
+        `python -m unittest -v test_main` reports "No module named
+        test_main" on the first run; memory has no such file yet, so the
+        heal fired `pip install test_main` — a pointless call, and exactly
+        the dependency-confusion hazard the local-module guard exists to
+        prevent. The plan already declares the file as this step's target.
+        """
+        healed: set[str] = set()
+        fired = attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'test_main'",
+            "python", healed, verify_cmd="python -m unittest -v test_main",
+            planned_files=["test_main.py"])
+        self.assertFalse(fired)
+        self.executor.run_command.assert_not_called()
+
+    def test_a_real_missing_package_still_heals(self):
+        self.executor.run_command.return_value = (True, "installed")
+        healed: set[str] = set()
+        self.assertTrue(attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'pytest'",
+            "python", healed, verify_cmd="python -m pytest",
+            planned_files=["test_main.py"]))
 
     def test_missing_python_module_installed_and_reverified(self):
         self.executor.run_command.side_effect = [
@@ -838,6 +867,63 @@ class TestDiagnosisLoopRecovery(unittest.TestCase):
         self.assertTrue(result)
         mock_rec.assert_called_once()
 
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_code_step_recovery_is_gated_on_the_declared_verify(self, mock_rec):
+        """A CODE step's recovery used to run with verify_cmd=None.
+
+        The exit then rested entirely on the model's summary, and an honest
+        "the verification is still failing" that happens not to end with the
+        RECOVERY: blocked marker counted as success. Observed: a ghost step
+        whose declared gate asserted the ghost moves was marked recovered
+        while the ghost stayed stationary, and the run reported Finished.
+        """
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        gate = ('python -c "from ghost import Ghost; g=Ghost(); '
+                'p0=g.pixel_pos(); g.update(0.2); assert g.pixel_pos()!=p0"')
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "assertion failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_recovered_step_records_its_gate(self, mock_rec):
+        """Otherwise nothing rechecks that gate for the rest of the run."""
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        gate = 'python -c "import g; assert g.ok()"'
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        self.assertTrue(_run_diagnosis_loop(
+            0, "step text", "assertion failed", plan_step=step, **kwargs))
+        self.assertIn(gate, get_gate_ledger().gates())
+        get_gate_ledger().reset()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(False, "still broken"))
+    def test_failed_recovery_records_no_gate(self, mock_rec):
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        gate = 'python -c "import g; assert g.ok()"'
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        self.assertFalse(_run_diagnosis_loop(
+            0, "step text", "assertion failed", plan_step=step, **kwargs))
+        self.assertEqual(get_gate_ledger().gates(), {})
+
     @patch("agentchanti.orchestrator.pipeline._diagnose_failure")
     @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
            return_value=(False, "could not fix"))
@@ -1067,6 +1153,133 @@ class TestLoopEscalation(unittest.TestCase):
             escalation_client=primary)
         self.assertEqual(result, (False, "failed"))
         mock_loop.assert_called_once()
+
+
+class TestAttemptJournal(AgentLoopTestCase):
+    """Cross-attempt memory for the retry ladder.
+
+    Modelled on the run that spent 54 turns and 497k tokens across four
+    blind attempts, each re-editing the same three files with conflicting
+    fixes, none of them finding a two-line bug.
+    """
+
+    def _record_pacman_ladder(self):
+        record_attempt(0, "first attempt", "verify-failed",
+                       ["tests/test_gameplay.py"] * 6,
+                       [("python -m unittest discover -s tests -v", False)],
+                       "Adjusted the ghost direction assertions.")
+        record_attempt(0, "escalation (stronger model)", "verify-failed",
+                       ["src/ghost.py", "src/game.py", "src/player.py"],
+                       [("python -m unittest discover -s tests -v", False)],
+                       "Rewrote ghost movement; tests still fail.")
+
+    def test_digest_is_empty_before_any_attempt(self):
+        self.assertEqual(attempt_digest(0), "")
+
+    def test_digest_names_files_commands_and_verdicts(self):
+        self._record_pacman_ladder()
+        digest = attempt_digest(0)
+        self.assertIn("attempt 1", digest)
+        self.assertIn("attempt 2", digest)
+        self.assertIn("tests/test_gameplay.py (x6)", digest)
+        self.assertIn("src/ghost.py", digest)
+        self.assertIn("-> FAILED", digest)
+        self.assertIn("Rewrote ghost movement", digest)
+
+    def test_digest_flags_files_churned_across_attempts(self):
+        """The signal that matters: same files, still red, wrong cause."""
+        record_attempt(0, "first attempt", "verify-failed",
+                       ["src/ghost.py"], [], "no luck")
+        record_attempt(0, "escalation", "verify-failed",
+                       ["src/ghost.py"], [], "still no luck")
+        digest = attempt_digest(0)
+        self.assertIn("NOTE:", digest)
+        self.assertIn("src/ghost.py", digest.split("NOTE:")[1])
+
+    def test_no_churn_note_for_a_single_attempt(self):
+        record_attempt(0, "first attempt", "verify-failed",
+                       ["src/ghost.py", "src/ghost.py"], [], "x")
+        self.assertNotIn("NOTE:", attempt_digest(0))
+
+    def test_journal_is_per_step(self):
+        record_attempt(0, "first attempt", "verify-failed", ["a.py"], [], "x")
+        self.assertEqual(attempt_digest(1), "")
+
+    def test_reset_clears_it(self):
+        record_attempt(0, "first attempt", "verify-failed", ["a.py"], [], "x")
+        reset_attempt_journal()
+        self.assertEqual(attempt_digest(0), "")
+
+    def test_digest_is_bounded(self):
+        for i in range(12):
+            record_attempt(0, f"attempt-{i}", "verify-failed",
+                           [f"f{j}.py" for j in range(30)],
+                           [(f"cmd-{j}", False) for j in range(20)],
+                           "x" * 4000)
+        digest = attempt_digest(0)
+        # 4 most recent attempts only, and the oldest are dropped.
+        self.assertIn("attempt-11", digest)
+        self.assertNotIn("attempt-0 ", digest)
+        self.assertIn("more", digest)   # file list truncated
+        self.assertLess(len(digest), 6000)
+
+    def test_loop_records_edits_and_commands(self):
+        """The journal is populated from real tool traffic, not hand-fed."""
+        llm = self._llm(
+            _tool_response(ToolCall(
+                name="write_file",
+                arguments={"path": "app.py", "content": "x = 1\n"},
+                id="1")),
+            _tool_response(ToolCall(
+                name="run_command",
+                arguments={"command": "false-cmd"}, id="2")),
+            _final("could not finish"),
+        )
+        self.executor.run_command.return_value = (False, "boom")
+        ok, _ = run_agent_loop(llm, self.tools, "step", "task",
+                               max_turns=3, verify_cmd="check")
+        self.assertFalse(ok)
+        digest = attempt_digest(0)
+        self.assertIn("app.py", digest)
+        self.assertIn("false-cmd", digest)
+        self.assertIn("-> FAILED", digest)
+
+    def test_failed_edit_is_not_recorded_as_an_edit(self):
+        """AgentTools returns errors as strings; a rejected edit must not
+        look like a change the next attempt should avoid repeating."""
+        llm = self._llm(
+            _tool_response(ToolCall(
+                name="edit_file",
+                arguments={"path": "missing.py", "old": "a", "new": "b"},
+                id="1")),
+            _final("gave up"),
+        )
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=2)
+        self.assertNotIn("missing.py", attempt_digest(0))
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_escalation_context_carries_digest_and_full_error(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            run_agent_loop_with_escalation,
+        )
+        self._record_pacman_ladder()
+        mock_loop.side_effect = [
+            (False, "AssertionError: (2, 2) == (2, 2)"),
+            (True, "ok"),
+        ]
+        primary = MagicMock()
+        escalation = MagicMock()
+        escalation.supports_tools.return_value = True
+        run_agent_loop_with_escalation(
+            primary, MagicMock(), "step", "task",
+            escalation_client=escalation, step_idx=0)
+        ctx = mock_loop.call_args_list[1][1]["context"]
+        self.assertIn("Previous attempts", ctx)          # narrative
+        self.assertIn("src/ghost.py", ctx)
+        self.assertIn("AssertionError: (2, 2)", ctx)     # full latest error
+        self.assertEqual(
+            mock_loop.call_args_list[1][1]["attempt_label"],
+            "escalation (stronger model)")
 
 
 class TestPlanStepBrief(unittest.TestCase):

@@ -9,7 +9,187 @@ from agentchanti.orchestrator.plan_step import (
     fix_import_dependencies,
     is_structured_plan, build_waves,
     plan_looks_truncated,
+    shallow_gate_reason, check_gate_quality, check_gate_consistency,
 )
+
+
+class TestShallowGateDetection(unittest.TestCase):
+    """A verify: that can only ever pass makes the gate ledger decorative."""
+
+    def assert_shallow(self, cmd):
+        self.assertIsNotNone(
+            shallow_gate_reason(cmd), f"expected shallow: {cmd}")
+
+    def assert_substantive(self, cmd):
+        reason = shallow_gate_reason(cmd)
+        self.assertIsNone(reason, f"expected substantive: {cmd} -> {reason}")
+
+    def test_real_gates_that_shipped_a_broken_game(self):
+        """Every CODE gate from the Pac-Man run that shipped ghosts stuck
+        inside wall tiles. All were green; none could have failed."""
+        for cmd in [
+            'python -c "import constants; print(constants.SCREEN_WIDTH, constants.SCREEN_HEIGHT)"',
+            'python -c "from map import create_default_maze, Map; m=Map(create_default_maze()); print(m.width, m.height)"',
+            'python -c "from player import Player; print(Player)"',
+            'python -c "from ghost import Ghost; print(Ghost)"',
+            'python -c "from game import Game; print(Game)"',
+            'python -c "import main"',
+        ]:
+            self.assert_shallow(cmd)
+
+    def test_import_only_names_the_specific_weakness(self):
+        reason = shallow_gate_reason('python -c "import main"')
+        self.assertIn("only imports", reason)
+        reason = shallow_gate_reason('python -c "import m; print(m.X)"')
+        self.assertIn("never asserts", reason)
+
+    def test_test_runners_are_substantive(self):
+        for cmd in ['python -m pytest -q', 'python -m unittest -v',
+                    'python -m unittest discover -s tests -v',
+                    'npm test --silent', 'npm run test', 'go test ./...',
+                    'python manage.py test main --noinput', 'cargo test']:
+            self.assert_substantive(cmd)
+
+    def test_assertions_are_substantive(self):
+        for cmd in [
+            'python -c "from game import Game; g=Game(); assert len(g.ghosts)==4"',
+            'python -c "import m; raise SystemExit(0 if m.f(2)==4 else 1)"',
+        ]:
+            self.assert_substantive(cmd)
+
+    def test_escaped_quotes_do_not_hide_an_assertion(self):
+        """A non-greedy body stops at the first \\" and truncates the
+        payload, which made escaped gates unparseable and slip through."""
+        self.assert_substantive(
+            'python -c "import main; assert hasattr(main, \\"Game\\")"')
+
+    def test_node_gates(self):
+        self.assert_shallow('node -e "require(\'./src/server.js\')"')
+        self.assert_substantive(
+            'node -e "const v=require(\'./v.js\'); if (v.validate(\'\')) process.exit(1)"')
+
+    def test_unjudgeable_commands_are_left_alone(self):
+        """Build/check/lint commands do real work — never manufacture a
+        complaint about a command we cannot classify."""
+        for cmd in ['python manage.py check', 'npm run build',
+                    'tsc --noEmit', '', '   ']:
+            self.assert_substantive(cmd)
+
+    def test_syntactically_broken_payload_is_not_judged(self):
+        self.assert_substantive('python -c "import (((("')
+
+    def test_gate_survives_a_venv_prefix(self):
+        self.assert_shallow(
+            r'call venv\Scripts\activate && python -c "import src.map"')
+
+
+class TestInterpreterForms(unittest.TestCase):
+    """A gate is only judged if its interpreter is recognised.
+
+    Matching only a bare `python` meant `venv\\Scripts\\python.exe -c ...`
+    was skipped outright — not judged and passed, *skipped* — so an entire
+    run's gates went unchecked.
+    """
+
+    def test_pathed_and_suffixed_interpreters_are_judged(self):
+        for interp in ("python", "python3", "python3.11", "py",
+                       "python.exe", "venv\\Scripts\\python.exe",
+                       "../venv/bin/python3", "./venv/bin/python",
+                       "C:\\Python313\\python.exe"):
+            with self.subTest(interp=interp):
+                self.assertIsNotNone(
+                    shallow_gate_reason(f'{interp} -c "import x"'),
+                    f"{interp} was not judged at all")
+
+    def test_pathed_node_is_judged(self):
+        self.assertIsNotNone(
+            shallow_gate_reason('node_modules/.bin/node -e "require(\'./x\')"'))
+
+
+class TestGateConsistency(unittest.TestCase):
+    """Verify commands that assume a cwd they will not get."""
+
+    def _pacman_plan(self):
+        return [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["pacman_clone/src/config.py"],
+                     exports=["SCREEN_WIDTH", "TILE_SIZE"],
+                     verify_cmd='venv\\Scripts\\python.exe -c '
+                                '"from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+            PlanStep(id="3.2", step_type="CODE", index=1,
+                     target_files=["pacman_clone/main.py"], exports=["main"],
+                     verify_cmd='python -c "import main; '
+                                'assert callable(main.main)"'),
+        ]
+
+    def test_detects_the_duplicated_tree_shape(self):
+        """The plan that shipped every module twice.
+
+        Targets live under `pacman_clone/`, gates import as if cwd were
+        `pacman_clone/`. The loop made the gate pass by writing a second
+        copy of each module at the repo root.
+        """
+        issues = check_gate_consistency(self._pacman_plan())
+        self.assertEqual({sid for sid, _ in issues}, {"2.1", "3.2"})
+        self.assertIn("pacman_clone", issues[0][1])
+
+    def test_coherent_plan_reports_nothing(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/config.py"], exports=["TILE_SIZE"],
+                     verify_cmd='python -c "from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
+
+    def test_third_party_imports_are_not_flagged(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/config.py"], exports=["TILE_SIZE"],
+                     verify_cmd='python -c "import pygame; '
+                                'from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
+
+    def test_test_runner_gates_are_not_inspected(self):
+        steps = [
+            PlanStep(id="4.1", step_type="TEST", index=0,
+                     target_files=["pacman_clone/tests/test_x.py"],
+                     verify_cmd="python -m pytest -q"),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
+
+
+class TestCheckGateQuality(unittest.TestCase):
+
+    def test_flags_only_code_steps(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     verify_cmd='python -c "import a"'),
+            # TEST steps keep their assertions in the test file, not the cmd
+            PlanStep(id="3.1", step_type="TEST", index=1,
+                     verify_cmd='python -c "import b"'),
+            PlanStep(id="1.1", step_type="CMD", index=2,
+                     verify_cmd='python -c "import c"'),
+        ]
+        gaps = check_gate_quality(steps)
+        self.assertEqual([sid for sid, _ in gaps], ["2.1"])
+
+    def test_missing_verify_is_not_reported_here(self):
+        """Absent verify: is a separate check — don't double-report it."""
+        steps = [PlanStep(id="2.1", step_type="CODE", index=0)]
+        self.assertEqual(check_gate_quality(steps), [])
+
+    def test_clean_plan_reports_nothing(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     verify_cmd='python -c "import a; assert a.f(1)==2"'),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     verify_cmd="python -m pytest -q"),
+        ]
+        self.assertEqual(check_gate_quality(steps), [])
 
 
 class TestPlanLooksTruncated(unittest.TestCase):
@@ -603,6 +783,110 @@ class TestFixImportDependencies(unittest.TestCase):
             for s in wave:
                 wave_of[s.id] = wi
         self.assertLess(wave_of["1.2"], wave_of["1.1"])
+
+    def test_backslash_import_still_matches_producer(self):
+        """Separator style must not defeat producer lookup.
+
+        The planner writes `target: src\\map.py` and `imports: src\\map.py:Map`.
+        Target paths are normalised at parse time, import paths historically
+        were not, so the exact-string lookup missed and NO dependency was
+        injected — producer and consumer then ran concurrently in the same
+        wave and the consumer rewrote the producer's file.
+        """
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"],
+                     imports_from={"src\\map.py": ["Map"]}),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("2.1", steps[1].depends_on)
+        # ...and the two must no longer share a wave.
+        waves = build_waves(steps)
+        wave_of = {s.id: wi for wi, w in enumerate(waves) for s in w}
+        self.assertLess(wave_of["2.1"], wave_of["2.2"])
+
+    def test_dotted_module_import_matches_producer(self):
+        """Python module notation ('src.map') resolves to target 'src/map.py'."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"],
+                     imports_from={"src.map": ["Map"]}),
+        ]
+        fix_import_dependencies(steps)
+        self.assertIn("2.1", steps[1].depends_on)
+
+    def test_every_import_spelling_the_planner_uses(self):
+        """Planners write the same dependency at least four ways.
+
+        The hybrid `src.map.py` — dotted package path with the extension
+        still attached — is the one that shipped a three-way race: map,
+        player and ghost all landed in one wave and the ghost step
+        overwrote the other two steps' targets mid-execution.
+        """
+        for form in ("src/map.py", "src\\map.py", "src.map", "src.map.py",
+                     "map.py", "./src/map.py"):
+            with self.subTest(form=form):
+                steps = [
+                    PlanStep(id="2.1", step_type="CODE", index=0,
+                             target_files=["src/map.py"], exports=["Map"]),
+                    PlanStep(id="2.2", step_type="CODE", index=1,
+                             target_files=["src/player.py"],
+                             imports_from={form: ["Map"]}),
+                ]
+                self.assertEqual(len(fix_import_dependencies(steps)), 1,
+                                 f"{form} did not resolve")
+                self.assertIn("2.1", steps[1].depends_on)
+
+    def test_bare_basename_only_when_unambiguous(self):
+        """Two steps may target the same filename in different directories;
+        a wrong edge there reorders waves."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["a/util.py"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["b/util.py"]),
+            PlanStep(id="2.3", step_type="CODE", index=2,
+                     target_files=["c/main.py"],
+                     imports_from={"util.py": ["f"]}),
+        ]
+        self.assertEqual(fix_import_dependencies(steps), [])
+        self.assertEqual(steps[2].depends_on, [])
+
+    def test_hybrid_form_sequences_a_three_way_wave(self):
+        """End to end: the exact shape that raced."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"], exports=["Player"],
+                     imports_from={"src.map.py": ["Map"]}),
+            PlanStep(id="2.3", step_type="CODE", index=2,
+                     target_files=["src/ghost.py"],
+                     imports_from={"src.map.py": ["Map"],
+                                   "src.player.py": ["Player"]}),
+        ]
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        wave_of = {s.id: wi for wi, w in enumerate(waves) for s in w}
+        self.assertLess(wave_of["2.1"], wave_of["2.2"])
+        self.assertLess(wave_of["2.2"], wave_of["2.3"])
+
+    def test_same_basename_different_dirs_not_linked(self):
+        """No basename fuzz: a wrong edge here would reorder waves wrongly."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/admin/index.js"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/public/page.js"],
+                     imports_from={"src/public/index.js": ["thing"]}),
+        ]
+        self.assertEqual(fix_import_dependencies(steps), [])
+        self.assertEqual(steps[1].depends_on, [])
 
 
 class TestBuildWaves(unittest.TestCase):

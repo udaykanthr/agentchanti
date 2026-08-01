@@ -81,6 +81,105 @@ def reset_loop_stats() -> None:
         _loop_runs.clear()
 
 
+# ── Cross-attempt memory ──────────────────────────────────────────────
+# The retry ladder (loop → escalation → recovery → recovery escalation)
+# gave each attempt a blank conversation carrying only the previous
+# attempt's error string. It never learned what the previous attempt
+# actually DID, so every attempt re-derived the same hypotheses and
+# re-edited the same files. Observed on a Pygame run: four attempts,
+# 8 turns each — 54 turns and 497k tokens — churning src/ghost.py,
+# src/game.py and src/player.py with conflicting fixes, none of them
+# finding the two-line bug. Record each attempt's edits, commands and
+# verdict so the next one starts knowing which doors are already shut.
+
+_JOURNAL_MAX_FILES = 8       # per attempt, in the rendered digest
+_JOURNAL_MAX_COMMANDS = 4    # per attempt, most recent first
+_JOURNAL_MAX_ATTEMPTS = 4    # most recent attempts shown
+_JOURNAL_SUMMARY_CHARS = 240
+
+_journal_lock = Lock()
+_attempts: dict[int, list[dict]] = {}
+
+
+def record_attempt(step_idx: int, label: str, outcome: str,
+                   edited: list[str], commands: list[tuple[str, bool]],
+                   summary: str) -> None:
+    """Append one finished attempt to *step_idx*'s journal."""
+    with _journal_lock:
+        _attempts.setdefault(step_idx, []).append({
+            "label": label,
+            "outcome": outcome,
+            "edited": list(edited),
+            "commands": list(commands),
+            "summary": (summary or "").strip(),
+        })
+
+
+def get_attempts(step_idx: int) -> list[dict]:
+    with _journal_lock:
+        return [dict(a) for a in _attempts.get(step_idx, [])]
+
+
+def reset_attempt_journal() -> None:
+    with _journal_lock:
+        _attempts.clear()
+
+
+def attempt_digest(step_idx: int) -> str:
+    """Compact record of prior attempts, for the next attempt's context.
+
+    Empty string when nothing has been tried yet, so callers can append
+    it unconditionally. Deliberately terse: this rides in the opening
+    user message of every retry, and the whole point of the ladder is
+    that budget is already scarce by the time it is consulted.
+    """
+    attempts = get_attempts(step_idx)
+    if not attempts:
+        return ""
+
+    lines = ["Previous attempts at this step ALL FAILED. What was already "
+             "tried (do not simply repeat it):"]
+    shown = attempts[-_JOURNAL_MAX_ATTEMPTS:]
+    offset = len(attempts) - len(shown)
+    for i, att in enumerate(shown, start=offset + 1):
+        lines.append(f"  attempt {i} — {att['label']} — {att['outcome']}")
+
+        edited = att["edited"]
+        if edited:
+            counts = Counter(edited)
+            shown_files = counts.most_common(_JOURNAL_MAX_FILES)
+            rendered = ", ".join(
+                f"{path} (x{n})" if n > 1 else path
+                for path, n in shown_files)
+            if len(counts) > _JOURNAL_MAX_FILES:
+                rendered += f", +{len(counts) - _JOURNAL_MAX_FILES} more"
+            lines.append(f"    edited: {rendered}")
+        else:
+            lines.append("    edited: nothing")
+
+        for cmd, ok in att["commands"][-_JOURNAL_MAX_COMMANDS:]:
+            lines.append(f"    ran: {cmd[:160]} -> "
+                         f"{'ok' if ok else 'FAILED'}")
+
+        if att["summary"]:
+            lines.append("    concluded: "
+                         + truncate_middle(att["summary"],
+                                           _JOURNAL_SUMMARY_CHARS)
+                           .replace("\n", " "))
+
+    # The single most useful signal: the same files keep being rewritten
+    # and the gate stays red, so the cause is somewhere nobody has looked.
+    all_edited = Counter(f for a in attempts for f in a["edited"])
+    repeated = [f for f, n in all_edited.items() if n >= 2]
+    if len(attempts) >= 2 and repeated:
+        lines.append(
+            "  NOTE: " + ", ".join(sorted(repeated)[:6])
+            + " have been edited across multiple failed attempts. Re-editing "
+              "them the same way will not work — look for the cause "
+              "somewhere the previous attempts did not read.")
+    return "\n".join(lines)
+
+
 def loop_stats_summary() -> str | None:
     """One-line human summary for the end-of-run log, or None if unused."""
     runs = get_loop_stats()
@@ -269,7 +368,8 @@ def commands_equivalent_modulo_flags(candidate: str | None,
 
 def attempt_env_self_heal(tools: AgentTools, verify_output: str,
                           language: str | None, healed: set[str],
-                          verify_cmd: str | None = None) -> bool:
+                          verify_cmd: str | None = None,
+                          planned_files: list[str] | None = None) -> bool:
     """Install a missing third-party dependency named in failing output.
 
     ``No module named X`` / ``Cannot find package 'X'`` are environment
@@ -294,6 +394,13 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
     else:
         memory = getattr(tools, "_memory", None)
         project_files = list(memory.all_files()) if memory is not None else []
+        # Files the step is about to create count as local too. A TEST step
+        # whose gate is `python -m unittest -v test_main` fails with
+        # "No module named test_main" before the file exists, and memory
+        # cannot know better — so the heal tried `pip install test_main`,
+        # a pointless call and the exact dependency-confusion hazard
+        # _missing_third_party_module exists to prevent.
+        project_files += [p for p in (planned_files or []) if p]
         mod = _missing_third_party_module(verify_output, project_files)
         if not mod or mod in healed:
             return False
@@ -325,6 +432,7 @@ def run_agent_loop(
     context: str = "",
     preload_files: list[str] | None = None,
     _recovery: bool = False,
+    attempt_label: str = "first attempt",
 ) -> tuple[bool, str]:
     """Run one step as a capped tool-calling loop.
 
@@ -359,9 +467,15 @@ def run_agent_loop(
     # the unpassable-gate escape below (recovery loops only).
     last_ok_cmd: str | None = None
 
+    # Cross-attempt memory: what this attempt actually touched and ran.
+    edited_files: list[str] = []
+    commands_run: list[tuple[str, bool]] = []
+
     def _finish(outcome: str, turns: int,
                 result: tuple[bool, str]) -> tuple[bool, str]:
         _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
+        record_attempt(step_idx, attempt_label, outcome,
+                       edited_files, commands_run, result[1])
         return result
 
     def _variant_gate_ok() -> bool:
@@ -382,7 +496,8 @@ def run_agent_loop(
         result = tools.execute_all([_verify_call(verify_cmd)])[0].content
         while (not result.startswith("exit: success")
                and attempt_env_self_heal(tools, result, language, healed,
-                                         verify_cmd)):
+                                         verify_cmd,
+                                         planned_files=preload_files)):
             result = tools.execute_all([_verify_call(verify_cmd)])[0].content
         return result
 
@@ -418,9 +533,20 @@ def run_agent_loop(
             _tool_msgs = tools.execute_all(response.tool_calls)
             messages.extend(_tool_msgs)
             for _tc, _tm in zip(response.tool_calls, _tool_msgs):
-                if (_tc.name == "run_command"
-                        and (_tm.content or "").startswith("exit: success")):
-                    last_ok_cmd = _tc.arguments.get("command", "")
+                _content = _tm.content or ""
+                if _tc.name == "run_command":
+                    _cmd = _tc.arguments.get("command", "")
+                    _ok = _content.startswith("exit: success")
+                    if _cmd:
+                        commands_run.append((_cmd, _ok))
+                    if _ok:
+                        last_ok_cmd = _cmd
+                elif _tc.name in ("write_file", "edit_file"):
+                    # Errors come back as strings rather than raising, so
+                    # only count edits that actually landed.
+                    _path = (_tc.arguments.get("path") or "").replace("\\", "/")
+                    if _path and not _content.lower().startswith("error"):
+                        edited_files.append(_path)
             # Read-only intervention: some models settle into inspecting
             # file after file without ever acting (observed: whole 8-turn
             # budgets of read_file, twice in one run, even with the
@@ -539,10 +665,17 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
         "[AgentLoop] step %d: loop failed — escalating to stronger model",
         kw.get("step_idx", 0) + 1)
     kw = dict(kw)
+    # Digest = what was tried (narrative, heavily truncated). The full
+    # error still rides alongside it: a verify failure's stack trace and
+    # assertion text are the most actionable thing the next attempt has,
+    # and the digest's per-attempt summary is far too short to carry them.
+    _digest = attempt_digest(kw.get("step_idx", 0))
     kw["context"] = (
         (kw.get("context") or "")
+        + (("\n\n" + _digest) if _digest else "")
         + "\n\nA previous attempt by another model FAILED:\n"
         + truncate_middle(info, 2000))
+    kw["attempt_label"] = "escalation (stronger model)"
     return run_agent_loop(escalation_client, tools, step_text, task, **kw)
 
 
@@ -685,12 +818,22 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
             f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
             "successfully — it will be run to verify your work.")
 
-    def _attempt(client, ctx: str) -> tuple[bool, str]:
+    def _attempt(client, label: str,
+                 latest_error: str | None = None) -> tuple[bool, str]:
+        # Recovery follows the main loop (and possibly its escalation), so
+        # 1-3 failed attempts have already left edits in the working tree.
+        # Recompute the digest per attempt so each one sees everything
+        # tried so far, including the recovery attempt before it.
+        digest = attempt_digest(step_idx)
+        ctx = (context + "\n\n" + digest) if digest else context
+        if latest_error:
+            ctx += ("\n\nA previous recovery attempt by another model "
+                    "FAILED:\n" + truncate_middle(latest_error, 2000))
         s, i = run_agent_loop(
             client, tools, step_text, task,
             display=display, step_idx=step_idx, language=language,
             max_turns=max_turns, verify_cmd=verify_cmd, context=ctx,
-            _recovery=True)
+            _recovery=True, attempt_label=label)
         # Only meaningful when no verify_cmd gated the exit — a passing
         # deterministic check outranks the model's own pessimism.
         if s and not verify_cmd \
@@ -708,7 +851,7 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     # failure the stronger model should get a shot at (observed: a
     # blocked npx-tailwind recovery never escalated because the wrapper
     # saw the self-reported success).
-    success, info = _attempt(llm_client, context)
+    success, info = _attempt(llm_client, "recovery")
     if (not success and escalation_client is not None
             and escalation_client is not llm_client
             and getattr(escalation_client, "supports_tools",
@@ -716,8 +859,6 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
         _logger.info(
             "[AgentLoop] step %d: recovery failed — escalating to "
             "stronger model", step_idx + 1)
-        success, info = _attempt(
-            escalation_client,
-            context + "\n\nA previous recovery attempt by another model "
-            "FAILED:\n" + truncate_middle(info, 2000))
+        success, info = _attempt(escalation_client, "recovery + escalation",
+                                 latest_error=info)
     return success, info

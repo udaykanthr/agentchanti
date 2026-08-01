@@ -27,9 +27,13 @@ Format
 
 from __future__ import annotations
 
+import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +772,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                         if ":" in entry:
                             file_path, symbol = entry.rsplit(":", 1)
                             current.imports_from.setdefault(
-                                file_path.strip(), []
+                                _norm_target_path(file_path), []
                             ).append(symbol.strip())
                 continue
             elif _bare_lower.startswith("imported_by:"):
@@ -852,7 +856,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                     if ":" in entry:
                         file_path, symbol = entry.rsplit(":", 1)
                         current.imports_from.setdefault(
-                            file_path.strip(), []
+                            _norm_target_path(file_path), []
                         ).append(symbol.strip())
 
         # Produces (alias for target_files, used by CMD steps)
@@ -993,6 +997,40 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     return steps
 
 
+def _build_file_to_step(steps: list[PlanStep]) -> dict[str, PlanStep]:
+    """Map every step's target file (normalized path + basename) to that step."""
+    import os as _os
+
+    file_to_step: dict[str, PlanStep] = {}
+    for step in steps:
+        for tf in step.target_files:
+            norm = tf.replace("\\", "/")
+            file_to_step[norm] = step
+            file_to_step[_os.path.basename(norm)] = step
+    return file_to_step
+
+
+def _resolve_producer(src_file: str,
+                      file_to_step: dict[str, PlanStep]) -> PlanStep | None:
+    """Find the step whose ``target_files`` provides *src_file*, if any.
+
+    Matches on the normalized path first, then the basename, then Python
+    dotted-module notation (``src.map`` → target ``src/map.py``).
+    """
+    import os as _os
+
+    src_norm = src_file.replace("\\", "/")
+    producer = (file_to_step.get(src_norm)
+                or file_to_step.get(_os.path.basename(src_norm)))
+    if producer is None and "/" not in src_norm:
+        # Python module notation: 'src.snake' → target 'src/snake.py'
+        dotted_path = src_norm.replace(".", "/")
+        for key, st in file_to_step.items():
+            if _os.path.splitext(key)[0] == dotted_path:
+                return st
+    return producer
+
+
 def _derive_imported_by(steps: list[PlanStep]) -> None:
     """Populate ``imported_by`` on each step from other steps' ``imports_from``.
 
@@ -1005,31 +1043,14 @@ def _derive_imported_by(steps: list[PlanStep]) -> None:
     Explicit ``imported_by:`` lines in the plan take precedence (they are set
     first during parsing; derivation only appends new entries, never clears them).
     """
-    import os as _os
-
-    # Build file → step map (normalized paths + basenames for fuzzy lookup)
-    file_to_step: dict[str, PlanStep] = {}
-    for step in steps:
-        for tf in step.target_files:
-            norm = tf.replace("\\", "/")
-            file_to_step[norm] = step
-            file_to_step[_os.path.basename(norm)] = step
+    file_to_step = _build_file_to_step(steps)
 
     for consumer_step in steps:
         consumer_files = consumer_step.target_files
         if not consumer_files:
             continue
         for src_file in consumer_step.imports_from:
-            src_norm = src_file.replace("\\", "/")
-            src_basename = _os.path.basename(src_norm)
-            producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
-            if producer is None and "/" not in src_norm:
-                # Python module notation: 'src.snake' → target 'src/snake.py'
-                dotted_path = src_norm.replace(".", "/")
-                for key, st in file_to_step.items():
-                    if _os.path.splitext(key)[0] == dotted_path:
-                        producer = st
-                        break
+            producer = _resolve_producer(src_file, file_to_step)
             if producer is None:
                 continue
             for cf in consumer_files:
@@ -1674,6 +1695,188 @@ def fix_nested_workspace_collision(steps: list[PlanStep]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Acceptance-gate quality
+# ---------------------------------------------------------------------------
+
+# A gate that runs a real test suite is substantive by construction — the
+# suite carries the assertions.
+_TEST_RUNNER_RE = re.compile(
+    r"\b(pytest|unittest|nose2|tox|jest|vitest|mocha|ava|karma|rspec|"
+    r"phpunit|manage\.py\s+test|go\s+test|cargo\s+test|dotnet\s+test|"
+    r"mvn\s+test|gradle\s+test|ctest)\b"
+    r"|\b(npm|yarn|pnpm)\s+(run\s+)?test\b",
+    re.IGNORECASE,
+)
+
+# `python -c "..."` / `node -e "..."` inline scripts — the form the planner
+# reaches for, and the form that is easy to write vacuously. The body must
+# tolerate escaped quotes (`assert hasattr(m, \"X\")`); a plain non-greedy
+# `.+?` stops at the first `\"` and silently truncates the payload, which
+# made every escaped gate look unparseable and slip through unjudged.
+#
+# The interpreter is rarely a bare name: plans reach for
+# ``venv\Scripts\python.exe -c``, ``../venv/bin/python3 -c``, ``py -c``.
+# An interpreter pattern that only matched ``python`` skipped those gates
+# entirely — not "judged and passed", *skipped* — so a whole run's worth
+# of gates went unchecked. Allow a leading path and an ``.exe`` suffix.
+_INTERP = r"""(?:\S*[\\/])?(?:python[0-9.]*|py)(?:\.exe)?"""
+_JS_INTERP = r"""(?:\S*[\\/])?(?:node|deno)(?:\.exe)?"""
+
+_INLINE_SCRIPT_RE = re.compile(
+    _INTERP + r"""\s+-c\s+(?P<pq>["'])"""
+    r"""(?P<py>(?:\\.|(?!(?P=pq)).)*)(?P=pq)"""
+    r"""|""" + _JS_INTERP + r"""\s+-e\s+(?P<jq>["'])"""
+    r"""(?P<js>(?:\\.|(?!(?P=jq)).)*)(?P=jq)""",
+    re.DOTALL,
+)
+
+# Anything that can fail on a wrong VALUE rather than a wrong import.
+_JS_ASSERTION_RE = re.compile(
+    r"\bassert\b|\bthrow\b|process\.exit\s*\(\s*[1-9]", re.IGNORECASE)
+
+
+def shallow_gate_reason(cmd: str) -> Optional[str]:
+    """Explain why *cmd* cannot detect a behavioural defect, or None.
+
+    A step's ``verify:`` is the only thing standing between a broken
+    implementation and a green run, yet planners habitually emit
+    ``python -c "from game import Game; print(Game)"`` — which passes as
+    long as the file parses. Observed consequence: a Pac-Man run shipped
+    with three of four ghosts spawned inside wall tiles, unable to ever
+    move. Every gate was green, the smoke test launched fine, and the
+    pipeline reported success, because nothing in the plan asserted a
+    single value.
+
+    The rule is deliberately blunt and easy to satisfy: a gate must
+    either run a test suite or assert something. Commands we cannot
+    classify (``python manage.py check``, ``npm run build``) are left
+    alone — they do real work and second-guessing them would be noise.
+    """
+    if not cmd or not cmd.strip():
+        return None
+    if _TEST_RUNNER_RE.search(cmd):
+        return None
+
+    match = _INLINE_SCRIPT_RE.search(cmd)
+    if match is None:
+        # Not an inline script — a build/check/lint command we can't judge.
+        return None
+
+    payload_py = match.group("py")
+    if payload_py is not None:
+        return _shallow_python_reason(payload_py)
+
+    payload_js = match.group("js") or ""
+    if _JS_ASSERTION_RE.search(payload_js):
+        return None
+    return ("runs an inline script that never asserts anything — it passes "
+            "as long as the module loads")
+
+
+def _shallow_python_reason(payload: str) -> Optional[str]:
+    """Classify a ``python -c`` payload. None when it can fail on a value."""
+    import ast as _ast
+
+    # Planner payloads arrive with shell escaping still applied.
+    source = payload.replace('\\"', '"').replace("\\'", "'")
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        # Can't judge it — don't manufacture a complaint.
+        return None
+
+    body = tree.body
+    if not body:
+        return None
+
+    if all(isinstance(node, (_ast.Import, _ast.ImportFrom)) for node in body):
+        return ("only imports the module — it proves the file parses, not "
+                "that it behaves correctly")
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Assert):
+            return None
+        # `sys.exit(1)` / `raise` on a bad value are assertions in spirit.
+        if isinstance(node, _ast.Raise):
+            return None
+
+    return ("imports and prints but never asserts — it passes whatever the "
+            "values are, so it cannot detect wrong behaviour")
+
+
+# `from a.b import x` / `import a.b` inside a verify payload.
+_PY_IMPORT_RE = re.compile(
+    r"\bfrom\s+([A-Za-z_][\w.]*)\s+import\b|\bimport\s+([A-Za-z_][\w.]*)")
+
+
+def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
+    """Find verify commands that assume a working directory they won't get.
+
+    Gates run from the repo root. A plan that targets
+    ``pacman_clone/src/config.py`` while its verify says
+    ``from src.config import ...`` has written a gate that cannot pass
+    there — the module only resolves from inside ``pacman_clone/``.
+
+    That mismatch is not a harmless red gate: the agent loop treats the
+    gate as ground truth and makes it pass. Observed on a Pygame run where
+    every step wrote its declared target, watched the gate fail, and then
+    wrote a *second copy* of the module at the repo root to satisfy it —
+    shipping a fully duplicated source tree, 439k tokens, and a green
+    pipeline. Catch it at plan time instead.
+
+    Returns ``(step_id, reason)`` pairs, empty when the plan is coherent.
+    """
+    from .plan_graph import PlanGraph
+
+    graph = PlanGraph(steps)
+    issues: list[tuple[str, str]] = []
+    for step in steps:
+        cmd = step.verify_cmd
+        if not cmd:
+            continue
+        match = _INLINE_SCRIPT_RE.search(cmd)
+        if match is None:
+            continue
+        payload = match.group("py")
+        if not payload:
+            continue
+        for imp in _PY_IMPORT_RE.finditer(payload):
+            module = imp.group(1) or imp.group(2)
+            if not module:
+                continue
+            key = module.replace(".", "/")
+            if graph.has_module(key):
+                continue          # resolves from the repo root — fine
+            prefix = graph.prefix_for(key)
+            if prefix:
+                issues.append((step.id, (
+                    f"imports `{module}`, but the plan targets that module "
+                    f"at `{prefix}/{key}.py`. The gate runs from the project "
+                    f"root, where this import fails")))
+                break
+    return issues
+
+
+def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
+    """Find CODE steps whose ``verify:`` cannot detect a behavioural defect.
+
+    Returns ``(step_id, reason)`` pairs, empty when every gate has teeth.
+    TEST steps are exempt: their gate is normally the suite itself, and the
+    assertions live in the test file rather than the command.
+    """
+    gaps: list[tuple[str, str]] = []
+    for step in steps:
+        if step.step_type != "CODE":
+            continue
+        if not step.verify_cmd:
+            continue  # missing verify entirely is a separate check
+        reason = shallow_gate_reason(step.verify_cmd)
+        if reason:
+            gaps.append((step.id, reason))
+    return gaps
+
+
+# ---------------------------------------------------------------------------
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 
@@ -1691,19 +1894,25 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
 
     Must be called **after** ``validate_plan()`` and **before**
     ``build_waves()``.
-    """
-    fixes: list[str] = []
-    all_ids = {s.id for s in steps}
 
-    # Build target-file → producer-step-id map
-    file_to_producer: dict[str, str] = {}
-    for s in steps:
-        for fpath in s.target_files:
-            file_to_producer[fpath] = s.id
+    Resolution goes through :class:`~.plan_graph.PlanGraph` rather than
+    string comparison. Matching ``imports:`` text against ``target:`` text
+    failed once per notation the planner invented — path, Windows path,
+    dotted module, dotted-with-extension, bare filename — and every miss
+    silently dropped an edge, putting producer and consumer in the same
+    wave. Observed twice: a player step overwrote the map step's target
+    mid-execution, and later a ghost step clobbered two sibling steps'
+    files in a three-way race. The graph keys on several identities at
+    once, including the exported symbol, which no spelling can disguise.
+    """
+    from .plan_graph import PlanGraph
+
+    fixes: list[str] = []
+    graph = PlanGraph(steps)
 
     for step in steps:
-        for file_path in step.imports_from:
-            producer_id = file_to_producer.get(file_path)
+        for file_path, symbols in step.imports_from.items():
+            producer_id = graph.producer_of(file_path, symbols)
             if producer_id is None:
                 continue  # existing project file, not produced by plan
             if producer_id == step.id:
@@ -2253,7 +2462,7 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
                         if ":" in entry:
                             fp, sym = entry.rsplit(":", 1)
                             current.imports_from.setdefault(
-                                fp.strip(), []
+                                _norm_target_path(fp), []
                             ).append(sym.strip())
 
             elif "produce" in key:

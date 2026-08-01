@@ -28,6 +28,7 @@ _DEFAULTS = {
     "lm_studio_reasoning_effort": None,  # None | "low" | "medium" | "high"
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
+    "openai_reasoning_effort": None,  # None | "low" | "medium" | "high"
     "gemini_api_key": "",
     "gemini_base_url": "https://generativelanguage.googleapis.com/v1beta",
     "anthropic_api_key": "",
@@ -199,6 +200,15 @@ class Config:
             "api_key", _DEFAULTS["openai_api_key"])
         self.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or openai_section.get(
             "base_url", _DEFAULTS["openai_base_url"])
+        # Reasoning effort for OpenAI reasoning models. The top-level
+        # `reasoning_effort:` key previously only reached LM Studio, so a
+        # config that set it saw no effect on an OpenAI run at all.
+        self.OPENAI_REASONING_EFFORT = (
+            os.getenv("OPENAI_REASONING_EFFORT")
+            or openai_section.get("reasoning_effort")
+            or yd.get("reasoning_effort")   # top-level fallback
+            or _DEFAULTS["openai_reasoning_effort"]
+        )
 
         # Gemini
         gemini_section = yd.get("gemini", {}) if isinstance(yd.get("gemini"), dict) else {}

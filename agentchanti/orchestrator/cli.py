@@ -253,6 +253,133 @@ def main():
         raise
 
 
+def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
+                          memory, language) -> None:
+    """Mark this wave's nodes built and report broken export promises.
+
+    Best-effort and never fatal: a parse failure here must not take down a
+    run whose code is fine. Only steps that actually completed are marked,
+    and a file we could not read or parse yields no ``actual_exports``,
+    which :meth:`PlanGraph.reconcile` treats as "no evidence" rather than
+    "export missing".
+    """
+    if plan_graph is None or not plan_steps:
+        return
+    try:
+        from ..language_backend import get_backend
+        backend = get_backend(language)
+    except Exception:
+        return
+
+    files = {}
+    try:
+        files = memory.as_dict() or {}
+    except Exception:
+        pass
+
+    for idx in pending:
+        if step_results.get(idx) != "done":
+            continue
+        step = next((s for s in plan_steps if s.index == idx), None)
+        if step is None:
+            continue
+        actual: list[str] = []
+        for target in getattr(step, "target_files", None) or []:
+            content = files.get(target) or files.get(
+                str(target).replace("\\", "/"))
+            if not content:
+                continue
+            try:
+                actual.extend(backend.extract_exports(content) or [])
+            except Exception:
+                continue
+        plan_graph.mark_built(step.id, actual)
+        missing = plan_graph.reconcile(step.id)
+        if missing:
+            # Advisory, not a verdict: export extraction is per-language
+            # and heuristic, so an absence here is a hint to look rather
+            # than proof. Claiming "these imports WILL fail" was wrong the
+            # first time it fired — every named symbol was a module-level
+            # constant the extractor could not see, and the gate importing
+            # them passed.
+            log.warning(
+                "[PlanGraph] step %s: declared export(s) not found in the "
+                "written file(s): %s — check before downstream steps "
+                "import them", step.id, ", ".join(sorted(missing)[:8]))
+
+
+def _enforce_monotonic_gates(snapshots, executor, stage: str,
+                             repair=None) -> bool:
+    """Snapshot *stage*, then re-run every acceptance gate recorded so far.
+
+    Must be called after **every** stage that can write source files —
+    each wave, the bulk-test fix round, and the smoke-test repair loop.
+    Skipping any of them lets that stage's edits ship unverified: the
+    smoke test repaired a launch crash by changing ``Player.update()``'s
+    signature, the already-green ``python -m unittest discover`` gate went
+    red, nothing rechecked it, and the run reported ``Finished``.
+
+    *repair* is an optional zero-arg callable invoked once when a
+    regression is found, before deciding to roll back. Use it where the
+    stage's edits are more likely correct than the failing gate — a
+    smoke-test fix that changes an API a test still stubs is a stale test,
+    not a bad fix, and rolling it back would re-break a working app to
+    satisfy the stub. Gates are re-run afterwards; only a still-red gate
+    rolls back.
+
+    Returns True when every gate passes — the stage is then committed and
+    becomes the new rollback target. On an unresolved regression the
+    workdir is restored to the last green snapshot and False is returned,
+    so the caller fails the run instead of reporting success over a red
+    gate.
+    """
+    from .wave_snapshots import get_gate_ledger
+
+    if not snapshots.managed:
+        # No managed repo (the workdir is the user's own git repo), so a
+        # rollback is neither possible nor wanted — their history is the
+        # safety net. Leave the verdict to the caller's own checks.
+        return True
+
+    def _names(regs):
+        return ", ".join(f"step {label or '?'}: `{cmd}`"
+                         for cmd, label, _out in regs)
+
+    regressions = get_gate_ledger().recheck(executor)
+
+    if regressions and repair is not None:
+        log.warning(
+            "[Monotonic] %s broke %d previously-passing gate(s): %s — "
+            "attempting one repair round before rolling back.",
+            stage, len(regressions), _names(regressions))
+        try:
+            repair()
+        except Exception as exc:
+            log.warning("[Monotonic] Repair round raised: %s", exc)
+        regressions = get_gate_ledger().recheck(executor)
+        if not regressions:
+            log.info("[Monotonic] Repair round restored every gate — "
+                     "keeping the changes from %s.", stage)
+
+    if not regressions:
+        snapshots.commit_wave(stage)
+        snapshots.mark_green()
+        return True
+
+    log.warning("[Monotonic] %s left %d gate(s) red: %s",
+                stage, len(regressions), _names(regressions))
+    rb_ok, rb_msg = snapshots.rollback_to_last()
+    if rb_ok:
+        log.warning(
+            "[Monotonic] Workdir rolled back to the last green snapshot "
+            "— the changes from %s were discarded.", stage)
+    else:
+        log.warning(
+            "[Monotonic] Rollback unavailable (%s) — regressing state left "
+            "in place for inspection.", rb_msg)
+    return False
+
+
 def _main_impl():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -387,7 +514,8 @@ def _main_impl():
             return
         llm_client = OpenAIClient(
             base_url=cfg.OPENAI_BASE_URL, model=model,
-            api_key=api_key, **llm_kwargs)
+            api_key=api_key,
+            reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
     elif provider == "gemini":
         from ..llm.gemini_client import GeminiClient
         api_key = cfg.GEMINI_API_KEY
@@ -545,7 +673,8 @@ def _main_impl():
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
                 base_url=cfg.OPENAI_BASE_URL, model=agent_model,
-                api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
+                api_key=cfg.OPENAI_API_KEY,
+                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
         elif agent_provider == "gemini":
             from ..llm.gemini_client import GeminiClient
             return GeminiClient(
@@ -910,7 +1039,8 @@ def _main_impl():
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
-                fix_import_dependencies,
+                fix_import_dependencies, check_gate_quality,
+                check_gate_consistency,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
@@ -939,6 +1069,53 @@ def _main_impl():
                     blind_fixes = route_blind_edits(plan_steps_parsed)
                     if blind_fixes:
                         log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
+
+                    # ── Acceptance-gate quality ──
+                    # A CODE step whose verify: only imports the module
+                    # cannot fail on wrong behaviour, which makes the whole
+                    # monotonic-gate machinery decorative. Observed: a
+                    # Pac-Man run shipped with three of four ghosts spawned
+                    # inside wall tiles — every gate green, smoke test
+                    # green, pipeline "Finished". Send the plan back with
+                    # the specific complaint rather than accepting gates
+                    # that can only ever pass.
+                    _gate_gaps = (check_gate_quality(plan_steps_parsed)
+                                  + check_gate_consistency(plan_steps_parsed))
+                    if _gate_gaps and plan_attempt < MAX_PLAN_RETRIES:
+                        log.warning(
+                            "[Plan] %d step(s) have a verify: that cannot "
+                            "fail on wrong behaviour — replanning: %s",
+                            len(_gate_gaps),
+                            ", ".join(f"{sid} ({why})"
+                                      for sid, why in _gate_gaps))
+                        display.show_status(
+                            "Plan has import-only acceptance gates, "
+                            "retrying...")
+                        _by_id = {s.id: s for s in plan_steps_parsed}
+                        _detail = "\n".join(
+                            f"  - step {sid}: "
+                            f"`{getattr(_by_id.get(sid), 'verify_cmd', '')}`"
+                            f" — {why}"
+                            for sid, why in _gate_gaps)
+                        planner_context += (
+                            "\n\n[PLANNER CORRECTION] These steps have a "
+                            "verify: command that passes as long as the "
+                            "file parses, so it can never detect wrong "
+                            "behaviour:\n" + _detail +
+                            "\n\nRewrite EVERY one of those verify: lines "
+                            "so it asserts a concrete value the step's "
+                            "description promises (or runs a test suite). "
+                            "Keep them single-line and runnable from the "
+                            "project root. Re-emit the COMPLETE plan.")
+                        continue
+                    if _gate_gaps:
+                        log.warning(
+                            "[Plan] Proceeding after %d attempt(s) with %d "
+                            "import-only gate(s) — these steps cannot fail "
+                            "on wrong behaviour: %s",
+                            MAX_PLAN_RETRIES, len(_gate_gaps),
+                            ", ".join(sid for sid, _ in _gate_gaps))
+
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")
@@ -1268,6 +1445,26 @@ def _main_impl():
     step_reports = [StepReport(index=i, text=steps[i]) for i in range(len(steps))]
 
     # ── 13. Execute waves ──
+    # The agent-loop attempt journal is keyed by step index, so a second
+    # run in the same process (library API, tests) would otherwise show a
+    # step the previous run's attempts as if they were its own.
+    from .agent_loop import reset_attempt_journal
+    reset_attempt_journal()
+
+    # Graph of what the plan promises to build. Nodes start as `planned`
+    # (nothing exists yet on a blank project, which is exactly why import
+    # resolution cannot use the KB code graph) and flip to `built` as
+    # steps complete, so declared exports can be checked against what was
+    # actually produced.
+    from .plan_graph import PlanGraph
+    plan_graph = PlanGraph(plan_steps_parsed or [])
+    _unresolved = plan_graph.unresolved_imports(plan_steps_parsed or [])
+    if _unresolved:
+        # Usually third-party or pre-existing files — informational only.
+        log.debug("[PlanGraph] %d import(s) not produced by any step: %s",
+                  len(_unresolved),
+                  ", ".join(f"{sid}->{spec}" for sid, spec in _unresolved[:8]))
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
@@ -1470,9 +1667,25 @@ def _main_impl():
             if not pipeline_success:
                 break
 
-        # Green wave — snapshot the workdir so later fix rounds have a
-        # rollback point (no-op when snapshots are disabled).
-        snapshots.commit_wave(f"wave {wave_idx + 1}")
+        # Flip this wave's plan-graph nodes to `built` and check the
+        # exports they promised against what the files actually define. A
+        # step that silently drops a declared export is a defect every
+        # downstream importer will hit, and it is far cheaper to name here
+        # than to debug from the resulting ImportError several waves later.
+        _reconcile_plan_graph(plan_graph, plan_steps_parsed, pending,
+                              step_results, memory, language)
+
+        # Snapshot the wave, then re-run every gate recorded so far. A step
+        # can break a sibling's already-green gate — including one recorded
+        # in this same wave, since wave steps run in parallel — so the
+        # recheck covers all gates, not just those from earlier waves.
+        # Only a wave that leaves every gate green becomes a rollback target;
+        # without this, HEAD (and so the rollback target) silently advances
+        # onto the commit that introduced the regression.
+        if not _enforce_monotonic_gates(
+                snapshots, executor, f"wave {wave_idx + 1}"):
+            pipeline_success = False
+            break
 
     # ── 13.5. Bulk test execution + per-file fix ──
     # All TEST steps with inline code deferred their runs until now so that:
@@ -1502,25 +1715,9 @@ def _main_impl():
         # ── Monotonic-progress check ──
         # Fix rounds may touch source files; a fix that turns a
         # previously-green per-step gate red is a regression. Re-run the
-        # recorded gates and roll the workdir back to the last wave
+        # recorded gates and roll the workdir back to the last green
         # snapshot rather than shipping the regression.
-        _regressions = get_gate_ledger().recheck(executor)
-        if _regressions:
-            _reg_names = ", ".join(
-                f"step {label or '?'}: `{cmd}`"
-                for cmd, label, _out in _regressions)
-            log.warning(
-                "[Monotonic] %d previously-passing gate(s) now fail "
-                "after fix rounds: %s", len(_regressions), _reg_names)
-            _rb_ok, _rb_msg = snapshots.rollback_to_last()
-            if _rb_ok:
-                log.warning(
-                    "[Monotonic] Workdir rolled back to the last green "
-                    "wave snapshot — the regressing fixes were discarded.")
-            else:
-                log.warning(
-                    "[Monotonic] Rollback unavailable (%s) — regressing "
-                    "state left in place for inspection.", _rb_msg)
+        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes"):
             pipeline_success = False
             verif_ok = False
 
@@ -1576,6 +1773,45 @@ def _main_impl():
         if not smoke_ok:
             pipeline_success = False
             log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
+
+        # The smoke-test repair loop rewrites source files to fix a launch
+        # crash, and it is the LAST stage that can do so. Its edits were
+        # previously never gate-checked: a repair that changed
+        # `Player.update()`'s signature turned the green
+        # `python -m unittest discover` gate red, and the run still printed
+        # `Finished`. Re-check here so success always means every gate is
+        # green — this is the final word on the run.
+        #
+        # A red gate here usually means the repair was RIGHT and a test
+        # still encodes the old API (observed: a test stubbing
+        # `update(self, game_map)` after the real signature changed), so
+        # give the test-fix machinery one round to catch the tests up
+        # rather than reflexively discarding a fix that made the app run.
+        else:
+            from .pipeline import run_bulk_test_execution_and_fix as _btf
+
+            def _repair_tests_after_smoke():
+                _btf(
+                    memory=memory,
+                    executor=executor,
+                    coder=coder,
+                    display=display,
+                    language=language,
+                    task=args.task,
+                    cfg=cfg,
+                    project_context=project_context,
+                    kb_context_builder=kb_context_builder,
+                    all_plan_steps=plan_steps_parsed,
+                    search_agent=search_agent,
+                )
+
+            if not _enforce_monotonic_gates(
+                    snapshots, executor, "smoke-test fixes",
+                    repair=_repair_tests_after_smoke):
+                pipeline_success = False
+                log.warning(
+                    "[SmokeTest] The launch fix left a previously-passing "
+                    "gate red — reporting failure rather than shipping it.")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):
