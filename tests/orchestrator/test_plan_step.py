@@ -604,6 +604,54 @@ class TestFixImportDependencies(unittest.TestCase):
                 wave_of[s.id] = wi
         self.assertLess(wave_of["1.2"], wave_of["1.1"])
 
+    def test_backslash_import_still_matches_producer(self):
+        """Separator style must not defeat producer lookup.
+
+        The planner writes `target: src\\map.py` and `imports: src\\map.py:Map`.
+        Target paths are normalised at parse time, import paths historically
+        were not, so the exact-string lookup missed and NO dependency was
+        injected — producer and consumer then ran concurrently in the same
+        wave and the consumer rewrote the producer's file.
+        """
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"],
+                     imports_from={"src\\map.py": ["Map"]}),
+        ]
+        fixes = fix_import_dependencies(steps)
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("2.1", steps[1].depends_on)
+        # ...and the two must no longer share a wave.
+        waves = build_waves(steps)
+        wave_of = {s.id: wi for wi, w in enumerate(waves) for s in w}
+        self.assertLess(wave_of["2.1"], wave_of["2.2"])
+
+    def test_dotted_module_import_matches_producer(self):
+        """Python module notation ('src.map') resolves to target 'src/map.py'."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"],
+                     imports_from={"src.map": ["Map"]}),
+        ]
+        fix_import_dependencies(steps)
+        self.assertIn("2.1", steps[1].depends_on)
+
+    def test_same_basename_different_dirs_not_linked(self):
+        """No basename fuzz: a wrong edge here would reorder waves wrongly."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/admin/index.js"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/public/page.js"],
+                     imports_from={"src/public/index.js": ["thing"]}),
+        ]
+        self.assertEqual(fix_import_dependencies(steps), [])
+        self.assertEqual(steps[1].depends_on, [])
+
 
 class TestBuildWaves(unittest.TestCase):
 

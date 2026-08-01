@@ -27,9 +27,12 @@ Format
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +771,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                         if ":" in entry:
                             file_path, symbol = entry.rsplit(":", 1)
                             current.imports_from.setdefault(
-                                file_path.strip(), []
+                                _norm_target_path(file_path), []
                             ).append(symbol.strip())
                 continue
             elif _bare_lower.startswith("imported_by:"):
@@ -852,7 +855,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
                     if ":" in entry:
                         file_path, symbol = entry.rsplit(":", 1)
                         current.imports_from.setdefault(
-                            file_path.strip(), []
+                            _norm_target_path(file_path), []
                         ).append(symbol.strip())
 
         # Produces (alias for target_files, used by CMD steps)
@@ -993,6 +996,40 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
     return steps
 
 
+def _build_file_to_step(steps: list[PlanStep]) -> dict[str, PlanStep]:
+    """Map every step's target file (normalized path + basename) to that step."""
+    import os as _os
+
+    file_to_step: dict[str, PlanStep] = {}
+    for step in steps:
+        for tf in step.target_files:
+            norm = tf.replace("\\", "/")
+            file_to_step[norm] = step
+            file_to_step[_os.path.basename(norm)] = step
+    return file_to_step
+
+
+def _resolve_producer(src_file: str,
+                      file_to_step: dict[str, PlanStep]) -> PlanStep | None:
+    """Find the step whose ``target_files`` provides *src_file*, if any.
+
+    Matches on the normalized path first, then the basename, then Python
+    dotted-module notation (``src.map`` → target ``src/map.py``).
+    """
+    import os as _os
+
+    src_norm = src_file.replace("\\", "/")
+    producer = (file_to_step.get(src_norm)
+                or file_to_step.get(_os.path.basename(src_norm)))
+    if producer is None and "/" not in src_norm:
+        # Python module notation: 'src.snake' → target 'src/snake.py'
+        dotted_path = src_norm.replace(".", "/")
+        for key, st in file_to_step.items():
+            if _os.path.splitext(key)[0] == dotted_path:
+                return st
+    return producer
+
+
 def _derive_imported_by(steps: list[PlanStep]) -> None:
     """Populate ``imported_by`` on each step from other steps' ``imports_from``.
 
@@ -1005,31 +1042,14 @@ def _derive_imported_by(steps: list[PlanStep]) -> None:
     Explicit ``imported_by:`` lines in the plan take precedence (they are set
     first during parsing; derivation only appends new entries, never clears them).
     """
-    import os as _os
-
-    # Build file → step map (normalized paths + basenames for fuzzy lookup)
-    file_to_step: dict[str, PlanStep] = {}
-    for step in steps:
-        for tf in step.target_files:
-            norm = tf.replace("\\", "/")
-            file_to_step[norm] = step
-            file_to_step[_os.path.basename(norm)] = step
+    file_to_step = _build_file_to_step(steps)
 
     for consumer_step in steps:
         consumer_files = consumer_step.target_files
         if not consumer_files:
             continue
         for src_file in consumer_step.imports_from:
-            src_norm = src_file.replace("\\", "/")
-            src_basename = _os.path.basename(src_norm)
-            producer = file_to_step.get(src_norm) or file_to_step.get(src_basename)
-            if producer is None and "/" not in src_norm:
-                # Python module notation: 'src.snake' → target 'src/snake.py'
-                dotted_path = src_norm.replace(".", "/")
-                for key, st in file_to_step.items():
-                    if _os.path.splitext(key)[0] == dotted_path:
-                        producer = st
-                        break
+            producer = _resolve_producer(src_file, file_to_step)
             if producer is None:
                 continue
             for cf in consumer_files:
@@ -1691,19 +1711,40 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
 
     Must be called **after** ``validate_plan()`` and **before**
     ``build_waves()``.
+
+    Both sides of the lookup are normalised. ``target:`` lines are
+    normalised at parse time but ``imports:`` lines historically were not,
+    so an exact-string match silently missed *every* import on any plan the
+    planner wrote with Windows separators (``target: src/map.py`` vs
+    ``imports: src\\map.py:Map``). The dependency was then never injected and
+    producer and consumer landed in the same wave: observed on a Pygame run
+    where step 2.2 (player) ran concurrently with step 2.1 (map) and
+    rewrote 2.1's ``src/map.py``, changing ``Map.__init__`` to require a
+    ``layout`` argument and breaking 2.1's already-green acceptance gate.
     """
+    import os as _os
+
     fixes: list[str] = []
-    all_ids = {s.id for s in steps}
 
     # Build target-file → producer-step-id map
     file_to_producer: dict[str, str] = {}
     for s in steps:
         for fpath in s.target_files:
-            file_to_producer[fpath] = s.id
+            file_to_producer[_norm_target_path(fpath)] = s.id
 
     for step in steps:
         for file_path in step.imports_from:
-            producer_id = file_to_producer.get(file_path)
+            norm = _norm_target_path(file_path)
+            producer_id = file_to_producer.get(norm)
+            if producer_id is None and "/" not in norm:
+                # Python dotted-module notation: 'src.map' → 'src/map.py'.
+                # Deliberately no basename fallback here: two steps may
+                # legitimately target the same filename in different
+                # directories, and a wrong dependency edge reorders waves.
+                dotted = norm.replace(".", "/")
+                producer_id = next(
+                    (pid for key, pid in file_to_producer.items()
+                     if _os.path.splitext(key)[0] == dotted), None)
             if producer_id is None:
                 continue  # existing project file, not produced by plan
             if producer_id == step.id:
@@ -2253,7 +2294,7 @@ def parse_heuristic_plan(text: str) -> list[PlanStep]:
                         if ":" in entry:
                             fp, sym = entry.rsplit(":", 1)
                             current.imports_from.setdefault(
-                                fp.strip(), []
+                                _norm_target_path(fp), []
                             ).append(sym.strip())
 
             elif "produce" in key:
