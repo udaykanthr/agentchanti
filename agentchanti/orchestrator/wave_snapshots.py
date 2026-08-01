@@ -74,6 +74,33 @@ def _is_harness_error(out: str | None) -> bool:
     return any(sig in low for sig in _HARNESS_ERROR_SIGNATURES)
 
 
+# Windows NTSTATUS failures start at 0xC0000000: 0xC0000409 fast-fail,
+# 0xC0000005 access violation, 0xC0000374 heap corruption. POSIX reports a
+# fatal signal as a negative return code.
+_NTSTATUS_FAILURE_BASE = 0xC0000000
+
+
+def is_abnormal_exit(code: int | None) -> bool:
+    """True when the process DIED rather than reporting a verdict.
+
+    A gate that crashes has produced no verdict at all, so treating it as
+    a regression is a category error. Observed: a green `python -m
+    unittest -v` gate was re-run by the monotonic check, the interpreter
+    fast-failed with 0xC0000409 (3221226505) after printing ordinary test
+    output, and the ledger read that as "the tests regressed" and rolled
+    back a correct test file. See [[silent-crash-diagnostics]] — the
+    crash is intermittent and unrelated to the code under test.
+    """
+    # Strictly an int: anything else (None, a Mock, an executor that does
+    # not track it) is absence of evidence, and guessing "crashed" there
+    # would suppress every genuine regression.
+    if not isinstance(code, int) or isinstance(code, bool):
+        return False
+    if code < 0:
+        return True                       # POSIX: killed by a signal
+    return code >= _NTSTATUS_FAILURE_BASE
+
+
 class GateLedger:
     """Acceptance commands that have passed at least once this run.
 
@@ -114,6 +141,25 @@ class GateLedger:
             ok, out = executor.run_command(cmd, timeout=timeout)
             if ok:
                 continue
+            exit_code = getattr(executor, "last_exit_code", None)
+            if is_abnormal_exit(exit_code):
+                # The process died instead of reporting a verdict, so
+                # there is nothing to conclude from it. Retry once: the
+                # native fast-fail this guards against is intermittent,
+                # and a second green run is real evidence.
+                _logger.warning(
+                    "[GateLedger] gate process terminated abnormally "
+                    "(exit %s) — retrying once before believing it (%s): %s",
+                    exit_code, label or "?", cmd)
+                ok, out = executor.run_command(cmd, timeout=timeout)
+                if ok:
+                    continue
+                if is_abnormal_exit(getattr(executor, "last_exit_code", None)):
+                    _logger.warning(
+                        "[GateLedger] gate crashed again — treating as "
+                        "inconclusive rather than a regression (%s): %s",
+                        label or "?", cmd)
+                    continue
             if _is_harness_error(out):
                 # The command can no longer launch (missing interpreter /
                 # wrong cwd) — inconclusive, not a code regression. Rolling

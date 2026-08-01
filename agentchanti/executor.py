@@ -8,6 +8,12 @@ from .cli_display import log
 class Executor:
     def __init__(self):
         self._background_processes: List[subprocess.Popen] = []
+        # Exit status of the most recent run_command. The (success, output)
+        # return loses it, and the code is the only way to tell a genuine
+        # test failure from a process that died abnormally — a native
+        # fast-fail prints ordinary-looking output and then exits
+        # 0xC0000409, which read as "the tests regressed".
+        self.last_exit_code: int | None = None
 
     # Phrases that indicate the model is producing generic filler instead
     # of an actual plan.  Matched case-insensitively against each step.
@@ -1055,6 +1061,7 @@ class Executor:
 
             stdout_bytes, _ = proc.communicate(timeout=timeout)
             output = Executor._decode_output(stdout_bytes)
+            self.last_exit_code = proc.returncode
             log.info(f"[Executor] Exit code: {proc.returncode}, "
                      f"output={len(output)} chars")
 
