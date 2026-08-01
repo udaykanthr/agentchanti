@@ -128,6 +128,9 @@ class OpenAIClient(LLMClient):
     _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
 
     def __init__(self, base_url: str, model: str, api_key: str, **kwargs):
+        # Popped before super(): LLMClient takes named parameters, not
+        # **kwargs, so an unknown key would raise TypeError.
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
         super().__init__(**kwargs)
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -136,9 +139,14 @@ class OpenAIClient(LLMClient):
         # _prepare_token_limit_retry, consumed by the next _chat call.
         self._retry_reasoning_effort: Optional[str] = None
         # Latched once the model reports that function tools and reasoning
-        # cannot be combined, so every later tool call sends
-        # reasoning_effort="none" up front instead of paying a 400 first.
-        self._tools_need_reasoning_off = False
+        # cannot be combined on /chat/completions. Tool-calling turns then
+        # go to /v1/responses, which supports both, instead of paying the
+        # 400 again or throwing the model's reasoning away.
+        self._tools_need_responses_api = False
+        # Reasoning effort for the Responses path. None leaves it to the
+        # provider default, which is what keeps reasoning ON without
+        # pinning an effort level the caller did not ask for.
+        self.reasoning_effort: Optional[str] = reasoning_effort
 
     @staticmethod
     def _cached_tokens(usage: dict) -> int:
@@ -319,6 +327,133 @@ class OpenAIClient(LLMClient):
 
         return result
 
+    # ── Native chat (/v1/responses with tools + reasoning) ──
+
+    @staticmethod
+    def _responses_input(messages: List[Message]) -> list[dict]:
+        """Translate chat messages to Responses API ``input`` items.
+
+        The shapes differ from /chat/completions in three ways that all
+        matter: a tool call is a top-level ``function_call`` item rather
+        than a field on the assistant message, a tool result is a
+        ``function_call_output`` item rather than a ``tool`` role, and both
+        are linked by ``call_id`` rather than ``tool_call_id``.
+        """
+        out: list[dict] = []
+        for i, m in enumerate(messages):
+            if m.role == "assistant" and m.tool_calls:
+                if m.content:
+                    out.append({"role": "assistant", "content": m.content})
+                for j, tc in enumerate(m.tool_calls):
+                    out.append({
+                        "type": "function_call",
+                        "call_id": tc.id or f"call_{i}_{j}",
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments),
+                    })
+            elif m.role == "tool":
+                out.append({
+                    "type": "function_call_output",
+                    "call_id": m.tool_call_id,
+                    "output": m.content or "",
+                })
+            else:
+                out.append({"role": m.role, "content": m.content or ""})
+        return out
+
+    @staticmethod
+    def _parse_responses_output(data: dict) -> tuple[str, list[ToolCall]]:
+        """Pull assistant text and tool calls out of a Responses payload.
+
+        ``output`` is a heterogeneous list — reasoning items, message
+        items whose ``content`` holds ``output_text`` parts, and
+        ``function_call`` items. Reasoning items are skipped: they carry
+        no user-visible text and the loop resends full history each turn.
+        """
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for item in data.get("output") or []:
+            kind = item.get("type")
+            if kind == "function_call":
+                raw = item.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else raw
+                except json.JSONDecodeError:
+                    args = {"_raw": raw}
+                tool_calls.append(ToolCall(
+                    name=item.get("name", ""), arguments=args,
+                    id=item.get("call_id") or item.get("id") or ""))
+            elif kind == "message":
+                for part in item.get("content") or []:
+                    if part.get("type") in ("output_text", "text"):
+                        text_parts.append(part.get("text") or "")
+        # Convenience field some responses include alongside `output`.
+        if not text_parts and isinstance(data.get("output_text"), str):
+            text_parts.append(data["output_text"])
+        return "".join(text_parts), tool_calls
+
+    def _chat_via_responses(self, messages: List[Message],
+                            tools: Optional[List[ToolDef]],
+                            est_tokens: int) -> ChatResponse:
+        """Tool-calling turn over ``/v1/responses``.
+
+        Used for models that refuse function tools on
+        ``/chat/completions`` while reasoning is enabled. Going through
+        this endpoint keeps BOTH — the alternative (reasoning_effort
+        "none") keeps tools but throws the model's reasoning away, which
+        is the capability the agent loop leans on hardest.
+        """
+        payload: dict = {
+            "model": self.model,
+            "input": self._responses_input(messages),
+            "max_output_tokens": self.max_output_tokens,
+            # The loop resends the full conversation every turn, so there
+            # is nothing to gain from server-side retention.
+            "store": False,
+        }
+        effort = self._retry_reasoning_effort or self.reasoning_effort
+        if effort:
+            payload["reasoning"] = {"effort": effort}
+            self._retry_reasoning_effort = None
+        if tools:
+            # Flat here — no nested "function" wrapper as in completions.
+            payload["tools"] = [
+                {"type": "function", "name": t.name,
+                 "description": t.description, "parameters": t.parameters}
+                for t in tools
+            ]
+
+        url = f"{self.base_url}/responses"
+        response = requests.post(url, headers=self._headers(), json=payload,
+                                 timeout=(10, 300))
+        _raise_for_status_with_body(response, model=self.model,
+                                    tool_count=len(tools or []),
+                                    payload=payload)
+        data = response.json()
+
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("input_tokens", est_tokens)
+        completion_tokens = usage.get("output_tokens", 0)
+        cached = (usage.get("input_tokens_details") or {}).get(
+            "cached_tokens", 0)
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else 0,
+            model_name=self.model,
+            cached_tokens=cached if isinstance(cached, int) else 0,
+        )
+
+        text, tool_calls = self._parse_responses_output(data)
+        stop_reason = data.get("status", "") or ""
+        incomplete = data.get("incomplete_details") or {}
+        if incomplete.get("reason") == "max_output_tokens":
+            stop_reason = "length"
+        log.debug(f"[OpenAI] Responses usage: prompt={prompt_tokens} "
+                  f"(cached={cached}) completion={completion_tokens} "
+                  f"tool_calls={len(tool_calls)}")
+        return ChatResponse(text=text, tool_calls=tool_calls,
+                            stop_reason=stop_reason)
+
     # ── Native chat (/chat/completions with tools) ──
 
     @staticmethod
@@ -351,6 +486,9 @@ class OpenAIClient(LLMClient):
                   f"{len(messages)} messages, {len(tools or [])} tools")
         token_tracker.set_context(est_tokens)
 
+        if tools and self._tools_need_responses_api:
+            return self._chat_via_responses(messages, tools, est_tokens)
+
         payload: dict = {
             "model": self.model,
             "messages": self._serialize_messages(messages),
@@ -368,28 +506,24 @@ class OpenAIClient(LLMClient):
                               "parameters": t.parameters}}
                 for t in tools
             ]
-            if self._tools_need_reasoning_off:
-                payload["reasoning_effort"] = "none"
 
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
         if response.status_code == 400 and tools and \
-                not self._tools_need_reasoning_off and \
+                not self._tools_need_responses_api and \
                 _reasoning_blocks_tools(response):
-            # The model defaults reasoning on server-side and then refuses
-            # function tools. Turning reasoning off keeps native tool
-            # calling — and the agent loop with it — instead of degrading
-            # to the text protocol. Latched, so this costs one 400 per
-            # session rather than one per call.
+            # This model defaults reasoning on server-side and refuses
+            # function tools here. /v1/responses supports both, so switch
+            # endpoints rather than dropping reasoning (which is what the
+            # agent loop leans on hardest) or dropping tools (which loses
+            # the agent loop entirely). Latched: one 400 per session.
             log.info(
-                "[OpenAI] %s rejects function tools while reasoning is on — "
-                "retrying with reasoning_effort='none' for this session",
-                self.model)
-            self._tools_need_reasoning_off = True
-            payload["reasoning_effort"] = "none"
-            response = requests.post(url, headers=self._headers(),
-                                     json=payload, timeout=(10, 300))
+                "[OpenAI] %s refuses function tools on /chat/completions "
+                "while reasoning is on — switching to /v1/responses for "
+                "tool calls this session", self.model)
+            self._tools_need_responses_api = True
+            return self._chat_via_responses(messages, tools, est_tokens)
         if response.status_code == 400 and \
                 _param_rejected(response, "max_completion_tokens"):
             # Legacy parameter name for older models/APIs. Only on a 400

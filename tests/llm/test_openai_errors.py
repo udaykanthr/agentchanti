@@ -169,22 +169,34 @@ class TestReasoningBlocksTools(unittest.TestCase):
                     _reasoning_blocks_tools(_response(400, text=body)))
 
 
-class TestReasoningOffRetryFlow(unittest.TestCase):
-    """End to end: the 400 is absorbed and native tools are kept."""
+class TestResponsesApiFallover(unittest.TestCase):
+    """End to end: the 400 switches endpoints, keeping tools AND reasoning."""
 
-    def _client(self):
+    def _client(self, **kw):
         from agentchanti.llm.openai_client import OpenAIClient
         return OpenAIClient(base_url="https://api.openai.com/v1",
-                            model="gpt-5.6-terra", api_key="k")
+                            model="gpt-5.6-terra", api_key="k", **kw)
 
-    def _ok(self):
+    def _tools(self):
+        from agentchanti.llm.chat_types import ToolDef
+        return [ToolDef(name="ping", description="p",
+                        parameters={"type": "object", "properties": {}})]
+
+    def _ok_responses(self):
         resp = MagicMock()
         resp.status_code = 200
-        resp.url = "https://api.openai.com/v1/chat/completions"
+        resp.url = "https://api.openai.com/v1/responses"
         resp.json.return_value = {
-            "choices": [{"message": {"content": "done", "tool_calls": []},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "done"}]},
+                {"type": "function_call", "call_id": "fc_1",
+                 "name": "ping", "arguments": '{"x": "1"}'},
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 2,
+                      "input_tokens_details": {"cached_tokens": 1}},
         }
         return resp
 
@@ -195,50 +207,137 @@ class TestReasoningOffRetryFlow(unittest.TestCase):
         """Snapshot each payload — the client mutates one dict in place, so
         inspecting call_args afterwards would only ever show the last state."""
         import copy
-        sent: list[dict] = []
+        sent: list[tuple[str, dict]] = []
         it = iter(responses)
 
         def _post(url, **kwargs):
-            sent.append(copy.deepcopy(kwargs.get("json")))
+            sent.append((url, copy.deepcopy(kwargs.get("json"))))
             return next(it)
 
         return _post, sent
 
-    def test_retries_with_reasoning_off_and_latches(self):
-        from agentchanti.llm.chat_types import ToolDef
+    def test_switches_endpoint_and_latches(self):
         client = self._client()
-        tools = [ToolDef(name="ping", description="p",
-                         parameters={"type": "object", "properties": {}})]
-
-        post_fn, sent = self._recorder([self._blocked(), self._ok()])
+        post_fn, sent = self._recorder([self._blocked(),
+                                        self._ok_responses()])
         with unittest.mock.patch(
                 "agentchanti.llm.openai_client.requests.post", post_fn):
-            client._chat([Message(role="user", content="hi")], tools=tools)
+            result = client._chat([Message(role="user", content="hi")],
+                                  tools=self._tools())
 
         self.assertEqual(len(sent), 2)
-        self.assertNotIn("reasoning_effort", sent[0])
-        self.assertEqual(sent[1]["reasoning_effort"], "none")
-        # Tools survive — the whole point of preferring this over the
-        # text-protocol downgrade.
-        self.assertIn("tools", sent[1])
-        self.assertTrue(client._tools_need_reasoning_off)
+        self.assertTrue(sent[0][0].endswith("/chat/completions"))
+        self.assertTrue(sent[1][0].endswith("/responses"))
+        # Tools survive, and nothing forced reasoning off.
+        self.assertIn("tools", sent[1][1])
+        self.assertNotIn("reasoning_effort", sent[1][1])
+        self.assertTrue(client._tools_need_responses_api)
+        # The response was parsed out of the Responses shape.
+        self.assertEqual(result.text, "done")
+        self.assertEqual([tc.name for tc in result.tool_calls], ["ping"])
+        self.assertEqual(result.tool_calls[0].arguments, {"x": "1"})
+        self.assertEqual(result.tool_calls[0].id, "fc_1")
 
-        # Latched: the next call pays no 400.
-        post_fn, sent = self._recorder([self._ok()])
+        # Latched: the next tool call goes straight to /responses.
+        post_fn, sent = self._recorder([self._ok_responses()])
         with unittest.mock.patch(
                 "agentchanti.llm.openai_client.requests.post", post_fn):
-            client._chat([Message(role="user", content="again")], tools=tools)
+            client._chat([Message(role="user", content="again")],
+                         tools=self._tools())
         self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0]["reasoning_effort"], "none")
+        self.assertTrue(sent[0][0].endswith("/responses"))
 
-    def test_no_tools_means_no_reasoning_override(self):
+    def test_reasoning_effort_is_sent_when_configured(self):
+        client = self._client(reasoning_effort="high")
+        client._tools_need_responses_api = True
+        post_fn, sent = self._recorder([self._ok_responses()])
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", post_fn):
+            client._chat([Message(role="user", content="hi")],
+                         tools=self._tools())
+        self.assertEqual(sent[0][1]["reasoning"], {"effort": "high"})
+
+    def test_toolless_turns_stay_on_chat_completions(self):
+        """Only tool calls need the other endpoint; don't move everything."""
         client = self._client()
-        client._tools_need_reasoning_off = True
-        post_fn, sent = self._recorder([self._ok()])
+        client._tools_need_responses_api = True
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.url = "https://api.openai.com/v1/chat/completions"
+        ok.json.return_value = {
+            "choices": [{"message": {"content": "hi", "tool_calls": []},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        post_fn, sent = self._recorder([ok])
         with unittest.mock.patch(
                 "agentchanti.llm.openai_client.requests.post", post_fn):
             client._chat([Message(role="user", content="hi")], tools=None)
-        self.assertNotIn("reasoning_effort", sent[0])
+        self.assertTrue(sent[0][0].endswith("/chat/completions"))
+
+
+class TestResponsesTranslation(unittest.TestCase):
+    """The two wire formats differ in ways that silently break tool loops."""
+
+    def _client(self):
+        from agentchanti.llm.openai_client import OpenAIClient
+        return OpenAIClient(base_url="https://api.openai.com/v1",
+                            model="m", api_key="k")
+
+    def test_tool_call_and_result_become_top_level_items(self):
+        from agentchanti.llm.chat_types import ToolCall
+        items = self._client()._responses_input([
+            Message(role="system", content="sys"),
+            Message(role="user", content="go"),
+            Message(role="assistant", content="thinking",
+                    tool_calls=[ToolCall(name="ping",
+                                         arguments={"x": 1}, id="fc_1")]),
+            Message(role="tool", content="pong", tool_call_id="fc_1",
+                    tool_name="ping"),
+        ])
+        self.assertEqual(items[0], {"role": "system", "content": "sys"})
+        self.assertEqual(items[1], {"role": "user", "content": "go"})
+        self.assertEqual(items[2], {"role": "assistant",
+                                    "content": "thinking"})
+        self.assertEqual(items[3], {"type": "function_call",
+                                    "call_id": "fc_1", "name": "ping",
+                                    "arguments": '{"x": 1}'})
+        # Not a "tool" role, and linked by call_id not tool_call_id.
+        self.assertEqual(items[4], {"type": "function_call_output",
+                                    "call_id": "fc_1", "output": "pong"})
+
+    def test_tool_call_without_an_id_gets_a_stable_one(self):
+        from agentchanti.llm.chat_types import ToolCall
+        items = self._client()._responses_input([
+            Message(role="assistant", tool_calls=[ToolCall(name="ping")]),
+        ])
+        self.assertTrue(items[0]["call_id"])
+
+    def test_parses_text_tool_calls_and_skips_reasoning_items(self):
+        from agentchanti.llm.openai_client import OpenAIClient
+        text, calls = OpenAIClient._parse_responses_output({
+            "output": [
+                {"type": "reasoning", "summary": ["hidden"]},
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "a"},
+                    {"type": "output_text", "text": "b"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f",
+                 "arguments": '{"k": "v"}'},
+            ]})
+        self.assertEqual(text, "ab")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].arguments, {"k": "v"})
+
+    def test_malformed_arguments_are_preserved_not_dropped(self):
+        from agentchanti.llm.openai_client import OpenAIClient
+        _, calls = OpenAIClient._parse_responses_output({
+            "output": [{"type": "function_call", "call_id": "c1",
+                        "name": "f", "arguments": "{not json"}]})
+        self.assertEqual(calls[0].arguments, {"_raw": "{not json"})
+
+    def test_empty_output_is_an_empty_response(self):
+        from agentchanti.llm.openai_client import OpenAIClient
+        text, calls = OpenAIClient._parse_responses_output({"output": []})
+        self.assertEqual((text, calls), ("", []))
 
 
 class TestTokenParamFallbackTrigger(unittest.TestCase):
