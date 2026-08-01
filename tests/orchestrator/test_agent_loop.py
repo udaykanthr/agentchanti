@@ -841,6 +841,63 @@ class TestDiagnosisLoopRecovery(unittest.TestCase):
         self.assertTrue(result)
         mock_rec.assert_called_once()
 
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_code_step_recovery_is_gated_on_the_declared_verify(self, mock_rec):
+        """A CODE step's recovery used to run with verify_cmd=None.
+
+        The exit then rested entirely on the model's summary, and an honest
+        "the verification is still failing" that happens not to end with the
+        RECOVERY: blocked marker counted as success. Observed: a ghost step
+        whose declared gate asserted the ghost moves was marked recovered
+        while the ghost stayed stationary, and the run reported Finished.
+        """
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        gate = ('python -c "from ghost import Ghost; g=Ghost(); '
+                'p0=g.pixel_pos(); g.update(0.2); assert g.pixel_pos()!=p0"')
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "assertion failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_recovered_step_records_its_gate(self, mock_rec):
+        """Otherwise nothing rechecks that gate for the rest of the run."""
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        gate = 'python -c "import g; assert g.ok()"'
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        self.assertTrue(_run_diagnosis_loop(
+            0, "step text", "assertion failed", plan_step=step, **kwargs))
+        self.assertIn(gate, get_gate_ledger().gates())
+        get_gate_ledger().reset()
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(False, "still broken"))
+    def test_failed_recovery_records_no_gate(self, mock_rec):
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+        get_gate_ledger().reset()
+        gate = 'python -c "import g; assert g.ok()"'
+        step = PlanStep(id="2.3", step_type="CODE", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        self.assertFalse(_run_diagnosis_loop(
+            0, "step text", "assertion failed", plan_step=step, **kwargs))
+        self.assertEqual(get_gate_ledger().gates(), {})
+
     @patch("agentchanti.orchestrator.pipeline._diagnose_failure")
     @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
            return_value=(False, "could not fix"))
