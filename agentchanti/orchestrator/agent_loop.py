@@ -655,13 +655,37 @@ def run_agent_loop(
         return (_recovery and verify_cmd is not None
                 and commands_equivalent_modulo_flags(last_ok_cmd, verify_cmd))
 
+    from .wave_snapshots import (describe_abnormal_exit, is_abnormal_exit,
+                                 log_crash_diagnostics)
+
+    def _verify_once() -> str:
+        return tools.execute_all([_verify_call(verify_cmd)])[0].content
+
     def _run_verify() -> str:
-        result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+        result = _verify_once()
+        # A crashed verifier produced no verdict, so failing the step on it
+        # is a category error — the same one already guarded in
+        # GateLedger.recheck and the BulkTest plan gate, and missing here.
+        # Observed: three consecutive attempts where `python -m unittest -v`
+        # PASSED seconds earlier and then the exit verification
+        # access-violated (0xC0000005), so a run whose tests were green was
+        # reported as failed. The model itself spotted the flakiness and
+        # ran the suite ten times in a loop to prove it.
+        if not result.startswith("exit: success"):
+            code = getattr(getattr(tools, "_executor", None),
+                           "last_exit_code", None)
+            if is_abnormal_exit(code):
+                _logger.warning(
+                    "[AgentLoop] step %d: verification process terminated "
+                    "abnormally (%s) — retrying once before believing it",
+                    step_idx + 1, describe_abnormal_exit(code) or code)
+                log_crash_diagnostics(code, verify_cmd)
+                result = _verify_once()
         while (not result.startswith("exit: success")
                and attempt_env_self_heal(tools, result, language, healed,
                                          verify_cmd,
                                          planned_files=preload_files)):
-            result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+            result = _verify_once()
         return result
 
     for turn in range(1, max_turns + 1):

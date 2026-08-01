@@ -2000,3 +2000,80 @@ class TestPreloadOutlinesDependencies(unittest.TestCase):
         out = self._pre(full_paths={"dep.py"})
         self.assertIn("def main()", out)
         self.assertNotIn("API outline", out)
+
+
+class TestVerifyCrashRetry(unittest.TestCase):
+    """A crashed verifier produced no verdict — do not fail the step on it.
+
+    GateLedger.recheck and the BulkTest plan gate already guard this; the
+    loop's own exit verification did not. Observed live: three consecutive
+    attempts where `python -m unittest -v` PASSED and the exit
+    verification then access-violated (0xC0000005), so a run whose tests
+    were green was reported as failed and the pipeline gave up. The model
+    even ran the suite ten times in a loop to demonstrate the flakiness.
+    """
+
+    def _tools(self, codes, outputs):
+        """AgentTools whose run_command yields scripted (ok, out) pairs."""
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+        ex = MagicMock()
+        seq = list(zip(codes, outputs))
+
+        def run_command(cmd, **kw):
+            code, out = seq.pop(0)
+            ex.last_exit_code = code
+            return (code == 0, out)
+
+        ex.run_command.side_effect = run_command
+        return build_step_tools(ex, FileMemory()), ex
+
+    def _run(self, tools, llm):
+        from agentchanti.orchestrator.agent_loop import run_agent_loop
+        return run_agent_loop(llm, tools, "step", "task",
+                              verify_cmd="python -m unittest -v",
+                              max_turns=2)
+
+    def _llm(self):
+        """Does one real edit, then claims done — the loop only runs the
+        exit verification after at least one tool call."""
+        from agentchanti.llm.chat_types import ToolCall
+        acting = MagicMock()
+        acting.has_tool_calls = True
+        acting.tool_calls = [ToolCall(name="write_file",
+                                      arguments={"path": "a.py",
+                                                 "content": "x = 1"},
+                                      id="t1")]
+        acting.to_message.return_value = MagicMock(role="assistant")
+        done = MagicMock()
+        done.has_tool_calls = False
+        done.content = "done"
+        llm = MagicMock()
+        llm.chat.side_effect = [acting, done, done, done]
+        return llm
+
+    def test_a_crashed_verify_is_retried_and_can_pass(self):
+        # first verify access-violates, retry succeeds
+        tools, ex = self._tools([3221225477, 0], ["", "OK"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertTrue(ok, "a green retry must rescue a crashed verify")
+        self.assertEqual(ex.run_command.call_count, 2)
+
+    def test_an_ordinary_failure_is_not_retried(self):
+        """exit 1 is a verdict — retrying it just costs a suite run."""
+        tools, ex = self._tools([1], ["FAILED (failures=1)"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertFalse(ok)
+        self.assertEqual(ex.run_command.call_count, 1)
+
+    def test_a_repeat_crash_still_fails(self):
+        tools, ex = self._tools([3221225477, 3221225477], ["", ""])
+        ok, _ = self._run(tools, self._llm())
+        self.assertFalse(ok)
+        self.assertEqual(ex.run_command.call_count, 2)
+
+    def test_a_clean_pass_runs_the_verify_once(self):
+        tools, ex = self._tools([0], ["OK"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertTrue(ok)
+        self.assertEqual(ex.run_command.call_count, 1)
