@@ -253,6 +253,78 @@ def main():
         raise
 
 
+def _enforce_monotonic_gates(snapshots, executor, stage: str,
+                             repair=None) -> bool:
+    """Snapshot *stage*, then re-run every acceptance gate recorded so far.
+
+    Must be called after **every** stage that can write source files —
+    each wave, the bulk-test fix round, and the smoke-test repair loop.
+    Skipping any of them lets that stage's edits ship unverified: the
+    smoke test repaired a launch crash by changing ``Player.update()``'s
+    signature, the already-green ``python -m unittest discover`` gate went
+    red, nothing rechecked it, and the run reported ``Finished``.
+
+    *repair* is an optional zero-arg callable invoked once when a
+    regression is found, before deciding to roll back. Use it where the
+    stage's edits are more likely correct than the failing gate — a
+    smoke-test fix that changes an API a test still stubs is a stale test,
+    not a bad fix, and rolling it back would re-break a working app to
+    satisfy the stub. Gates are re-run afterwards; only a still-red gate
+    rolls back.
+
+    Returns True when every gate passes — the stage is then committed and
+    becomes the new rollback target. On an unresolved regression the
+    workdir is restored to the last green snapshot and False is returned,
+    so the caller fails the run instead of reporting success over a red
+    gate.
+    """
+    from .wave_snapshots import get_gate_ledger
+
+    if not snapshots.managed:
+        # No managed repo (the workdir is the user's own git repo), so a
+        # rollback is neither possible nor wanted — their history is the
+        # safety net. Leave the verdict to the caller's own checks.
+        return True
+
+    def _names(regs):
+        return ", ".join(f"step {label or '?'}: `{cmd}`"
+                         for cmd, label, _out in regs)
+
+    regressions = get_gate_ledger().recheck(executor)
+
+    if regressions and repair is not None:
+        log.warning(
+            "[Monotonic] %s broke %d previously-passing gate(s): %s — "
+            "attempting one repair round before rolling back.",
+            stage, len(regressions), _names(regressions))
+        try:
+            repair()
+        except Exception as exc:
+            log.warning("[Monotonic] Repair round raised: %s", exc)
+        regressions = get_gate_ledger().recheck(executor)
+        if not regressions:
+            log.info("[Monotonic] Repair round restored every gate — "
+                     "keeping the changes from %s.", stage)
+
+    if not regressions:
+        snapshots.commit_wave(stage)
+        snapshots.mark_green()
+        return True
+
+    log.warning("[Monotonic] %s left %d gate(s) red: %s",
+                stage, len(regressions), _names(regressions))
+    rb_ok, rb_msg = snapshots.rollback_to_last()
+    if rb_ok:
+        log.warning(
+            "[Monotonic] Workdir rolled back to the last green snapshot "
+            "— the changes from %s were discarded.", stage)
+    else:
+        log.warning(
+            "[Monotonic] Rollback unavailable (%s) — regressing state left "
+            "in place for inspection.", rb_msg)
+    return False
+
+
 def _main_impl():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -1470,9 +1542,17 @@ def _main_impl():
             if not pipeline_success:
                 break
 
-        # Green wave — snapshot the workdir so later fix rounds have a
-        # rollback point (no-op when snapshots are disabled).
-        snapshots.commit_wave(f"wave {wave_idx + 1}")
+        # Snapshot the wave, then re-run every gate recorded so far. A step
+        # can break a sibling's already-green gate — including one recorded
+        # in this same wave, since wave steps run in parallel — so the
+        # recheck covers all gates, not just those from earlier waves.
+        # Only a wave that leaves every gate green becomes a rollback target;
+        # without this, HEAD (and so the rollback target) silently advances
+        # onto the commit that introduced the regression.
+        if not _enforce_monotonic_gates(
+                snapshots, executor, f"wave {wave_idx + 1}"):
+            pipeline_success = False
+            break
 
     # ── 13.5. Bulk test execution + per-file fix ──
     # All TEST steps with inline code deferred their runs until now so that:
@@ -1502,25 +1582,9 @@ def _main_impl():
         # ── Monotonic-progress check ──
         # Fix rounds may touch source files; a fix that turns a
         # previously-green per-step gate red is a regression. Re-run the
-        # recorded gates and roll the workdir back to the last wave
+        # recorded gates and roll the workdir back to the last green
         # snapshot rather than shipping the regression.
-        _regressions = get_gate_ledger().recheck(executor)
-        if _regressions:
-            _reg_names = ", ".join(
-                f"step {label or '?'}: `{cmd}`"
-                for cmd, label, _out in _regressions)
-            log.warning(
-                "[Monotonic] %d previously-passing gate(s) now fail "
-                "after fix rounds: %s", len(_regressions), _reg_names)
-            _rb_ok, _rb_msg = snapshots.rollback_to_last()
-            if _rb_ok:
-                log.warning(
-                    "[Monotonic] Workdir rolled back to the last green "
-                    "wave snapshot — the regressing fixes were discarded.")
-            else:
-                log.warning(
-                    "[Monotonic] Rollback unavailable (%s) — regressing "
-                    "state left in place for inspection.", _rb_msg)
+        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes"):
             pipeline_success = False
             verif_ok = False
 
@@ -1576,6 +1640,45 @@ def _main_impl():
         if not smoke_ok:
             pipeline_success = False
             log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
+
+        # The smoke-test repair loop rewrites source files to fix a launch
+        # crash, and it is the LAST stage that can do so. Its edits were
+        # previously never gate-checked: a repair that changed
+        # `Player.update()`'s signature turned the green
+        # `python -m unittest discover` gate red, and the run still printed
+        # `Finished`. Re-check here so success always means every gate is
+        # green — this is the final word on the run.
+        #
+        # A red gate here usually means the repair was RIGHT and a test
+        # still encodes the old API (observed: a test stubbing
+        # `update(self, game_map)` after the real signature changed), so
+        # give the test-fix machinery one round to catch the tests up
+        # rather than reflexively discarding a fix that made the app run.
+        else:
+            from .pipeline import run_bulk_test_execution_and_fix as _btf
+
+            def _repair_tests_after_smoke():
+                _btf(
+                    memory=memory,
+                    executor=executor,
+                    coder=coder,
+                    display=display,
+                    language=language,
+                    task=args.task,
+                    cfg=cfg,
+                    project_context=project_context,
+                    kb_context_builder=kb_context_builder,
+                    all_plan_steps=plan_steps_parsed,
+                    search_agent=search_agent,
+                )
+
+            if not _enforce_monotonic_gates(
+                    snapshots, executor, "smoke-test fixes",
+                    repair=_repair_tests_after_smoke):
+                pipeline_success = False
+                log.warning(
+                    "[SmokeTest] The launch fix left a previously-passing "
+                    "gate red — reporting failure rather than shipping it.")
 
     # ── 14. Populate step reports from display state ──
     for i, sr in enumerate(step_reports):

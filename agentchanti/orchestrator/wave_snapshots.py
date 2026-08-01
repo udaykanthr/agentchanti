@@ -150,6 +150,11 @@ class ProjectSnapshots:
         self.enabled = enabled
         self.managed = False           # True only for a repo we created
         self._last_sha: str | None = None
+        # Last snapshot whose gate recheck actually passed. Distinct from
+        # _last_sha: a wave is committed before its gates are rechecked, so
+        # _last_sha may be the very commit that introduced a regression.
+        # Rolling back must target the last *verified* state, not HEAD.
+        self._last_green_sha: str | None = None
 
     # -- plumbing ------------------------------------------------------
 
@@ -241,6 +246,9 @@ class ProjectSnapshots:
             self._ensure_gitignore()
             self._purge_tracked_volatile()
             self._last_sha = self._head_sha()
+            # Nothing has run yet this session, so the resumed HEAD is the
+            # baseline we can safely fall back to.
+            self._last_green_sha = self._last_sha
             _logger.info("[Snapshots] Resuming managed snapshot repo at %s",
                          self.root)
             return True
@@ -271,6 +279,7 @@ class ProjectSnapshots:
 
         self.managed = True
         self._commit("agentchanti: baseline (pre-run)")
+        self._last_green_sha = self._last_sha
         _logger.info("[Snapshots] Initialised snapshot repo at %s", self.root)
         return True
 
@@ -287,7 +296,11 @@ class ProjectSnapshots:
         return self._last_sha
 
     def commit_wave(self, label: str) -> str | None:
-        """Snapshot the workdir after a green wave. Returns the commit sha."""
+        """Snapshot the workdir after a wave. Returns the commit sha.
+
+        The commit is *not* yet a rollback target — call :meth:`mark_green`
+        once the wave's gates have been rechecked and still pass.
+        """
         if not self.managed:
             return None
         sha = self._commit(f"agentchanti: {label}")
@@ -295,19 +308,40 @@ class ProjectSnapshots:
             _logger.info("[Snapshots] %s -> %s", label, sha[:12])
         return sha
 
+    def mark_green(self) -> str | None:
+        """Promote the latest snapshot to "last verified green".
+
+        Only call this after the gate ledger has been rechecked and found
+        clean. Everything committed since the previous green snapshot then
+        becomes permanent as far as rollback is concerned.
+        """
+        if not self.managed:
+            return None
+        self._last_green_sha = self._last_sha
+        return self._last_green_sha
+
+    def last_green_sha(self) -> str | None:
+        return self._last_green_sha
+
     def rollback_to_last(self) -> tuple[bool, str]:
-        """Hard-restore the workdir to the last snapshot.
+        """Hard-restore the workdir to the last *verified green* snapshot.
+
+        Deliberately not HEAD: waves are committed before their gates are
+        rechecked, so HEAD can be the very commit that introduced the
+        regression — resetting to it would "roll back" to the broken state
+        and report success while discarding nothing.
 
         Untracked files are removed too (``clean -fd``) — but ignored
         ones (venv/, node_modules/, .agentchanti/) survive, so the
         environment does not need rebuilding after a rollback.
         """
-        if not self.managed or not self._last_sha:
+        if not self.managed or not self._last_green_sha:
             return False, "no snapshot available"
-        ok1, out1 = self._git("reset", "--hard", self._last_sha)
+        ok1, out1 = self._git("reset", "--hard", self._last_green_sha)
         ok2, out2 = self._git("clean", "-fd")
         ok = ok1 and ok2
         if ok:
             _logger.warning("[Snapshots] Rolled back workdir to %s",
-                            self._last_sha[:12])
+                            self._last_green_sha[:12])
+            self._last_sha = self._last_green_sha
         return ok, f"{out1}\n{out2}".strip()

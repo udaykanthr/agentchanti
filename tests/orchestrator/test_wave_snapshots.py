@@ -80,6 +80,145 @@ class TestGateLedger(unittest.TestCase):
         get_gate_ledger().reset()
 
 
+class TestEnforceMonotonicGates(unittest.TestCase):
+    """The shared guard applied after every source-mutating stage."""
+
+    def setUp(self):
+        get_gate_ledger().reset()
+
+    def tearDown(self):
+        get_gate_ledger().reset()
+
+    def _snapshots(self, managed=True):
+        snaps = MagicMock()
+        snaps.managed = managed
+        snaps.rollback_to_last.return_value = (True, "")
+        return snaps
+
+    def test_clean_stage_is_committed_and_marked_green(self):
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("pytest -q", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "ok")
+        snaps = self._snapshots()
+
+        self.assertTrue(_enforce_monotonic_gates(snaps, executor, "wave 1"))
+        snaps.commit_wave.assert_called_once_with("wave 1")
+        snaps.mark_green.assert_called_once()
+        snaps.rollback_to_last.assert_not_called()
+
+    def test_smoke_fix_that_breaks_a_gate_fails_and_rolls_back(self):
+        """The exact shipped-broken case.
+
+        The smoke-test repair changed `Player.update()`'s signature, which
+        turned the already-green unittest gate red. Nothing rechecked it and
+        the run reported success.
+        """
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("python -m unittest discover -v", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (
+            False, "TypeError: <lambda>() missing 1 required positional "
+                   "argument: 'game_map'\nFAILED (errors=1)")
+        snaps = self._snapshots()
+
+        self.assertFalse(
+            _enforce_monotonic_gates(snaps, executor, "smoke-test fixes"))
+        snaps.rollback_to_last.assert_called_once()
+        snaps.mark_green.assert_not_called()
+
+    def test_unmanaged_repo_is_left_alone(self):
+        """Inside the user's own git repo, never roll back or re-run gates."""
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("pytest -q", "4.1")
+        executor = MagicMock()
+        snaps = self._snapshots(managed=False)
+
+        self.assertTrue(
+            _enforce_monotonic_gates(snaps, executor, "smoke-test fixes"))
+        executor.run_command.assert_not_called()
+        snaps.rollback_to_last.assert_not_called()
+
+    def test_successful_repair_keeps_the_fix_instead_of_rolling_back(self):
+        """A stale test, not a bad fix.
+
+        The smoke-test repair legitimately changed `Player.update()`; the
+        test still stubbed the old signature. Rolling back would re-break a
+        working app to satisfy the stub, so the repair round runs first and
+        its success keeps the fix.
+        """
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("python -m unittest discover -v", "4.1")
+        executor = MagicMock()
+        # Red before the repair, green after it.
+        executor.run_command.side_effect = [
+            (False, "FAILED (errors=1)"),
+            (True, "OK"),
+        ]
+        snaps = self._snapshots()
+        repair = MagicMock()
+
+        self.assertTrue(_enforce_monotonic_gates(
+            snaps, executor, "smoke-test fixes", repair=repair))
+        repair.assert_called_once()
+        snaps.rollback_to_last.assert_not_called()
+        snaps.mark_green.assert_called_once()
+
+    def test_failed_repair_still_rolls_back(self):
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("python -m unittest discover -v", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "FAILED (errors=1)")
+        snaps = self._snapshots()
+        repair = MagicMock()
+
+        self.assertFalse(_enforce_monotonic_gates(
+            snaps, executor, "smoke-test fixes", repair=repair))
+        repair.assert_called_once()
+        snaps.rollback_to_last.assert_called_once()
+
+    def test_repair_is_skipped_when_nothing_regressed(self):
+        """The repair round costs LLM calls — never run it speculatively."""
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("pytest -q", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "ok")
+        snaps = self._snapshots()
+        repair = MagicMock()
+
+        self.assertTrue(_enforce_monotonic_gates(
+            snaps, executor, "smoke-test fixes", repair=repair))
+        repair.assert_not_called()
+
+    def test_raising_repair_is_contained(self):
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("pytest -q", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "FAILED")
+        snaps = self._snapshots()
+
+        def _boom():
+            raise RuntimeError("fix loop exploded")
+
+        self.assertFalse(_enforce_monotonic_gates(
+            snaps, executor, "smoke-test fixes", repair=_boom))
+        snaps.rollback_to_last.assert_called_once()
+
+    def test_harness_error_is_not_treated_as_a_regression(self):
+        """A gate that can no longer launch must not discard good code."""
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        get_gate_ledger().record("venv\\Scripts\\python.exe -c \"import x\"",
+                                 "2.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (
+            False, "The system cannot find the path specified.")
+        snaps = self._snapshots()
+
+        self.assertTrue(
+            _enforce_monotonic_gates(snaps, executor, "smoke-test fixes"))
+        snaps.rollback_to_last.assert_not_called()
+
+
 def _git_available() -> bool:
     try:
         return subprocess.run(["git", "--version"],
@@ -120,6 +259,7 @@ class TestProjectSnapshots(unittest.TestCase):
         snaps.start()
         sha = snaps.commit_wave("wave 1")
         self.assertIsNotNone(sha)
+        snaps.mark_green()   # wave 1's gates rechecked clean
         # A regressing fix round: mutate a file, add a stray one
         self._write("a.txt", "broken by fix round")
         self._write("stray.txt", "should be cleaned")
@@ -128,6 +268,62 @@ class TestProjectSnapshots(unittest.TestCase):
         with open(os.path.join(self.root, "a.txt"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "original")
         self.assertFalse(os.path.exists(os.path.join(self.root, "stray.txt")))
+
+    def test_unverified_wave_is_not_a_rollback_target(self):
+        """A committed-but-not-green wave must never become the target.
+
+        This is the bug that made rollback a silent no-op: waves are
+        committed *before* their gates are rechecked, so HEAD was the very
+        commit carrying the regression. `reset --hard HEAD` then restored
+        the broken state and reported success while discarding nothing.
+        """
+        self._write("a.txt", "green")
+        snaps = ProjectSnapshots(self.root)
+        snaps.start()
+        snaps.commit_wave("wave 1")
+        snaps.mark_green()
+        green_sha = snaps.last_green_sha()
+
+        # Wave 2 introduces a regression and is committed before its gates
+        # are rechecked — so it is never marked green.
+        self._write("a.txt", "regressed by wave 2")
+        wave2_sha = snaps.commit_wave("wave 2")
+        self.assertNotEqual(wave2_sha, green_sha)
+        self.assertEqual(snaps.last_green_sha(), green_sha)
+
+        ok, _ = snaps.rollback_to_last()
+        self.assertTrue(ok)
+        with open(os.path.join(self.root, "a.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "green")
+
+    def test_rollback_without_any_green_wave_uses_baseline(self):
+        """A regression in the very first wave falls back to the pre-run state."""
+        self._write("a.txt", "pre-run")
+        snaps = ProjectSnapshots(self.root)
+        snaps.start()
+        self._write("a.txt", "regressed by wave 1")
+        self._write("new.py", "written by wave 1")
+        snaps.commit_wave("wave 1")   # never marked green
+        ok, _ = snaps.rollback_to_last()
+        self.assertTrue(ok)
+        with open(os.path.join(self.root, "a.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "pre-run")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "new.py")))
+
+    def test_rollback_is_repeatable(self):
+        """After a rollback, HEAD tracking must not strand the green pointer."""
+        self._write("a.txt", "green")
+        snaps = ProjectSnapshots(self.root)
+        snaps.start()
+        snaps.commit_wave("wave 1")
+        snaps.mark_green()
+        self._write("a.txt", "bad")
+        snaps.commit_wave("wave 2")
+        self.assertTrue(snaps.rollback_to_last()[0])
+        self._write("a.txt", "bad again")
+        self.assertTrue(snaps.rollback_to_last()[0])
+        with open(os.path.join(self.root, "a.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "green")
 
     def test_ignored_dirs_survive_rollback(self):
         self._write("a.txt", "v1")
