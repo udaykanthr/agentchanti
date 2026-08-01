@@ -1386,6 +1386,12 @@ def _main_impl():
     step_reports = [StepReport(index=i, text=steps[i]) for i in range(len(steps))]
 
     # ── 13. Execute waves ──
+    # The agent-loop attempt journal is keyed by step index, so a second
+    # run in the same process (library API, tests) would otherwise show a
+    # step the previous run's attempts as if they were its own.
+    from .agent_loop import reset_attempt_journal
+    reset_attempt_journal()
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
