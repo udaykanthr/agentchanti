@@ -1032,6 +1032,7 @@ def _main_impl():
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
                 fix_import_dependencies, check_gate_quality,
+                check_gate_consistency,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
@@ -1070,7 +1071,8 @@ def _main_impl():
                     # green, pipeline "Finished". Send the plan back with
                     # the specific complaint rather than accepting gates
                     # that can only ever pass.
-                    _gate_gaps = check_gate_quality(plan_steps_parsed)
+                    _gate_gaps = (check_gate_quality(plan_steps_parsed)
+                                  + check_gate_consistency(plan_steps_parsed))
                     if _gate_gaps and plan_attempt < MAX_PLAN_RETRIES:
                         log.warning(
                             "[Plan] %d step(s) have a verify: that cannot "

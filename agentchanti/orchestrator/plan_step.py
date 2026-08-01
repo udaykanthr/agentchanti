@@ -1713,10 +1713,19 @@ _TEST_RUNNER_RE = re.compile(
 # tolerate escaped quotes (`assert hasattr(m, \"X\")`); a plain non-greedy
 # `.+?` stops at the first `\"` and silently truncates the payload, which
 # made every escaped gate look unparseable and slip through unjudged.
+#
+# The interpreter is rarely a bare name: plans reach for
+# ``venv\Scripts\python.exe -c``, ``../venv/bin/python3 -c``, ``py -c``.
+# An interpreter pattern that only matched ``python`` skipped those gates
+# entirely — not "judged and passed", *skipped* — so a whole run's worth
+# of gates went unchecked. Allow a leading path and an ``.exe`` suffix.
+_INTERP = r"""(?:\S*[\\/])?(?:python[0-9.]*|py)(?:\.exe)?"""
+_JS_INTERP = r"""(?:\S*[\\/])?(?:node|deno)(?:\.exe)?"""
+
 _INLINE_SCRIPT_RE = re.compile(
-    r"""(?:python[0-9.]*|py)\s+-c\s+(?P<pq>["'])"""
+    _INTERP + r"""\s+-c\s+(?P<pq>["'])"""
     r"""(?P<py>(?:\\.|(?!(?P=pq)).)*)(?P=pq)"""
-    r"""|(?:node|deno)\s+-e\s+(?P<jq>["'])"""
+    r"""|""" + _JS_INTERP + r"""\s+-e\s+(?P<jq>["'])"""
     r"""(?P<js>(?:\\.|(?!(?P=jq)).)*)(?P=jq)""",
     re.DOTALL,
 )
@@ -1793,6 +1802,59 @@ def _shallow_python_reason(payload: str) -> Optional[str]:
 
     return ("imports and prints but never asserts — it passes whatever the "
             "values are, so it cannot detect wrong behaviour")
+
+
+# `from a.b import x` / `import a.b` inside a verify payload.
+_PY_IMPORT_RE = re.compile(
+    r"\bfrom\s+([A-Za-z_][\w.]*)\s+import\b|\bimport\s+([A-Za-z_][\w.]*)")
+
+
+def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
+    """Find verify commands that assume a working directory they won't get.
+
+    Gates run from the repo root. A plan that targets
+    ``pacman_clone/src/config.py`` while its verify says
+    ``from src.config import ...`` has written a gate that cannot pass
+    there — the module only resolves from inside ``pacman_clone/``.
+
+    That mismatch is not a harmless red gate: the agent loop treats the
+    gate as ground truth and makes it pass. Observed on a Pygame run where
+    every step wrote its declared target, watched the gate fail, and then
+    wrote a *second copy* of the module at the repo root to satisfy it —
+    shipping a fully duplicated source tree, 439k tokens, and a green
+    pipeline. Catch it at plan time instead.
+
+    Returns ``(step_id, reason)`` pairs, empty when the plan is coherent.
+    """
+    from .plan_graph import PlanGraph
+
+    graph = PlanGraph(steps)
+    issues: list[tuple[str, str]] = []
+    for step in steps:
+        cmd = step.verify_cmd
+        if not cmd:
+            continue
+        match = _INLINE_SCRIPT_RE.search(cmd)
+        if match is None:
+            continue
+        payload = match.group("py")
+        if not payload:
+            continue
+        for imp in _PY_IMPORT_RE.finditer(payload):
+            module = imp.group(1) or imp.group(2)
+            if not module:
+                continue
+            key = module.replace(".", "/")
+            if graph.has_module(key):
+                continue          # resolves from the repo root — fine
+            prefix = graph.prefix_for(key)
+            if prefix:
+                issues.append((step.id, (
+                    f"imports `{module}`, but the plan targets that module "
+                    f"at `{prefix}/{key}.py`. The gate runs from the project "
+                    f"root, where this import fails")))
+                break
+    return issues
 
 
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:

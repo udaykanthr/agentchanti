@@ -9,7 +9,7 @@ from agentchanti.orchestrator.plan_step import (
     fix_import_dependencies,
     is_structured_plan, build_waves,
     plan_looks_truncated,
-    shallow_gate_reason, check_gate_quality,
+    shallow_gate_reason, check_gate_quality, check_gate_consistency,
 )
 
 
@@ -81,6 +81,85 @@ class TestShallowGateDetection(unittest.TestCase):
     def test_gate_survives_a_venv_prefix(self):
         self.assert_shallow(
             r'call venv\Scripts\activate && python -c "import src.map"')
+
+
+class TestInterpreterForms(unittest.TestCase):
+    """A gate is only judged if its interpreter is recognised.
+
+    Matching only a bare `python` meant `venv\\Scripts\\python.exe -c ...`
+    was skipped outright — not judged and passed, *skipped* — so an entire
+    run's gates went unchecked.
+    """
+
+    def test_pathed_and_suffixed_interpreters_are_judged(self):
+        for interp in ("python", "python3", "python3.11", "py",
+                       "python.exe", "venv\\Scripts\\python.exe",
+                       "../venv/bin/python3", "./venv/bin/python",
+                       "C:\\Python313\\python.exe"):
+            with self.subTest(interp=interp):
+                self.assertIsNotNone(
+                    shallow_gate_reason(f'{interp} -c "import x"'),
+                    f"{interp} was not judged at all")
+
+    def test_pathed_node_is_judged(self):
+        self.assertIsNotNone(
+            shallow_gate_reason('node_modules/.bin/node -e "require(\'./x\')"'))
+
+
+class TestGateConsistency(unittest.TestCase):
+    """Verify commands that assume a cwd they will not get."""
+
+    def _pacman_plan(self):
+        return [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["pacman_clone/src/config.py"],
+                     exports=["SCREEN_WIDTH", "TILE_SIZE"],
+                     verify_cmd='venv\\Scripts\\python.exe -c '
+                                '"from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+            PlanStep(id="3.2", step_type="CODE", index=1,
+                     target_files=["pacman_clone/main.py"], exports=["main"],
+                     verify_cmd='python -c "import main; '
+                                'assert callable(main.main)"'),
+        ]
+
+    def test_detects_the_duplicated_tree_shape(self):
+        """The plan that shipped every module twice.
+
+        Targets live under `pacman_clone/`, gates import as if cwd were
+        `pacman_clone/`. The loop made the gate pass by writing a second
+        copy of each module at the repo root.
+        """
+        issues = check_gate_consistency(self._pacman_plan())
+        self.assertEqual({sid for sid, _ in issues}, {"2.1", "3.2"})
+        self.assertIn("pacman_clone", issues[0][1])
+
+    def test_coherent_plan_reports_nothing(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/config.py"], exports=["TILE_SIZE"],
+                     verify_cmd='python -c "from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
+
+    def test_third_party_imports_are_not_flagged(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/config.py"], exports=["TILE_SIZE"],
+                     verify_cmd='python -c "import pygame; '
+                                'from src.config import TILE_SIZE; '
+                                'assert TILE_SIZE > 0"'),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
+
+    def test_test_runner_gates_are_not_inspected(self):
+        steps = [
+            PlanStep(id="4.1", step_type="TEST", index=0,
+                     target_files=["pacman_clone/tests/test_x.py"],
+                     verify_cmd="python -m pytest -q"),
+        ]
+        self.assertEqual(check_gate_consistency(steps), [])
 
 
 class TestCheckGateQuality(unittest.TestCase):

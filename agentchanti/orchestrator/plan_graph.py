@@ -53,6 +53,14 @@ _STATUS_PLANNED = "planned"
 _STATUS_BUILDING = "building"
 _STATUS_BUILT = "built"
 
+# Directories that group source inside a project rather than containing a
+# project. Everything living under `src/` does not make `src` a subproject.
+_NOT_PROJECT_ROOTS = frozenset({
+    "src", "lib", "app", "apps", "test", "tests", "source", "sources",
+    "pkg", "internal", "cmd", "api", "components", "static", "public",
+    "assets", "docs", "doc", "scripts", "config", "core", "common",
+})
+
 
 def normalize_path(path: str) -> str:
     """Collapse separators and strip a leading ``./``."""
@@ -187,6 +195,49 @@ class PlanGraph:
         """Step id that produces *spec*, or None."""
         node = self.resolve(spec, symbols)
         return node.step_id if node is not None else None
+
+    def has_module(self, key: str) -> bool:
+        """True when *key* names a planned target relative to the repo root.
+
+        Strict — no symbol or basename fallback. Used to judge whether a
+        command run from the repo root can actually import that module.
+        """
+        return key in self._by_key
+
+    def prefix_for(self, key: str) -> Optional[str]:
+        """Directory that *key* would need as cwd to resolve, if any.
+
+        Returns the leading path a planned target carries that *key* lacks.
+        A plan targeting ``pacman_clone/src/config.py`` while its verify
+        says ``from src.config import ...`` yields ``pacman_clone`` — the
+        gate is unsatisfiable from the repo root, which is where it runs.
+        """
+        suffix = "/" + key
+        for node_key in self._by_key:
+            if node_key.endswith(suffix):
+                return node_key[: -len(suffix)]
+        return None
+
+    def common_root(self) -> Optional[str]:
+        """Single directory every planned target sits under, if any.
+
+        ``None`` when targets are spread across the repo root, or when the
+        shared directory is a conventional source folder rather than a
+        project container — all files living under ``src/`` does not make
+        ``src`` a subproject.
+        """
+        firsts = set()
+        for node in self.nodes:
+            head, sep, _ = node.path.partition("/")
+            if not sep:
+                return None          # a target sits at the repo root
+            firsts.add(head)
+        if len(firsts) != 1:
+            return None
+        root = firsts.pop()
+        if root.lower() in _NOT_PROJECT_ROOTS:
+            return None
+        return root
 
     # ── lifecycle ─────────────────────────────────────────────────────
 

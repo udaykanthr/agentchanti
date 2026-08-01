@@ -170,6 +170,23 @@ _INTENT_INLINE_RULES = """
     places entities on a grid, assert they are not inside walls; if it
     implements movement, assert a position actually changes. Never a
     scaffolding command.
+
+21. **verify: runs from the PROJECT ROOT — its imports must match your
+    target: paths**: The gate is executed with the project root as the
+    working directory, so an import must spell the full path from there.
+    If you target `pacman_clone/src/config.py`, the module is
+    `pacman_clone.src.config`, NOT `src.config`:
+
+      BAD  target: pacman_clone/src/config.py
+           verify: python -c "from src.config import TILE_SIZE; ..."
+      GOOD target: src/config.py
+           verify: python -c "from src.config import TILE_SIZE; ..."
+
+    Simplest is to put source at the repo root (`src/...`, `main.py`) and
+    not nest the project in a extra directory at all. A gate that cannot
+    pass from the project root does not fail harmlessly — the executing
+    agent takes the gate as ground truth and will duplicate your files at
+    the root to satisfy it.
 """
 
 _CHECKLIST_INTENT = """
