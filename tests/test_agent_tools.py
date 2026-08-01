@@ -238,3 +238,64 @@ class TestHeredocGuard(AgentToolsTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestNoTestsCollected(AgentToolsTestCase):
+    """"exit: FAILED" read identically for two different problems.
+
+    Both unittest and pytest exit 5 when the runner COLLECTED NOTHING —
+    a discovery problem, with no assertion having run at all. The tool
+    result never showed the exit code, so the model could not tell that
+    from a failing test and debugged code that was never executed:
+    observed a loop spending four consecutive run_command turns
+    re-running an empty suite. 19 occurrences across 7 of 8 measured runs.
+    """
+
+    def _detect(self, cmd, code, out=""):
+        from agentchanti.agent_tools import _no_tests_collected
+        return _no_tests_collected(cmd, code, out)
+
+    def test_exit_5_from_a_test_runner_is_a_discovery_problem(self):
+        for cmd in ("python -m unittest -v", "python -m pytest -q",
+                    "python manage.py test", "tox"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self._detect(cmd, 5))
+
+    def test_a_failing_assertion_is_not(self):
+        """The hint must never appear on a real test failure."""
+        self.assertFalse(
+            self._detect("python -m unittest -v", 1, "FAILED (failures=1)"))
+
+    def test_exit_5_from_an_unrelated_command_is_not(self):
+        """5 is an ordinary failure code for other programs."""
+        self.assertFalse(self._detect('python -c "import sys; sys.exit(5)"', 5))
+        self.assertFalse(self._detect("npm run build", 5))
+
+    def test_output_markers_work_without_an_exit_code(self):
+        """Some runners report it in words; the code may be unavailable."""
+        for out in ("no tests ran in 0.00s", "Ran 0 tests in 0.000s",
+                    "collected 0 items"):
+            with self.subTest(out=out):
+                self.assertTrue(self._detect("npm test", None, out))
+
+    def test_a_passing_suite_is_not_flagged(self):
+        self.assertFalse(self._detect("python -m pytest", 0, "2 passed"))
+
+    def test_the_hint_reaches_the_tool_result(self):
+        import os
+        result = self._call("run_command", command="python -m unittest -v")
+        self.assertIn("exit: FAILED", result)
+        self.assertIn("COLLECTED NO TESTS", result)
+        self.assertIn("test_*.py", result)
+        self.assertIn("__init__.py", result)
+
+    def test_a_real_failure_gets_no_hint_through_the_tool(self):
+        self._write("tests/__init__.py", "")
+        self._write("tests/test_x.py",
+                    "import unittest\n"
+                    "class T(unittest.TestCase):\n"
+                    "    def test_f(self):\n"
+                    "        self.assertEqual(1, 2)\n")
+        result = self._call("run_command", command="python -m unittest -v")
+        self.assertIn("exit: FAILED", result)
+        self.assertNotIn("COLLECTED NO TESTS", result)
