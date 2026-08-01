@@ -1406,3 +1406,72 @@ class TestEffectivePhases(unittest.TestCase):
         eff = _effective_phases(steps)
         for s in steps:
             self.assertGreaterEqual(eff[s.id], _phase_of(s.id))
+
+
+class TestUnrunnableGate(unittest.TestCase):
+    """A gate that cannot parse is impossible, not merely weak.
+
+    Observed in a live run: the planner wrote a `python -c` payload with a
+    literal backslash-n to fake a multi-line loop. Python rejects it with
+    "unexpected character after line continuation character", so no
+    implementation of ghost.py could ever satisfy it. Two models made
+    three attempts — 24 turns and ~20 command runs — before the run was
+    abandoned. The gate is re-run on every monotonic recheck, so this is a
+    permanent blocker, not a one-off.
+    """
+
+    BROKEN = ('python -c "from map import Map; from ghost import Ghost; '
+              'm=Map(); g=Ghost(m, index=0); changed=False; '
+              + chr(92) + 'nfor _ in range(40): g.update(0.05); assert changed"')
+
+    def _reason(self, cmd):
+        from agentchanti.orchestrator.plan_step import unrunnable_gate_reason
+        return unrunnable_gate_reason(cmd)
+
+    def test_catches_the_gate_from_the_failing_run(self):
+        reason = self._reason(self.BROKEN)
+        self.assertIsNotNone(reason)
+        self.assertIn("not valid Python", reason)
+        self.assertIn("can never pass", reason)
+
+    def test_a_real_newline_in_the_payload_is_legal(self):
+        """python -c accepts genuine multi-line source — never flag it."""
+        self.assertIsNone(
+            self._reason('python -c "import a' + chr(10) + 'assert a.f() == 2"'))
+
+    def test_valid_gates_are_untouched(self):
+        for cmd in ('python -c "from a import B; assert B().x == 1"',
+                    'python -c "assert True"',
+                    'python -m unittest -v',
+                    'python -m pytest -q',
+                    'npm test --silent',
+                    'go test ./...',
+                    ''):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._reason(cmd))
+
+    def test_other_syntax_errors_are_caught(self):
+        self.assertIsNotNone(self._reason('python -c "def f(: pass"'))
+
+    def test_a_pathed_interpreter_is_still_judged(self):
+        cmd = ('venv' + chr(92) + 'Scripts' + chr(92) + 'python.exe -c '
+               '"x = ' + chr(92) + 'nfor i in []: pass"')
+        self.assertIsNotNone(self._reason(cmd))
+
+    def test_unrunnable_is_reported_for_TEST_steps_too(self):
+        """Shallowness is CODE-only; impossibility is not."""
+        steps = [PlanStep(id="4.1", step_type="TEST", index=0,
+                          verify_cmd=self.BROKEN)]
+        gaps = check_gate_quality(steps)
+        self.assertEqual([g[0] for g in gaps], ["4.1"])
+        self.assertIn("not valid Python", gaps[0][1])
+
+    def test_unrunnable_outranks_shallow(self):
+        """Reporting 'too shallow' would send the planner to fix the wrong
+        thing — the gate is broken, not weak."""
+        steps = [PlanStep(id="2.1", step_type="CODE", index=0,
+                          verify_cmd='python -c "import main' + chr(92) + 'nx"')]
+        gaps = check_gate_quality(steps)
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("not valid Python", gaps[0][1])
+        self.assertNotIn("only imports", gaps[0][1])

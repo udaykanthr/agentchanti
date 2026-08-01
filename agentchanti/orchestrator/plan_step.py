@@ -28,6 +28,7 @@ Format
 from __future__ import annotations
 
 import logging
+import ast
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -1857,20 +1858,67 @@ def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
     return issues
 
 
+def unrunnable_gate_reason(cmd: str) -> Optional[str]:
+    """Explain why *cmd* can never run at all, or None.
+
+    A gate is executed on every monotonic recheck, so one that cannot even
+    parse is a permanent, unsatisfiable blocker rather than a test of the
+    code. Observed: a planner wrote a `python -c` payload containing a
+    literal backslash-n to fake a multi-line loop —
+
+        ...; changed=False; \nfor _ in range(40): g.update(0.05, ...)
+
+    — which Python rejects with "unexpected character after line
+    continuation character". No implementation of ghost.py could satisfy
+    it. Three attempts across two models spent 24 turns and ~20 command
+    runs on it before the run was abandoned.
+
+    Only the inline `python -c` payload is judged; a real newline inside
+    it is perfectly legal and must not be flagged.
+    """
+    if not cmd:
+        return None
+    match = _INLINE_SCRIPT_RE.search(cmd)
+    if not match:
+        return None
+    payload = match.groupdict().get("py")
+    if not payload:
+        return None
+    try:
+        ast.parse(payload)
+    except SyntaxError as exc:
+        return (f"the verify command's python -c payload is not valid "
+                f"Python ({exc.msg}) — it can never pass, whatever the "
+                f"code does. Write it as a single line of statements "
+                f"separated by ';', or move the logic into a test file")
+    except ValueError as exc:          # e.g. embedded null bytes
+        return (f"the verify command's python -c payload cannot be parsed "
+                f"({exc}) — it can never pass")
+    return None
+
+
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
     """Find CODE steps whose ``verify:`` cannot detect a behavioural defect.
 
     Returns ``(step_id, reason)`` pairs, empty when every gate has teeth.
-    TEST steps are exempt: their gate is normally the suite itself, and the
-    assertions live in the test file rather than the command.
+
+    Shallowness is judged for CODE steps only: a TEST step's gate is
+    normally the suite itself, with the assertions in the test file rather
+    than the command. Being UNRUNNABLE is checked for every step type —
+    a gate that cannot parse is impossible to satisfy no matter what the
+    step produces, and exempting TEST steps from that would leave the
+    worst kind of gate in place.
     """
     gaps: list[tuple[str, str]] = []
     for step in steps:
-        if step.step_type != "CODE":
-            continue
         if not step.verify_cmd:
             continue  # missing verify entirely is a separate check
-        reason = shallow_gate_reason(step.verify_cmd)
+        # Unrunnable outranks shallow: a gate that cannot parse is not
+        # weak, it is impossible, and reporting "too shallow" would send
+        # the planner to fix the wrong thing.
+        reason = unrunnable_gate_reason(step.verify_cmd)
+        if reason is None and step.step_type == "CODE":
+            reason = shallow_gate_reason(step.verify_cmd)
         if reason:
             gaps.append((step.id, reason))
     return gaps
