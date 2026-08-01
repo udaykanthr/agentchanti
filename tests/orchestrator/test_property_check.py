@@ -246,5 +246,54 @@ class TestRunPropertyCheckSkips(unittest.TestCase):
         self.assertIn("iteration 517", err)
 
 
+class TestPropertyCheckWriteScope(unittest.TestCase):
+    """The stage may author its own file and fix the source it tests.
+
+    It must not touch another step's deliverables. Observed: the loop
+    rewrote the plan's own tests/test_game.py, discarding the 600-frame
+    adversarial suite verified in an earlier wave, then edited main.py --
+    and still never produced test_properties.py, so the stage reported
+    "skipped" while its edits stayed on disk and reached the final commit.
+    """
+
+    def test_scope_is_the_property_file_plus_the_simulation_sources(self):
+        captured = {}
+
+        def _fake_build(executor, memory, kb_context_builder=None,
+                        project_root=".", write_scope=None):
+            captured["scope"] = write_scope
+            return MagicMock()
+
+        cfg = MagicMock()
+        cfg.PROPERTY_CHECK_ENABLED = True
+        cfg.AGENT_LOOP_MAX_TURNS = 8
+        with unittest.mock.patch(
+                "agentchanti.orchestrator.agent_loop.agent_loop_enabled",
+                return_value=True),              unittest.mock.patch(
+                "agentchanti.orchestrator.agent_loop.build_step_tools",
+                side_effect=_fake_build),              unittest.mock.patch(
+                "agentchanti.orchestrator.agent_loop."
+                "run_agent_loop_with_escalation", return_value=(True, "ok")):
+            run_property_check(
+                memory=_Memory({"main.py": _GAME}), executor=MagicMock(),
+                coder=MagicMock(), display=None, task="t",
+                language="python", cfg=cfg)
+
+        scope = captured.get("scope")
+        self.assertIsNotNone(scope, "build_step_tools got no write_scope")
+        self.assertIn("test_properties.py", scope)
+        self.assertIn("main.py", scope,
+                      "the source under test must stay writable")
+
+    def test_other_paths_are_not_in_scope(self):
+        from agentchanti.agent_tools import AgentTools
+        tools = AgentTools(project_root=".",
+                           write_scope=["test_properties.py", "main.py"])
+        self.assertIsNone(tools._write_denied("test_properties.py"))
+        self.assertIsNone(tools._write_denied("main.py"))
+        self.assertIsNotNone(tools._write_denied("tests/test_game.py"))
+        self.assertIsNotNone(tools._write_denied("README.md"))
+
+
 if __name__ == "__main__":
     unittest.main()

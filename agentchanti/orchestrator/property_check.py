@@ -203,7 +203,19 @@ def run_property_check(
         # The whole stage sits inside the guard, not just the loop call:
         # never take a run down over the property check itself. An earlier
         # cut left build_step_tools outside and a raise there escaped.
-        tools = build_step_tools(executor, memory)
+        # Writable: the file this stage authors, plus the simulation source
+        # it is testing (the prompt tells it to fix a real violation in the
+        # source rather than weaken the assertion). Nothing else — above
+        # all, not another step's tests.
+        #
+        # Observed without this: the loop rewrote the plan's own
+        # tests/test_game.py, discarding the 600-frame adversarial suite
+        # that had been written and verified in wave 4 minutes earlier,
+        # then edited main.py — and still never produced
+        # test_properties.py, so the stage reported "skipped" while its
+        # edits stayed on disk and went into the final commit.
+        tools = build_step_tools(executor, memory,
+                                 write_scope=[test_file] + list(sim_files))
         step_text = build_property_step(sim_files, task, intent_spec)
         ok, info = run_agent_loop_with_escalation(
             llm_client, tools, step_text, task,
