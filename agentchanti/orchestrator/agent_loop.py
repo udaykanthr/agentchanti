@@ -15,6 +15,7 @@ prefix.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -303,11 +304,97 @@ def _preload_listing(tools: AgentTools) -> str:
             "list_files again unless you have changed the tree):\n" + body)
 
 
+# A dependency smaller than this is cheaper to send whole than to outline,
+# and the values matter: a constants module IS its assignments.
+_OUTLINE_MIN_CHARS = 2_000
+# Longest literal kept inline in an outline (e.g. a maze layout is elided).
+_OUTLINE_MAX_LITERAL = 80
+
+
+def _py_signature_outline(source: str) -> str | None:
+    """API surface of a Python module: declarations, no bodies.
+
+    A step importing `map.py` needs to know that `Map.is_walkable(x, y)`
+    exists, not how it is implemented — and bodies are ~95% of the bytes.
+    Measured on a generated game module: 21,364 chars of source reduce to
+    1,138 chars of signatures.
+
+    Returns ``None`` when the source will not parse, so the caller falls
+    back to sending the real text rather than a half-outline.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+    lines: list[str] = []
+
+    def render_def(node, indent: str) -> None:
+        a = node.args
+        names = [x.arg for x in getattr(a, "posonlyargs", [])] +                 [x.arg for x in a.args]
+        if a.vararg:
+            names.append("*" + a.vararg.arg)
+        names += [x.arg for x in a.kwonlyargs]
+        if a.kwarg:
+            names.append("**" + a.kwarg.arg)
+        kw = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        lines.append(f"{indent}{kw} {node.name}({', '.join(names)})")
+
+    def literal(node) -> str:
+        try:
+            text = ast.unparse(node)
+        except Exception:
+            return "..."
+        text = " ".join(text.split())
+        return text if len(text) <= _OUTLINE_MAX_LITERAL else "..."
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            render_def(node, "")
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(literal(b) for b in node.bases)
+            lines.append(f"class {node.name}" + (f"({bases})" if bases else ""))
+            members = [b for b in node.body
+                       if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.Assign, ast.AnnAssign))]
+            if not members:
+                lines.append("    ...")
+            for b in members:
+                if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    render_def(b, "    ")
+                elif isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name):
+                    lines.append(f"    {b.target.id} = {literal(b.value) if b.value else '...'}")
+                elif isinstance(b, ast.Assign):
+                    for t in b.targets:
+                        if isinstance(t, ast.Name):
+                            lines.append(f"    {t.id} = {literal(b.value)}")
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            lines.append(f"{node.target.id} = "
+                         + (literal(node.value) if node.value else "..."))
+        elif isinstance(node, ast.Assign):
+            # Module-level constants are the whole point of a constants
+            # module, so keep short values verbatim.
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    lines.append(f"{t.id} = {literal(node.value)}")
+
+    return "\n".join(lines) if lines else None
+
+
 def _preload_target_files(tools: AgentTools,
-                          paths: list[str] | None) -> str:
-    """Read the step's existing target files up front so the loop doesn't
-    burn its first turns on read_file round-trips — whose output then rides
-    along, re-sent, in every later turn.
+                          paths: list[str] | None,
+                          full_paths: set[str] | None = None) -> str:
+    """Read the step's context up front so the loop doesn't burn its first
+    turns on read_file round-trips — whose output then rides along,
+    re-sent, in every later turn.
+
+    Files in *full_paths* (the step's own targets — what it is about to
+    edit) are sent verbatim. Everything else is a DEPENDENCY, and a
+    dependency is only consulted for its API: what a step importing
+    `map.py` needs is that `Map.is_walkable(x, y)` exists, not how it is
+    implemented. Those are reduced to a signature outline, which measured
+    8% of source size on a generated game module (21,364 -> 1,750 chars)
+    while keeping every constant's value.
 
     Only existing, non-empty files inside the project root are included;
     files the step will *create* are skipped (nothing to read yet). The
@@ -316,6 +403,12 @@ def _preload_target_files(tools: AgentTools,
     """
     if not paths:
         return ""
+    # ``None`` means "no dependency information available", so every
+    # file is sent whole — the previous behaviour. Outlining is opt-in
+    # via an explicit set, so a caller that cannot say which file is
+    # being edited never gets an outline of the file it must modify.
+    outline_ok = full_paths is not None
+    full_set = {str(p).replace("\\", "/") for p in (full_paths or ())}
     seen: set[str] = set()
     blocks: list[str] = []
     total = 0
@@ -333,6 +426,19 @@ def _preload_target_files(tools: AgentTools,
         body = tools._tool_read_file(path)
         if body.startswith("ERROR"):
             continue
+        if (outline_ok and rel not in full_set and rel.endswith(".py")
+                and len(body) >= _OUTLINE_MIN_CHARS):
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    outline = _py_signature_outline(fh.read())
+            except OSError:
+                outline = None
+            # An unparseable module falls through to the real text: half an
+            # outline is worse than none.
+            if outline:
+                body = (f"{rel} (API outline — signatures only, bodies "
+                        f"omitted; read_file it if you need an "
+                        f"implementation)\n{outline}")
         room = _PRELOAD_MAX_CHARS - total
         if len(body) > room:
             # This used to `break`, so ONE oversized file emptied the whole
@@ -485,6 +591,7 @@ def run_agent_loop(
     verify_cmd: str | None = None,
     context: str = "",
     preload_files: list[str] | None = None,
+    preload_full_paths: set[str] | None = None,
     _recovery: bool = False,
     attempt_label: str = "first attempt",
 ) -> tuple[bool, str]:
@@ -502,7 +609,8 @@ def run_agent_loop(
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
     """
-    preloaded = _preload_target_files(tools, preload_files)
+    preloaded = _preload_target_files(tools, preload_files,
+                                      preload_full_paths)
     listing = _preload_listing(tools)
     messages = [
         Message(role="system", content=AGENT_LOOP_SYSTEM_PROMPT),

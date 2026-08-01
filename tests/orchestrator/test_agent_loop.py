@@ -1879,3 +1879,124 @@ class TestMonotonicEscalationLadder(unittest.TestCase):
                                   step_idx=8, escalation_client=strong)
         self.assertTrue(ok)
         self.assertIs(mock_loop.call_args[0][0], weak)
+
+
+class TestSignatureOutline(unittest.TestCase):
+    """A dependency is consulted for its API, not its implementation.
+
+    Bodies are ~92% of a module's bytes. A step importing `map.py` needs
+    to know `Map.is_walkable(x, y)` exists, not how it is written — and
+    the preload budget was being spent on, and truncated by, code the
+    model never reads.
+    """
+
+    SRC = (
+        "import os\n"
+        "TILE_SIZE = 24\n"
+        # A real maze layout runs to hundreds of characters — bulk, not
+        # interface — so it must be elided rather than carried.
+        "LAYOUT = [" + ", ".join(["'#" + "." * 30 + "#'"] * 8) + "]\n"
+        "def helper(a, b=2, *rest, key=None, **kw):\n"
+        "    total = 0\n"
+        "    for i in range(1000):\n"
+        "        total += i\n"
+        "    return total\n"
+        "class Map(Base):\n"
+        "    MAX = 9\n"
+        "    def __init__(self, layout):\n"
+        "        self.layout = layout\n"
+        "    async def load(self, path):\n"
+        "        return None\n"
+        "class Empty:\n"
+        "    pass\n"
+    )
+
+    def _outline(self, src=None):
+        from agentchanti.orchestrator.agent_loop import _py_signature_outline
+        return _py_signature_outline(self.SRC if src is None else src)
+
+    def test_keeps_the_api_surface(self):
+        out = self._outline()
+        self.assertIn("def helper(a, b, *rest, key, **kw)", out)
+        self.assertIn("class Map(Base)", out)
+        self.assertIn("    def __init__(self, layout)", out)
+        self.assertIn("    async def load(self, path)", out)
+
+    def test_drops_the_bodies(self):
+        out = self._outline()
+        self.assertNotIn("total += i", out)
+        self.assertNotIn("self.layout = layout", out)
+
+    def test_constants_keep_their_values(self):
+        """A constants module IS its assignments — the value is the API."""
+        self.assertIn("TILE_SIZE = 24", self._outline())
+
+    def test_a_long_literal_is_elided(self):
+        """A maze layout is bulk, not interface."""
+        out = self._outline()
+        self.assertIn("LAYOUT = ...", out)
+
+    def test_an_empty_class_still_renders(self):
+        self.assertIn("class Empty", self._outline())
+
+    def test_unparseable_source_returns_none(self):
+        """Half an outline is worse than none — caller sends real text."""
+        self.assertIsNone(self._outline("def f(:\n"))
+
+    def test_it_is_much_smaller(self):
+        out = self._outline()
+        self.assertLess(len(out), len(self.SRC) * 0.6)
+
+
+class TestPreloadOutlinesDependencies(unittest.TestCase):
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        os.chdir(tempfile.mkdtemp())
+        body = "\n".join(f"        x{i} = {i}" for i in range(400))
+        with open("dep.py", "w", encoding="utf-8") as fh:
+            fh.write("CONST = 7\nclass Dep:\n    def api(self, n):\n" + body + "\n")
+        with open("target.py", "w", encoding="utf-8") as fh:
+            fh.write("def main():\n    return 1\n")
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def _pre(self, **kw):
+        from agentchanti.orchestrator.agent_loop import _preload_target_files
+        return _preload_target_files(self.tools, ["target.py", "dep.py"], **kw)
+
+    def test_dependencies_are_outlined_and_targets_are_not(self):
+        out = self._pre(full_paths={"target.py"})
+        self.assertIn("API outline", out)
+        self.assertIn("def api(self, n)", out)
+        self.assertNotIn("x399 = 399", out)
+        self.assertIn("def main()", out)      # the target, in full
+
+    def test_it_shrinks_the_bundle(self):
+        self.assertLess(len(self._pre(full_paths={"target.py"})),
+                        len(self._pre()) * 0.5)
+
+    def test_outlining_is_opt_in(self):
+        """Without an explicit target set the caller cannot say which file
+        is being edited, so nothing is outlined."""
+        self.assertNotIn("API outline", self._pre())
+
+    def test_a_file_being_edited_is_never_outlined(self):
+        out = self._pre(full_paths={"target.py", "dep.py"})
+        self.assertNotIn("API outline", out)
+
+    def test_small_dependencies_are_sent_whole(self):
+        """Below the threshold an outline saves nothing and loses detail."""
+        out = self._pre(full_paths={"dep.py"})
+        self.assertIn("def main()", out)
+        self.assertNotIn("API outline", out)
