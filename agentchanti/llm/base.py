@@ -9,6 +9,57 @@ from .chat_types import ChatResponse, Message, ToolDef, flatten_messages
 
 
 # Matches well-formed <think>...</think> blocks (including newlines).
+_TRUSTSTORE_APPLIED = False
+
+
+def ensure_system_trust_store() -> None:
+    """Route TLS verification through the OS trust store, once per process.
+
+    certifi's bundle does not contain the issuing CA on machines where a
+    corporate proxy or endpoint-security product terminates TLS, so every
+    provider call dies with:
+
+        SSLError: certificate verify failed: unable to get local issuer
+        certificate
+
+    — at the first LLM request, with nothing pointing at the cause. The
+    `truststore` package resolves it by validating against the platform
+    store, which does have the injected root. Idempotent, best-effort, and
+    a no-op when truststore is absent or already active.
+    """
+    global _TRUSTSTORE_APPLIED
+    if _TRUSTSTORE_APPLIED:
+        return
+    _TRUSTSTORE_APPLIED = True
+    try:
+        import truststore
+    except ImportError:
+        return
+    try:
+        truststore.inject_into_ssl()
+        log.debug("[LLM] TLS verification routed through the OS trust store")
+    except Exception as exc:      # never block a run on this
+        log.debug("[LLM] truststore injection skipped: %s", exc)
+
+
+def explain_tls_failure(exc: Exception) -> str:
+    """Extra guidance appended to a certificate-verification error."""
+    text = str(exc)
+    if "certificate verify failed" not in text.lower():
+        return ""
+    try:
+        import truststore     # noqa: F401
+        hint = ("truststore is installed but did not resolve it — check "
+                "whether the intercepting CA is in the OS trust store")
+    except ImportError:
+        hint = "install it with `pip install truststore` and re-run"
+    return (
+        "\n\nTLS certificate verification failed. This usually means a "
+        "proxy or endpoint-security product is terminating TLS and its CA "
+        "is not in certifi's bundle; " + hint + "."
+    )
+
+
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
 # Matches a leading reasoning block where the opening <think> was lost
 # (e.g. truncated by streaming) but the closing tag survived.
@@ -83,6 +134,10 @@ class LLMClient(ABC):
 
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
                  stream: bool = True, max_output_tokens: int = 16384):
+        # Before any provider call: on a TLS-intercepted machine certifi
+        # cannot build a chain and every request fails with an opaque
+        # SSLError.
+        ensure_system_trust_store()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.stream = stream
@@ -198,7 +253,8 @@ class LLMClient(ABC):
                     self._backoff(attempt, error=e)
 
         raise LLMError(
-            f"LLM failed after {self.max_retries} retries: {last_error}")
+            f"LLM failed after {self.max_retries} retries: {last_error}"
+            + explain_tls_failure(last_error))
 
     def chat(self, messages: List[Message],
              tools: Optional[List[ToolDef]] = None) -> ChatResponse:

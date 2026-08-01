@@ -1,5 +1,6 @@
 """Tests for the runtime smoke verification stage."""
 
+import re
 import os
 import textwrap
 
@@ -277,9 +278,15 @@ class TestGroundedFixLoop:
         coder = _ScriptedCoder([GOOD_FIX])
         _attempt_fix(
             CRASH, 'python "main.py"', memory, Executor(), coder, "main.py")
-        assert "INSTALLED PACKAGES" in coder.prompts[0]
-        assert "pytest==" in coder.prompts[0]
-        assert "#### [FILE]:" in coder.prompts[0]
+        prompt = coder.prompts[0]
+        assert "INSTALLED PACKAGES" in prompt
+        # Assert the block is POPULATED, not that some specific unrelated
+        # package appears. The old `"pytest==" in prompt` only passed on a
+        # lean interpreter: the list is capped, so on a 178-package env
+        # pytest fell outside it and the test failed for the environment
+        # rather than the behaviour.
+        assert re.search(r"\w+==\d", prompt), prompt[:400]
+        assert "#### [FILE]:" in prompt
 
 
 # ── Swallowed-traceback targeting ──────────────────────────────────

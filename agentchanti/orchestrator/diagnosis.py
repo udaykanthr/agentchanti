@@ -395,15 +395,15 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
     _versions_note = ""
     if executor is not None:
         try:
-            from .api_grounding import get_installed_package_versions
+            from .api_grounding import (get_installed_package_versions,
+                                        grounding_packages)
             _vers = get_installed_package_versions(executor=executor)
-            _pkgs = [f"{n}=={v}" for n, v in sorted(_vers.items())
-                     if n not in ("pip", "setuptools", "wheel")]
+            _pkgs = grounding_packages(_vers, memory)
             if _pkgs:
                 _versions_note = (
                     "INSTALLED PACKAGES — any code fix must only use APIs "
                     "that exist in these EXACT versions (do not assume "
-                    "older or newer APIs): " + ", ".join(_pkgs[:40]) + "\n\n"
+                    "older or newer APIs): " + ", ".join(_pkgs) + "\n\n"
                 )
         except Exception:
             pass

@@ -4278,10 +4278,14 @@ def run_bulk_test_execution_and_fix(
             # observed flipping a suite that had just passed four times
             # into two failures. Retry once, exactly as the gate ledger
             # does, before falling back.
+            from .wave_snapshots import (describe_abnormal_exit,
+                                         log_crash_diagnostics)
+            _code = getattr(executor, "last_exit_code", None)
             _logger.warning(
                 "[BulkTest] Plan-declared gate terminated abnormally "
-                "(exit %s) — retrying once before believing it: %s",
-                getattr(executor, "last_exit_code", None), _declared_suite)
+                "(%s) — retrying once before believing it: %s",
+                describe_abnormal_exit(_code) or _code, _declared_suite)
+            log_crash_diagnostics(_code, _declared_suite)
             _pf_ok, _pf_out = executor.run_command(
                 _declared_suite, cwd=subproject_cwd)
         if _pf_ok:
@@ -5900,15 +5904,15 @@ def run_wiring_verification(
 
     ver_line = ""
     try:
-        from .api_grounding import get_installed_package_versions
+        from .api_grounding import (get_installed_package_versions,
+                                    grounding_packages)
         _versions = get_installed_package_versions(
             cwd=project_root or None, executor=executor, language=language)
-        _pkgs = [f"{n}=={v}" for n, v in sorted(_versions.items())
-                 if n not in ("pip", "setuptools", "wheel")]
+        _pkgs = grounding_packages(_versions, memory)
         if _pkgs:
             ver_line = (
                 "Installed packages — any fix must only use APIs that exist "
-                "in these EXACT versions: " + ", ".join(_pkgs[:40]) + "\n\n"
+                "in these EXACT versions: " + ", ".join(_pkgs) + "\n\n"
             )
     except Exception:
         pass

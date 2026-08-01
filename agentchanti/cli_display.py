@@ -231,6 +231,36 @@ def _format_elapsed(elapsed: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+def _make_output_encoding_lenient() -> None:
+    """Stop an unencodable glyph from killing the run.
+
+    Redirecting output on Windows (``agentchanti ... > run.log``) gives
+    stdout a cp1252 handle, and Rich's box-drawing and status characters
+    are not in cp1252. The failure is fatal and arrives from deep inside
+    the renderer:
+
+        UnicodeEncodeError: 'charmap' codec can't encode character
+        '\\u26a1' in position 0
+
+    Observed killing a run that had completed all eight steps. Switching
+    the stream to ``errors="replace"`` degrades those glyphs to ``?``
+    instead, which is a cosmetic loss in a log file nobody reads for its
+    box corners. Encoding is left alone — only the error handler changes —
+    so a UTF-8 console is unaffected.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        if (getattr(stream, "errors", None) or "").lower() in (
+                "replace", "backslashreplace", "ignore", "xmlcharrefreplace"):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass        # closed, detached, or not a text stream
+
+
 def set_status(display, message: str) -> None:
     """Set *display*'s status line, tolerating displays that lack one.
 
@@ -342,6 +372,7 @@ class CLIDisplay:
         self._spinner_thread: threading.Thread | None = None
 
         if _RICH_AVAILABLE:
+            _make_output_encoding_lenient()
             self._console = Console()
             self._renderable = _LiveRenderable(self)
             self._live = Live(

@@ -149,8 +149,10 @@ class GateLedger:
                 # and a second green run is real evidence.
                 _logger.warning(
                     "[GateLedger] gate process terminated abnormally "
-                    "(exit %s) — retrying once before believing it (%s): %s",
-                    exit_code, label or "?", cmd)
+                    "(%s) — retrying once before believing it (%s): %s",
+                    describe_abnormal_exit(exit_code) or exit_code,
+                    label or "?", cmd)
+                log_crash_diagnostics(exit_code, cmd)
                 ok, out = executor.run_command(cmd, timeout=timeout)
                 if ok:
                     continue
@@ -391,3 +393,73 @@ class ProjectSnapshots:
                             self._last_green_sha[:12])
             self._last_sha = self._last_green_sha
         return ok, f"{out1}\n{out2}".strip()
+
+
+# ── Native-crash diagnostics ─────────────────────────────────────────
+# Windows NTSTATUS codes seen from child interpreters in real runs.
+_NTSTATUS_NAMES = {
+    0xC0000005: "ACCESS_VIOLATION (bad memory access in a native module)",
+    0xC0000409: "STACK_BUFFER_OVERRUN / fast-fail "
+                "(__fastfail, often a CRT or SDL abort)",
+    0xC000001D: "ILLEGAL_INSTRUCTION",
+    0xC00000FD: "STACK_OVERFLOW",
+    0xC0000374: "HEAP_CORRUPTION",
+}
+
+_crash_hint_shown = False
+
+
+def describe_abnormal_exit(code: int | None) -> str:
+    """Human-readable cause for an abnormal exit, or ``""``.
+
+    The bare number tells nobody anything: a run that dies with "exit code
+    3221226505" reads as a mystery, when it is a native crash in a child
+    interpreter and the pipeline's own code is not implicated.
+    """
+    if not isinstance(code, int) or isinstance(code, bool):
+        return ""
+    if code < 0:
+        return f"killed by signal {-code}"
+    if code < _NTSTATUS_FAILURE_BASE:
+        return ""
+    name = _NTSTATUS_NAMES.get(code & 0xFFFFFFFF)
+    hexcode = f"0x{code & 0xFFFFFFFF:08X}"
+    return f"{hexcode} — {name}" if name else f"{hexcode} — native crash"
+
+
+def log_crash_diagnostics(code: int | None, command: str = "") -> None:
+    """Explain an abnormal exit, and once per run say how to capture a dump.
+
+    The pipeline already retries these (a crash is not a verdict), but the
+    underlying fault stays invisible: the child dies before it can report
+    anything, so the only way to see WHERE is a crash dump. Printing the
+    enabling command once turns "this happens sometimes" into something a
+    user can actually investigate.
+    """
+    global _crash_hint_shown
+    detail = describe_abnormal_exit(code)
+    if not detail:
+        return
+    _logger.warning("[Crash] child process terminated abnormally: %s%s",
+                detail, f" — while running `{command}`" if command else "")
+    if _crash_hint_shown or os.name != "nt":
+        return
+    _crash_hint_shown = True
+    _logger.warning(
+        "[Crash] this is a fault inside the child interpreter (commonly a "
+        "native extension such as SDL/pygame during teardown), not a "
+        "failure of the code under test — the pipeline retries it rather "
+        "than trusting the result. To capture a dump for diagnosis, run "
+        "once as Administrator:\n"
+        '  reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error '
+        'Reporting\LocalDumps" /v DumpFolder /t REG_EXPAND_SZ /d '
+        '"%%LOCALAPPDATA%%\CrashDumps" /f\n'
+        '  reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error '
+        'Reporting\LocalDumps" /v DumpType /t REG_DWORD /d 2 /f\n'
+        "then reproduce and inspect the .dmp in %LOCALAPPDATA%\CrashDumps.")
+
+
+def reset_crash_hint() -> None:
+    """Test helper: re-arm the once-per-run hint."""
+    global _crash_hint_shown
+    _crash_hint_shown = False

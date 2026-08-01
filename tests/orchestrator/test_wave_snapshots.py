@@ -461,3 +461,74 @@ class TestProjectSnapshots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCrashDiagnostics(unittest.TestCase):
+    """A bare exit code tells nobody anything.
+
+    Runs died with "exit code 3221226505" repeatedly across sessions and
+    it read as a mystery, when it is a native crash inside the child
+    interpreter that the pipeline already retries around.
+    """
+
+    def setUp(self):
+        from agentchanti.orchestrator.wave_snapshots import reset_crash_hint
+        reset_crash_hint()
+
+    def test_names_the_codes_seen_in_real_runs(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        self.assertIn("0xC0000409", describe_abnormal_exit(3221226505))
+        self.assertIn("fast-fail", describe_abnormal_exit(3221226505))
+        self.assertIn("0xC0000005", describe_abnormal_exit(3221225477))
+        self.assertIn("ACCESS_VIOLATION", describe_abnormal_exit(3221225477))
+
+    def test_an_unknown_native_code_still_renders_as_hex(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        out = describe_abnormal_exit(0xC0000123)
+        self.assertIn("0xC0000123", out)
+        self.assertIn("native crash", out)
+
+    def test_posix_signals(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        self.assertIn("signal 11", describe_abnormal_exit(-11))
+
+    def test_ordinary_exits_describe_nothing(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        for code in (0, 1, 5, None, True, "1"):
+            with self.subTest(code=code):
+                self.assertEqual(describe_abnormal_exit(code), "")
+
+    def test_the_dump_instructions_appear_once_per_run(self):
+        import os
+
+        from agentchanti.orchestrator.wave_snapshots import (
+            log_crash_diagnostics,
+        )
+        with self.assertLogs("agentchanti", level="WARNING") as first:
+            log_crash_diagnostics(3221226505, "python -m unittest -v")
+        joined = "\n".join(first.output)
+        self.assertIn("0xC0000409", joined)
+        self.assertIn("python -m unittest -v", joined)
+        if os.name == "nt":
+            self.assertIn("LocalDumps", joined)
+
+        with self.assertLogs("agentchanti", level="WARNING") as second:
+            log_crash_diagnostics(3221226505, "python -m unittest -v")
+        self.assertNotIn("LocalDumps", "\n".join(second.output),
+                         "the dump instructions must not repeat every crash")
+
+    def test_a_clean_exit_logs_nothing(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            log_crash_diagnostics,
+        )
+        import logging
+        with self.assertNoLogs("agentchanti", level="WARNING"):
+            log_crash_diagnostics(1, "python -m unittest -v")

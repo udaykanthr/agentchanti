@@ -384,3 +384,100 @@ def local_top_levels_from_files(file_paths) -> set[str]:
         if first:
             tops.add(first)
     return tops
+
+
+# Packages that are never worth a slot in a grounding prompt.
+_GROUNDING_SKIP = frozenset({"pip", "setuptools", "wheel"})
+# Cap on the rendered list — a prompt block, not an inventory.
+_GROUNDING_MAX = 40
+
+
+def _imported_top_levels(sources) -> set[str]:
+    """Top-level module names imported by the given source texts.
+
+    Regex rather than ``ast``: the sources may be mid-edit and fail to
+    parse, and a missed import only costs relevance, never correctness.
+    """
+    names: set[str] = set()
+    if not sources:
+        return names
+    # `import a, b as c` must yield BOTH a and b — capturing only the first
+    # name silently dropped the package on any multi-import line.
+    pattern = re.compile(
+        r"^\s*(?:import\s+(?P<mods>[A-Za-z_][\w.]*(?:\s+as\s+\w+)?"
+        r"(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)"
+        r"|from\s+(?P<pkg>[A-Za-z_][\w.]*)\s+import)",
+        re.MULTILINE)
+    for text in sources:
+        if not text:
+            continue
+        for m in pattern.finditer(text):
+            raw = m.group("mods") or m.group("pkg") or ""
+            for piece in raw.split(","):
+                mod = piece.strip().split(" as ")[0].strip().split(".")[0]
+                if mod:
+                    names.add(mod.lower())
+    return names
+
+
+def grounding_packages(versions: dict, memory_files=None,
+                       limit: int = _GROUNDING_MAX) -> list[str]:
+    """``name==version`` strings for a prompt, most relevant first.
+
+    The list used to be ``sorted(versions)[:40]`` — alphabetical, so on any
+    environment past ~40 packages the cap dropped whatever came after the
+    letter 'e'. Measured on a 178-package interpreter it kept up to
+    ``email-validator`` and discarded pygame, pytest, requests and rich:
+    a block headed "write code against these EXACT versions" that omitted
+    the library the project actually imports.
+
+    Packages the project imports come first and are never displaced by the
+    cap; the rest fill any remaining room alphabetically, so a small
+    environment renders exactly as before.
+
+    *memory_files* is the usual ``{path: content}`` mapping; a plain
+    iterable of paths also works (import detection is then skipped).
+    """
+    if not versions:
+        return []
+
+    # Accept a mapping, a FileMemory-like object, or a bare path iterable.
+    # Relevance is a bonus, never a precondition: anything unreadable here
+    # degrades to the previous alphabetical behaviour rather than costing
+    # the caller its whole grounding block.
+    if memory_files is not None and not isinstance(memory_files, dict):
+        for accessor in ("as_dict", "all_files"):
+            fn = getattr(memory_files, accessor, None)
+            if callable(fn):
+                try:
+                    memory_files = fn()
+                    break
+                except Exception:
+                    pass
+
+    sources: list[str] = []
+    paths: list[str] = []
+    if isinstance(memory_files, dict):
+        paths = list(memory_files)
+        sources = [c for c in memory_files.values() if isinstance(c, str)]
+    elif memory_files:
+        try:
+            paths = list(memory_files)
+        except TypeError:
+            paths = []
+
+    # A project-local module is not a third-party package. Such a name is
+    # dropped from the block entirely, not merely left unpromoted: telling
+    # the model `src==9.9.9` when the project has its own `src/` invites it
+    # to write against a PyPI package it is not importing.
+    local = {t.lower() for t in local_top_levels_from_files(paths)}
+    wanted = _imported_top_levels(sources) - local
+
+    def render(name):
+        return f"{name}=={versions[name]}"
+
+    names = sorted(n for n in versions
+                   if n.lower() not in _GROUNDING_SKIP and n.lower() not in local)
+    relevant = [n for n in names if n.lower() in wanted]
+    rest = [n for n in names if n.lower() not in wanted]
+    return [render(n) for n in (relevant + rest)[:limit]]

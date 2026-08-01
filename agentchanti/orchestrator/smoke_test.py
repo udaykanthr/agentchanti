@@ -178,20 +178,20 @@ def _same_crash(a: str, b: str) -> bool:
     return a.strip()[-400:] == b.strip()[-400:]
 
 
-def _installed_versions_line(executor) -> str:
+def _installed_versions_line(executor, memory_files=None) -> str:
     """Installed-packages prompt block so fixes target the real versions."""
     try:
-        from .api_grounding import get_installed_package_versions
+        from .api_grounding import (get_installed_package_versions,
+                                    grounding_packages)
         versions = get_installed_package_versions(executor=executor)
+        pkgs = grounding_packages(versions, memory_files)
     except Exception:
         return ""
-    pkgs = [f"{n}=={v}" for n, v in sorted(versions.items())
-            if n not in ("pip", "setuptools", "wheel")]
     if not pkgs:
         return ""
     return (
         "=== INSTALLED PACKAGES (write code against these EXACT versions) "
-        "===\n" + ", ".join(pkgs[:40]) + "\n\n"
+        "===\n" + ", ".join(pkgs) + "\n\n"
     )
 
 
@@ -242,7 +242,7 @@ def _attempt_fix(
     prompt = (
         f"The application crashed when launched with `{cmd}`.\n\n"
         f"=== CRASH OUTPUT ===\n{crash_output[-3000:]}\n\n"
-        + _installed_versions_line(executor)
+        + _installed_versions_line(executor, memory_files)
         + "=== SOURCE FILES ===\n" + "\n\n".join(sources) + "\n\n"
         "Fix the crash. Pay close attention to the exact error message — it "
         "often states the correct API to use. Reply with the COMPLETE "
