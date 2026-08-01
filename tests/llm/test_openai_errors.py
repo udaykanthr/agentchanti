@@ -9,7 +9,10 @@ retried three times regardless, and the resulting LLMError escaped.
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock
+
+from agentchanti.llm.chat_types import Message
 
 from agentchanti.llm.base import LLMError, NonRetryableLLMError, \
     ToolsNotSupportedError
@@ -17,6 +20,7 @@ from agentchanti.llm.openai_client import (
     _looks_like_tools_rejection,
     _param_rejected,
     _raise_for_status_with_body,
+    _reasoning_blocks_tools,
 )
 
 
@@ -126,6 +130,115 @@ class TestToolsRejectionDetection(unittest.TestCase):
 
     def test_error_type_is_the_one_chat_downgrades_on(self):
         self.assertFalse(issubclass(ToolsNotSupportedError, LLMError))
+
+
+class TestReasoningBlocksTools(unittest.TestCase):
+    """Reasoning-on + function tools is recoverable, not a lack of support.
+
+    The real message from a model that defaults reasoning on server-side:
+    "Function tools with reasoning_effort are not supported for
+    gpt-5.6-terra in /v1/chat/completions. To use function tools, use
+    /v1/responses or set reasoning_effort to 'none'."
+    """
+
+    REAL_BODY = ('{"error":{"message":"Function tools with reasoning_effort '
+                 'are not supported for gpt-5.6-terra in '
+                 '/v1/chat/completions. To use function tools, use '
+                 '/v1/responses or set reasoning_effort to \'none\'."}}')
+
+    def test_recognises_the_real_message(self):
+        self.assertTrue(
+            _reasoning_blocks_tools(_response(400, text=self.REAL_BODY)))
+
+    def test_is_not_confused_with_no_tool_support(self):
+        """These take different paths: one retries with reasoning off and
+        KEEPS tools, the other abandons tools for the session."""
+        resp = _response(400, text=self.REAL_BODY)
+        self.assertTrue(_reasoning_blocks_tools(resp))
+        self.assertFalse(_looks_like_tools_rejection(resp))
+
+    def test_unrelated_400s_do_not_match(self):
+        for body in (
+            '{"error":{"message":"Invalid schema for function write_file"}}',
+            '{"error":{"message":"reasoning_effort must be one of low, high"}}',
+            '{"error":{"message":"context_length_exceeded"}}',
+            "",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    _reasoning_blocks_tools(_response(400, text=body)))
+
+
+class TestReasoningOffRetryFlow(unittest.TestCase):
+    """End to end: the 400 is absorbed and native tools are kept."""
+
+    def _client(self):
+        from agentchanti.llm.openai_client import OpenAIClient
+        return OpenAIClient(base_url="https://api.openai.com/v1",
+                            model="gpt-5.6-terra", api_key="k")
+
+    def _ok(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.url = "https://api.openai.com/v1/chat/completions"
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "done", "tool_calls": []},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        return resp
+
+    def _blocked(self):
+        return _response(400, text=TestReasoningBlocksTools.REAL_BODY)
+
+    def _recorder(self, responses):
+        """Snapshot each payload — the client mutates one dict in place, so
+        inspecting call_args afterwards would only ever show the last state."""
+        import copy
+        sent: list[dict] = []
+        it = iter(responses)
+
+        def _post(url, **kwargs):
+            sent.append(copy.deepcopy(kwargs.get("json")))
+            return next(it)
+
+        return _post, sent
+
+    def test_retries_with_reasoning_off_and_latches(self):
+        from agentchanti.llm.chat_types import ToolDef
+        client = self._client()
+        tools = [ToolDef(name="ping", description="p",
+                         parameters={"type": "object", "properties": {}})]
+
+        post_fn, sent = self._recorder([self._blocked(), self._ok()])
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", post_fn):
+            client._chat([Message(role="user", content="hi")], tools=tools)
+
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("reasoning_effort", sent[0])
+        self.assertEqual(sent[1]["reasoning_effort"], "none")
+        # Tools survive — the whole point of preferring this over the
+        # text-protocol downgrade.
+        self.assertIn("tools", sent[1])
+        self.assertTrue(client._tools_need_reasoning_off)
+
+        # Latched: the next call pays no 400.
+        post_fn, sent = self._recorder([self._ok()])
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", post_fn):
+            client._chat([Message(role="user", content="again")], tools=tools)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["reasoning_effort"], "none")
+
+    def test_no_tools_means_no_reasoning_override(self):
+        client = self._client()
+        client._tools_need_reasoning_off = True
+        post_fn, sent = self._recorder([self._ok()])
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", post_fn):
+            client._chat([Message(role="user", content="hi")], tools=None)
+        self.assertNotIn("reasoning_effort", sent[0])
 
 
 class TestTokenParamFallbackTrigger(unittest.TestCase):

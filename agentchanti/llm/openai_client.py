@@ -32,6 +32,27 @@ def _looks_like_tools_rejection(response) -> bool:
     return any(marker in body for marker in _TOOLS_REJECTED_MARKERS)
 
 
+def _reasoning_blocks_tools(response) -> bool:
+    """True when the model refuses tools *while reasoning is enabled*.
+
+    Some reasoning models default ``reasoning_effort`` to a non-``none``
+    value server-side and then reject function tools on
+    ``/v1/chat/completions``::
+
+        Function tools with reasoning_effort are not supported for
+        gpt-5.6-terra in /v1/chat/completions. To use function tools, use
+        /v1/responses or set reasoning_effort to 'none'.
+
+    This is recoverable and worth distinguishing from a model that has no
+    tool support at all: sending ``reasoning_effort: "none"`` keeps native
+    tool calling — and therefore the whole agent-loop path — instead of
+    falling back to the text protocol for the rest of the session.
+    """
+    body = (response.text or "").lower()
+    return "reasoning_effort" in body and (
+        "tool" in body or "function" in body)
+
+
 _PARAM_REJECTED_WORDS = ("unsupported", "unrecognized", "unrecognised",
                          "unknown", "invalid", "not supported")
 
@@ -114,6 +135,10 @@ class OpenAIClient(LLMClient):
         # One-shot reasoning-effort downgrade: armed by
         # _prepare_token_limit_retry, consumed by the next _chat call.
         self._retry_reasoning_effort: Optional[str] = None
+        # Latched once the model reports that function tools and reasoning
+        # cannot be combined, so every later tool call sends
+        # reasoning_effort="none" up front instead of paying a 400 first.
+        self._tools_need_reasoning_off = False
 
     @staticmethod
     def _cached_tokens(usage: dict) -> int:
@@ -234,7 +259,8 @@ class OpenAIClient(LLMClient):
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
-        if response.status_code == 400 and                 _param_rejected(response, "max_completion_tokens"):
+        if response.status_code == 400 and \
+                _param_rejected(response, "max_completion_tokens"):
             # Legacy parameter name for older models/APIs (see _chat).
             first_failure = response
             del payload["max_completion_tokens"]
@@ -342,11 +368,30 @@ class OpenAIClient(LLMClient):
                               "parameters": t.parameters}}
                 for t in tools
             ]
+            if self._tools_need_reasoning_off:
+                payload["reasoning_effort"] = "none"
 
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
-        if response.status_code == 400 and                 _param_rejected(response, "max_completion_tokens"):
+        if response.status_code == 400 and tools and \
+                not self._tools_need_reasoning_off and \
+                _reasoning_blocks_tools(response):
+            # The model defaults reasoning on server-side and then refuses
+            # function tools. Turning reasoning off keeps native tool
+            # calling — and the agent loop with it — instead of degrading
+            # to the text protocol. Latched, so this costs one 400 per
+            # session rather than one per call.
+            log.info(
+                "[OpenAI] %s rejects function tools while reasoning is on — "
+                "retrying with reasoning_effort='none' for this session",
+                self.model)
+            self._tools_need_reasoning_off = True
+            payload["reasoning_effort"] = "none"
+            response = requests.post(url, headers=self._headers(),
+                                     json=payload, timeout=(10, 300))
+        if response.status_code == 400 and \
+                _param_rejected(response, "max_completion_tokens"):
             # Legacy parameter name for older models/APIs. Only on a 400
             # that actually names the parameter: firing on any 400 masked
             # the real error behind a bogus "use max_completion_tokens".
