@@ -21,7 +21,7 @@ import re
 from collections import Counter
 from threading import Lock
 
-from ..agent_tools import AgentTools
+from ..agent_tools import AgentTools, _truncate
 from ..llm.chat_types import Message, ToolCall
 
 _logger = logging.getLogger(__name__)
@@ -209,6 +209,9 @@ _WITHHOLD_READONLY_AT = 3
 # Pre-load caps: keep the injected file bundle from dominating the prompt.
 _PRELOAD_MAX_FILES = 6
 _PRELOAD_MAX_CHARS = 12_000
+# Below this much remaining budget a truncated file is more confusing than
+# useful — skip it and let the loop read_file if it actually needs it.
+_PRELOAD_MIN_USEFUL_CHARS = 1_500
 
 # Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
@@ -294,8 +297,23 @@ def _preload_target_files(tools: AgentTools,
         body = tools._tool_read_file(path)
         if body.startswith("ERROR"):
             continue
-        if total + len(body) > _PRELOAD_MAX_CHARS:
-            break
+        room = _PRELOAD_MAX_CHARS - total
+        if len(body) > room:
+            # This used to `break`, so ONE oversized file emptied the whole
+            # bundle — including every smaller file behind it. Generated
+            # modules routinely run 20-40 KB, so in practice nothing was
+            # ever preloaded: `[PlanStep] Injected 3 plan-context files`
+            # would log while the loop's opening message stayed under
+            # 1.1k tokens and the model still spent turn 1 on read_file.
+            #
+            # Truncate to the remaining budget instead. read_file itself
+            # truncates at _MAX_READ_CHARS, so a head-of-file is exactly
+            # what the model would have got from the round-trip we are
+            # replacing — with the same explicit truncation notice, so it
+            # knows to read the rest if it needs it.
+            if room < _PRELOAD_MIN_USEFUL_CHARS:
+                continue        # no room left worth spending; try the next
+            body = _truncate(body, room, f"{rel} preload")
         total += len(body)
         blocks.append(body)
         if len(blocks) >= _PRELOAD_MAX_FILES:

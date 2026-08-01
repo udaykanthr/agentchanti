@@ -1683,3 +1683,70 @@ class TestDeclaredVerifyGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPreloadBudget(unittest.TestCase):
+    """One oversized file must not empty the whole preload bundle.
+
+    The char-budget check used to `break`, so a single file larger than
+    _PRELOAD_MAX_CHARS discarded every block — including the smaller files
+    behind it. Generated modules routinely run 20-40 KB, so in practice
+    nothing was ever preloaded: `[PlanStep] Injected 3 plan-context files`
+    logged while the loop's opening message stayed under 1.1k tokens and
+    the model still spent turn 1 on read_file.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.makedirs("src", exist_ok=True)
+        # Sizes matching a real run: a 40 KB module and a 3 KB one.
+        with open("src/game.py", "w", encoding="utf-8") as fh:
+            fh.write("class Game:\n" + "    x = 1\n" * 4000)
+        with open("src/map.py", "w", encoding="utf-8") as fh:
+            fh.write("class Map:\n" + "    y = 2\n" * 300)
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def _preload(self, paths):
+        from agentchanti.orchestrator.agent_loop import _preload_target_files
+        return _preload_target_files(self.tools, paths)
+
+    def test_an_oversized_file_still_preloads_truncated(self):
+        from agentchanti.orchestrator.agent_loop import _PRELOAD_MAX_CHARS
+        blob = self._preload(["src/game.py"])
+        self.assertGreater(len(blob), _PRELOAD_MAX_CHARS // 2,
+                           "an oversized file preloaded nothing at all")
+        self.assertIn("truncated at", blob,
+                      "a truncated preload must say so, like read_file does")
+
+    def test_a_big_file_first_does_not_discard_the_bundle(self):
+        blob = self._preload(["main.py", "src/game.py", "src/map.py"])
+        self.assertIn("src/game.py", blob)
+
+    def test_smaller_files_behind_a_big_one_are_reached(self):
+        """The budget is spent, not abandoned, when a file does not fit."""
+        from agentchanti.orchestrator.agent_loop import _PRELOAD_MAX_CHARS
+        blob = self._preload(["src/map.py", "src/game.py"])
+        self.assertIn("src/map.py", blob)
+        self.assertIn("src/game.py", blob)
+        self.assertLessEqual(len(blob), _PRELOAD_MAX_CHARS + 500,
+                             "the char budget must still bound the bundle")
+
+    def test_nonexistent_paths_cost_nothing(self):
+        self.assertEqual(self._preload(["main.py", "nope.py"]), "")
+
+    def test_empty_input_is_empty(self):
+        self.assertEqual(self._preload([]), "")
+        self.assertEqual(self._preload(None), "")
