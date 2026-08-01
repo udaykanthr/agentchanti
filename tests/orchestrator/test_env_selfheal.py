@@ -117,3 +117,73 @@ class TestMissingThirdPartyModule:
     def test_no_match_returns_none(self):
         assert _missing_third_party_module("2 failed, 1 passed", self.FILES) is None
         assert _missing_third_party_module("", self.FILES) is None
+
+
+class _CrashOnceExecutor:
+    """Plan gate dies with an NTSTATUS code, then succeeds on retry."""
+
+    def __init__(self, exit_codes):
+        self._codes = list(exit_codes)
+        self.commands: list[str] = []
+        self.last_exit_code = 0
+
+    def run_command(self, cmd, cwd=None, timeout=None, **_kw):
+        self.commands.append(cmd)
+        if "--version" in cmd:
+            self.last_exit_code = 0
+            return True, "pytest 9.1.1"
+        self.last_exit_code = self._codes.pop(0) if self._codes else 0
+        return self.last_exit_code == 0, "output"
+
+
+class TestPlanGateAbnormalExitRetry:
+    """A crashed gate process is not evidence the suite fails.
+
+    Observed: `python -m unittest -v` passed four times in a row, then
+    access-violated (0xC0000005) on the BulkTest gate. BulkTest believed
+    it, fell back to `python -m pytest` -- a different command with
+    different import roots -- and that run reported two failures, starting
+    a fix cascade that ended with the run reporting failure.
+    """
+
+    def _run(self, executor):
+        from agentchanti.orchestrator.pipeline import (
+            run_bulk_test_execution_and_fix,
+        )
+        from unittest.mock import MagicMock
+
+        memory = MagicMock()
+        memory.all_files.return_value = {"tests/test_x.py": "def test_a(): pass"}
+        memory.as_dict.return_value = {"tests/test_x.py": "def test_a(): pass"}
+        return run_bulk_test_execution_and_fix(
+            memory=memory, executor=executor, coder=MagicMock(),
+            display=MagicMock(), language="python", task="t",
+            cfg=MagicMock(), all_plan_steps=[
+                _Step(["tests/test_x.py"], "python -m unittest -v")],
+        )
+
+    def test_crashed_gate_is_retried_before_falling_back(self):
+        # 0xC0000005 on the first gate run, clean pass on the retry.
+        ex = _CrashOnceExecutor([3221225477, 0])
+        ok, _err = self._run(ex)
+        gate_runs = [c for c in ex.commands if c == "python -m unittest -v"]
+        assert len(gate_runs) == 2, ex.commands
+        assert ok
+        # The framework runner must never have been reached.
+        assert not any(c.startswith("python -m pytest")
+                       and "--version" not in c for c in ex.commands)
+
+    def test_a_repeat_crash_still_falls_back(self):
+        ex = _CrashOnceExecutor([3221225477, 3221225477, 0])
+        self._run(ex)
+        gate_runs = [c for c in ex.commands if c == "python -m unittest -v"]
+        assert len(gate_runs) == 2
+        assert any(c.startswith("python -m pytest")
+                   and "--version" not in c for c in ex.commands)
+
+    def test_an_ordinary_failure_is_not_retried(self):
+        # exit 1 is a real result; retrying it would just waste a suite run.
+        ex = _CrashOnceExecutor([1, 0])
+        self._run(ex)
+        gate_runs = [c for c in ex.commands if c == "python -m unittest -v"]
+        assert len(gate_runs) == 1, ex.commands

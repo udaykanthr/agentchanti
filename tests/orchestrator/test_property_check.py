@@ -174,23 +174,76 @@ class TestRunPropertyCheckSkips(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(err, "")
 
-    def test_a_violated_invariant_fails_the_run(self):
-        cfg = MagicMock()
+    def _run_with_loop_result(self, result, *, write_test_file, cfg=None):
+        """Run the stage in a temp cwd, optionally with the test file present."""
+        import os
+        import tempfile
+        cfg = cfg or MagicMock()
         cfg.PROPERTY_CHECK_ENABLED = True
         cfg.AGENT_LOOP_MAX_TURNS = 8
-        with unittest.mock.patch(
-                "agentchanti.orchestrator.agent_loop.agent_loop_enabled",
-                return_value=True), \
-             unittest.mock.patch(
-                "agentchanti.orchestrator.agent_loop.build_step_tools",
-                return_value=MagicMock()), \
-             unittest.mock.patch(
-                "agentchanti.orchestrator.agent_loop."
-                "run_agent_loop_with_escalation",
-                return_value=(False, "ghost entered wall at iteration 42")):
-            ok, err = run_property_check(**self._args(cfg=cfg))
+        prev = os.getcwd()
+        tmp = tempfile.mkdtemp()
+        try:
+            os.chdir(tmp)
+            if write_test_file:
+                with open("test_properties.py", "w", encoding="utf-8") as fh:
+                    fh.write("import unittest\n")
+            with unittest.mock.patch(
+                    "agentchanti.orchestrator.agent_loop.agent_loop_enabled",
+                    return_value=True), \
+                 unittest.mock.patch(
+                    "agentchanti.orchestrator.agent_loop.build_step_tools",
+                    return_value=MagicMock()), \
+                 unittest.mock.patch(
+                    "agentchanti.orchestrator.agent_loop."
+                    "run_agent_loop_with_escalation", return_value=result):
+                # executor.project_root must not be a MagicMock path here.
+                ex = MagicMock()
+                ex.project_root = tmp
+                return run_property_check(**self._args(cfg=cfg, executor=ex))
+        finally:
+            os.chdir(prev)
+
+    def test_a_violated_invariant_fails_the_run(self):
+        ok, err = self._run_with_loop_result(
+            (False, "ghost entered wall at iteration 42"),
+            write_test_file=True)
         self.assertFalse(ok)
         self.assertIn("iteration 42", err)
+
+    def test_a_test_file_that_was_never_written_is_a_skip(self):
+        """The check that never ran must not fail the run.
+
+        Observed: the loop spent all 8 turns chasing a pre-existing crash
+        in the project's own suite and never authored test_properties.py.
+        The verify reported `unittest.loader._FailedTest ... ERROR` and the
+        pipeline was failed for "invariants violated" it had never checked.
+        """
+        ok, err = self._run_with_loop_result(
+            (False, "Verification still failing after 8 turns:\nexit: FAILED\n"
+                    "test_properties (unittest.loader._FailedTest"
+                    ".test_properties) ... ERROR"),
+            write_test_file=False)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_an_unimportable_test_file_is_a_skip(self):
+        """A broken harness says nothing about the source under test."""
+        ok, err = self._run_with_loop_result(
+            (False, "ERROR: test_properties (unittest.loader._FailedTest)\n"
+                    "ModuleNotFoundError: No module named 'entities'"),
+            write_test_file=True)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_a_real_assertion_failure_still_fails_the_run(self):
+        """The skip paths must not swallow a genuine violation."""
+        ok, err = self._run_with_loop_result(
+            (False, "AssertionError: ghost at (4, 5) is a wall tile "
+                    "on iteration 517 with dt=0.0431"),
+            write_test_file=True)
+        self.assertFalse(ok)
+        self.assertIn("iteration 517", err)
 
 
 if __name__ == "__main__":

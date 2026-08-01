@@ -4261,12 +4261,29 @@ def run_bulk_test_execution_and_fix(
     # resolves under `unittest discover -s src` but not `pytest` from the
     # repo root). Run the declared command first; only fall back to the
     # framework runner if it genuinely does not pass.
+    from .wave_snapshots import is_abnormal_exit
     _declared_suite = _plan_declared_suite_cmd(all_plan_steps, test_files)
     if _declared_suite and _declared_suite != " ".join(base_cmd.split()):
         _logger.info("[BulkTest] Running plan-declared suite gate first: %s",
                      _declared_suite)
         _pf_ok, _pf_out = executor.run_command(
             _declared_suite, cwd=subproject_cwd)
+        if not _pf_ok and is_abnormal_exit(
+                getattr(executor, "last_exit_code", None)):
+            # The process died rather than reporting failures — on Windows
+            # a pygame suite fast-fails (0xC0000409) or access-violates
+            # (0xC0000005) roughly one invocation in three. Believing that
+            # demotes the plan's declared gate to the framework default,
+            # which is a different command with different import roots;
+            # observed flipping a suite that had just passed four times
+            # into two failures. Retry once, exactly as the gate ledger
+            # does, before falling back.
+            _logger.warning(
+                "[BulkTest] Plan-declared gate terminated abnormally "
+                "(exit %s) — retrying once before believing it: %s",
+                getattr(executor, "last_exit_code", None), _declared_suite)
+            _pf_ok, _pf_out = executor.run_command(
+                _declared_suite, cwd=subproject_cwd)
         if _pf_ok:
             _logger.info("[BulkTest] Suite passed via plan-declared gate — "
                          "skipping framework re-run.")

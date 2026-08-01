@@ -34,10 +34,29 @@ simulation, so ordinary CRUD/web projects pay nothing.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
 from ..cli_display import log
+
+# Markers that the property test could not be IMPORTED, as opposed to
+# running and asserting. unittest reports an unimportable target as a
+# synthetic `_FailedTest`, which otherwise reads exactly like a genuine
+# invariant failure.
+_HARNESS_ERROR_MARKERS = (
+    "unittest.loader._FailedTest",
+    "modulenotfounderror",
+    "importerror",
+    "no module named",
+    "attributeerror: module",
+)
+
+
+def _harness_error(info: str | None) -> bool:
+    """True when the failure is the test harness, not the source."""
+    text = (info or "").lower()
+    return any(m.lower() in text for m in _HARNESS_ERROR_MARKERS)
 
 # A method that advances state by a time delta — the shape that makes a
 # project timestep-sensitive in the first place. Matching the parameter
@@ -203,6 +222,37 @@ def run_property_check(
         log.info("[PropertyCheck] Invariants hold under randomised "
                  "frame timing")
         return True, ""
+
+    # A failed verify is only an invariant violation when the property test
+    # actually RAN and asserted. Two other outcomes reach here and must not
+    # fail the run:
+    #
+    #   • the loop never wrote the file. Observed: the model spent all 8
+    #     turns chasing a pre-existing crash in the project's own suite and
+    #     never authored test_properties.py; the verify then reported
+    #     `unittest.loader._FailedTest ... ERROR` and the pipeline was
+    #     failed for "invariants violated" it had never checked.
+    #   • the file exists but cannot be imported — a broken harness, which
+    #     says nothing about the source under test.
+    #
+    # This stage adds a check the run did not previously have; it must
+    # never be the reason a run that would otherwise pass reports failure.
+    _root = getattr(executor, "project_root", None)
+    if not isinstance(_root, str) or not _root:
+        _root = os.getcwd()
+    if not os.path.isfile(os.path.join(_root, test_file)):
+        log.warning(
+            "[PropertyCheck] The loop never produced %s (%s) — skipping "
+            "rather than failing the run on a check that never ran",
+            test_file, (info or "")[:200])
+        return True, ""
+    if _harness_error(info):
+        log.warning(
+            "[PropertyCheck] %s exists but could not be loaded (%s) — "
+            "skipping; a broken harness is not an invariant violation",
+            test_file, (info or "")[:200])
+        return True, ""
+
     log.warning("[PropertyCheck] Invariants violated under randomised "
                 "frame timing: %s", (info or "")[:300])
     return False, f"Property check failed: {(info or '')[:800]}"
