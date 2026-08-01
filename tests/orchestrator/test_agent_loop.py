@@ -408,6 +408,64 @@ class TestLoopTelemetry(AgentLoopTestCase):
         self.assertEqual(get_loop_stats()[0]["outcome"], "exhausted")
 
 
+class TestLoopPreloadPaths(unittest.TestCase):
+    """The loop should not spend a turn reading what the plan already named.
+
+    Only target_files were preloaded, so a step creating a NEW file had
+    nothing to preload and burned turn 1 on read_file calls for its own
+    declared imports — observed as `turn 1/8: read_file, read_file,
+    read_file, list_files`, and the act-now nudge that follows.
+    """
+
+    def setUp(self):
+        from agentchanti.orchestrator import memory as _m
+        _m.clear_plan_context_files()
+        self.addCleanup(_m.clear_plan_context_files)
+
+    def _step(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        return PlanStep(
+            id="3.1", step_type="CODE", index=0,
+            target_files=["pkg/entities.py"],
+            imports_from={"pkg/map.py": ["Map"],
+                          "pkg/constants.py": ["TILE_SIZE"]})
+
+    def test_includes_declared_imports_not_just_targets(self):
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/map.py": "m", "pkg/constants.py": "c"})
+        self.assertEqual(
+            _loop_preload_paths(self._step()),
+            ["pkg/entities.py", "pkg/map.py", "pkg/constants.py"])
+
+    def test_target_comes_first(self):
+        """For a step EDITING a file, that file matters most in the budget."""
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/map.py": "m"})
+        self.assertEqual(_loop_preload_paths(self._step())[0],
+                         "pkg/entities.py")
+
+    def test_deduplicates_across_targets_and_context(self):
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/entities.py": "e", "pkg/map.py": "m"})
+        self.assertEqual(_loop_preload_paths(self._step()),
+                         ["pkg/entities.py", "pkg/map.py"])
+
+    def test_works_without_plan_context(self):
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        self.assertEqual(_loop_preload_paths(self._step()),
+                         ["pkg/entities.py"])
+
+    def test_step_without_targets_or_context_is_empty(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        self.assertEqual(
+            _loop_preload_paths(PlanStep(id="1", step_type="CODE", index=0)),
+            [])
+
+
 class TestEnvSelfHeal(AgentLoopTestCase):
     """Missing-dependency verify failures are healed with one install
     instead of being fed to the model (the observed run burned 16 turns

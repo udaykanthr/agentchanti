@@ -4002,6 +4002,42 @@ def _plan_step_brief(plan_step) -> str:
     return "\n".join(lines)
 
 
+def _loop_preload_paths(plan_step) -> list[str]:
+    """Files to hand the agent loop up front: targets AND declared imports.
+
+    Only ``target_files`` used to be preloaded, so a step creating a NEW
+    file had nothing to preload — its targets do not exist yet — and the
+    loop spent its first turn calling read_file on the very dependencies
+    the plan had already named. Observed repeatedly, including a step that
+    burned turn 1 on three read_file calls plus list_files, and the
+    "2 read-only turns — injecting act-now nudge" path that follows from
+    it. Those reads then ride along in every later turn anyway, so the
+    round-trip buys nothing but a turn out of a budget of eight.
+
+    ``build_step_context`` has already resolved the step's declared
+    imports (including ghost contracts for files a later step will
+    create); reuse its keys rather than re-deriving them. Non-existent
+    paths are skipped by the preloader, so ghosts cost nothing.
+
+    Targets come first: for a step EDITING an existing file, that file is
+    the most important thing in the budget.
+    """
+    paths: list[str] = list(getattr(plan_step, "target_files", None) or [])
+    try:
+        from .memory import get_plan_context_files
+        paths.extend(get_plan_context_files() or {})
+    except Exception:
+        pass
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in paths:
+        key = str(p).replace("\\", "/")
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(p)
+    return ordered
+
+
 def _record_passed_gate(success: bool, plan_step, memory: FileMemory,
                         task: str = "") -> None:
     """Add a step's declared verify to the monotonic gate ledger.
@@ -4108,7 +4144,7 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
-            preload_files=getattr(plan_step, "target_files", None),
+            preload_files=_loop_preload_paths(plan_step),
         )
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
@@ -5400,7 +5436,7 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
-            preload_files=getattr(plan_step, "target_files", None),
+            preload_files=_loop_preload_paths(plan_step),
         )
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge
