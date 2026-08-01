@@ -10,6 +10,7 @@ from agentchanti.orchestrator.plan_step import (
     is_structured_plan, build_waves,
     plan_looks_truncated,
     shallow_gate_reason, check_gate_quality, check_gate_consistency,
+    build_step_context,
 )
 
 
@@ -1177,3 +1178,127 @@ imports: src/snake.py:Snake
         steps = parse_structured_plan(text)
         producer = next(s for s in steps if s.id == "2.1")
         self.assertIn("tests/test_game_logic.py", producer.imported_by)
+
+
+class TestBuildStepContext(unittest.TestCase):
+    """The step's declared imports must actually reach the model.
+
+    ``build_step_context`` resolves a step's ``imports:`` into file
+    contents; ``pipeline.py`` stashes the result and both the classic
+    generate/review path and the agent loop's preload consume it. It had
+    no test coverage, and it was returning ``{}`` for essentially every
+    Python plan: the dict is keyed by the planner's spelling, which is
+    the DOTTED module (``pacman_game.map``), so every ``memory.get()``
+    and every disk read missed. Observed: each CODE step opening with
+    ``read_file, read_file, read_file`` to fetch files the pipeline had
+    already resolved and loaded.
+    """
+
+    PLAN = """==PLAN==
+
+--STEP 4.1 [CODE] depends:none
+Constants.
+target: pacman_game/constants.py
+exports: TILE_SIZE, Direction
+imports: none
+verify: python -c "import pacman_game.constants"
+
+--STEP 5.1 [CODE] depends:4.1
+Map.
+target: pacman_game/map.py
+exports: Map
+imports: pacman_game.constants:Tile
+verify: python -c "import pacman_game.map"
+
+--STEP 6.1 [CODE] depends:5.1
+Entities.
+target: pacman_game/entities.py
+exports: Player, Ghost
+imports: pacman_game.map:Map, pacman_game.constants:Direction
+verify: python -c "import pacman_game.entities"
+
+--STEP 7.1 [CODE] depends:none
+Flat script.
+target: main.py
+exports: run
+imports: helpers.py:util
+verify: python -c "import main"
+
+==END==
+"""
+
+    class _Mem:
+        def __init__(self, files=None):
+            self._files = files or {}
+
+        def get(self, path):
+            return self._files.get(path)
+
+    def _steps(self):
+        return parse_structured_plan(self.PLAN)
+
+    def _step(self, sid):
+        return next(s for s in self._steps() if s.id == sid)
+
+    def test_dotted_imports_resolve_to_real_file_contents(self):
+        disk = {
+            "pacman_game/map.py": "class Map: pass",
+            "pacman_game/constants.py": "TILE_SIZE = 20",
+        }
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=disk.get)
+        self.assertEqual(set(files),
+                         {"pacman_game/map.py", "pacman_game/constants.py"})
+        self.assertIn("class Map: pass", files["pacman_game/map.py"])
+
+    def test_memory_content_is_preferred_over_disk(self):
+        mem = self._Mem({"pacman_game/map.py": "MEMORY VERSION"})
+        files = build_step_context(
+            self._step("6.1"), self._steps(), mem,
+            read_from_disk=lambda p: "DISK VERSION")
+        self.assertIn("MEMORY VERSION", files["pacman_game/map.py"])
+
+    def test_package_import_hint_keeps_the_planner_spelling(self):
+        """`from map import Map` fails inside a package.
+
+        _relative_import_path assumes a flat script layout. The planner's
+        dotted spec is the spelling its own `verify:` gate imports, run
+        from the project root, so it is the one to hand the model.
+        """
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: "code")
+        hint = files["pacman_game/map.py"].splitlines()[0]
+        self.assertIn("from pacman_game.map import Map", hint)
+
+    def test_flat_layout_still_gets_a_relative_hint(self):
+        files = build_step_context(
+            self._step("7.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: "def util(): pass")
+        hint = files["helpers.py"].splitlines()[0]
+        self.assertIn("from helpers import util", hint)
+
+    def test_missing_file_falls_through_to_a_ghost_contract(self):
+        """The ghost branch was dead code whenever a reader was supplied.
+
+        It hung off `elif read_from_disk:` / `else:`, so any caller that
+        passed a reader (i.e. all of them) skipped it entirely and a step
+        importing a not-yet-written file got no contract at all.
+        """
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: None)
+        ghost = files["pacman_game/map.py"]
+        self.assertIn("PLANNED FILE", ghost)
+        self.assertIn("step 5.1", ghost)
+        self.assertIn("Map", ghost)
+
+    def test_completed_producer_with_no_content_yields_no_ghost(self):
+        steps = self._steps()
+        for s in steps:
+            s.status = "completed"
+        step6 = next(s for s in steps if s.id == "6.1")
+        files = build_step_context(step6, steps, self._Mem(),
+                                   read_from_disk=lambda p: None)
+        self.assertEqual(files, {})

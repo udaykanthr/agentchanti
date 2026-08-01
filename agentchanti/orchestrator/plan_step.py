@@ -2076,8 +2076,25 @@ def build_step_context(
     """
     files: dict[str, str] = {}
 
+    # `imports:` entries keep the spelling the planner used, which for
+    # Python is almost always the DOTTED module (`pacman_game.map`) — not
+    # a path any lookup here can hit. Every `memory.get()` and every disk
+    # read below therefore missed, this function returned {}, and the two
+    # things that consume its output (the classic path's plan-context
+    # block and the agent loop's preload) silently got nothing. Observed:
+    # every CODE step opening with `read_file, read_file, read_file` to
+    # fetch files the pipeline had already resolved and loaded. Resolve
+    # through the plan graph, which knows all six spellings.
+    from .plan_graph import PlanGraph
+    _graph = PlanGraph(all_steps or [])
+
+    def _declared_path(spec: str, symbols) -> str:
+        node = _graph.resolve(spec, symbols)
+        return node.path if node is not None else spec
+
     # 1. Plan-declared imports (real or ghost)
-    for file_path, symbols in step.imports_from.items():
+    for _spec, symbols in step.imports_from.items():
+        file_path = _declared_path(_spec, symbols)
         # Compute the correct Python import path relative to each target file.
         # The first target is used as the reference; if there are no targets,
         # fall back to a simple path→module conversion.
@@ -2085,7 +2102,15 @@ def build_step_context(
         import_hint = ""
         _JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
         if ref_target and file_path.endswith(".py"):
-            import_module = _relative_import_path(ref_target, file_path)
+            # When the planner wrote a dotted module, that spelling IS the
+            # answer — it is the same one its `verify:` gate imports, run
+            # from the project root. _relative_import_path assumes a flat
+            # script layout and would turn `pacman_game.map` into a bare
+            # `from map import Map`, which fails inside a package.
+            if _is_dotted_module_spec(_spec):
+                import_module = _spec
+            else:
+                import_module = _relative_import_path(ref_target, file_path)
             symbol_str = ", ".join(symbols) if symbols else "..."
             import_hint = f"# Correct Python import: from {import_module} import {symbol_str}\n"
         elif ref_target and any(file_path.endswith(ext) for ext in _JS_EXTS):
@@ -2097,14 +2122,17 @@ def build_step_context(
             import_hint = f"// Correct import: import {{ {symbol_str} }} from '{import_module}'\n"
 
         content = memory.get(file_path) if memory else None
+        if not content and read_from_disk:
+            content = read_from_disk(file_path)
         if content:
             files[file_path] = import_hint + content
-        elif read_from_disk:
-            disk_content = read_from_disk(file_path)
-            if disk_content:
-                files[file_path] = import_hint + disk_content
         else:
-            # Ghost contract: file not yet created, include planned info
+            # Ghost contract: file not yet created, include planned info.
+            # Reached whenever the file has no content yet — the `elif
+            # read_from_disk:` this replaces made the ghost branch dead
+            # code for every caller that supplies a reader (i.e. all of
+            # them), so a step importing a not-yet-written file got no
+            # contract at all.
             producer = _find_producer(file_path, all_steps)
             if producer and producer.status != "completed":
                 ghost = (
@@ -2180,6 +2208,23 @@ def _relative_import_path(target_file: str, dep_file: str) -> str:
     # If dep is directly accessible from the same directory, use the remainder
     remaining = dep_parts[common:]
     return ".".join(remaining) if remaining else dep_module.replace("/", ".")
+
+
+_SOURCE_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+                ".mts", ".cts", ".go", ".rs", ".java", ".rb")
+
+
+def _is_dotted_module_spec(spec: str) -> bool:
+    """True when *spec* is a dotted module path (``pacman_game.map``).
+
+    Distinguishes the planner's dotted spelling from a file path — a path
+    names a directory or carries a source extension, a module does
+    neither.
+    """
+    s = (spec or "").replace("\\", "/")
+    if not s or "/" in s or "." not in s:
+        return False
+    return not s.endswith(_SOURCE_EXTS)
 
 
 def _find_producer(file_path: str, steps: list[PlanStep]) -> Optional[PlanStep]:
