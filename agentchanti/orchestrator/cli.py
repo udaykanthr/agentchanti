@@ -1774,20 +1774,47 @@ def _main_impl():
             pipeline_success = False
             log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
 
-        # The smoke-test repair loop rewrites source files to fix a launch
-        # crash, and it is the LAST stage that can do so. Its edits were
-        # previously never gate-checked: a repair that changed
-        # `Player.update()`'s signature turned the green
-        # `python -m unittest discover` gate red, and the run still printed
-        # `Finished`. Re-check here so success always means every gate is
-        # green — this is the final word on the run.
-        #
-        # A red gate here usually means the repair was RIGHT and a test
-        # still encodes the old API (observed: a test stubbing
-        # `update(self, game_map)` after the real signature changed), so
-        # give the test-fix machinery one round to catch the tests up
-        # rather than reflexively discarding a fix that made the app run.
+        # ── 13.8. Adversarial property check ──
+        # Everything above exercises the code at a FIXED timestep, which
+        # is the one condition under which a timestep-dependent defect is
+        # invisible. Observed: a Pac-Man run shipped with every ghost able
+        # to walk through walls — behavioural gates, generated tests and
+        # the smoke test were all green, because all three used a constant
+        # dt and the bug only exists when dt varies. Runs before the gate
+        # recheck below so its edits are gated like any other stage's, and
+        # skips silently unless the project has an update(dt) loop.
         else:
+            from .property_check import run_property_check
+            prop_ok, prop_err = run_property_check(
+                memory=memory,
+                executor=executor,
+                coder=coder,
+                display=display,
+                task=args.task,
+                language=language,
+                cfg=cfg,
+                intent_spec=intent_spec,
+            )
+            if not prop_ok:
+                pipeline_success = False
+                log.warning("[PropertyCheck] Pipeline marked failed: %s",
+                            prop_err[:300])
+
+            # The smoke-test repair loop rewrites source files to fix a
+            # launch crash, and together with the property check above it
+            # is the LAST thing that can do so. Those edits were
+            # previously never gate-checked: a repair that changed
+            # `Player.update()`'s signature turned the green
+            # `python -m unittest discover` gate red, and the run still
+            # printed `Finished`. Re-check here so success always means
+            # every gate is green — this is the final word on the run.
+            #
+            # A red gate here usually means the repair was RIGHT and a
+            # test still encodes the old API (observed: a test stubbing
+            # `update(self, game_map)` after the real signature changed),
+            # so give the test-fix machinery one round to catch the tests
+            # up rather than reflexively discarding a fix that made the
+            # app run.
             from .pipeline import run_bulk_test_execution_and_fix as _btf
 
             def _repair_tests_after_smoke():
