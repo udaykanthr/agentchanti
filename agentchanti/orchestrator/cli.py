@@ -508,7 +508,8 @@ def _main_impl():
             return
         llm_client = OpenAIClient(
             base_url=cfg.OPENAI_BASE_URL, model=model,
-            api_key=api_key, **llm_kwargs)
+            api_key=api_key,
+            reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
     elif provider == "gemini":
         from ..llm.gemini_client import GeminiClient
         api_key = cfg.GEMINI_API_KEY
@@ -666,7 +667,8 @@ def _main_impl():
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
                 base_url=cfg.OPENAI_BASE_URL, model=agent_model,
-                api_key=cfg.OPENAI_API_KEY, **llm_kwargs)
+                api_key=cfg.OPENAI_API_KEY,
+                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
         elif agent_provider == "gemini":
             from ..llm.gemini_client import GeminiClient
             return GeminiClient(

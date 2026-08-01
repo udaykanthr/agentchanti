@@ -161,6 +161,26 @@ class OpenAIClient(LLMClient):
         cached = details.get("cached_tokens", 0)
         return cached if isinstance(cached, int) else 0
 
+    def _is_reasoning_model(self) -> bool:
+        return self.model.lower().startswith(self._REASONING_MODEL_PREFIXES)
+
+    def _effort(self) -> Optional[str]:
+        """Reasoning effort to send, or None to leave it to the provider.
+
+        A one-shot downgrade armed after a reasoning burn outranks the
+        configured value — that retry exists precisely because the model
+        spent the whole completion budget thinking. Gated on the model
+        looking like a reasoning model, since sending the parameter to one
+        that does not accept it is a 400.
+        """
+        if self._retry_reasoning_effort:
+            effort = self._retry_reasoning_effort
+            self._retry_reasoning_effort = None
+            return effort
+        if self.reasoning_effort and self._is_reasoning_model():
+            return self.reasoning_effort
+        return None
+
     def _prepare_token_limit_retry(self) -> None:
         """Reasoning models can burn the whole completion budget on hidden
         reasoning tokens, returning an empty response with
@@ -196,10 +216,9 @@ class OpenAIClient(LLMClient):
         # max_tokens.  Try the new name first, fall back on 400 error.
         _tok_key = "max_completion_tokens"
         payload[_tok_key] = self.max_output_tokens
-        if self._retry_reasoning_effort:
-            # Consume the one-shot downgrade armed after a reasoning burn.
-            payload["reasoning_effort"] = self._retry_reasoning_effort
-            self._retry_reasoning_effort = None
+        _effort = self._effort()
+        if _effort:
+            payload["reasoning_effort"] = _effort
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
@@ -252,10 +271,9 @@ class OpenAIClient(LLMClient):
             "stream_options": {"include_usage": True},
             "max_completion_tokens": self.max_output_tokens,
         }
-        if self._retry_reasoning_effort:
-            # Consume the one-shot downgrade armed after a reasoning burn.
-            payload["reasoning_effort"] = self._retry_reasoning_effort
-            self._retry_reasoning_effort = None
+        _effort = self._effort()
+        if _effort:
+            payload["reasoning_effort"] = _effort
         url = f"{self.base_url}/chat/completions"
 
         content_parts: list[str] = []
@@ -411,10 +429,9 @@ class OpenAIClient(LLMClient):
             # is nothing to gain from server-side retention.
             "store": False,
         }
-        effort = self._retry_reasoning_effort or self.reasoning_effort
+        effort = self._effort()
         if effort:
             payload["reasoning"] = {"effort": effort}
-            self._retry_reasoning_effort = None
         if tools:
             # Flat here — no nested "function" wrapper as in completions.
             payload["tools"] = [
@@ -495,10 +512,9 @@ class OpenAIClient(LLMClient):
             "stream": False,
             "max_completion_tokens": self.max_output_tokens,
         }
-        if self._retry_reasoning_effort:
-            # Consume the one-shot downgrade armed after a reasoning burn.
-            payload["reasoning_effort"] = self._retry_reasoning_effort
-            self._retry_reasoning_effort = None
+        _effort = self._effort()
+        if _effort:
+            payload["reasoning_effort"] = _effort
         if tools:
             payload["tools"] = [
                 {"type": "function",

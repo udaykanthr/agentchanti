@@ -275,6 +275,66 @@ class TestResponsesApiFallover(unittest.TestCase):
         self.assertTrue(sent[0][0].endswith("/chat/completions"))
 
 
+class TestConfiguredReasoningEffort(unittest.TestCase):
+    """`reasoning_effort:` in config previously only reached LM Studio."""
+
+    def _client(self, model="gpt-5.6-terra", effort="high"):
+        from agentchanti.llm.openai_client import OpenAIClient
+        return OpenAIClient(base_url="https://api.openai.com/v1",
+                            model=model, api_key="k", reasoning_effort=effort)
+
+    def test_config_key_resolves_for_openai(self):
+        from agentchanti.config import Config
+        cfg = Config({"reasoning_effort": "high"})
+        self.assertEqual(cfg.OPENAI_REASONING_EFFORT, "high")
+
+    def test_openai_section_outranks_top_level(self):
+        from agentchanti.config import Config
+        cfg = Config({"reasoning_effort": "high",
+                      "openai": {"reasoning_effort": "low"}})
+        self.assertEqual(cfg.OPENAI_REASONING_EFFORT, "low")
+
+    def test_absent_by_default(self):
+        from agentchanti.config import Config
+        self.assertIsNone(Config({}).OPENAI_REASONING_EFFORT)
+
+    def test_sent_for_a_reasoning_model(self):
+        self.assertEqual(self._client()._effort(), "high")
+
+    def test_withheld_from_a_non_reasoning_model(self):
+        """Sending the parameter to a model that lacks it is a 400."""
+        self.assertIsNone(self._client(model="gpt-4o-mini")._effort())
+
+    def test_burn_downgrade_outranks_configured_effort(self):
+        """The one-shot downgrade exists because the model just spent its
+        whole budget thinking — honouring 'high' again would repeat it."""
+        client = self._client()
+        client._prepare_token_limit_retry()
+        self.assertEqual(client._effort(), "low")
+        # One-shot: the configured value applies again afterwards.
+        self.assertEqual(client._effort(), "high")
+
+    def test_reaches_the_chat_completions_payload(self):
+        client = self._client()
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.url = "https://api.openai.com/v1/chat/completions"
+        ok.json.return_value = {
+            "choices": [{"message": {"content": "hi", "tool_calls": []},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        sent = {}
+
+        def _post(url, **kwargs):
+            sent.update(kwargs.get("json") or {})
+            return ok
+
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", _post):
+            client._chat([Message(role="user", content="hi")], tools=None)
+        self.assertEqual(sent.get("reasoning_effort"), "high")
+
+
 class TestResponsesTranslation(unittest.TestCase):
     """The two wire formats differ in ways that silently break tool loops."""
 
