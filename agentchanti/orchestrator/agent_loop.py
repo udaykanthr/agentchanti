@@ -101,6 +101,11 @@ _journal_lock = Lock()
 _attempts: dict[int, list[dict]] = {}
 
 
+# Journal label for a run on the escalation (stronger) model. Checked by
+# escalation_already_failed() to keep the ladder monotonic.
+ESCALATION_ATTEMPT_LABEL = "escalation (stronger model)"
+
+
 def record_attempt(step_idx: int, label: str, outcome: str,
                    edited: list[str], commands: list[tuple[str, bool]],
                    summary: str) -> None:
@@ -212,6 +217,9 @@ _PRELOAD_MAX_CHARS = 12_000
 # Below this much remaining budget a truncated file is more confusing than
 # useful — skip it and let the loop read_file if it actually needs it.
 _PRELOAD_MIN_USEFUL_CHARS = 1_500
+# A file listing longer than this belongs to a tree the model should
+# explore with filtered calls, not carry in full in every turn.
+_PRELOAD_MAX_LISTING_CHARS = 3_000
 
 # Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
@@ -253,7 +261,8 @@ def _platform_note() -> str:
 
 
 def _build_user_message(step_text: str, task: str, language: str | None,
-                        context: str, preloaded: str = "") -> str:
+                        context: str, preloaded: str = "",
+                        listing: str = "") -> str:
     parts = [f"Overall task: {task}", f"Current step: {step_text}"]
     if language:
         parts.append(f"Project language: {language}")
@@ -262,9 +271,36 @@ def _build_user_message(step_text: str, task: str, language: str | None,
         parts.append(note)
     if context:
         parts.append(f"Project state:\n{context}")
+    if listing:
+        parts.append(listing)
     if preloaded:
         parts.append(preloaded)
     return "\n\n".join(parts)
+
+
+def _preload_listing(tools: AgentTools) -> str:
+    """The project's file list, up front.
+
+    Orientation is the loop's reflex first move: measured on a 7-step run,
+    every single step opened with ``list_files`` — a whole turn out of
+    eight spent learning a layout the harness can hand over for free. The
+    answer also rides along in every later turn once fetched, so paying a
+    round trip for it buys nothing.
+
+    Kept small and skipped when it would be large: a listing long enough
+    to need truncating is one the model should explore with its own
+    filtered calls rather than read in full.
+    """
+    try:
+        body = tools._tool_list_files()
+    except Exception:
+        return ""
+    if not body or body.startswith("ERROR"):
+        return ""
+    if len(body) > _PRELOAD_MAX_LISTING_CHARS:
+        return ""
+    return ("Project files (already listed for you — do NOT call "
+            "list_files again unless you have changed the tree):\n" + body)
 
 
 def _preload_target_files(tools: AgentTools,
@@ -467,11 +503,12 @@ def run_agent_loop(
     handlers in ``step_handlers.py``.
     """
     preloaded = _preload_target_files(tools, preload_files)
+    listing = _preload_listing(tools)
     messages = [
         Message(role="system", content=AGENT_LOOP_SYSTEM_PROMPT),
         Message(role="user",
                 content=_build_user_message(step_text, task, language,
-                                            context, preloaded)),
+                                            context, preloaded, listing)),
     ]
     definitions = tools.definitions()
     action_definitions = [d for d in definitions
@@ -693,8 +730,25 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
         + (("\n\n" + _digest) if _digest else "")
         + "\n\nA previous attempt by another model FAILED:\n"
         + truncate_middle(info, 2000))
-    kw["attempt_label"] = "escalation (stronger model)"
+    kw["attempt_label"] = ESCALATION_ATTEMPT_LABEL
     return run_agent_loop(escalation_client, tools, step_text, task, **kw)
+
+
+def escalation_already_failed(step_idx: int) -> bool:
+    """True when the stronger model has already had a failed run at this step.
+
+    The ladder used to be loop(weak) -> loop(strong) -> recovery(weak) ->
+    recovery(strong): after the stronger model failed, the next attempt
+    went back to the weaker one. Observed on a Pac-Man run, step 7 spent
+    32 turns across those four attempts — 47% of the whole run's turns —
+    and only the final strong attempt succeeded. Each attempt re-sends the
+    conversation, so turns are the dominant driver of prompt tokens.
+    """
+    return any(
+        a.get("label") == ESCALATION_ATTEMPT_LABEL
+        and a.get("outcome") != "verified"
+        for a in get_attempts(step_idx)
+    )
 
 
 def _verify_call(verify_cmd: str):
@@ -869,11 +923,25 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     # failure the stronger model should get a shot at (observed: a
     # blocked npx-tailwind recovery never escalated because the wrapper
     # saw the self-reported success).
+    _escalation_usable = (
+        escalation_client is not None
+        and escalation_client is not llm_client
+        and getattr(escalation_client, "supports_tools", lambda: False)())
+
+    # Keep the ladder monotonic. If the stronger model already failed this
+    # step in the main loop, a recovery run on the WEAKER one is the least
+    # likely rung to succeed and costs a full turn budget to find out —
+    # observed step 7 spending 8 turns there between two strong-model
+    # attempts, inside a 32-turn step that was 47% of the run's turns.
+    if _escalation_usable and escalation_already_failed(step_idx):
+        _logger.info(
+            "[AgentLoop] step %d: the stronger model already failed this "
+            "step — starting recovery there instead of re-trying the "
+            "weaker one", step_idx + 1)
+        return _attempt(escalation_client, "recovery + escalation")
+
     success, info = _attempt(llm_client, "recovery")
-    if (not success and escalation_client is not None
-            and escalation_client is not llm_client
-            and getattr(escalation_client, "supports_tools",
-                        lambda: False)()):
+    if not success and _escalation_usable:
         _logger.info(
             "[AgentLoop] step %d: recovery failed — escalating to "
             "stronger model", step_idx + 1)

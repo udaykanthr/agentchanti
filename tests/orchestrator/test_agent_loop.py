@@ -1750,3 +1750,132 @@ class TestPreloadBudget(unittest.TestCase):
     def test_empty_input_is_empty(self):
         self.assertEqual(self._preload([]), "")
         self.assertEqual(self._preload(None), "")
+
+
+class TestPreloadListing(unittest.TestCase):
+    """Orientation is the loop's reflex first move — hand it over for free.
+
+    Measured on a 7-step run, every single step opened with `list_files`:
+    a whole turn out of eight spent learning a layout the harness already
+    knows. The answer also rides along in every later turn once fetched,
+    so the round trip buys nothing.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.makedirs("src", exist_ok=True)
+        with open("src/map.py", "w", encoding="utf-8") as fh:
+            fh.write("class Map:\n    pass\n")
+        with open("main.py", "w", encoding="utf-8") as fh:
+            fh.write("def main():\n    pass\n")
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def test_lists_the_tree_and_tells_the_model_not_to_repeat_it(self):
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        out = _preload_listing(self.tools)
+        self.assertIn("main.py", out)
+        self.assertIn("src/map.py", out)
+        self.assertIn("do NOT call list_files", out)
+
+    def test_a_large_tree_is_skipped_not_truncated(self):
+        """A half-listing is worse than none — it reads as complete."""
+        import os
+
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        for i in range(400):
+            with open(f"f{i}_with_a_longish_name.py", "w",
+                      encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+        self.assertEqual(_preload_listing(self.tools), "")
+
+    def test_a_broken_tools_object_is_survivable(self):
+        from unittest.mock import MagicMock
+
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        broken = MagicMock()
+        broken._tool_list_files.side_effect = RuntimeError("boom")
+        self.assertEqual(_preload_listing(broken), "")
+
+    def test_it_reaches_the_opening_message(self):
+        from agentchanti.orchestrator.agent_loop import _build_user_message
+        msg = _build_user_message("step", "task", "python", "",
+                                  preloaded="PRELOADED",
+                                  listing="LISTING")
+        self.assertIn("LISTING", msg)
+        self.assertIn("PRELOADED", msg)
+
+
+class TestMonotonicEscalationLadder(unittest.TestCase):
+    """Never step back down to the weaker model mid-ladder.
+
+    The ladder was loop(weak) -> loop(strong) -> recovery(weak) ->
+    recovery(strong). Once the stronger model had failed, the next rung
+    went back to the weaker one — the least likely attempt to succeed, at
+    a full turn budget to find out. Observed on a Pac-Man run: step 7 took
+    32 turns across those four attempts, 47% of the whole run's turns,
+    and only the final strong attempt worked.
+    """
+
+    def _clients(self):
+        weak, strong = MagicMock(), MagicMock()
+        weak.supports_tools.return_value = True
+        strong.supports_tools.return_value = True
+        return weak, strong
+
+    def test_detects_a_failed_escalation_in_the_journal(self):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, escalation_already_failed,
+            record_attempt,
+        )
+        self.assertFalse(escalation_already_failed(3))
+        record_attempt(3, "first attempt", "verify-failed", [], [], "")
+        self.assertFalse(escalation_already_failed(3))
+        record_attempt(3, ESCALATION_ATTEMPT_LABEL, "verify-failed", [], [], "")
+        self.assertTrue(escalation_already_failed(3))
+
+    def test_a_successful_escalation_does_not_count(self):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, escalation_already_failed,
+            record_attempt,
+        )
+        record_attempt(4, ESCALATION_ATTEMPT_LABEL, "verified", [], [], "")
+        self.assertFalse(escalation_already_failed(4))
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_recovery_starts_strong_after_a_failed_escalation(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, record_attempt, run_recovery_loop,
+        )
+        mock_loop.return_value = (True, "fixed")
+        weak, strong = self._clients()
+        record_attempt(7, ESCALATION_ATTEMPT_LABEL, "verify-failed", [], [], "")
+        ok, _ = run_recovery_loop(weak, MagicMock(), "step", "task", "err",
+                                  step_idx=7, escalation_client=strong)
+        self.assertTrue(ok)
+        self.assertEqual(mock_loop.call_count, 1,
+                         "the weaker model must not get a recovery run")
+        self.assertIs(mock_loop.call_args[0][0], strong)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_without_a_failed_escalation_recovery_starts_weak(self, mock_loop):
+        """The normal ladder is unchanged — the weak model still gets a go."""
+        from agentchanti.orchestrator.agent_loop import run_recovery_loop
+        mock_loop.return_value = (True, "fixed")
+        weak, strong = self._clients()
+        ok, _ = run_recovery_loop(weak, MagicMock(), "step", "task", "err",
+                                  step_idx=8, escalation_client=strong)
+        self.assertTrue(ok)
+        self.assertIs(mock_loop.call_args[0][0], weak)
