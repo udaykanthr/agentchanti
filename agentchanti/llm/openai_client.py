@@ -32,8 +32,28 @@ def _looks_like_tools_rejection(response) -> bool:
     return any(marker in body for marker in _TOOLS_REJECTED_MARKERS)
 
 
+_PARAM_REJECTED_WORDS = ("unsupported", "unrecognized", "unrecognised",
+                         "unknown", "invalid", "not supported")
+
+
+def _param_rejected(response, param: str) -> bool:
+    """True when a 400 specifically complains about *param*.
+
+    The ``max_completion_tokens`` → ``max_tokens`` fallback used to fire on
+    *any* 400, which meant an unrelated rejection silently retried with the
+    legacy parameter and then reported that second failure — "Unsupported
+    parameter: 'max_tokens' ... Use 'max_completion_tokens' instead" — the
+    exact opposite of the real problem, with the first error discarded.
+    """
+    body = (response.text or "").lower()
+    if param.lower() not in body:
+        return False
+    return any(word in body for word in _PARAM_REJECTED_WORDS)
+
+
 def _raise_for_status_with_body(response, model: str = "",
-                                tool_count: int = 0) -> None:
+                                tool_count: int = 0,
+                                payload: Optional[dict] = None) -> None:
     """``raise_for_status`` that keeps the provider's explanation.
 
     ``requests`` raises ``400 Client Error: Bad Request for url: ...`` and
@@ -52,18 +72,22 @@ def _raise_for_status_with_body(response, model: str = "",
 
     detail = ""
     try:
-        payload = response.json()
-        err = payload.get("error") if isinstance(payload, dict) else None
+        body = response.json()
+        err = body.get("error") if isinstance(body, dict) else None
         if isinstance(err, dict):
             detail = err.get("message") or json.dumps(err)[:500]
-        elif payload:
-            detail = json.dumps(payload)[:500]
+        elif body:
+            detail = json.dumps(body)[:500]
     except Exception:
         detail = (response.text or "")[:500]
 
     context = f"model={model}" if model else ""
     if tool_count:
         context += f", {tool_count} tool(s)"
+    if payload:
+        # Naming the request parameters turns "this model rejected the
+        # request" into something actionable without another round trip.
+        context += ", params=" + ",".join(sorted(payload))
     message = (f"{response.status_code} from {response.url.split('?')[0]}"
                + (f" [{context}]" if context else "")
                + (f": {detail}" if detail else ""))
@@ -146,13 +170,17 @@ class OpenAIClient(LLMClient):
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
-        if response.status_code == 400 and _tok_key == "max_completion_tokens":
-            # Fall back to legacy parameter name
+        if response.status_code == 400 and _param_rejected(response, _tok_key):
+            # Legacy parameter name for older models/APIs (see _chat).
+            first_failure = response
             del payload[_tok_key]
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      timeout=(10, 300))
-        _raise_for_status_with_body(response, model=self.model)
+            if response.status_code >= 400:
+                response = first_failure
+        _raise_for_status_with_body(response, model=self.model,
+                                    payload=payload)
         data = response.json()
 
         usage = data.get("usage", {})
@@ -206,13 +234,17 @@ class OpenAIClient(LLMClient):
 
         response = requests.post(url, headers=self._headers(), json=payload,
                                  stream=True, timeout=(10, 120))
-        if response.status_code == 400 and "max_completion_tokens" in payload:
-            # Fall back to legacy parameter name for older models/APIs
+        if response.status_code == 400 and                 _param_rejected(response, "max_completion_tokens"):
+            # Legacy parameter name for older models/APIs (see _chat).
+            first_failure = response
             del payload["max_completion_tokens"]
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      stream=True, timeout=(10, 120))
-        _raise_for_status_with_body(response, model=self.model)
+            if response.status_code >= 400:
+                response = first_failure
+        _raise_for_status_with_body(response, model=self.model,
+                                    payload=payload)
 
         with streaming_response(response):
             for line in response.iter_lines(decode_unicode=True):
@@ -314,12 +346,17 @@ class OpenAIClient(LLMClient):
         url = f"{self.base_url}/chat/completions"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
-        if response.status_code == 400 and "max_completion_tokens" in payload:
-            # Fall back to legacy parameter name for older models/APIs
+        if response.status_code == 400 and                 _param_rejected(response, "max_completion_tokens"):
+            # Legacy parameter name for older models/APIs. Only on a 400
+            # that actually names the parameter: firing on any 400 masked
+            # the real error behind a bogus "use max_completion_tokens".
+            first_failure = response
             del payload["max_completion_tokens"]
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      timeout=(10, 300))
+            if response.status_code >= 400:
+                response = first_failure   # the original is the real one
         if response.status_code == 400 and tools and \
                 _looks_like_tools_rejection(response):
             # Degrade to the text path for the rest of the session instead
@@ -331,7 +368,8 @@ class OpenAIClient(LLMClient):
                 f"model '{self.model}' rejected tools: "
                 f"{(response.text or '')[:300]}")
         _raise_for_status_with_body(response, model=self.model,
-                                    tool_count=len(tools or []))
+                                    tool_count=len(tools or []),
+                                    payload=payload)
         data = response.json()
 
         usage = data.get("usage", {})

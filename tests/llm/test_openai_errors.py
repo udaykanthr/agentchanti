@@ -15,6 +15,7 @@ from agentchanti.llm.base import LLMError, NonRetryableLLMError, \
     ToolsNotSupportedError
 from agentchanti.llm.openai_client import (
     _looks_like_tools_rejection,
+    _param_rejected,
     _raise_for_status_with_body,
 )
 
@@ -52,6 +53,21 @@ class TestRaiseForStatusWithBody(unittest.TestCase):
         self.assertIn("gpt-5.6-terra", msg)
         self.assertIn("6 tool(s)", msg)
         self.assertIn("400", msg)
+
+    def test_names_the_request_parameters_that_were_sent(self):
+        """Turns "the model rejected it" into something actionable."""
+        resp = _response(400, {"error": {"message": "Unsupported parameter"}})
+        with self.assertRaises(NonRetryableLLMError) as ctx:
+            _raise_for_status_with_body(
+                resp, model="m",
+                payload={"model": "m", "messages": [], "stream": False,
+                         "max_completion_tokens": 16384, "tools": []})
+        msg = str(ctx.exception)
+        self.assertIn("params=", msg)
+        self.assertIn("max_completion_tokens", msg)
+        self.assertIn("tools", msg)
+        # The request payload, not the response body.
+        self.assertNotIn("params=error", msg)
 
     def test_non_json_body_still_surfaces(self):
         resp = _response(400, payload=None, text="upstream rejected request")
@@ -110,6 +126,46 @@ class TestToolsRejectionDetection(unittest.TestCase):
 
     def test_error_type_is_the_one_chat_downgrades_on(self):
         self.assertFalse(issubclass(ToolsNotSupportedError, LLMError))
+
+
+class TestTokenParamFallbackTrigger(unittest.TestCase):
+    """The max_completion_tokens -> max_tokens fallback must be targeted.
+
+    Firing it on *any* 400 meant an unrelated rejection was silently
+    retried with the legacy parameter, and the reported error became
+    "Unsupported parameter: 'max_tokens' ... Use 'max_completion_tokens'
+    instead" — the exact opposite of the truth, with the real first error
+    discarded. Cost a full debugging round to see through.
+    """
+
+    def test_fires_when_the_parameter_is_named(self):
+        for body in (
+            "{\"error\":{\"message\":\"Unsupported parameter: "
+            "'max_completion_tokens' is not supported with this model.\"}}",
+            "{\"error\":{\"message\":\"Unrecognized request argument "
+            "supplied: max_completion_tokens\"}}",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(_param_rejected(
+                    _response(400, text=body), "max_completion_tokens"))
+
+    def test_does_not_fire_on_an_unrelated_400(self):
+        for body in (
+            '{"error":{"message":"Invalid schema for function write_file"}}',
+            '{"error":{"message":"context_length_exceeded"}}',
+            '{"error":{"message":"Incorrect API key provided"}}',
+            "",
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(_param_rejected(
+                    _response(400, text=body), "max_completion_tokens"))
+
+    def test_does_not_fire_when_named_without_a_rejection_word(self):
+        """A body that merely mentions the parameter is not a rejection."""
+        self.assertFalse(_param_rejected(
+            _response(400, text='{"error":{"message":"max_completion_tokens '
+                                'was 4096 and the prompt was too long"}}'),
+            "max_completion_tokens"))
 
 
 if __name__ == "__main__":
