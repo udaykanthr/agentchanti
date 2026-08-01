@@ -2947,12 +2947,24 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             _rec_verify = _declared_verify_cmd(plan_step, memory, task=task)
         _rec_tools = build_step_tools(
             executor, memory, kb_context_builder=kb_context_builder)
-        recovered, rec_info = run_recovery_loop(
-            llm_client, _rec_tools, step_text, task, error_info,
-            display=display, step_idx=step_idx, language=language,
-            max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
-            verify_cmd=_rec_verify,
-            escalation_client=getattr(coder, "escalation_client", None))
+        try:
+            recovered, rec_info = run_recovery_loop(
+                llm_client, _rec_tools, step_text, task, error_info,
+                display=display, step_idx=step_idx, language=language,
+                max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+                verify_cmd=_rec_verify,
+                escalation_client=getattr(coder, "escalation_client", None))
+        except Exception as rec_exc:
+            # This function promises that a crash during diagnosis fails the
+            # STEP, not the run — but the recovery call sat outside the
+            # guard. Observed: a model that rejected every tool-calling
+            # request raised LLMError out of here and killed the pipeline
+            # with a bare traceback, after the very first CODE step.
+            log.error(
+                "Task %d: Agent-loop recovery raised %s: %s",
+                step_idx + 1, type(rec_exc).__name__, rec_exc)
+            display.complete_step(step_idx, "failed")
+            return False
         if recovered:
             log.info(f"Task {step_idx+1}: Agent loop recovered the step: "
                      f"{rec_info[:200]}")

@@ -7,10 +7,71 @@ import json
 import requests
 from typing import List, Optional
 
-from .base import LLMClient
+from .base import LLMClient, NonRetryableLLMError, ToolsNotSupportedError
 from .chat_types import ChatResponse, Message, ToolCall, ToolDef
 from .cancellation import streaming_response, check_cancelled
 from ..cli_display import token_tracker, log
+
+# A 400 whose message points at the tools/functions part of the request.
+# Kept narrow on purpose: misreading an unrelated 400 as "no tool support"
+# would silently drop the whole agent-loop path for the session.
+_TOOLS_REJECTED_MARKERS = (
+    "does not support tools",
+    "does not support function",
+    "tools are not supported",
+    "function calling is not supported",
+    "unsupported parameter: 'tools'",
+    "unsupported value: 'tools'",
+    "invalid parameter: 'tools'",
+    "unknown parameter: 'tools'",
+)
+
+
+def _looks_like_tools_rejection(response) -> bool:
+    body = (response.text or "").lower()
+    return any(marker in body for marker in _TOOLS_REJECTED_MARKERS)
+
+
+def _raise_for_status_with_body(response, model: str = "",
+                                tool_count: int = 0) -> None:
+    """``raise_for_status`` that keeps the provider's explanation.
+
+    ``requests`` raises ``400 Client Error: Bad Request for url: ...`` and
+    throws the response body away — but the body is the only thing that
+    says *what* was wrong. Observed: a model rejected every tool-calling
+    request and three runs' worth of logs showed nothing but the bare
+    status line, leaving no way to tell a bad tool schema from an
+    unsupported parameter.
+
+    A 4xx other than 408/429 is also raised as
+    :class:`NonRetryableLLMError`: the request is malformed, so sending it
+    twice more only spends time and money to fail identically.
+    """
+    if response.status_code < 400:
+        return
+
+    detail = ""
+    try:
+        payload = response.json()
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, dict):
+            detail = err.get("message") or json.dumps(err)[:500]
+        elif payload:
+            detail = json.dumps(payload)[:500]
+    except Exception:
+        detail = (response.text or "")[:500]
+
+    context = f"model={model}" if model else ""
+    if tool_count:
+        context += f", {tool_count} tool(s)"
+    message = (f"{response.status_code} from {response.url.split('?')[0]}"
+               + (f" [{context}]" if context else "")
+               + (f": {detail}" if detail else ""))
+
+    if 400 <= response.status_code < 500 and response.status_code not in (
+            408, 409, 429):
+        raise NonRetryableLLMError(message)
+    response.raise_for_status()
 
 
 class OpenAIClient(LLMClient):
@@ -91,7 +152,7 @@ class OpenAIClient(LLMClient):
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      timeout=(10, 300))
-        response.raise_for_status()
+        _raise_for_status_with_body(response, model=self.model)
         data = response.json()
 
         usage = data.get("usage", {})
@@ -151,7 +212,7 @@ class OpenAIClient(LLMClient):
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      stream=True, timeout=(10, 120))
-        response.raise_for_status()
+        _raise_for_status_with_body(response, model=self.model)
 
         with streaming_response(response):
             for line in response.iter_lines(decode_unicode=True):
@@ -259,7 +320,18 @@ class OpenAIClient(LLMClient):
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
                                      timeout=(10, 300))
-        response.raise_for_status()
+        if response.status_code == 400 and tools and \
+                _looks_like_tools_rejection(response):
+            # Degrade to the text path for the rest of the session instead
+            # of dying. Only Ollama ever raised this, so a model that
+            # rejects tools over the OpenAI API used to take the whole run
+            # down: observed with a model whose every tool-calling request
+            # 400'd, killing the pipeline on the first CODE step.
+            raise ToolsNotSupportedError(
+                f"model '{self.model}' rejected tools: "
+                f"{(response.text or '')[:300]}")
+        _raise_for_status_with_body(response, model=self.model,
+                                    tool_count=len(tools or []))
         data = response.json()
 
         usage = data.get("usage", {})

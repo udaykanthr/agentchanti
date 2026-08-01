@@ -53,6 +53,15 @@ class LLMError(Exception):
     """Raised when all LLM retries are exhausted."""
 
 
+class NonRetryableLLMError(LLMError):
+    """A request the provider will reject identically every time.
+
+    A malformed request (4xx other than 408/409/429) does not become valid
+    by being sent again. Retrying it three times with exponential backoff
+    only delays the inevitable failure and spends quota doing it.
+    """
+
+
 class ToolsNotSupportedError(Exception):
     """Raised by a provider when the active model rejects native tool calling.
 
