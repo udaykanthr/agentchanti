@@ -138,6 +138,14 @@ class OpenAIClient(LLMClient):
         # One-shot reasoning-effort downgrade: armed by
         # _prepare_token_limit_retry, consumed by the next _chat call.
         self._retry_reasoning_effort: Optional[str] = None
+        # Session-sticky downgrade, latched after the FIRST reasoning burn.
+        # The one-shot alone only rescued the call that burned: every later
+        # request went back to the configured effort and burned again.
+        # Measured on one Pac-Man run: 4 burns x 16384 = 65,536 completion
+        # tokens for zero visible output — 43% of everything received.
+        # Mirrors _native_tools_ok: once the model has demonstrated it
+        # cannot work at this setting, stop paying to rediscover that.
+        self._session_effort_floor: Optional[str] = None
         # Latched once the model reports that function tools and reasoning
         # cannot be combined on /chat/completions. Tool-calling turns then
         # go to /v1/responses, which supports both, instead of paying the
@@ -177,6 +185,8 @@ class OpenAIClient(LLMClient):
             effort = self._retry_reasoning_effort
             self._retry_reasoning_effort = None
             return effort
+        if self._session_effort_floor:
+            return self._session_effort_floor
         if self.reasoning_effort and self._is_reasoning_model():
             return self.reasoning_effort
         return None
@@ -185,9 +195,23 @@ class OpenAIClient(LLMClient):
         """Reasoning models can burn the whole completion budget on hidden
         reasoning tokens, returning an empty response with
         ``finish_reason: length``. Retrying verbatim is a coin flip —
-        request low reasoning effort for the retry instead."""
-        if self.model.lower().startswith(self._REASONING_MODEL_PREFIXES):
-            self._retry_reasoning_effort = "low"
+        request low reasoning effort for the retry instead.
+
+        The downgrade also latches for the rest of the session. A model
+        that burned its entire budget once will do it again on the next
+        comparable request, and each repeat costs a full completion cap
+        plus a wasted round trip before the retry rescues it.
+        """
+        if not self._is_reasoning_model():
+            return
+        self._retry_reasoning_effort = "low"
+        if self._session_effort_floor is None:
+            self._session_effort_floor = "low"
+            log.warning(
+                "[OpenAI] %s spent its entire output budget on reasoning at "
+                "effort=%s — dropping to 'low' for the rest of this session "
+                "rather than paying the same burn on every later call.",
+                self.model, self.reasoning_effort or "provider default")
 
     def _headers(self) -> dict:
         return {

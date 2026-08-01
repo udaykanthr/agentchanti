@@ -1113,20 +1113,35 @@ class PlannerAgent(Agent):
                             len(docs) if docs else 0,
                         )
 
+                    # Pre-compute per-topic keyword sets for Filter 0.
+                    # Deliberately OUTSIDE the `if docs:` guard below: these
+                    # also arm the per-step filter in context_builder, and
+                    # hanging that off "planning found docs" inverted the
+                    # logic. Planning returning 0 docs is evidence the
+                    # per-step searches will surface nothing relevant either
+                    # — exactly when the filter matters most — yet it left
+                    # _intent_topics unset, and an empty topic list makes
+                    # _passes_topic_filter admit everything. Observed on a
+                    # Pygame run whose topics parsed as "pygame, unittest":
+                    # 0 docs at planning, then "React Component Export
+                    # Instructions" injected into all 8 steps, 20,062 KB
+                    # tokens of mostly React/Vitest/Django material.
+                    _topic_kws: set[str] = set()
+                    _per_topic_kws: list[set[str]] = []
+                    if _use_topics:
+                        for _t in _parsed_topics:
+                            kws = {
+                                w.lower()
+                                for w in re.findall(r'[a-zA-Z]{3,}', _t)
+                            }
+                            if kws:
+                                _per_topic_kws.append(kws)
+                                _topic_kws.update(kws)
+                    if _per_topic_kws and kb_context_builder is not None:
+                        kb_context_builder._intent_topics = _per_topic_kws
+
                     if docs:
                         # Fallback-path filter loop.
-                        # Pre-compute per-topic keyword sets for Filter 0.
-                        _topic_kws: set[str] = set()
-                        _per_topic_kws: list[set[str]] = []
-                        if _use_topics:
-                            for _t in _parsed_topics:
-                                kws = {
-                                    w.lower()
-                                    for w in re.findall(r'[a-zA-Z]{3,}', _t)
-                                }
-                                if kws:
-                                    _per_topic_kws.append(kws)
-                                    _topic_kws.update(kws)
 
                         def _topic_stem_match(a: str, b: str) -> bool:
                             """True when a and b share a common stem prefix."""
@@ -1326,10 +1341,9 @@ class PlannerAgent(Agent):
                         # them into every step's KB context automatically.
                         if _preloaded and kb_context_builder is not None:
                             kb_context_builder._preloaded_docs = _preloaded
-                        # Also propagate topic filter so batch_search in
-                        # context_builder can reuse the same allowlist.
-                        if _per_topic_kws and kb_context_builder is not None:
-                            kb_context_builder._intent_topics = _per_topic_kws
+                        # (topic filter already propagated above, before the
+                        # `if docs:` guard, so a 0-doc planning search still
+                        # arms it)
                         if doc_hints:
                             parts.append("\n[Framework/Library Documentation]")
                             parts.append(
