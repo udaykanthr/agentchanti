@@ -741,6 +741,62 @@ class TestFixImportDependencies(unittest.TestCase):
         fix_import_dependencies(steps)
         self.assertIn("2.1", steps[1].depends_on)
 
+    def test_every_import_spelling_the_planner_uses(self):
+        """Planners write the same dependency at least four ways.
+
+        The hybrid `src.map.py` — dotted package path with the extension
+        still attached — is the one that shipped a three-way race: map,
+        player and ghost all landed in one wave and the ghost step
+        overwrote the other two steps' targets mid-execution.
+        """
+        for form in ("src/map.py", "src\\map.py", "src.map", "src.map.py",
+                     "map.py", "./src/map.py"):
+            with self.subTest(form=form):
+                steps = [
+                    PlanStep(id="2.1", step_type="CODE", index=0,
+                             target_files=["src/map.py"], exports=["Map"]),
+                    PlanStep(id="2.2", step_type="CODE", index=1,
+                             target_files=["src/player.py"],
+                             imports_from={form: ["Map"]}),
+                ]
+                self.assertEqual(len(fix_import_dependencies(steps)), 1,
+                                 f"{form} did not resolve")
+                self.assertIn("2.1", steps[1].depends_on)
+
+    def test_bare_basename_only_when_unambiguous(self):
+        """Two steps may target the same filename in different directories;
+        a wrong edge there reorders waves."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["a/util.py"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["b/util.py"]),
+            PlanStep(id="2.3", step_type="CODE", index=2,
+                     target_files=["c/main.py"],
+                     imports_from={"util.py": ["f"]}),
+        ]
+        self.assertEqual(fix_import_dependencies(steps), [])
+        self.assertEqual(steps[2].depends_on, [])
+
+    def test_hybrid_form_sequences_a_three_way_wave(self):
+        """End to end: the exact shape that raced."""
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["src/map.py"], exports=["Map"]),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     target_files=["src/player.py"], exports=["Player"],
+                     imports_from={"src.map.py": ["Map"]}),
+            PlanStep(id="2.3", step_type="CODE", index=2,
+                     target_files=["src/ghost.py"],
+                     imports_from={"src.map.py": ["Map"],
+                                   "src.player.py": ["Player"]}),
+        ]
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        wave_of = {s.id: wi for wi, w in enumerate(waves) for s in w}
+        self.assertLess(wave_of["2.1"], wave_of["2.2"])
+        self.assertLess(wave_of["2.2"], wave_of["2.3"])
+
     def test_same_basename_different_dirs_not_linked(self):
         """No basename fuzz: a wrong edge here would reorder waves wrongly."""
         steps = [

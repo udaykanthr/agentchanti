@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -1817,6 +1818,44 @@ def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 
+# Source extensions an import spec may or may not carry.
+_SOURCE_EXTS = (".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+                ".go", ".rs", ".java", ".rb", ".php", ".vue", ".svelte")
+
+
+def _strip_source_ext(path: str) -> str:
+    low = path.lower()
+    for ext in _SOURCE_EXTS:
+        if low.endswith(ext):
+            return path[: -len(ext)]
+    return path
+
+
+def _import_path_candidates(norm: str) -> list[str]:
+    """Extension-less path forms an import spec could denote.
+
+    Planners write the same dependency at least four different ways across
+    runs, and each unrecognised form silently drops a dependency edge:
+
+        src/map.py     path, already normalised
+        src\\map.py     Windows separators
+        src.map        Python dotted module
+        src.map.py     the hybrid — dotted package path with the file
+                       extension still attached
+
+    The hybrid is the one that bit: stripping the extension first is what
+    lets the dotted conversion produce ``src/map`` instead of the nonsense
+    ``src/map/py``. Observed on a Pygame run where map, player and ghost
+    all landed in one wave and the ghost step overwrote the other two
+    steps' target files while they were still executing.
+    """
+    stem = _strip_source_ext(norm)
+    candidates = [stem]
+    if "/" not in stem and "." in stem:
+        candidates.append(stem.replace(".", "/"))
+    return candidates
+
+
 def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
     """Auto-inject missing ``depends_on`` entries based on import relationships.
 
@@ -1846,25 +1885,43 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
 
     fixes: list[str] = []
 
-    # Build target-file → producer-step-id map
+    # Three indexes over the plan's target files: exact normalised path,
+    # extension-less stem (so `src.map.py`, `src.map` and `src/map.py` all
+    # land on the same producer), and basename for the bare-filename form.
     file_to_producer: dict[str, str] = {}
+    stem_to_producer: dict[str, str] = {}
+    base_to_producer: dict[str, str] = {}
+    base_counts: Counter = Counter()
     for s in steps:
         for fpath in s.target_files:
-            file_to_producer[_norm_target_path(fpath)] = s.id
+            norm = _norm_target_path(fpath)
+            file_to_producer[norm] = s.id
+            stem = _strip_source_ext(norm)
+            stem_to_producer[stem] = s.id
+            base = _os.path.basename(stem)
+            base_to_producer[base] = s.id
+            base_counts[base] += 1
 
     for step in steps:
         for file_path in step.imports_from:
             norm = _norm_target_path(file_path)
             producer_id = file_to_producer.get(norm)
-            if producer_id is None and "/" not in norm:
-                # Python dotted-module notation: 'src.map' → 'src/map.py'.
-                # Deliberately no basename fallback here: two steps may
-                # legitimately target the same filename in different
-                # directories, and a wrong dependency edge reorders waves.
-                dotted = norm.replace(".", "/")
-                producer_id = next(
-                    (pid for key, pid in file_to_producer.items()
-                     if _os.path.splitext(key)[0] == dotted), None)
+            if producer_id is None:
+                for cand in _import_path_candidates(norm):
+                    producer_id = stem_to_producer.get(cand)
+                    if producer_id is not None:
+                        break
+            if producer_id is None:
+                # Bare filename (`map.py` for target `src/map.py`). Two
+                # guards, because a wrong edge here reorders waves: the
+                # import must not name a directory of its own (an explicit
+                # `src/public/index.js` must never bind to
+                # `src/admin/index.js`), and the basename must be unique
+                # across the plan's targets.
+                stem = _strip_source_ext(norm)
+                base = _os.path.basename(stem)
+                if "/" not in stem and base_counts.get(base, 0) == 1:
+                    producer_id = base_to_producer.get(base)
             if producer_id is None:
                 continue  # existing project file, not produced by plan
             if producer_id == step.id:
