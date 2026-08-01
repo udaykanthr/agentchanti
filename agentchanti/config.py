@@ -77,7 +77,6 @@ _DEFAULTS = {
     "analyser_enabled": False,
     "wiring_verification_enabled": True,
     "smoke_test_enabled": True,
-    "property_check_enabled": True,
     "pricing": {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -475,17 +474,6 @@ class Config:
         self.SMOKE_TEST_ENABLED = _get_bool(
             "SMOKE_TEST_ENABLED", "smoke_test_enabled",
             _st_section.get("enabled", _DEFAULTS["smoke_test_enabled"]),
-        )
-
-        # Adversarial property check — for simulation-style projects only,
-        # drive the update loop with randomised delta-times and assert the
-        # invariants hold. Costs nothing on projects with no such loop.
-        _pc_section = yd.get("property_check", {})
-        if not isinstance(_pc_section, dict):
-            _pc_section = {}
-        self.PROPERTY_CHECK_ENABLED = _get_bool(
-            "PROPERTY_CHECK_ENABLED", "property_check_enabled",
-            _pc_section.get("enabled", _DEFAULTS["property_check_enabled"]),
         )
 
         # Plugins

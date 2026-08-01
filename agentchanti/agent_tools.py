@@ -66,39 +66,12 @@ class AgentTools:
     """
 
     def __init__(self, project_root: str = ".", executor=None,
-                 searcher=None, memory=None, command_timeout: int = 120,
-                 write_scope=None):
+                 searcher=None, memory=None, command_timeout: int = 120):
         self.project_root = os.path.abspath(project_root)
         self._executor = executor
         self._searcher = searcher
         self._memory = memory
         self._command_timeout = command_timeout
-        # Optional allow-list of writable paths. ``None`` = unrestricted
-        # (every ordinary step). A stage that is only supposed to author
-        # ONE file passes that file, and writes anywhere else come back as
-        # a tool error instead of silently landing on disk.
-        self._write_scope = (
-            None if write_scope is None
-            else {self._norm_scope(p) for p in write_scope})
-
-    @staticmethod
-    def _norm_scope(path: str) -> str:
-        p = str(path).replace("\\", "/").strip()
-        while p.startswith("./"):
-            p = p[2:]
-        return p.lstrip("/")
-
-    def _write_denied(self, path: str) -> Optional[str]:
-        """Error string when *path* is outside the write scope, else None."""
-        if self._write_scope is None:
-            return None
-        if self._norm_scope(path) in self._write_scope:
-            return None
-        allowed = ", ".join(sorted(self._write_scope))
-        return (f"ERROR: this step may only write to {allowed} — refusing to "
-                f"modify '{path}'. Other files are deliverables from earlier "
-                f"steps that have already been verified. Put your work in "
-                f"{allowed}.")
 
     # ── Definitions ──
 
@@ -290,9 +263,6 @@ class AgentTools:
         return header + _truncate(numbered, _MAX_READ_CHARS, "file content")
 
     def _tool_write_file(self, path: str, content: str) -> str:
-        denied = self._write_denied(path)
-        if denied:
-            return denied
         full = self._resolve(path)
         os.makedirs(os.path.dirname(full) or self.project_root, exist_ok=True)
         with open(full, "w", encoding="utf-8", newline="\n") as f:
@@ -301,9 +271,6 @@ class AgentTools:
         return f"OK: wrote {len(content)} chars to {path}"
 
     def _tool_edit_file(self, path: str, old_text: str, new_text: str) -> str:
-        denied = self._write_denied(path)
-        if denied:
-            return denied
         full = self._resolve(path)
         if not os.path.isfile(full):
             return f"ERROR: file not found: {path}"

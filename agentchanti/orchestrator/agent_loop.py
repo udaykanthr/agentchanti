@@ -776,20 +776,12 @@ def reverifiable_cmd(cmd: str | None) -> str | None:
 
 
 def build_step_tools(executor, memory, kb_context_builder=None,
-                     project_root: str = ".",
-                     write_scope=None) -> AgentTools:
-    """Assemble :class:`AgentTools` from the objects a step handler holds.
-
-    *write_scope* limits which paths the loop may write. Ordinary steps
-    pass ``None`` (unrestricted); a stage that is only meant to author one
-    file passes that file, so a wandering loop cannot overwrite earlier
-    steps' verified deliverables.
-    """
+                     project_root: str = ".") -> AgentTools:
+    """Assemble :class:`AgentTools` from the objects a step handler holds."""
     searcher = getattr(kb_context_builder, "_searcher", None) \
         if kb_context_builder is not None else None
     return AgentTools(project_root=project_root, executor=executor,
-                      searcher=searcher, memory=memory,
-                      write_scope=write_scope)
+                      searcher=searcher, memory=memory)
 
 
 def agent_loop_enabled(cfg, llm_client) -> bool:

@@ -1785,37 +1785,20 @@ def _main_impl():
             pipeline_success = False
             log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
 
-        # ── 13.8. Adversarial property check ──
-        # Everything above exercises the code at a FIXED timestep, which
-        # is the one condition under which a timestep-dependent defect is
-        # invisible. Observed: a Pac-Man run shipped with every ghost able
-        # to walk through walls — behavioural gates, generated tests and
-        # the smoke test were all green, because all three used a constant
-        # dt and the bug only exists when dt varies. Runs before the gate
-        # recheck below so its edits are gated like any other stage's, and
-        # skips silently unless the project has an update(dt) loop.
+        # An adversarial property check used to run here — one bounded loop
+        # authoring a randomised-dt invariant test, aimed at the class of
+        # defect a fixed timestep hides (a Pac-Man run shipped with ghosts
+        # walking through walls while every gate was green). It was removed:
+        # over three runs it never once produced its test file, cost ~33%
+        # of a run's tokens (147k sent / 10k received on the last one),
+        # falsely failed a pipeline whose gates were all green, and
+        # overwrote a verified test file from an earlier wave. The idea is
+        # sound; a loop that authors the test is not the way to get it.
+        # See git history for the implementation.
         else:
-            from .property_check import run_property_check
-            set_status(display,
-                       "Checking invariants under randomised frame timing...")
-            prop_ok, prop_err = run_property_check(
-                memory=memory,
-                executor=executor,
-                coder=coder,
-                display=display,
-                task=args.task,
-                language=language,
-                cfg=cfg,
-                intent_spec=intent_spec,
-            )
-            if not prop_ok:
-                pipeline_success = False
-                log.warning("[PropertyCheck] Pipeline marked failed: %s",
-                            prop_err[:300])
-
             # The smoke-test repair loop rewrites source files to fix a
-            # launch crash, and together with the property check above it
-            # is the LAST thing that can do so. Those edits were
+            # launch crash, and it is the LAST thing that can do so.
+            # Those edits were
             # previously never gate-checked: a repair that changed
             # `Player.update()`'s signature turned the green
             # `python -m unittest discover` gate red, and the run still

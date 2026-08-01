@@ -169,32 +169,32 @@ class TestSetStatusHelper(unittest.TestCase):
 class TestStatusOnlyProxy(unittest.TestCase):
     """Post-wave loops must not write into a finished step's row.
 
-    Regression: the property check and the smoke-test repair loops are not
-    plan steps, but they call the agent loop with ``step_idx=0``, so their
-    per-turn progress overwrote the row of step 1 — which had finished
-    minutes earlier. Observed: step 1 ("Create the virtual environment",
-    long green) reading "Agent loop 3/8: edit_file".
+    Regression: the smoke-test repair loops are not plan steps, but they
+    call the agent loop with ``step_idx=0``, so their per-turn progress
+    overwrote the row of step 1 — which had finished minutes earlier.
+    Observed: step 1 ("Create the virtual environment", long green)
+    reading "Agent loop 3/8: edit_file".
     """
 
     def test_step_info_becomes_a_status_message(self):
         from agentchanti.cli_display import status_only
         d = _make_headless_display()
         d.set_steps(["step one", "step two"])
-        proxy = status_only(d, "Property check")
+        proxy = status_only(d, "Smoke test")
         proxy.step_info(0, "Agent loop 3/8: edit_file")
         self.assertEqual(d.status_message,
-                         "Property check: Agent loop 3/8: edit_file")
+                         "Smoke test: Agent loop 3/8: edit_file")
         self.assertNotIn("Agent loop", d.steps[0].get("info", "") or "")
 
     def test_other_attributes_pass_through(self):
         from agentchanti.cli_display import status_only
         d = _make_headless_display()
-        proxy = status_only(d, "Property check")
+        proxy = status_only(d, "Smoke test")
         self.assertIs(proxy.show_status.__self__, d)
 
     def test_none_display_stays_none(self):
         from agentchanti.cli_display import status_only
-        self.assertIsNone(status_only(None, "Property check"))
+        self.assertIsNone(status_only(None, "Smoke test"))
 
 
 class TestPostWaveStagesReportProgress(unittest.TestCase):
@@ -202,9 +202,9 @@ class TestPostWaveStagesReportProgress(unittest.TestCase):
 
     Regression: the footer plumbing existed (see TestPostStepStatusFooter)
     but nothing called it once the waves ended. Bulk test, smoke test, the
-    property check, the gate rechecks and learning extraction ran for a
-    minute or more while the UI showed a finished step list and only the
-    clock and token counters moved — indistinguishable from a hang.
+    gate rechecks and learning extraction ran for a minute or more while
+    the UI showed a finished step list and only the clock and token
+    counters moved — indistinguishable from a hang.
     """
 
     def _read(self, relpath: str) -> str:
@@ -218,7 +218,6 @@ class TestPostWaveStagesReportProgress(unittest.TestCase):
         self.assertGreater(len(tail), 0, "post-wave section not found")
         for fragment in ("Running the full test suite",
                          "Launching the app to check it starts",
-                         "Checking invariants under randomised frame timing",
                          "Extracting learnings from this run"):
             self.assertIn(fragment, tail,
                           f"no status message for stage: {fragment}")
