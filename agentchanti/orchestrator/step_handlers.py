@@ -1285,20 +1285,26 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
                                      f"from CMD output ({manifest}): {candidate}/")
                             return candidate
 
-    # Only consider real source files, not internal tracking paths.
-    # Internal paths use underscore-prefixed directories (_cmd_output/,
-    # _fix_output/, _search_context/) and must be excluded from sub-project
-    # detection.  Directories like __tests__/ and __mocks__/ are legitimate.
+    # A sub-project root can only exist if some file lives in a
+    # SUBDIRECTORY, so root-level files tell us nothing here and the
+    # `'/' in p` filter is the real question being asked.
+    # Internal tracking paths use underscore-prefixed directories
+    # (_cmd_output/, _fix_output/, _search_context/) and are excluded;
+    # directories like __tests__/ and __mocks__/ are legitimate.
     _internal = ('_cmd_output/', '_fix_output/', '_search_context/')
-    source_paths = [
+    nested_paths = [
         p for p in all_files
         if not p.startswith(_internal) and '/' in p
     ]
-    if not source_paths:
+    if not nested_paths:
+        # This is the normal, correct outcome for a flat project — not a
+        # failure. The previous wording ("No source files in memory")
+        # contradicted the memory keys printed alongside it, which read as
+        # a bug in the pipeline every time a flat project ran.
         log.debug(
-            "[SubProject] No source files in memory — "
-            "Fallback 0 did not detect a scaffold cmd. "
-            "Memory keys: %s",
+            "[SubProject] Every file is at the project root (no path has a "
+            "directory component), so there is no sub-project — scanning "
+            "disk for a nested manifest before giving up. Memory keys: %s",
             list(all_files.keys())[:10],
         )
         # Last-resort: scan immediate subdirectories on disk for project
@@ -1345,7 +1351,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
 
     # Extract first path component from each file
     first_components: set[str] = set()
-    for p in source_paths:
+    for p in nested_paths:
         parts = p.replace('\\', '/').split('/')
         if len(parts) >= 2:  # must have at least dir/file
             first_components.add(parts[0])
@@ -1414,7 +1420,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
     # (e.g. search provider added files), look for a known project manifest
     from ..executor import Executor
     manifest_dirs = set()
-    for p in source_paths:
+    for p in nested_paths:
         if os.path.basename(p) in Executor._PROTECTED_FILENAMES:
             dirname = os.path.dirname(p)
             if dirname:  # Must be a subdirectory
@@ -1449,7 +1455,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         from collections import Counter
         counts = Counter(
             p.replace('\\', '/').split('/')[0]
-            for p in source_paths
+            for p in nested_paths
             if len(p.replace('\\', '/').split('/')) >= 2
         )
         if counts:
