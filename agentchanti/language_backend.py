@@ -141,6 +141,18 @@ class PythonBackend(LanguageBackend):
             name = m.group(1)
             if not name.startswith('_'):
                 exports.append(name)
+        # Module-level assignments — constants are exports too, and missing
+        # them made every `TILE_SIZE = 24` / `START = "start"` look absent.
+        # Observed: a step declaring TILE_SIZE, TILE_WALL, START, WIN … was
+        # reported as defining none of them, while the acceptance gate that
+        # imported exactly those symbols passed.
+        # Column 0 only, so locals inside a class or function body are not
+        # mistaken for module attributes.
+        for m in re.finditer(r'^([A-Za-z]\w*)\s*(?::[^=\n]+)?=[^=]',
+                             content, re.MULTILINE):
+            name = m.group(1)
+            if name not in exports:
+                exports.append(name)
         return exports
 
     def get_config_candidates(self) -> list[str]:

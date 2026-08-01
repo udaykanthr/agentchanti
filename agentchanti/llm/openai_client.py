@@ -527,8 +527,13 @@ class OpenAIClient(LLMClient):
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
         if response.status_code == 400 and tools and \
-                not self._tools_need_responses_api and \
                 _reasoning_blocks_tools(response):
+            # Deliberately NOT gated on the latch being unset. Wave steps
+            # share one client across threads: two concurrent tool calls
+            # both got this 400, the first latched and recovered, and the
+            # second saw the latch already true, skipped the retry and
+            # raised — costing that step a failure and a recovery loop.
+            # Retrying is idempotent, so just always do it.
             # This model defaults reasoning on server-side and refuses
             # function tools here. /v1/responses supports both, so switch
             # endpoints rather than dropping reasoning (which is what the

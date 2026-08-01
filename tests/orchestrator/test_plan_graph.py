@@ -130,6 +130,45 @@ class TestLifecycle(unittest.TestCase):
     def test_reconcile_ignores_steps_that_have_not_been_built(self):
         self.assertEqual(self.graph.reconcile("2.1"), [])
 
+    def test_module_level_constants_count_as_exports(self):
+        """The extractor used to see only class/def, so a step declaring
+        TILE_SIZE, START, WIN … was reported as defining none of them —
+        while the acceptance gate importing exactly those symbols passed."""
+        from agentchanti.language_backend import get_backend
+        source = (
+            "import pygame\n"
+            "TILE_SIZE = 24\n"
+            "TILE_WALL = 0\n"
+            "TILE_PELLET: int = 2\n"
+            "START = 'start'\n"
+            "class Map:\n"
+            "    INNER = 1\n"
+            "    def __init__(self):\n"
+            "        local = 2\n"
+            "def helper():\n"
+            "    other = 3\n"
+            "_private = 4\n"
+        )
+        found = set(get_backend("python").extract_exports(source))
+        for name in ("TILE_SIZE", "TILE_WALL", "TILE_PELLET", "START",
+                     "Map", "helper"):
+            self.assertIn(name, found)
+        # Class-body and function-local names are not module attributes.
+        for name in ("INNER", "local", "other", "_private"):
+            self.assertNotIn(name, found)
+
+    def test_reconcile_is_clean_for_a_constants_module(self):
+        graph = PlanGraph([
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     target_files=["config.py"],
+                     exports=["TILE_SIZE", "SCREEN_WIDTH"]),
+        ])
+        from agentchanti.language_backend import get_backend
+        actual = get_backend("python").extract_exports(
+            "TILE_SIZE = 24\nSCREEN_WIDTH = 640\n")
+        graph.mark_built("2.1", actual)
+        self.assertEqual(graph.reconcile("2.1"), [])
+
 
 class TestUnresolvedImports(unittest.TestCase):
 

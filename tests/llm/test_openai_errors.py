@@ -247,6 +247,37 @@ class TestResponsesApiFallover(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertTrue(sent[0][0].endswith("/responses"))
 
+    def test_a_sibling_latching_mid_flight_does_not_lose_the_retry(self):
+        """Wave steps share one client across threads.
+
+        Two parallel tool calls both got the 400. The first latched and
+        recovered; the second — already past the latch check when it was
+        flipped — saw it set, skipped its own retry and raised, costing
+        that step a failure and a whole recovery loop for a condition
+        already known to be handleable.
+        """
+        client = self._client()
+        responses = iter([self._blocked(), self._ok_responses()])
+        sent: list[str] = []
+
+        def _post(url, **kwargs):
+            sent.append(url)
+            resp = next(responses)
+            if resp.status_code == 400:
+                # A sibling thread latches while this request is in flight.
+                client._tools_need_responses_api = True
+            return resp
+
+        with unittest.mock.patch(
+                "agentchanti.llm.openai_client.requests.post", _post):
+            result = client._chat([Message(role="user", content="hi")],
+                                  tools=self._tools())
+
+        self.assertEqual(len(sent), 2, "the retry was skipped")
+        self.assertTrue(sent[0].endswith("/chat/completions"))
+        self.assertTrue(sent[1].endswith("/responses"))
+        self.assertEqual(result.text, "done")
+
     def test_reasoning_effort_is_sent_when_configured(self):
         client = self._client(reasoning_effort="high")
         client._tools_need_responses_api = True

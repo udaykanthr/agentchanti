@@ -296,10 +296,16 @@ def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
         plan_graph.mark_built(step.id, actual)
         missing = plan_graph.reconcile(step.id)
         if missing:
+            # Advisory, not a verdict: export extraction is per-language
+            # and heuristic, so an absence here is a hint to look rather
+            # than proof. Claiming "these imports WILL fail" was wrong the
+            # first time it fired — every named symbol was a module-level
+            # constant the extractor could not see, and the gate importing
+            # them passed.
             log.warning(
-                "[PlanGraph] step %s declared export(s) its files do not "
-                "define: %s — downstream imports of these will fail",
-                step.id, ", ".join(sorted(missing)[:8]))
+                "[PlanGraph] step %s: declared export(s) not found in the "
+                "written file(s): %s — check before downstream steps "
+                "import them", step.id, ", ".join(sorted(missing)[:8]))
 
 
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
