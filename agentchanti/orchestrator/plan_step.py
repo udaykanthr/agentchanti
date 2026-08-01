@@ -1818,44 +1818,6 @@ def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 
-# Source extensions an import spec may or may not carry.
-_SOURCE_EXTS = (".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-                ".go", ".rs", ".java", ".rb", ".php", ".vue", ".svelte")
-
-
-def _strip_source_ext(path: str) -> str:
-    low = path.lower()
-    for ext in _SOURCE_EXTS:
-        if low.endswith(ext):
-            return path[: -len(ext)]
-    return path
-
-
-def _import_path_candidates(norm: str) -> list[str]:
-    """Extension-less path forms an import spec could denote.
-
-    Planners write the same dependency at least four different ways across
-    runs, and each unrecognised form silently drops a dependency edge:
-
-        src/map.py     path, already normalised
-        src\\map.py     Windows separators
-        src.map        Python dotted module
-        src.map.py     the hybrid — dotted package path with the file
-                       extension still attached
-
-    The hybrid is the one that bit: stripping the extension first is what
-    lets the dotted conversion produce ``src/map`` instead of the nonsense
-    ``src/map/py``. Observed on a Pygame run where map, player and ghost
-    all landed in one wave and the ghost step overwrote the other two
-    steps' target files while they were still executing.
-    """
-    stem = _strip_source_ext(norm)
-    candidates = [stem]
-    if "/" not in stem and "." in stem:
-        candidates.append(stem.replace(".", "/"))
-    return candidates
-
-
 def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
     """Auto-inject missing ``depends_on`` entries based on import relationships.
 
@@ -1871,57 +1833,24 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
     Must be called **after** ``validate_plan()`` and **before**
     ``build_waves()``.
 
-    Both sides of the lookup are normalised. ``target:`` lines are
-    normalised at parse time but ``imports:`` lines historically were not,
-    so an exact-string match silently missed *every* import on any plan the
-    planner wrote with Windows separators (``target: src/map.py`` vs
-    ``imports: src\\map.py:Map``). The dependency was then never injected and
-    producer and consumer landed in the same wave: observed on a Pygame run
-    where step 2.2 (player) ran concurrently with step 2.1 (map) and
-    rewrote 2.1's ``src/map.py``, changing ``Map.__init__`` to require a
-    ``layout`` argument and breaking 2.1's already-green acceptance gate.
+    Resolution goes through :class:`~.plan_graph.PlanGraph` rather than
+    string comparison. Matching ``imports:`` text against ``target:`` text
+    failed once per notation the planner invented — path, Windows path,
+    dotted module, dotted-with-extension, bare filename — and every miss
+    silently dropped an edge, putting producer and consumer in the same
+    wave. Observed twice: a player step overwrote the map step's target
+    mid-execution, and later a ghost step clobbered two sibling steps'
+    files in a three-way race. The graph keys on several identities at
+    once, including the exported symbol, which no spelling can disguise.
     """
-    import os as _os
+    from .plan_graph import PlanGraph
 
     fixes: list[str] = []
-
-    # Three indexes over the plan's target files: exact normalised path,
-    # extension-less stem (so `src.map.py`, `src.map` and `src/map.py` all
-    # land on the same producer), and basename for the bare-filename form.
-    file_to_producer: dict[str, str] = {}
-    stem_to_producer: dict[str, str] = {}
-    base_to_producer: dict[str, str] = {}
-    base_counts: Counter = Counter()
-    for s in steps:
-        for fpath in s.target_files:
-            norm = _norm_target_path(fpath)
-            file_to_producer[norm] = s.id
-            stem = _strip_source_ext(norm)
-            stem_to_producer[stem] = s.id
-            base = _os.path.basename(stem)
-            base_to_producer[base] = s.id
-            base_counts[base] += 1
+    graph = PlanGraph(steps)
 
     for step in steps:
-        for file_path in step.imports_from:
-            norm = _norm_target_path(file_path)
-            producer_id = file_to_producer.get(norm)
-            if producer_id is None:
-                for cand in _import_path_candidates(norm):
-                    producer_id = stem_to_producer.get(cand)
-                    if producer_id is not None:
-                        break
-            if producer_id is None:
-                # Bare filename (`map.py` for target `src/map.py`). Two
-                # guards, because a wrong edge here reorders waves: the
-                # import must not name a directory of its own (an explicit
-                # `src/public/index.js` must never bind to
-                # `src/admin/index.js`), and the basename must be unique
-                # across the plan's targets.
-                stem = _strip_source_ext(norm)
-                base = _os.path.basename(stem)
-                if "/" not in stem and base_counts.get(base, 0) == 1:
-                    producer_id = base_to_producer.get(base)
+        for file_path, symbols in step.imports_from.items():
+            producer_id = graph.producer_of(file_path, symbols)
             if producer_id is None:
                 continue  # existing project file, not produced by plan
             if producer_id == step.id:

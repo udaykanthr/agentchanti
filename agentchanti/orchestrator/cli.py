@@ -253,6 +253,55 @@ def main():
         raise
 
 
+def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
+                          memory, language) -> None:
+    """Mark this wave's nodes built and report broken export promises.
+
+    Best-effort and never fatal: a parse failure here must not take down a
+    run whose code is fine. Only steps that actually completed are marked,
+    and a file we could not read or parse yields no ``actual_exports``,
+    which :meth:`PlanGraph.reconcile` treats as "no evidence" rather than
+    "export missing".
+    """
+    if plan_graph is None or not plan_steps:
+        return
+    try:
+        from ..language_backend import get_backend
+        backend = get_backend(language)
+    except Exception:
+        return
+
+    files = {}
+    try:
+        files = memory.as_dict() or {}
+    except Exception:
+        pass
+
+    for idx in pending:
+        if step_results.get(idx) != "done":
+            continue
+        step = next((s for s in plan_steps if s.index == idx), None)
+        if step is None:
+            continue
+        actual: list[str] = []
+        for target in getattr(step, "target_files", None) or []:
+            content = files.get(target) or files.get(
+                str(target).replace("\\", "/"))
+            if not content:
+                continue
+            try:
+                actual.extend(backend.extract_exports(content) or [])
+            except Exception:
+                continue
+        plan_graph.mark_built(step.id, actual)
+        missing = plan_graph.reconcile(step.id)
+        if missing:
+            log.warning(
+                "[PlanGraph] step %s declared export(s) its files do not "
+                "define: %s — downstream imports of these will fail",
+                step.id, ", ".join(sorted(missing)[:8]))
+
+
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
                              repair=None) -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
@@ -1392,6 +1441,20 @@ def _main_impl():
     from .agent_loop import reset_attempt_journal
     reset_attempt_journal()
 
+    # Graph of what the plan promises to build. Nodes start as `planned`
+    # (nothing exists yet on a blank project, which is exactly why import
+    # resolution cannot use the KB code graph) and flip to `built` as
+    # steps complete, so declared exports can be checked against what was
+    # actually produced.
+    from .plan_graph import PlanGraph
+    plan_graph = PlanGraph(plan_steps_parsed or [])
+    _unresolved = plan_graph.unresolved_imports(plan_steps_parsed or [])
+    if _unresolved:
+        # Usually third-party or pre-existing files — informational only.
+        log.debug("[PlanGraph] %d import(s) not produced by any step: %s",
+                  len(_unresolved),
+                  ", ".join(f"{sid}->{spec}" for sid, spec in _unresolved[:8]))
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
@@ -1593,6 +1656,14 @@ def _main_impl():
 
             if not pipeline_success:
                 break
+
+        # Flip this wave's plan-graph nodes to `built` and check the
+        # exports they promised against what the files actually define. A
+        # step that silently drops a declared export is a defect every
+        # downstream importer will hit, and it is far cheaper to name here
+        # than to debug from the resulting ImportError several waves later.
+        _reconcile_plan_graph(plan_graph, plan_steps_parsed, pending,
+                              step_results, memory, language)
 
         # Snapshot the wave, then re-run every gate recorded so far. A step
         # can break a sibling's already-green gate — including one recorded
