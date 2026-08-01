@@ -1694,6 +1694,126 @@ def fix_nested_workspace_collision(steps: list[PlanStep]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Acceptance-gate quality
+# ---------------------------------------------------------------------------
+
+# A gate that runs a real test suite is substantive by construction — the
+# suite carries the assertions.
+_TEST_RUNNER_RE = re.compile(
+    r"\b(pytest|unittest|nose2|tox|jest|vitest|mocha|ava|karma|rspec|"
+    r"phpunit|manage\.py\s+test|go\s+test|cargo\s+test|dotnet\s+test|"
+    r"mvn\s+test|gradle\s+test|ctest)\b"
+    r"|\b(npm|yarn|pnpm)\s+(run\s+)?test\b",
+    re.IGNORECASE,
+)
+
+# `python -c "..."` / `node -e "..."` inline scripts — the form the planner
+# reaches for, and the form that is easy to write vacuously. The body must
+# tolerate escaped quotes (`assert hasattr(m, \"X\")`); a plain non-greedy
+# `.+?` stops at the first `\"` and silently truncates the payload, which
+# made every escaped gate look unparseable and slip through unjudged.
+_INLINE_SCRIPT_RE = re.compile(
+    r"""(?:python[0-9.]*|py)\s+-c\s+(?P<pq>["'])"""
+    r"""(?P<py>(?:\\.|(?!(?P=pq)).)*)(?P=pq)"""
+    r"""|(?:node|deno)\s+-e\s+(?P<jq>["'])"""
+    r"""(?P<js>(?:\\.|(?!(?P=jq)).)*)(?P=jq)""",
+    re.DOTALL,
+)
+
+# Anything that can fail on a wrong VALUE rather than a wrong import.
+_JS_ASSERTION_RE = re.compile(
+    r"\bassert\b|\bthrow\b|process\.exit\s*\(\s*[1-9]", re.IGNORECASE)
+
+
+def shallow_gate_reason(cmd: str) -> Optional[str]:
+    """Explain why *cmd* cannot detect a behavioural defect, or None.
+
+    A step's ``verify:`` is the only thing standing between a broken
+    implementation and a green run, yet planners habitually emit
+    ``python -c "from game import Game; print(Game)"`` — which passes as
+    long as the file parses. Observed consequence: a Pac-Man run shipped
+    with three of four ghosts spawned inside wall tiles, unable to ever
+    move. Every gate was green, the smoke test launched fine, and the
+    pipeline reported success, because nothing in the plan asserted a
+    single value.
+
+    The rule is deliberately blunt and easy to satisfy: a gate must
+    either run a test suite or assert something. Commands we cannot
+    classify (``python manage.py check``, ``npm run build``) are left
+    alone — they do real work and second-guessing them would be noise.
+    """
+    if not cmd or not cmd.strip():
+        return None
+    if _TEST_RUNNER_RE.search(cmd):
+        return None
+
+    match = _INLINE_SCRIPT_RE.search(cmd)
+    if match is None:
+        # Not an inline script — a build/check/lint command we can't judge.
+        return None
+
+    payload_py = match.group("py")
+    if payload_py is not None:
+        return _shallow_python_reason(payload_py)
+
+    payload_js = match.group("js") or ""
+    if _JS_ASSERTION_RE.search(payload_js):
+        return None
+    return ("runs an inline script that never asserts anything — it passes "
+            "as long as the module loads")
+
+
+def _shallow_python_reason(payload: str) -> Optional[str]:
+    """Classify a ``python -c`` payload. None when it can fail on a value."""
+    import ast as _ast
+
+    # Planner payloads arrive with shell escaping still applied.
+    source = payload.replace('\\"', '"').replace("\\'", "'")
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        # Can't judge it — don't manufacture a complaint.
+        return None
+
+    body = tree.body
+    if not body:
+        return None
+
+    if all(isinstance(node, (_ast.Import, _ast.ImportFrom)) for node in body):
+        return ("only imports the module — it proves the file parses, not "
+                "that it behaves correctly")
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Assert):
+            return None
+        # `sys.exit(1)` / `raise` on a bad value are assertions in spirit.
+        if isinstance(node, _ast.Raise):
+            return None
+
+    return ("imports and prints but never asserts — it passes whatever the "
+            "values are, so it cannot detect wrong behaviour")
+
+
+def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
+    """Find CODE steps whose ``verify:`` cannot detect a behavioural defect.
+
+    Returns ``(step_id, reason)`` pairs, empty when every gate has teeth.
+    TEST steps are exempt: their gate is normally the suite itself, and the
+    assertions live in the test file rather than the command.
+    """
+    gaps: list[tuple[str, str]] = []
+    for step in steps:
+        if step.step_type != "CODE":
+            continue
+        if not step.verify_cmd:
+            continue  # missing verify entirely is a separate check
+        reason = shallow_gate_reason(step.verify_cmd)
+        if reason:
+            gaps.append((step.id, reason))
+    return gaps
+
+
+# ---------------------------------------------------------------------------
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 

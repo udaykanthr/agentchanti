@@ -115,7 +115,7 @@ Create the Express server: GET /api/health returns JSON {"status": "ok"}; export
 target: src/server.js
 exports: app, startServer
 imports: none
-verify: node -e "require('./src/server.js')"
+verify: node -e "const {app}=require('./src/server.js'); if(typeof app.listen!=='function') process.exit(1)"
 
 --STEP 2.2 [CODE] depends:1.1
 Create input validation utility: validateInput(input) rejects null/empty strings; sanitize(input) trims and strips angle brackets
@@ -128,7 +128,7 @@ verify: node -e "const v=require('./src/utils/validate.js'); if (v.validateInput
 Add POST /api/data to the existing server: reject invalid req.body.value with 400, otherwise respond with the sanitized value
 target: src/server.js
 imports: src/utils/validate.js:validateInput, src/utils/validate.js:sanitize
-verify: node -e "require('./src/server.js')"
+verify: node -e "const {sanitize}=require('./src/utils/validate.js'); if(sanitize(' <b>x ')!=='bx') process.exit(1)"
 
 --STEP 4.1 [TEST] depends:3.1
 Write and run tests for the server and validation
@@ -147,12 +147,29 @@ _INTENT_INLINE_RULES = """
     the description. A tool-using agent implements the step against the
     real project state, so precision of intent matters more than code.
 
-20. **verify: is REQUIRED on every CODE and TEST step**: It is the
-    deterministic acceptance gate the executing agent must satisfy
-    before the step counts as done. Choose the cheapest re-runnable
-    command that proves the goal (e.g. `python manage.py check`,
-    `python manage.py test <app> --noinput`, `npm test --silent`,
-    `node -e "require('./src/x.js')"`). Never a scaffolding command.
+20. **verify: is REQUIRED on every CODE and TEST step, and it MUST be
+    able to FAIL on wrong behaviour**: It is the deterministic acceptance
+    gate the executing agent must satisfy before the step counts as done,
+    and the only thing standing between a broken implementation and a
+    green run. Choose the cheapest re-runnable command that would go RED
+    if the code were subtly wrong.
+
+    A gate must either run a test suite (`python -m pytest -q`,
+    `python manage.py test <app> --noinput`, `npm test --silent`) or
+    **assert a concrete value**. Import-only gates are worthless — they
+    pass as long as the file parses:
+
+      BAD  python -c "import game"
+      BAD  python -c "from game import Game; print(Game)"
+      BAD  node -e "require('./src/server.js')"
+      GOOD python -c "from game import Game; g=Game(); assert len(g.ghosts)==4"
+      GOOD python -c "from maze import Maze; m=Maze(); assert not m.is_wall(*m.spawn)"
+      GOOD node -e "const {validate}=require('./src/v.js'); if(validate('')) process.exit(1)"
+
+    Assert the behaviour the step's description promises. If the step
+    places entities on a grid, assert they are not inside walls; if it
+    implements movement, assert a position actually changes. Never a
+    scaffolding command.
 """
 
 _CHECKLIST_INTENT = """
@@ -160,6 +177,7 @@ _CHECKLIST_INTENT = """
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
 - [ ] Every CODE/TEST step has a verify: line with a re-runnable acceptance command
+- [ ] Every CODE verify: either runs a test suite or asserts a concrete value — no import-only gates
 - [ ] NO content: or edit: blocks anywhere — descriptions carry the intent
 - [ ] Each description states the file's exports and key behaviours precisely
 - [ ] No two steps have the same target: file (consolidate into one step)
@@ -1461,7 +1479,7 @@ content:                               ← CODE/TEST steps that CREATE new files
 ```                                    ←   Close the fence.
 ---file-content-end---                 ←   REQUIRED closing marker after every content: block.
 """) + """produces: <file1>, <file2>             ← CMD steps. Files created by the command.
-verify: <shell command>                ← CODE/TEST steps. Optional acceptance command proving the step works (exit 0 = pass). MUST be a single line — no heredocs (<<PY), no line continuations; multi-line scripts silently break (Windows cmd runs it). Must be runnable from the project root and re-runnable (no scaffolding). It runs with the pipeline's own Python — NEVER activate a virtualenv in it, never use placeholders, and never cd into a folder that does not exist yet. Example: python manage.py test main --noinput
+verify: <shell command>                ← CODE/TEST steps. Acceptance command proving the step works (exit 0 = pass). MUST be able to FAIL on wrong behaviour: either run a test suite or assert a concrete value — `python -c "import x"` and `node -e "require('./x.js')"` are worthless because they only prove the file parses. MUST be a single line — no heredocs (<<PY), no line continuations; multi-line scripts silently break (Windows cmd runs it). Must be runnable from the project root and re-runnable (no scaffolding). It runs with the pipeline's own Python — NEVER activate a virtualenv in it, never use placeholders, and never cd into a folder that does not exist yet. Example: python manage.py test main --noinput  |  python -c "from game import Game; g=Game(); assert len(g.ghosts)==4"
 kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB docs you used when writing the inline code. Omit if none.
 """ + ("""
 DO NOT include file contents anywhere in the plan. No content: blocks,

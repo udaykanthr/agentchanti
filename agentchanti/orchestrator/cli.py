@@ -982,7 +982,7 @@ def _main_impl():
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
-                fix_import_dependencies,
+                fix_import_dependencies, check_gate_quality,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
@@ -1011,6 +1011,52 @@ def _main_impl():
                     blind_fixes = route_blind_edits(plan_steps_parsed)
                     if blind_fixes:
                         log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
+
+                    # ── Acceptance-gate quality ──
+                    # A CODE step whose verify: only imports the module
+                    # cannot fail on wrong behaviour, which makes the whole
+                    # monotonic-gate machinery decorative. Observed: a
+                    # Pac-Man run shipped with three of four ghosts spawned
+                    # inside wall tiles — every gate green, smoke test
+                    # green, pipeline "Finished". Send the plan back with
+                    # the specific complaint rather than accepting gates
+                    # that can only ever pass.
+                    _gate_gaps = check_gate_quality(plan_steps_parsed)
+                    if _gate_gaps and plan_attempt < MAX_PLAN_RETRIES:
+                        log.warning(
+                            "[Plan] %d step(s) have a verify: that cannot "
+                            "fail on wrong behaviour — replanning: %s",
+                            len(_gate_gaps),
+                            ", ".join(f"{sid} ({why})"
+                                      for sid, why in _gate_gaps))
+                        display.show_status(
+                            "Plan has import-only acceptance gates, "
+                            "retrying...")
+                        _by_id = {s.id: s for s in plan_steps_parsed}
+                        _detail = "\n".join(
+                            f"  - step {sid}: "
+                            f"`{getattr(_by_id.get(sid), 'verify_cmd', '')}`"
+                            f" — {why}"
+                            for sid, why in _gate_gaps)
+                        planner_context += (
+                            "\n\n[PLANNER CORRECTION] These steps have a "
+                            "verify: command that passes as long as the "
+                            "file parses, so it can never detect wrong "
+                            "behaviour:\n" + _detail +
+                            "\n\nRewrite EVERY one of those verify: lines "
+                            "so it asserts a concrete value the step's "
+                            "description promises (or runs a test suite). "
+                            "Keep them single-line and runnable from the "
+                            "project root. Re-emit the COMPLETE plan.")
+                        continue
+                    if _gate_gaps:
+                        log.warning(
+                            "[Plan] Proceeding after %d attempt(s) with %d "
+                            "import-only gate(s) — these steps cannot fail "
+                            "on wrong behaviour: %s",
+                            MAX_PLAN_RETRIES, len(_gate_gaps),
+                            ", ".join(sid for sid, _ in _gate_gaps))
+
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
                     log.warning("[Plan] Structured parse returned 0 steps, falling back")

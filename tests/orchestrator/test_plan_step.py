@@ -9,7 +9,108 @@ from agentchanti.orchestrator.plan_step import (
     fix_import_dependencies,
     is_structured_plan, build_waves,
     plan_looks_truncated,
+    shallow_gate_reason, check_gate_quality,
 )
+
+
+class TestShallowGateDetection(unittest.TestCase):
+    """A verify: that can only ever pass makes the gate ledger decorative."""
+
+    def assert_shallow(self, cmd):
+        self.assertIsNotNone(
+            shallow_gate_reason(cmd), f"expected shallow: {cmd}")
+
+    def assert_substantive(self, cmd):
+        reason = shallow_gate_reason(cmd)
+        self.assertIsNone(reason, f"expected substantive: {cmd} -> {reason}")
+
+    def test_real_gates_that_shipped_a_broken_game(self):
+        """Every CODE gate from the Pac-Man run that shipped ghosts stuck
+        inside wall tiles. All were green; none could have failed."""
+        for cmd in [
+            'python -c "import constants; print(constants.SCREEN_WIDTH, constants.SCREEN_HEIGHT)"',
+            'python -c "from map import create_default_maze, Map; m=Map(create_default_maze()); print(m.width, m.height)"',
+            'python -c "from player import Player; print(Player)"',
+            'python -c "from ghost import Ghost; print(Ghost)"',
+            'python -c "from game import Game; print(Game)"',
+            'python -c "import main"',
+        ]:
+            self.assert_shallow(cmd)
+
+    def test_import_only_names_the_specific_weakness(self):
+        reason = shallow_gate_reason('python -c "import main"')
+        self.assertIn("only imports", reason)
+        reason = shallow_gate_reason('python -c "import m; print(m.X)"')
+        self.assertIn("never asserts", reason)
+
+    def test_test_runners_are_substantive(self):
+        for cmd in ['python -m pytest -q', 'python -m unittest -v',
+                    'python -m unittest discover -s tests -v',
+                    'npm test --silent', 'npm run test', 'go test ./...',
+                    'python manage.py test main --noinput', 'cargo test']:
+            self.assert_substantive(cmd)
+
+    def test_assertions_are_substantive(self):
+        for cmd in [
+            'python -c "from game import Game; g=Game(); assert len(g.ghosts)==4"',
+            'python -c "import m; raise SystemExit(0 if m.f(2)==4 else 1)"',
+        ]:
+            self.assert_substantive(cmd)
+
+    def test_escaped_quotes_do_not_hide_an_assertion(self):
+        """A non-greedy body stops at the first \\" and truncates the
+        payload, which made escaped gates unparseable and slip through."""
+        self.assert_substantive(
+            'python -c "import main; assert hasattr(main, \\"Game\\")"')
+
+    def test_node_gates(self):
+        self.assert_shallow('node -e "require(\'./src/server.js\')"')
+        self.assert_substantive(
+            'node -e "const v=require(\'./v.js\'); if (v.validate(\'\')) process.exit(1)"')
+
+    def test_unjudgeable_commands_are_left_alone(self):
+        """Build/check/lint commands do real work — never manufacture a
+        complaint about a command we cannot classify."""
+        for cmd in ['python manage.py check', 'npm run build',
+                    'tsc --noEmit', '', '   ']:
+            self.assert_substantive(cmd)
+
+    def test_syntactically_broken_payload_is_not_judged(self):
+        self.assert_substantive('python -c "import (((("')
+
+    def test_gate_survives_a_venv_prefix(self):
+        self.assert_shallow(
+            r'call venv\Scripts\activate && python -c "import src.map"')
+
+
+class TestCheckGateQuality(unittest.TestCase):
+
+    def test_flags_only_code_steps(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     verify_cmd='python -c "import a"'),
+            # TEST steps keep their assertions in the test file, not the cmd
+            PlanStep(id="3.1", step_type="TEST", index=1,
+                     verify_cmd='python -c "import b"'),
+            PlanStep(id="1.1", step_type="CMD", index=2,
+                     verify_cmd='python -c "import c"'),
+        ]
+        gaps = check_gate_quality(steps)
+        self.assertEqual([sid for sid, _ in gaps], ["2.1"])
+
+    def test_missing_verify_is_not_reported_here(self):
+        """Absent verify: is a separate check — don't double-report it."""
+        steps = [PlanStep(id="2.1", step_type="CODE", index=0)]
+        self.assertEqual(check_gate_quality(steps), [])
+
+    def test_clean_plan_reports_nothing(self):
+        steps = [
+            PlanStep(id="2.1", step_type="CODE", index=0,
+                     verify_cmd='python -c "import a; assert a.f(1)==2"'),
+            PlanStep(id="2.2", step_type="CODE", index=1,
+                     verify_cmd="python -m pytest -q"),
+        ]
+        self.assertEqual(check_gate_quality(steps), [])
 
 
 class TestPlanLooksTruncated(unittest.TestCase):
