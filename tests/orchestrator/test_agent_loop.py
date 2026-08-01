@@ -14,6 +14,7 @@ from agentchanti.orchestrator.agent_loop import (
     RECOVERY_BLOCKED_MARKER,
     RECOVERY_FAILED_MARKER,
     agent_loop_enabled,
+    attempt_env_self_heal,
     attempt_digest,
     build_step_tools,
     get_loop_stats,
@@ -411,6 +412,31 @@ class TestEnvSelfHeal(AgentLoopTestCase):
     """Missing-dependency verify failures are healed with one install
     instead of being fed to the model (the observed run burned 16 turns
     while the fix was `pip install pytest`)."""
+
+    def test_the_step_s_own_target_is_never_pip_installed(self):
+        """A TEST step's gate fails before the test file exists.
+
+        `python -m unittest -v test_main` reports "No module named
+        test_main" on the first run; memory has no such file yet, so the
+        heal fired `pip install test_main` — a pointless call, and exactly
+        the dependency-confusion hazard the local-module guard exists to
+        prevent. The plan already declares the file as this step's target.
+        """
+        healed: set[str] = set()
+        fired = attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'test_main'",
+            "python", healed, verify_cmd="python -m unittest -v test_main",
+            planned_files=["test_main.py"])
+        self.assertFalse(fired)
+        self.executor.run_command.assert_not_called()
+
+    def test_a_real_missing_package_still_heals(self):
+        self.executor.run_command.return_value = (True, "installed")
+        healed: set[str] = set()
+        self.assertTrue(attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'pytest'",
+            "python", healed, verify_cmd="python -m pytest",
+            planned_files=["test_main.py"]))
 
     def test_missing_python_module_installed_and_reverified(self):
         self.executor.run_command.side_effect = [

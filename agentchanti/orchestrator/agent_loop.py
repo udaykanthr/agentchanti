@@ -368,7 +368,8 @@ def commands_equivalent_modulo_flags(candidate: str | None,
 
 def attempt_env_self_heal(tools: AgentTools, verify_output: str,
                           language: str | None, healed: set[str],
-                          verify_cmd: str | None = None) -> bool:
+                          verify_cmd: str | None = None,
+                          planned_files: list[str] | None = None) -> bool:
     """Install a missing third-party dependency named in failing output.
 
     ``No module named X`` / ``Cannot find package 'X'`` are environment
@@ -393,6 +394,13 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
     else:
         memory = getattr(tools, "_memory", None)
         project_files = list(memory.all_files()) if memory is not None else []
+        # Files the step is about to create count as local too. A TEST step
+        # whose gate is `python -m unittest -v test_main` fails with
+        # "No module named test_main" before the file exists, and memory
+        # cannot know better — so the heal tried `pip install test_main`,
+        # a pointless call and the exact dependency-confusion hazard
+        # _missing_third_party_module exists to prevent.
+        project_files += [p for p in (planned_files or []) if p]
         mod = _missing_third_party_module(verify_output, project_files)
         if not mod or mod in healed:
             return False
@@ -488,7 +496,8 @@ def run_agent_loop(
         result = tools.execute_all([_verify_call(verify_cmd)])[0].content
         while (not result.startswith("exit: success")
                and attempt_env_self_heal(tools, result, language, healed,
-                                         verify_cmd)):
+                                         verify_cmd,
+                                         planned_files=preload_files)):
             result = tools.execute_all([_verify_call(verify_cmd)])[0].content
         return result
 
