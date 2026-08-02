@@ -321,9 +321,21 @@ class LLMClient(ABC):
                         # 16384 tokens, ~110s, empty text, zero tool
                         # calls). A verbatim retry is a coin flip; let
                         # the provider dial reasoning down first.
+                        # Report what the provider ACTUALLY produced, not
+                        # only what we asked for: Ollama's cloud silently
+                        # caps generation at 32,768 whatever num_predict
+                        # says, so logging the configured 81,920 as "the
+                        # limit" sends the reader chasing the wrong number.
+                        _stopped_at = (
+                            f"{self._last_completion_tokens} of "
+                            f"{self.max_output_tokens}"
+                            if self._last_completion_tokens
+                            and self._last_completion_tokens
+                            < self.max_output_tokens
+                            else f"{self.max_output_tokens}")
                         log.warning(
                             f"[LLM] Chat hit the output-token limit "
-                            f"({self.max_output_tokens}) with no visible "
+                            f"({_stopped_at}) with no visible "
                             f"output on attempt {attempt}/"
                             f"{self.max_retries} — reasoning burn; "
                             f"requesting reduced effort for the retry")

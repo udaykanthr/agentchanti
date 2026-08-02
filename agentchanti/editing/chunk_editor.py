@@ -143,8 +143,17 @@ _EDIT_FULL_FILE_MARKER = re.compile(
 # must then be resolved by symbol name against known_chunks at apply time
 # (sentinel line range 0-0).  Without the parens, the suffix is only a
 # symbol when it is not a language tag ("file.py:python" stays full-file).
+# The parenthetical is a HINT, not a range: "(lines 5-30)" is caught by
+# _EDIT_MARKER above, so anything reaching here is prose the model chose
+# to describe WHERE inside the symbol it is editing. Restricting it to
+# the literal word "lines" meant a diagnosis that correctly wrote
+#   #### [EDIT]: config.py:MAZE (row 16)
+# matched none of the three markers, was silently dropped, and the run
+# halted with "Diagnosis produced no actionable fix" — twice, on a
+# correct diagnosis. Any parenthetical is accepted now; the chunk is
+# resolved by symbol name regardless of what it says.
 _EDIT_SYMBOL_MARKER = re.compile(
-    r"####\s*\[EDIT\]:\s*(\S+?):([\w.]+)\s*(?:(\(\s*lines?\b[^)]*\))\s*)?$",
+    r"####\s*\[EDIT\]:\s*(\S+?):([\w.]+)\s*(?:(\([^)]*\))\s*)?$",
     re.IGNORECASE,
 )
 
@@ -835,6 +844,29 @@ class ChunkEditor:
             for chunk in (known_chunks or []):
                 if (chunk.file_path == edit.file_path
                         and _chunk_id_matches(chunk.chunk_id, edit.chunk_id)):
+                    new_span = len(edit.new_content.strip().splitlines())
+                    chunk_span = chunk.line_end - chunk.line_start + 1
+                    # A symbol edit carrying far less content than the
+                    # chunk holds is editing PART of it — one row of a
+                    # maze, one entry of a dict. Replacing the whole chunk
+                    # with it would splice a single row over a 21-row
+                    # constant: silent corruption, strictly worse than the
+                    # silent no-op this branch used to produce.
+                    if chunk_span > 2 and new_span < chunk_span * 0.7:
+                        sub = ChunkEditor._align_within_chunk(
+                            edit, chunk, original_lines)
+                        if sub:
+                            logger.info(
+                                "[ChunkEditor] Resolved %s:%s to a partial "
+                                "edit → lines %d-%d (of chunk %d-%d)",
+                                edit.file_path, edit.chunk_id, sub[0], sub[1],
+                                chunk.line_start, chunk.line_end)
+                            return sub
+                        raise ValueError(
+                            f"Cannot place partial edit for "
+                            f"{edit.file_path}:{edit.chunk_id} — {new_span} "
+                            f"line(s) into a {chunk_span}-line chunk with no "
+                            f"unambiguous match; refusing to overwrite it")
                     logger.info(
                         "[ChunkEditor] Resolved %s:%s by symbol → lines %d-%d",
                         edit.file_path, edit.chunk_id,
@@ -1064,6 +1096,55 @@ class ChunkEditor:
                 break
 
         return last_import
+
+    @staticmethod
+    def _align_within_chunk(
+        edit: ChunkEditResponse,
+        chunk: FileChunk,
+        original_lines: list[str] | None,
+    ) -> tuple[int, int] | None:
+        """Locate the sub-range of *chunk* that *edit* replaces.
+
+        The replacement text is the EDITED version, so it will not appear
+        in the original — exact anchoring cannot work here. Similarity
+        can: a rewritten maze row still resembles the row it replaces far
+        more than it resembles any other row.
+
+        Returns None unless one line is both a strong match and clearly
+        better than the runner-up. Maze rows look alike, and a confident
+        guess between two near-equal candidates silently edits the wrong
+        line, which is exactly the failure this guard exists to prevent.
+        """
+        if not original_lines:
+            return None
+        new_lines = [l for l in edit.new_content.strip().splitlines()
+                     if l.strip()]
+        if len(new_lines) != 1:
+            # Multi-line partial edits need real anchors, not similarity.
+            return None
+
+        import difflib
+        target = new_lines[0].strip()
+        scored: list[tuple[float, int]] = []
+        for i in range(chunk.line_start - 1,
+                       min(chunk.line_end, len(original_lines))):
+            cand = original_lines[i].strip()
+            if not cand:
+                continue
+            ratio = difflib.SequenceMatcher(None, target, cand).ratio()
+            scored.append((ratio, i + 1))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        best, line_no = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+        if best < 0.6 or (best - runner_up) < 0.05:
+            logger.warning(
+                "[ChunkEditor] Ambiguous partial edit for %s:%s — best match "
+                "%.2f vs runner-up %.2f; refusing to guess which line",
+                edit.file_path, edit.chunk_id, best, runner_up)
+            return None
+        return line_no, line_no
 
     @staticmethod
     def _python_const_chunks(

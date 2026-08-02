@@ -191,6 +191,14 @@ class OllamaClient(LLMClient):
             "stream": True,
             "options": {"num_predict": self.max_output_tokens},
         }
+        # Both text paths do this; _chat did not, so the burn retry armed
+        # `think: false` and then sent a byte-identical request anyway.
+        # Every retry exhaustion in a long benchmark session was on this
+        # path -- the classic path burned 7 times in one run and recovered
+        # every time, while the loop path lost two whole steps to three
+        # deterministic repeats of the same burn, ~5.5 minutes each.
+        # Leaving the flag armed also leaked it into the next _generate.
+        self._apply_generate_options(payload)
         if tools:
             payload["tools"] = [
                 {"type": "function",
