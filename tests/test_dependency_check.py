@@ -1138,3 +1138,63 @@ class TestOrphanSuppressions:
         orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
         assert len(orphan) == 1
         assert orphan[0].source_file == "src/snake.py"
+
+
+class TestPackageInitializerIsNeverOrphaned:
+    """Nothing imports a package initializer BY NAME.
+
+    Python imports `__init__.py` implicitly when the package is imported;
+    JS resolves `index.js` from the directory. So "no other file imports
+    it" is always true for these and never means anything.
+
+    Observed live: the check fired on `pacman/__init__.py`, reported
+    "Likely parent: 'pacman/__init__.py'" — the file as its own parent,
+    a nonsense diagnosis — then spent 1,496 tokens generating a fix,
+    wrote the file, and broke the already-green
+    `from pacman.map import Map` gate. The monotonic guard rolled the
+    wave back and the run reported failure.
+    """
+
+    def test_python_package_init_is_skipped(self):
+        after_files = {
+            "pacman/map.py": "TILE_SIZE = 24\nclass Map:\n    pass\n",
+            "pacman/__init__.py": "from .map import Map, TILE_SIZE\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["pacman/__init__.py"],
+            step_text="Create the package initializer",
+            memory_files=after_files,
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert orphan == [], f"initializer flagged as orphaned: {orphan}"
+
+    def test_js_index_is_skipped(self):
+        after_files = {
+            "src/util.js": "export const x = 1;\n",
+            "src/index.js": "export { x } from './util.js';\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["src/index.js"],
+            step_text="Create the barrel file",
+            memory_files=after_files,
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert orphan == [], f"index.js flagged as orphaned: {orphan}"
+
+    def test_an_ordinary_module_is_still_flagged(self):
+        """The guard must not blunt the check it is narrowing."""
+        after_files = {
+            "app/main.py": "def run():\n    pass\n",
+            "app/helpers.py": "def helper():\n    return 1\n",
+        }
+        gaps = find_gaps(
+            DependencySnapshot(), build_snapshot(after_files),
+            new_files=["app/helpers.py"],
+            step_text="Create helpers",
+            memory_files=after_files,
+        )
+        orphan = [g for g in gaps if g.gap_type == "orphaned_export"]
+        assert len(orphan) == 1
+        assert orphan[0].source_file == "app/helpers.py"
