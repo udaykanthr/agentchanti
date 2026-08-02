@@ -132,6 +132,13 @@ class LLMClient(ABC):
     #: cap" (OpenAI ``length``, Anthropic ``max_tokens``, Ollama ``length``).
     _TOKEN_LIMIT_REASONS = ("length", "max_tokens", "max_output_tokens")
 
+    # Below this share of the output budget, VISIBLE output is a sliver and
+    # a cap hit means the budget was spent on hidden reasoning rather than
+    # on an answer that was genuinely too long. Deliberately low: a real
+    # long answer cut short sits near 100%, a burn near zero, so anything
+    # in between stays on the truncation path and is returned to the caller.
+    _HIDDEN_BURN_MAX_VISIBLE_SHARE = 0.25
+
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
                  stream: bool = True, max_output_tokens: int = 16384):
         # Before any provider call: on a TLS-intercepted machine certifi
@@ -155,6 +162,12 @@ class LLMClient(ABC):
         # that was cut at the token cap — a truncated result the caller
         # (e.g. the planner) should treat as incomplete.
         self._last_truncated: bool = False
+        # VISIBLE completion tokens of the last call, as the provider
+        # reported them. Hidden reasoning/thinking is charged to the same
+        # output budget but excluded here, which is what makes a burn
+        # distinguishable from an answer that was genuinely too long.
+        # 0 means "not reported" and disables the burn check.
+        self._last_completion_tokens: int = 0
 
     def set_stream_callback(self, callback: Callable[[int], None]) -> None:
         """Set a callback that receives ``(tokens_generated)`` during streaming."""
@@ -221,6 +234,26 @@ class LLMClient(ABC):
                         f"[LLM] Empty response on attempt "
                         f"{attempt}/{self.max_retries}")
                     raise LLMError("LLM returned empty response after all retries")
+
+                # A cap hit with only a sliver of VISIBLE output means the
+                # budget went somewhere invisible — hidden thinking. That
+                # is the same burn handled above for empty responses, and
+                # it was falling through here simply because a few tokens
+                # of prose escaped. Observed on Gemini: 654 visible tokens
+                # of a 16,384 budget, cut mid-file, twice with identical
+                # counts — a verbatim retry reproduces it exactly, so the
+                # step failed having written nothing.
+                if (hit_cap and attempt < self.max_retries
+                        and self._looks_like_hidden_burn()):
+                    log.warning(
+                        "[LLM] Only %d visible tokens of a %d budget before "
+                        "the cap on attempt %d/%d — the rest went to hidden "
+                        "reasoning; retrying with it dialled down",
+                        self._last_completion_tokens, self.max_output_tokens,
+                        attempt, self.max_retries)
+                    self._prepare_token_limit_retry()
+                    self._backoff(attempt)
+                    continue
 
                 # Non-empty. Flag truncation (cut at the token cap) so callers
                 # that need a complete answer — the planner — can detect a
@@ -333,6 +366,21 @@ class LLMClient(ABC):
         cap (OpenAI ``length``, Anthropic ``max_tokens``, Ollama
         ``length``)."""
         return (result.stop_reason or "").lower() in cls._TOKEN_LIMIT_REASONS
+
+    def _looks_like_hidden_burn(self) -> bool:
+        """True when a cap hit produced only a sliver of visible output.
+
+        The remaining budget went to hidden reasoning, so retrying the
+        same prompt reproduces it exactly — the fix is to dial reasoning
+        down, which is what the empty-response path already does. Returns
+        False when the provider does not report completion tokens, so an
+        unknown count never triggers a retry.
+        """
+        visible = self._last_completion_tokens
+        if not visible or self.max_output_tokens <= 0:
+            return False
+        return (visible / self.max_output_tokens
+                ) < self._HIDDEN_BURN_MAX_VISIBLE_SHARE
 
     def _generate_hit_token_limit(self) -> bool:
         """Text-path counterpart of :meth:`_hit_token_limit`, reading the

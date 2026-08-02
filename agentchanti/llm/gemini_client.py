@@ -277,6 +277,8 @@ class GeminiClient(LLMClient):
         usage = data.get("usageMetadata", {})
         prompt_tokens = usage.get("promptTokenCount", est_tokens)
         completion_tokens = usage.get("candidatesTokenCount", 0)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
@@ -370,6 +372,8 @@ class GeminiClient(LLMClient):
                         continue
 
         result = "".join(content_parts)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else tokens_generated,

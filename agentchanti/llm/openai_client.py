@@ -263,6 +263,8 @@ class OpenAIClient(LLMClient):
         prompt_tokens = usage.get("prompt_tokens", est_tokens)
         completion_tokens = usage.get("completion_tokens", 0)
         cached_tokens = self._cached_tokens(usage)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
@@ -354,6 +356,8 @@ class OpenAIClient(LLMClient):
                         continue
 
         result = "".join(content_parts)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
