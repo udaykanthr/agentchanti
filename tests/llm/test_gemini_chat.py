@@ -243,3 +243,100 @@ class TestCacheAccounting(unittest.TestCase):
              patch("agentchanti.llm.gemini_client.token_tracker") as tt:
             _client()._chat([Message(role="user", content="go")])
         self.assertEqual(tt.record.call_args.kwargs["cached_tokens"], 700)
+
+
+class TestAuthByHeader(unittest.TestCase):
+    """The key used to travel as ?key=... in the URL.
+
+    That put it into every request exception, proxy log and debug trace —
+    it leaked into a traceback during development.
+    """
+
+    def test_key_is_sent_as_a_header(self):
+        self.assertEqual(_client()._headers()["x-goog-api-key"], "k")
+
+    def test_no_url_carries_the_key(self):
+        captured = {}
+
+        def fake_post(url, **kw):
+            captured["url"] = url
+            captured["headers"] = kw.get("headers") or {}
+            return _response(payload={"candidates": []})
+
+        with patch("agentchanti.llm.gemini_client.requests.post",
+                   side_effect=fake_post):
+            _client()._chat([Message(role="user", content="go")])
+        self.assertNotIn("key=", captured["url"])
+        self.assertIn("x-goog-api-key", captured["headers"])
+
+
+class TestThinkingBurn(unittest.TestCase):
+    """Gemini spends output tokens on hidden thoughts before any text.
+
+    Measured live: a 200-token cap returned thoughtsTokenCount 190 and
+    six visible tokens with finishReason MAX_TOKENS. At the real 16k cap
+    that is an empty response. The base class already retries an empty
+    response that hit the cap — but only if the provider records the stop
+    reason, which Gemini never did, so the burn was invisible.
+    """
+
+    def test_max_tokens_is_recognised_as_a_cap_hit(self):
+        c = _client()
+        c._last_stop_reason = "MAX_TOKENS"
+        self.assertTrue(c._generate_hit_token_limit())
+
+    def test_a_clean_stop_is_not(self):
+        c = _client()
+        c._last_stop_reason = "STOP"
+        self.assertFalse(c._generate_hit_token_limit())
+
+    def test_the_retry_pins_a_thinking_budget(self):
+        c = _client()
+        self.assertNotIn("thinkingConfig", c._generation_config())
+        c._prepare_token_limit_retry()
+        self.assertEqual(
+            c._generation_config()["thinkingConfig"]["thinkingBudget"], 512)
+
+    def test_the_cap_latches_for_the_session(self):
+        """A model that burned once burns again on the next request."""
+        c = _client()
+        c._prepare_token_limit_retry()
+        c._prepare_token_limit_retry()
+        self.assertEqual(
+            c._generation_config()["thinkingConfig"]["thinkingBudget"], 512)
+
+    def test_the_non_streaming_path_records_the_stop_reason(self):
+        payload = {"candidates": [{"finishReason": "MAX_TOKENS",
+                                   "content": {"parts": [{"text": ""}]}}]}
+        c = _client()
+        with patch("agentchanti.llm.gemini_client.requests.post",
+                   return_value=_response(payload=payload)):
+            c._generate("hi")
+        self.assertEqual(c._last_stop_reason, "MAX_TOKENS")
+        self.assertTrue(c._generate_hit_token_limit())
+
+
+class TestNonRetryableErrors(unittest.TestCase):
+    """A malformed request does not become valid by being resent."""
+
+    def test_a_400_is_non_retryable(self):
+        from agentchanti.llm.base import LLMError, NonRetryableLLMError
+        with patch("agentchanti.llm.gemini_client.requests.post",
+                   return_value=_response(
+                       status=400,
+                       payload={"error": {"message": "API key not valid"}})):
+            with self.assertRaises(NonRetryableLLMError):
+                _client()._chat([Message(role="user", content="go")])
+        self.assertTrue(issubclass(NonRetryableLLMError, LLMError))
+
+    def test_429_and_5xx_stay_retryable(self):
+        from agentchanti.llm.base import LLMError, NonRetryableLLMError
+        for status in (429, 500, 503):
+            with self.subTest(status=status):
+                with patch("agentchanti.llm.gemini_client.requests.post",
+                           return_value=_response(
+                               status=status,
+                               payload={"error": {"message": "busy"}})):
+                    with self.assertRaises(LLMError) as ctx:
+                        _client()._chat([Message(role="user", content="go")])
+                self.assertNotIsInstance(ctx.exception, NonRetryableLLMError)

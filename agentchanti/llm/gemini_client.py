@@ -6,7 +6,8 @@ import json
 import requests
 from typing import List, Optional
 
-from .base import LLMClient, LLMError, ToolsNotSupportedError
+from .base import (LLMClient, LLMError, NonRetryableLLMError,
+                   ToolsNotSupportedError)
 from .cancellation import streaming_response, check_cancelled
 from .chat_types import ChatResponse, Message, ToolCall, ToolDef
 from ..cli_display import token_tracker, log
@@ -46,6 +47,10 @@ class GeminiClient(LLMClient):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        # Session-sticky thinking cap, latched after the model spends its
+        # whole output budget on hidden thoughts. Mirrors the OpenAI
+        # client's reasoning-effort latch.
+        self._thinking_budget: Optional[int] = None
 
     # ── Native chat (structured tool calling) ──
 
@@ -62,6 +67,42 @@ class GeminiClient(LLMClient):
         if isinstance(node, list):
             return [cls._clean_schema(v) for v in node]
         return node
+
+    def _headers(self) -> dict:
+        """Auth by header, never in the URL.
+
+        The key used to travel as ``?key=...``, which put it into every
+        request exception, proxy log and debug trace — it leaked into a
+        traceback during development. ``x-goog-api-key`` keeps it out of
+        the URL entirely.
+        """
+        return {"Content-Type": "application/json",
+                "x-goog-api-key": self.api_key}
+
+    def _generation_config(self) -> dict:
+        cfg: dict = {"maxOutputTokens": self.max_output_tokens}
+        if self._thinking_budget is not None:
+            cfg["thinkingConfig"] = {"thinkingBudget": self._thinking_budget}
+        return cfg
+
+    def _prepare_token_limit_retry(self) -> None:
+        """Cap hidden thinking after it consumed the whole output budget.
+
+        Gemini 3.x spends output tokens on thoughts before any visible
+        text. Measured: a 200-token cap produced
+        ``thoughtsTokenCount: 190`` and six visible tokens, finishReason
+        MAX_TOKENS. At the real 16k cap that is an empty response and a
+        wasted call. Retrying verbatim repeats it, so the retry pins a
+        small thinking budget instead — and it latches, because a model
+        that burned once will burn again on the next comparable request.
+        """
+        if self._thinking_budget is None:
+            self._thinking_budget = 512
+            log.warning(
+                "[Gemini] %s spent its entire output budget on thinking "
+                "(finishReason MAX_TOKENS, no visible text) — capping "
+                "thinkingBudget at 512 for the rest of this session.",
+                self.model)
 
     @staticmethod
     def _cached_tokens(usage: dict) -> int:
@@ -133,7 +174,7 @@ class GeminiClient(LLMClient):
         system, contents = self._system_and_contents(messages)
         payload: dict = {
             "contents": contents,
-            "generationConfig": {"maxOutputTokens": self.max_output_tokens},
+            "generationConfig": self._generation_config(),
         }
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
@@ -144,9 +185,9 @@ class GeminiClient(LLMClient):
                  "parameters": self._clean_schema(t.parameters)}
                 for t in tools]}]
 
-        url = (f"{self.base_url}/models/{self.model}"
-               f":generateContent?key={self.api_key}")
-        response = requests.post(url, json=payload, timeout=(10, 300))
+        url = f"{self.base_url}/models/{self.model}:generateContent"
+        response = requests.post(url, headers=self._headers(), json=payload,
+                                 timeout=(10, 300))
         if response.status_code >= 400:
             detail = ""
             try:
@@ -159,9 +200,14 @@ class GeminiClient(LLMClient):
                 # back to the text protocol instead of failing the step.
                 raise ToolsNotSupportedError(
                     f"{self.model} rejected function declarations: {detail}")
-            raise LLMError(f"{response.status_code} from Gemini "
-                           f"[model={self.model}, {len(tools or [])} tool(s)]"
-                           f"{': ' + detail if detail else ''}")
+            message = (f"{response.status_code} from Gemini "
+                       f"[model={self.model}, {len(tools or [])} tool(s)]"
+                       f"{': ' + detail if detail else ''}")
+            # A malformed request or a bad key does not become valid by
+            # being resent; retrying spends latency to fail identically.
+            if 400 <= response.status_code < 500 and                     response.status_code not in (408, 409, 429):
+                raise NonRetryableLLMError(message)
+            raise LLMError(message)
         data = response.json()
 
         usage = data.get("usageMetadata", {})
@@ -215,12 +261,11 @@ class GeminiClient(LLMClient):
                     "parts": [{"text": prompt}]
                 }
             ],
-            "generationConfig": {
-                "maxOutputTokens": self.max_output_tokens,
-            },
+            "generationConfig": self._generation_config(),
         }
-        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
-        response = requests.post(url, json=payload, timeout=(10, 300))
+        url = f"{self.base_url}/models/{self.model}:generateContent"
+        response = requests.post(url, headers=self._headers(), json=payload,
+                                 timeout=(10, 300))
         response.raise_for_status()
         data = response.json()
 
@@ -241,7 +286,12 @@ class GeminiClient(LLMClient):
         # Extract text from candidates
         candidates = data.get("candidates", [])
         if not candidates:
+            self._last_stop_reason = ""
             return ""
+        # MAX_TOKENS here means thinking (or output) hit the cap. The base
+        # class maps it to a token-limit retry via _TOKEN_LIMIT_REASONS;
+        # leaving it unset made every burn invisible.
+        self._last_stop_reason = candidates[0].get("finishReason", "") or ""
         parts = candidates[0].get("content", {}).get("parts", [])
         response_text = "".join(p.get("text", "") for p in parts)
         log.debug(f"[Gemini] Response:\n{response_text}")
@@ -260,22 +310,20 @@ class GeminiClient(LLMClient):
                     "parts": [{"text": prompt}]
                 }
             ],
-            "generationConfig": {
-                "maxOutputTokens": self.max_output_tokens,
-            },
+            "generationConfig": self._generation_config(),
         }
-        url = (
-            f"{self.base_url}/models/{self.model}"
-            f":streamGenerateContent?alt=sse&key={self.api_key}"
-        )
+        url = (f"{self.base_url}/models/{self.model}"
+               f":streamGenerateContent?alt=sse")
 
+        self._last_stop_reason = ""
         content_parts: list[str] = []
         tokens_generated = 0
         prompt_tokens = est_tokens
         completion_tokens = 0
         cached_tokens = 0
 
-        response = requests.post(url, json=payload, stream=True, timeout=(10, 120))
+        response = requests.post(url, headers=self._headers(), json=payload,
+                                 stream=True, timeout=(10, 120))
         response.raise_for_status()
         # Logging the headers as the body stream can't be read before iter_lines
         log.debug(f"[Gemini] Response Status: {response.status_code}, Headers: {dict(response.headers)}")
@@ -300,6 +348,12 @@ class GeminiClient(LLMClient):
                         candidates = chunk.get("candidates", [])
                         if not candidates:
                             continue
+                        # The final chunk carries finishReason; MAX_TOKENS
+                        # there is a thinking/output burn the base class
+                        # retries at a reduced thinking budget.
+                        _fr = candidates[0].get("finishReason")
+                        if _fr:
+                            self._last_stop_reason = _fr
                         parts = candidates[0].get("content", {}).get("parts", [])
                         for part in parts:
                             token = part.get("text", "")
@@ -346,7 +400,7 @@ class GeminiClient(LLMClient):
         embed_model = model or "text-embedding-004"
         url = (
             f"{self.base_url}/models/{embed_model}"
-            f":embedContent?key={self.api_key}"
+            f":embedContent"
         )
         payload = {
             "model": f"models/{embed_model}",
@@ -361,7 +415,8 @@ class GeminiClient(LLMClient):
             payload["outputDimensionality"] = dimensions
 
         try:
-            response = requests.post(url, json=payload, timeout=(10, 60))
+            response = requests.post(url, headers=self._headers(),
+                                     json=payload, timeout=(10, 60))
             response.raise_for_status()
             data = response.json()
             return data.get("embedding", {}).get("values", [])

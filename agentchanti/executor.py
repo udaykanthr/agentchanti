@@ -274,6 +274,42 @@ class Executor:
         files[filename] = content
 
     @staticmethod
+    def parse_blocks_for_single_target(text: str, target: str) -> Dict[str, str]:
+        """Attribute an unlabelled code block to the step's only target.
+
+        Every other extractor needs the model to name the file — a
+        ``#### [FILE]:`` marker, a path after the fence language, or a
+        ``# path`` first line. Pattern 5 needs an existing KB symbol
+        index, which a blank project does not have at step 2.
+
+        So a model that answers with prose and a bare ``` fence produces
+        nothing at all. Observed on Gemini: correct, complete code, no
+        filename anywhere, "No files parsed from coder response" twice,
+        two diagnosis rounds, then the pipeline halted after 12 minutes
+        and 129k tokens having written nothing.
+
+        When the step declares exactly ONE target there is nothing to
+        guess: the code belongs to that file. Deterministic, no LLM call.
+        The largest block wins, because explanatory snippets are short and
+        the implementation is not.
+        """
+        if not text or not target:
+            return {}
+        blocks = [m.group(1) for m in
+                  re.finditer(r"```(?:[a-zA-Z0-9_+\-]*)\n(.*?)```", text,
+                              re.DOTALL)]
+        blocks = [b for b in blocks if b.strip()]
+        if not blocks:
+            return {}
+        best = max(blocks, key=len)
+        # A couple of lines is a fragment being discussed, not a file.
+        if len(best.strip().splitlines()) < 3:
+            return {}
+        files: Dict[str, str] = {}
+        Executor._try_add_file(files, target, best.rstrip("\n"))
+        return files
+
+    @staticmethod
     def parse_code_blocks_fuzzy(text: str) -> Dict[str, str]:
         """Fallback parser for LLM responses that don't follow the strict format.
 

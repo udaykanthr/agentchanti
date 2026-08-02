@@ -4483,6 +4483,25 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             if _echo_lines:
                 files = _parse_echo_resp(_echo_lines)
         if not files:
+            # Last resort before giving up: when the step declares exactly
+            # ONE target there is nothing to guess, so an unlabelled code
+            # block belongs to that file. Every earlier extractor needs the
+            # model to name the file, and Pattern 5 needs a KB symbol index
+            # a blank project does not have yet — so a model that answers
+            # in prose with a bare fence produced nothing at all and halted
+            # the run. Observed on Gemini: correct code, no filename, two
+            # failed attempts plus two diagnosis rounds, 12 minutes and
+            # 129k tokens for zero files written.
+            _targets = list(getattr(plan_step, "target_files", None) or [])
+            if len(_targets) == 1:
+                files = executor.parse_blocks_for_single_target(
+                    response, _targets[0])
+                if files:
+                    log.info(
+                        "Step %d: response had no file markers — attributing "
+                        "its code block to the step's only target (%s)",
+                        step_idx + 1, _targets[0])
+        if not files:
             feedback = "No file markers found. Use #### [FILE]: path/to/file.py format."
             display.step_info(step_idx, "No files parsed, retrying...")
             log.warning(f"Step {step_idx+1}: No files parsed from coder response.")
