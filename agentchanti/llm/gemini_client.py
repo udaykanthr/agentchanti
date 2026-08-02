@@ -64,6 +64,20 @@ class GeminiClient(LLMClient):
         return node
 
     @staticmethod
+    def _cached_tokens(usage: dict) -> int:
+        """Prompt tokens served from Gemini's implicit cache.
+
+        Gemini caches a repeated prefix automatically and reports the hit
+        at ``usageMetadata.cachedContentTokenCount`` — measured at 16,362
+        of 24,011 prompt tokens (68%) on a repeated request. Not reading
+        it made every Gemini token look full-price and overstated a run's
+        cost roughly threefold against the OpenAI client, which does
+        report its cache hits.
+        """
+        cached = (usage or {}).get("cachedContentTokenCount", 0)
+        return cached if isinstance(cached, int) else 0
+
+    @staticmethod
     def _system_and_contents(messages):
         """Split messages into Gemini's systemInstruction + contents.
 
@@ -153,10 +167,12 @@ class GeminiClient(LLMClient):
         usage = data.get("usageMetadata", {})
         prompt_tokens = usage.get("promptTokenCount", est_tokens)
         completion_tokens = usage.get("candidatesTokenCount", 0)
+        cached_tokens = self._cached_tokens(usage)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
             model_name=self.model,
+            cached_tokens=cached_tokens,
         )
 
         candidates = data.get("candidates") or []
@@ -216,8 +232,11 @@ class GeminiClient(LLMClient):
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
             model_name=self.model,
+            cached_tokens=self._cached_tokens(usage),
         )
-        log.debug(f"[Gemini] Usage: prompt={prompt_tokens} completion={completion_tokens}")
+        log.debug(f"[Gemini] Usage: prompt={prompt_tokens} "
+                  f"completion={completion_tokens} "
+                  f"cached={self._cached_tokens(usage)}")
 
         # Extract text from candidates
         candidates = data.get("candidates", [])
@@ -254,6 +273,7 @@ class GeminiClient(LLMClient):
         tokens_generated = 0
         prompt_tokens = est_tokens
         completion_tokens = 0
+        cached_tokens = 0
 
         response = requests.post(url, json=payload, stream=True, timeout=(10, 120))
         response.raise_for_status()
@@ -276,6 +296,7 @@ class GeminiClient(LLMClient):
                         if usage:
                             prompt_tokens = usage.get("promptTokenCount", prompt_tokens)
                             completion_tokens = usage.get("candidatesTokenCount", completion_tokens)
+                            cached_tokens = self._cached_tokens(usage) or cached_tokens
                         candidates = chunk.get("candidates", [])
                         if not candidates:
                             continue
@@ -295,8 +316,10 @@ class GeminiClient(LLMClient):
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else tokens_generated,
             model_name=self.model,
+            cached_tokens=cached_tokens,
         )
-        log.debug(f"[Gemini] Streamed usage: prompt={prompt_tokens} completion={completion_tokens}")
+        log.debug(f"[Gemini] Streamed usage: prompt={prompt_tokens} "
+                  f"completion={completion_tokens} cached={cached_tokens}")
         log.debug(f"[Gemini] Response:\n{result}")
 
         if self._stream_callback:

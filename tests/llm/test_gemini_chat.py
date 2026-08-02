@@ -209,3 +209,37 @@ class TestResponseParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCacheAccounting(unittest.TestCase):
+    """Gemini caches a repeated prefix automatically and reports the hit.
+
+    Measured live: a repeated 24,011-token prompt came back with
+    cachedContentTokenCount = 16,362 (68%). Not reading that field made
+    every Gemini token look full-price and overstated a run's cost
+    roughly threefold against the OpenAI client, which does report its
+    cache hits.
+    """
+
+    def test_reads_the_cache_field(self):
+        self.assertEqual(GeminiClient._cached_tokens(
+            {"promptTokenCount": 24011, "cachedContentTokenCount": 16362}),
+            16362)
+
+    def test_absent_or_malformed_field_is_zero(self):
+        self.assertEqual(GeminiClient._cached_tokens({}), 0)
+        self.assertEqual(GeminiClient._cached_tokens(None), 0)
+        self.assertEqual(
+            GeminiClient._cached_tokens({"cachedContentTokenCount": "x"}), 0)
+
+    def test_chat_reports_cached_tokens_to_the_tracker(self):
+        payload = {"candidates": [{"finishReason": "STOP",
+                                   "content": {"parts": [{"text": "ok"}]}}],
+                   "usageMetadata": {"promptTokenCount": 1000,
+                                     "candidatesTokenCount": 10,
+                                     "cachedContentTokenCount": 700}}
+        with patch("agentchanti.llm.gemini_client.requests.post",
+                   return_value=_response(payload=payload)), \
+             patch("agentchanti.llm.gemini_client.token_tracker") as tt:
+            _client()._chat([Message(role="user", content="go")])
+        self.assertEqual(tt.record.call_args.kwargs["cached_tokens"], 700)
