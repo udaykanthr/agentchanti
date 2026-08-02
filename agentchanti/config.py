@@ -22,6 +22,11 @@ _DEFAULTS = {
     "stream": True,
     "llm_max_retries": 3,
     "llm_retry_delay": 2.0,
+    # Seconds to wait for the next byte of a generation. Streaming resets
+    # it per chunk, so this really guards the wait before the FIRST token —
+    # which for a reasoning model is however long it thinks. 300 cost a
+    # measured run 12 timed-out calls and two abandoned steps.
+    "llm_read_timeout": 900,
     "checkpoint_file": ".agentchanti_checkpoint.json",
     "ollama_base_url": "http://localhost:11434/api/generate",
     "lm_studio_base_url": "http://localhost:1234/v1",
@@ -177,6 +182,8 @@ class Config:
                                     _DEFAULTS["llm_max_retries"], cast=int)
         self.LLM_RETRY_DELAY = _get("LLM_RETRY_DELAY", "llm_retry_delay",
                                     _DEFAULTS["llm_retry_delay"], cast=float)
+        self.LLM_READ_TIMEOUT = _get("LLM_READ_TIMEOUT", "llm_read_timeout",
+                                     _DEFAULTS["llm_read_timeout"], cast=int)
         self.STREAM_RESPONSES = _get_bool("STREAM_RESPONSES", "stream",
                                           _DEFAULTS["stream"])
 

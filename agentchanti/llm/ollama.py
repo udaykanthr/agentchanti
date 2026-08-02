@@ -1,4 +1,4 @@
-import json
+﻿import json
 import requests
 from typing import List, Optional
 
@@ -12,10 +12,18 @@ class OllamaClient(LLMClient):
 
     NATIVE_CHAT = True
 
-    def __init__(self, base_url: str, model: str, **kwargs):
+    #: Seconds to wait for the NEXT byte of a generation (not for the whole
+    #: call â€” streaming resets it per chunk). A reasoning model can think
+    #: for minutes before emitting anything, so the first chunk is the one
+    #: this really guards. 300 was too tight for cloud models.
+    DEFAULT_READ_TIMEOUT = 900
+
+    def __init__(self, base_url: str, model: str,
+                 read_timeout: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.base_url = base_url
         self.model = model
+        self.read_timeout = read_timeout or self.DEFAULT_READ_TIMEOUT
         # One-shot: armed by _prepare_token_limit_retry after a reasoning
         # burn, consumed by the next generate call to disable thinking.
         self._retry_disable_think = False
@@ -40,7 +48,7 @@ class OllamaClient(LLMClient):
             payload["think"] = False
             self._retry_disable_think = False
 
-    # ── Non-streaming generation ──
+    # â”€â”€ Non-streaming generation â”€â”€
 
     def _generate(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
@@ -55,7 +63,8 @@ class OllamaClient(LLMClient):
             "options": {"num_predict": self.max_output_tokens},
         }
         self._apply_generate_options(payload)
-        response = requests.post(self.base_url, json=payload, timeout=(10, 300))
+        response = requests.post(self.base_url, json=payload,
+                                 timeout=(10, self.read_timeout))
         response.raise_for_status()
         data = response.json()
         result = data.get("response", "")
@@ -78,7 +87,7 @@ class OllamaClient(LLMClient):
         log.debug(f"[Ollama] Response:\n{result}")
         return result
 
-    # ── Streaming generation ──
+    # â”€â”€ Streaming generation â”€â”€
 
     def _generate_stream(self, prompt: str) -> str:
         est_tokens = int(len(prompt.split()) * 1.3)
@@ -98,7 +107,7 @@ class OllamaClient(LLMClient):
         self._last_stop_reason = ""
 
         response = requests.post(self.base_url, json=payload,
-                                 stream=True, timeout=(10, 120))
+                                 stream=True, timeout=(10, self.read_timeout))
         response.raise_for_status()
 
         with streaming_response(response):
@@ -126,7 +135,7 @@ class OllamaClient(LLMClient):
 
         result = "".join(content_parts)
         # See _generate: without this the hidden-burn detector is blind on
-        # the streaming path too — which is the default (stream: true).
+        # the streaming path too â€” which is the default (stream: true).
         self._last_completion_tokens = tokens_generated
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
@@ -141,7 +150,7 @@ class OllamaClient(LLMClient):
 
         return result
 
-    # ── Native chat (/api/chat) ──
+    # â”€â”€ Native chat (/api/chat) â”€â”€
 
     @staticmethod
     def _serialize_messages(messages: List[Message]) -> list[dict]:
@@ -165,10 +174,21 @@ class OllamaClient(LLMClient):
                   f"{len(messages)} messages, {len(tools or [])} tools")
         token_tracker.set_context(est_tokens)
 
+        # Streamed, even though the caller wants one whole response.
+        #
+        # A read timeout applies to the gap BETWEEN bytes, not to the call:
+        # streaming resets it on every chunk, so a long generation keeps the
+        # connection alive instead of being cut mid-thought. Non-streaming
+        # /api/chat had to deliver everything inside one window, and cloud
+        # reasoning models routinely exceed it â€” a measured run lost 12
+        # calls and two whole steps to `Read timed out (read timeout=300)`,
+        # each costing the full 300s three times over. The text path has
+        # always streamed, which is why it saw one timeout to the chat
+        # path's twelve.
         payload: dict = {
             "model": self.model,
             "messages": self._serialize_messages(messages),
-            "stream": False,
+            "stream": True,
             "options": {"num_predict": self.max_output_tokens},
         }
         if tools:
@@ -180,18 +200,40 @@ class OllamaClient(LLMClient):
             ]
 
         url = f"{self._api_root}/api/chat"
-        response = requests.post(url, json=payload, timeout=(10, 300))
+        response = requests.post(url, json=payload, stream=True,
+                                 timeout=(10, self.read_timeout))
         if response.status_code == 400 and tools and \
                 "does not support tools" in response.text.lower():
             raise ToolsNotSupportedError(
                 f"model '{self.model}' rejected tools: {response.text}")
         response.raise_for_status()
-        data = response.json()
 
-        message = data.get("message") or {}
-        text = message.get("content", "") or ""
+        # Reassemble the streamed chunks into the same shape the
+        # non-streaming endpoint returns, so everything below is unchanged.
+        data: dict = {}
+        text_parts: list[str] = []
+        raw_tool_calls: list[dict] = []
+        with streaming_response(response):
+            for line in response.iter_lines(decode_unicode=True):
+                check_cancelled()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = chunk.get("message") or {}
+                if msg.get("content"):
+                    text_parts.append(msg["content"])
+                # Tool calls arrive whole, not split across chunks.
+                for tc in msg.get("tool_calls") or []:
+                    raw_tool_calls.append(tc)
+                if chunk.get("done"):
+                    data = chunk
+
+        text = "".join(text_parts)
         tool_calls: list[ToolCall] = []
-        for i, tc in enumerate(message.get("tool_calls") or []):
+        for i, tc in enumerate(raw_tool_calls):
             fn = tc.get("function") or {}
             args = fn.get("arguments") or {}
             # Some models return arguments as a JSON string
@@ -217,7 +259,7 @@ class OllamaClient(LLMClient):
         return ChatResponse(text=text, tool_calls=tool_calls,
                             stop_reason=data.get("done_reason", "") or "")
 
-    # ── Embeddings (unchanged) ──
+    # â”€â”€ Embeddings (unchanged) â”€â”€
 
     def generate_embedding(self, text: str, model: Optional[str] = None, **kwargs) -> List[float]:
         embed_model = model or self.model

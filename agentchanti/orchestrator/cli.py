@@ -510,8 +510,11 @@ def _main_impl():
 
     provider = args.provider or cfg.PROVIDER
     if provider == "ollama":
+        # read_timeout is Ollama-only — it cannot go in llm_kwargs, which
+        # every provider shares.
         llm_client = OllamaClient(
-            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
+            base_url=cfg.OLLAMA_BASE_URL, model=model,
+            read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
     elif provider == "openai":
         from ..llm.openai_client import OpenAIClient
         api_key = cfg.OPENAI_API_KEY
@@ -675,7 +678,8 @@ def _main_impl():
         # Create a separate client with the agent-specific provider + model
         if agent_provider == "ollama":
             return OllamaClient(
-                base_url=cfg.OLLAMA_BASE_URL, model=agent_model, **llm_kwargs)
+                base_url=cfg.OLLAMA_BASE_URL, model=agent_model,
+                read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
         elif agent_provider == "openai":
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
