@@ -8,6 +8,7 @@ any language using simple indent + keyword heuristics.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -223,6 +224,11 @@ def _chunk_id_matches(chunk_id: str, edit_id: str) -> bool:
 class ChunkEditor:
     """Regex-based file chunking and chunk-level edit application."""
 
+    #: Set by :meth:`apply_chunk_edits` when a splice was rejected and the
+    #: original content returned unchanged.  Reset at the start of every
+    #: call, so it always describes the most recent one.
+    last_apply_rejected: bool = False
+
     def chunk_file(self, file_path: str, content: str) -> list[FileChunk]:
         """Split a file into logical chunks using regex patterns.
 
@@ -318,6 +324,16 @@ class ChunkEditor:
                 signature=sig,
                 parent=parent,
             ))
+
+        # Module-level constants are edit targets in their own right — a
+        # maze layout, a config dict, a lookup table.  Without a named
+        # chunk they land in an anonymous top_level gap, so an
+        # "[EDIT]: f.py:DEFAULT_MAZE" cannot resolve by symbol and falls
+        # back to the LLM's line arithmetic, which is routinely a line or
+        # two short and leaves an orphan tail behind the splice.
+        if lang == "python":
+            chunks.extend(
+                self._python_const_chunks(file_path, content, lines, chunks))
 
         # Fill gaps: any lines not covered by chunks become "top_level" chunks
         chunks = self._fill_gaps(chunks, lines, file_path, imports_end, total)
@@ -564,6 +580,7 @@ class ChunkEditor:
         against the known chunks first.  This corrects hallucinated line
         numbers from the LLM that would otherwise corrupt the file.
         """
+        self.last_apply_rejected = False
         lines = original_content.splitlines(True)
         total_lines = len(lines)
 
@@ -780,6 +797,13 @@ class ChunkEditor:
                     edits[0].file_path if edits else "?",
                     _se.msg, _se.lineno,
                 )
+                # Returning the original silently is indistinguishable from
+                # a successful edit: the caller writes it back, reports
+                # "applied", and the next diagnosis attempt re-derives the
+                # same fix against an unchanged file.  Record the rejection
+                # so the caller can fall through to its own fallback now
+                # instead of spending another round trip to learn nothing.
+                self.last_apply_rejected = True
                 return original_content
         return result
 
@@ -1040,6 +1064,64 @@ class ChunkEditor:
                 break
 
         return last_import
+
+    @staticmethod
+    def _python_const_chunks(
+        file_path: str,
+        content: str,
+        lines: list[str],
+        existing: list[FileChunk],
+    ) -> list[FileChunk]:
+        """Named chunks for module-level assignments (``const:NAME``).
+
+        The span comes from ``ast``, not from counting brackets, so a
+        multi-line literal ends where it actually ends.  That precision is
+        the whole point: the regex chunker would run a constant up to the
+        next ``def``, and a span that is too wide fails the 70% "full chunk
+        replacement" test just as surely as one that is too narrow.
+
+        Files that do not parse yield nothing — a syntax error is exactly
+        when line numbers are least trustworthy, but guessing spans from
+        broken source would be worse than leaving the edit to the existing
+        content-alignment fallback.
+        """
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            return []
+
+        covered: set[int] = set()
+        for c in existing:
+            covered.update(range(c.line_start, c.line_end + 1))
+
+        out: list[FileChunk] = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+
+            start, end = node.lineno, (node.end_lineno or node.lineno)
+            # Never overlap a def/class chunk: two chunks claiming the same
+            # lines make the splice order-dependent.
+            if any(ln in covered for ln in range(start, end + 1)):
+                continue
+
+            out.append(FileChunk(
+                file_path=file_path,
+                chunk_id=f"const:{targets[0].id}",
+                line_start=start,
+                line_end=end,
+                content="".join(lines[start - 1:end]),
+                chunk_type="const",
+                signature=lines[start - 1].rstrip(),
+            ))
+            covered.update(range(start, end + 1))
+        return out
 
     @staticmethod
     def _fill_gaps(

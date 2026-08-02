@@ -822,8 +822,22 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                         # with hallucinated line numbers) resolve against
                         # the file's real function/class boundaries.
                         _known = _ce.chunk_file(_fpath, _existing)
-                        files[_fpath] = _ce.apply_chunk_edits(
+                        _spliced = _ce.apply_chunk_edits(
                             _existing, _file_edits, known_chunks=_known)
+                        if _ce.last_apply_rejected:
+                            # The splice broke the file and was rolled back.
+                            # Recording the unchanged content here would
+                            # write it out, report "applied", and leave the
+                            # next attempt to re-diagnose an identical file
+                            # — a whole round trip that cannot succeed.
+                            # Drop it and let the full-file fallback below
+                            # try to land the same fix in this attempt.
+                            log.warning(
+                                "Step %d: ChunkEdit rejected for %s (splice "
+                                "was not applied) — falling back to "
+                                "full-file parsing", step_idx + 1, _fpath)
+                        else:
+                            files[_fpath] = _spliced
                     except Exception as _exc:
                         log.warning(
                             "Step %d: ChunkEdit apply failed for %s: %s",
