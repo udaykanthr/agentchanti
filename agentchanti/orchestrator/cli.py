@@ -998,10 +998,30 @@ def _main_impl():
             display.show_status(
                 f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
             )
-            plan = planner.process(args.task, context=planner_context,
-                                   language=language,
-                                   plan_mode=getattr(cfg, "PLAN_MODE",
-                                                     "content"))
+            try:
+                plan = planner.process(args.task, context=planner_context,
+                                       language=language,
+                                       plan_mode=getattr(cfg, "PLAN_MODE",
+                                                         "content"))
+            except LLMError as exc:
+                # A model that spends its whole output budget on hidden
+                # reasoning returns nothing, every retry, deterministically
+                # (observed: minimax-m3:cloud, 3 x 16384 tokens, 7.5
+                # minutes, no plan).  That is a configuration problem the
+                # user can act on — a raw traceback tells them nothing
+                # about which model failed or what to change.
+                _model = getattr(llm_client, "model", "?")
+                _tries = getattr(llm_client, "max_retries", "?")
+                log.error("Planner produced no usable plan with model %s: %s",
+                          _model, exc)
+                print(f"\nPlanning failed: no usable response from "
+                      f"'{_model}' after {_tries} attempts.")
+                print(f"  Cause: {exc}")
+                print("  If this model reasons before answering, it may be "
+                      "spending its whole output budget on hidden thinking.")
+                print("  Try a larger max_output_tokens, or set a different "
+                      "planner model under `models:` in .agentchanti.yaml.")
+                sys.exit(1)
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
             # ── Planner no-op signal ──

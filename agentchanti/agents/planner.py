@@ -203,10 +203,112 @@ _CHECKLIST_INTENT = """
 - [ ] Total steps between 2-15
 - [ ] No install steps for already-installed packages
 - [ ] Config/tooling steps come BEFORE code that depends on them
-- [ ] Leaf components created BEFORE parent components
-- [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
-- [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
 """
+
+# Checklist lines that only mean something for a component-based frontend.
+_CHECKLIST_COMPONENT = """- [ ] Leaf components created BEFORE parent components
+- [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
+"""
+
+_CHECKLIST_PYTHON = """- [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
+"""
+
+# Languages whose projects are built out of composed UI components.  The
+# component-ordering and entry-point-wiring rules are noise anywhere else.
+_COMPONENT_LANGS = frozenset({"javascript", "typescript"})
+
+
+def _framework_rules(language: str | None) -> str:
+    """Framework-specific planner rules for *language* only.
+
+    These blocks used to ship on every request.  A Pygame task was being
+    asked to reason about Django's LogoutView and React Testing Library's
+    within() — rules it cannot possibly apply.  On a reasoning model that
+    is not merely wasted context: minimax-m3 spent its entire 16,384-token
+    output budget thinking about the full prompt and returned nothing,
+    three times, killing the run before it wrote a line of code.  The same
+    model answers a plain "break this task into steps" for the same task
+    in 2,948 tokens.
+
+    An unknown language keeps everything — dropping a rule that might
+    apply is worse than carrying one that does not.
+    """
+    base = (language or "").split(":", 1)[0].lower()
+
+    python_rules = """
+21. **Tests import ONLY frameworks the environment will have**: Every
+    package a test file imports must either appear in the installed
+    packages of the project knowledge or be installed by an earlier CMD
+    step of THIS plan. In a Django project the suite runs via
+    `python manage.py test`, so write `django.test.TestCase` /
+    `unittest` tests — do NOT `import pytest` (it is not installed by
+    `pip install django`). Match the installed framework VERSION: with
+    Django >= 5, `LogoutView` rejects GET, so logout tests must use
+    `self.client.post(...)` and views/templates must log out via a POST
+    form, not a link.
+"""
+
+    js_rules = """
+22. **Testing Library queries must tolerate repeated text**: Brand names
+    and nav labels legitimately appear in BOTH the header and the footer
+    of the same page. Singular queries THROW on a second match —
+    `getByText('Brand')` and `getByRole('link', {name: 'Home'})` are the
+    most common self-inflicted test failures. Scope every query for text
+    that could repeat to a landmark:
+    `within(screen.getByRole('banner')).getByText('Brand')` for the
+    header, `within(screen.getByRole('contentinfo')).getByRole('link',
+    {name: 'Home'})` for the footer (import `within` from
+    '@testing-library/react'), or use `getAllByText(...)` and assert the
+    count. Never assert a brand name with a singular query.
+"""
+
+    if not base:
+        return python_rules + js_rules
+    out = ""
+    if base == "python":
+        out += python_rules
+    if base in _COMPONENT_LANGS:
+        out += js_rules
+    return out
+
+
+def _component_rules(language: str | None) -> str:
+    """Component-ordering and entry-point-wiring rules. See _framework_rules.
+
+    Kept as rules 17/18 so the surrounding numbering stays stable — the
+    prompt refers to rules by number elsewhere.
+    """
+    base = (language or "").split(":", 1)[0].lower()
+    if base and base not in _COMPONENT_LANGS:
+        return ""
+    return """17. **Leaf components BEFORE parents**: Create child components first, then
+    parents that import them. Declare imports: to enforce correct ordering.
+
+18. **Explicitly wire entry-point and parent files**: When a new component or
+    module must be mounted/imported by an existing file (e.g. main.jsx, App.tsx,
+    router.py, index.ts), you MUST include a dedicated CODE step that modifies
+    that entry-point file to add the import. Do NOT assume the pipeline will
+    auto-wire it. The wiring step must declare:
+      imports: <new-component-file>:<ExportedSymbol>
+    This also lets the pipeline derive `imported_by` automatically — so the
+    dependency checker knows the exact parent without guessing.
+    If you cannot add a wiring step, declare `imported_by: <parent-file>` on
+    the child component step so the dependency checker knows where to wire it.
+
+"""
+
+
+def _checklist_extras(language: str | None) -> str:
+    """Language-gated tail of the quality checklist. See _framework_rules."""
+    base = (language or "").split(":", 1)[0].lower()
+    if not base:
+        return _CHECKLIST_COMPONENT + _CHECKLIST_PYTHON
+    out = ""
+    if base in _COMPONENT_LANGS:
+        out += _CHECKLIST_COMPONENT
+    if base == "python":
+        out += _CHECKLIST_PYTHON
+    return out
 
 
 def _classify_task_intent(task: str) -> str:
@@ -1608,21 +1710,8 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
     before any code steps. Use the language-specific examples from the
     PROJECT STATE context above — do NOT default to npm for non-JS projects.
 
-17. **Leaf components BEFORE parents**: Create child components first, then
-    parents that import them. Declare imports: to enforce correct ordering.
-
-18. **Explicitly wire entry-point and parent files**: When a new component or
-    module must be mounted/imported by an existing file (e.g. main.jsx, App.tsx,
-    router.py, index.ts), you MUST include a dedicated CODE step that modifies
-    that entry-point file to add the import. Do NOT assume the pipeline will
-    auto-wire it. The wiring step must declare:
-      imports: <new-component-file>:<ExportedSymbol>
-    This also lets the pipeline derive `imported_by` automatically — so the
-    dependency checker knows the exact parent without guessing.
-    If you cannot add a wiring step, declare `imported_by: <parent-file>` on
-    the child component step so the dependency checker knows where to wire it.
-
-""" + (_INTENT_INLINE_RULES if plan_mode == "intent" else """19. **Inline code for CODE and TEST steps — two formats**:
+""" + _component_rules(language) + (
+            _INTENT_INLINE_RULES if plan_mode == "intent" else """19. **Inline code for CODE and TEST steps — two formats**:
 
     **For MODIFYING an existing file** (the file appears in [FILES TO MODIFY]):
     Use an `edit:` block with find/replace pairs. This is PREFERRED — it is
@@ -1698,30 +1787,8 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
       ...
       ```
       ---file-content-end---
-""") + """
-21. **Tests import ONLY frameworks the environment will have**: Every
-    package a test file imports must either appear in the installed
-    packages of the project knowledge or be installed by an earlier CMD
-    step of THIS plan. In a Django project the suite runs via
-    `python manage.py test`, so write `django.test.TestCase` /
-    `unittest` tests — do NOT `import pytest` (it is not installed by
-    `pip install django`). Match the installed framework VERSION: with
-    Django >= 5, `LogoutView` rejects GET, so logout tests must use
-    `self.client.post(...)` and views/templates must log out via a POST
-    form, not a link.
-
-22. **Testing Library queries must tolerate repeated text**: Brand names
-    and nav labels legitimately appear in BOTH the header and the footer
-    of the same page. Singular queries THROW on a second match —
-    `getByText('Brand')` and `getByRole('link', {name: 'Home'})` are the
-    most common self-inflicted test failures. Scope every query for text
-    that could repeat to a landmark:
-    `within(screen.getByRole('banner')).getByText('Brand')` for the
-    header, `within(screen.getByRole('contentinfo')).getByRole('link',
-    {name: 'Home'})` for the footer (import `within` from
-    '@testing-library/react'), or use `getAllByText(...)` and assert the
-    count. Never assert a brand name with a singular query.
-""" + (_CHECKLIST_INTENT if plan_mode == "intent" else """
+""") + _framework_rules(language) + (
+            _CHECKLIST_INTENT if plan_mode == "intent" else """
 ═══════ QUALITY CHECKLIST ═══════
 - [ ] Every CODE step has a target: line with exact file paths
 - [ ] Every CODE step has exports: and imports: lines
@@ -1736,8 +1803,5 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] Total steps between 2-15
 - [ ] No install steps for already-installed packages
 - [ ] Config/tooling steps come BEFORE code that depends on them
-- [ ] Leaf components created BEFORE parent components
-- [ ] Every new component/module that mounts in an entry-point (main.jsx, App.tsx, etc.) has an explicit CODE step to update that entry-point, OR has imported_by: declared
-- [ ] No test file imports a framework that is neither installed nor installed by a plan step (Django: use django.test, not pytest)
-""")
+""") + _checklist_extras(language)
         return self.llm_client.generate_response(prompt)

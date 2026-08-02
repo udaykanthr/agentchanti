@@ -63,6 +63,12 @@ class OllamaClient(LLMClient):
 
         prompt_tokens = data.get("prompt_eval_count", est_tokens)
         completion_tokens = data.get("eval_count", 0)
+        # Feeds _looks_like_hidden_burn(): a cap hit with only a sliver of
+        # visible text means the budget went to hidden thinking.  Without
+        # this the detector sees 0, disables itself for this provider, and
+        # a truncated response reaches the caller as though it were whole.
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
@@ -119,6 +125,9 @@ class OllamaClient(LLMClient):
                     continue
 
         result = "".join(content_parts)
+        # See _generate: without this the hidden-burn detector is blind on
+        # the streaming path too — which is the default (stream: true).
+        self._last_completion_tokens = tokens_generated
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             tokens_generated,
@@ -196,6 +205,8 @@ class OllamaClient(LLMClient):
 
         prompt_tokens = data.get("prompt_eval_count", est_tokens)
         completion_tokens = data.get("eval_count", 0)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
