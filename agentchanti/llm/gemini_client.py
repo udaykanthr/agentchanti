@@ -241,7 +241,11 @@ class GeminiClient(LLMClient):
                         id="",
                         provider_state={"thoughtSignature": sig} if sig else {}))
 
+        # cached= belongs here as much as on the text paths: without it a
+        # log-derived cost estimate reads every Gemini token as full price
+        # and overstates a run threefold.
         log.debug(f"[Gemini] Chat usage: prompt={prompt_tokens} "
+                  f"(cached={cached_tokens}) "
                   f"completion={completion_tokens} "
                   f"tool_calls={len(tool_calls)}")
         return ChatResponse(text="".join(text_parts), tool_calls=tool_calls,

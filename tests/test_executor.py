@@ -63,3 +63,28 @@ class TestSingleTargetBlockAttribution:
         text = "```\nclass A:\n    x = 1\n    y = 2\n```"
         assert "class A" in Executor.parse_blocks_for_single_target(
             text, "a.py")["a.py"]
+
+    def test_an_unterminated_fence_is_still_extracted(self):
+        """A response cut at the output-token cap never closes its fence.
+
+        Observed on Gemini: truncated at 16,384 tokens with one open
+        fence, so the closing-fence pattern matched nothing and the step
+        produced no files at all.
+        """
+        trunc = ("Here is the code.\n\n```python\nclass Map:\n"
+                 "    def __init__(self):\n        self.grid = []\n"
+                 "    def is_wall(self, x, y):\n        return True\n")
+        got = Executor.parse_blocks_for_single_target(trunc, "a.py")
+        assert "class Map" in got["a.py"]
+
+    def test_a_truncated_block_that_cannot_parse_is_refused(self):
+        """Half a module is worse than none: it fails at import with a
+        SyntaxError that reads like a code bug, not a truncated reply."""
+        bad = ("text\n```python\nclass Map:\n    def foo(self):\n"
+               "        x = (1,\n")
+        assert Executor.parse_blocks_for_single_target(bad, "a.py") == {}
+
+    def test_syntax_is_only_checked_for_python(self):
+        bad = ("text\n```\nsome: [unclosed\n  yaml: fragment\n"
+               "  more: lines\n")
+        assert Executor.parse_blocks_for_single_target(bad, "a.txt") != {}

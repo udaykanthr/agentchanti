@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import subprocess
@@ -298,6 +299,14 @@ class Executor:
         blocks = [m.group(1) for m in
                   re.finditer(r"```(?:[a-zA-Z0-9_+\-]*)\n(.*?)```", text,
                               re.DOTALL)]
+        # A response cut at the output-token cap ends mid-block, so its
+        # final fence never closes and the pattern above misses it
+        # entirely. Observed on Gemini: truncated at 16,384 tokens with
+        # one unterminated fence, and the step produced nothing at all.
+        if text.count("```") % 2 == 1:
+            tail = re.split(r"```(?:[a-zA-Z0-9_+\-]*)\n", text)[-1]
+            if tail.strip():
+                blocks.append(tail)
         blocks = [b for b in blocks if b.strip()]
         if not blocks:
             return {}
@@ -305,6 +314,18 @@ class Executor:
         # A couple of lines is a fragment being discussed, not a file.
         if len(best.strip().splitlines()) < 3:
             return {}
+        # Never write source that cannot parse. A truncated block is the
+        # common case here, and half a module is worse than none: it
+        # fails at import with a SyntaxError that reads like a code bug
+        # rather than a truncated response.
+        if target.endswith(".py"):
+            try:
+                ast.parse(best)
+            except (SyntaxError, ValueError):
+                log.warning(
+                    "[Executor] Unlabelled block for '%s' does not parse "
+                    "(likely a truncated response) — not writing it", target)
+                return {}
         files: Dict[str, str] = {}
         Executor._try_add_file(files, target, best.rstrip("\n"))
         return files
