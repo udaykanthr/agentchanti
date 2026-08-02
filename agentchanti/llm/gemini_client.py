@@ -6,18 +6,184 @@ import json
 import requests
 from typing import List, Optional
 
-from .base import LLMClient
+from .base import LLMClient, LLMError, ToolsNotSupportedError
 from .cancellation import streaming_response, check_cancelled
+from .chat_types import ChatResponse, Message, ToolCall, ToolDef
 from ..cli_display import token_tracker, log
 
 
+# Phrases a provider uses when it will not accept function declarations.
+# Kept narrow: misreading an unrelated 400 as "no tool support" would
+# silently drop the whole agent-loop path for the rest of the session.
+_TOOLS_REJECTED_MARKERS = (
+    "function calling is not supported",
+    "does not support function",
+    "tools are not supported",
+    "unsupported field: tools",
+    "unknown name \"tools\"",
+    "functiondeclarations",
+)
+
+
+def _looks_like_tools_rejection(detail: str) -> bool:
+    low = (detail or "").lower()
+    return any(m in low for m in _TOOLS_REJECTED_MARKERS)
+
+
 class GeminiClient(LLMClient):
+
+    NATIVE_CHAT = True
+
+    # Gemini rejects JSON Schema keywords it does not implement, and a 400
+    # here would silently drop the whole agent-loop path for the session.
+    _SCHEMA_DROP_KEYS = frozenset({
+        "additionalProperties", "$schema", "$id", "definitions", "$defs",
+        "examples", "default", "exclusiveMinimum", "exclusiveMaximum",
+    })
 
     def __init__(self, base_url: str, model: str, api_key: str, **kwargs):
         super().__init__(**kwargs)
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+
+    # ── Native chat (structured tool calling) ──
+
+    @classmethod
+    def _clean_schema(cls, node):
+        """Strip JSON Schema keywords Gemini's function declarations reject.
+
+        The API accepts an OpenAPI-flavoured subset; unknown keywords are a
+        400, and ``AgentTools`` schemas carry several of them.
+        """
+        if isinstance(node, dict):
+            return {k: cls._clean_schema(v) for k, v in node.items()
+                    if k not in cls._SCHEMA_DROP_KEYS}
+        if isinstance(node, list):
+            return [cls._clean_schema(v) for v in node]
+        return node
+
+    @staticmethod
+    def _system_and_contents(messages):
+        """Split messages into Gemini's systemInstruction + contents.
+
+        Gemini has no system role and only knows ``user`` and ``model``.
+        Tool results go back as a ``functionResponse`` part, which the API
+        expects on a ``user`` turn.
+        """
+        system_bits: list[str] = []
+        contents: list[dict] = []
+        for m in messages:
+            if m.role == "system":
+                if m.content:
+                    system_bits.append(m.content)
+                continue
+            if m.role == "tool":
+                contents.append({"role": "user", "parts": [{
+                    "functionResponse": {
+                        "name": m.tool_name or "tool",
+                        # The API requires an object here, not a bare string.
+                        "response": {"result": m.content or ""},
+                    }}]})
+                continue
+            if m.role == "assistant":
+                parts: list[dict] = []
+                if m.content:
+                    parts.append({"text": m.content})
+                for tc in m.tool_calls:
+                    part = {"functionCall": {"name": tc.name,
+                                             "args": tc.arguments or {}}}
+                    # Gemini 3.x rejects a replayed functionCall whose
+                    # thoughtSignature is missing, so it must be returned
+                    # verbatim on the same part it arrived on.
+                    sig = (tc.provider_state or {}).get("thoughtSignature")
+                    if sig:
+                        part["thoughtSignature"] = sig
+                    parts.append(part)
+                if not parts:
+                    parts = [{"text": ""}]
+                contents.append({"role": "model", "parts": parts})
+                continue
+            contents.append({"role": "user",
+                             "parts": [{"text": m.content or ""}]})
+        return "\n\n".join(system_bits), contents
+
+    def _chat(self, messages: List[Message],
+              tools: Optional[List[ToolDef]] = None) -> ChatResponse:
+        est_tokens = int(sum(len((m.content or "").split())
+                             for m in messages) * 1.3)
+        log.debug(f"[Gemini] Chat: ~{est_tokens} est. tokens, "
+                  f"{len(messages)} messages, {len(tools or [])} tools")
+        token_tracker.set_context(est_tokens)
+
+        system, contents = self._system_and_contents(messages)
+        payload: dict = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": self.max_output_tokens},
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            payload["tools"] = [{"functionDeclarations": [
+                {"name": t.name,
+                 "description": t.description,
+                 "parameters": self._clean_schema(t.parameters)}
+                for t in tools]}]
+
+        url = (f"{self.base_url}/models/{self.model}"
+               f":generateContent?key={self.api_key}")
+        response = requests.post(url, json=payload, timeout=(10, 300))
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                err = (response.json() or {}).get("error") or {}
+                detail = err.get("message", "")
+            except Exception:
+                detail = (response.text or "")[:400]
+            if tools and _looks_like_tools_rejection(detail):
+                # Same contract as the OpenAI client: let the caller fall
+                # back to the text protocol instead of failing the step.
+                raise ToolsNotSupportedError(
+                    f"{self.model} rejected function declarations: {detail}")
+            raise LLMError(f"{response.status_code} from Gemini "
+                           f"[model={self.model}, {len(tools or [])} tool(s)]"
+                           f"{': ' + detail if detail else ''}")
+        data = response.json()
+
+        usage = data.get("usageMetadata", {})
+        prompt_tokens = usage.get("promptTokenCount", est_tokens)
+        completion_tokens = usage.get("candidatesTokenCount", 0)
+        token_tracker.record(
+            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            completion_tokens if isinstance(completion_tokens, int) else 0,
+            model_name=self.model,
+        )
+
+        candidates = data.get("candidates") or []
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        stop_reason = ""
+        if candidates:
+            stop_reason = candidates[0].get("finishReason", "") or ""
+            for part in candidates[0].get("content", {}).get("parts", []):
+                if "text" in part and part["text"]:
+                    text_parts.append(part["text"])
+                fc = part.get("functionCall")
+                if fc:
+                    sig = part.get("thoughtSignature")
+                    tool_calls.append(ToolCall(
+                        name=fc.get("name", ""),
+                        arguments=fc.get("args") or {},
+                        # Gemini assigns no call ids; the tool NAME is the
+                        # link back, which Message.tool_name carries.
+                        id="",
+                        provider_state={"thoughtSignature": sig} if sig else {}))
+
+        log.debug(f"[Gemini] Chat usage: prompt={prompt_tokens} "
+                  f"completion={completion_tokens} "
+                  f"tool_calls={len(tool_calls)}")
+        return ChatResponse(text="".join(text_parts), tool_calls=tool_calls,
+                            stop_reason=stop_reason)
 
     # ── Non-streaming generation ──
 
