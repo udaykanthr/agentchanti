@@ -203,6 +203,15 @@ class ChunkEditResponse:
     insert_after: int = 0      # line number to insert after (for new chunks)
 
 
+_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)|^\s*class\s+(\w+)",
+                     re.MULTILINE)
+
+
+def _defined_names(text: str) -> list[str]:
+    """Names of functions/classes *text* defines, in order."""
+    return [a or b for a, b in _DEF_RE.findall(text)]
+
+
 def _reopens_declaration(new_content: str, chunk: FileChunk) -> bool:
     """True when *new_content* restates the chunk's own declaration.
 
@@ -820,6 +829,13 @@ class ChunkEditor:
                 # Replace line range (1-indexed to 0-indexed)
                 s = max(0, start - 1)
                 e = min(len(lines), end)
+                # An empty range is a pure INSERTION (see
+                # _additive_insertion). Butting a new `def` straight
+                # against the previous method's last line is valid Python
+                # but fails every style gate, so separate them.
+                if e <= s and s > 0 and lines[s - 1].strip() \
+                        and new_lines and new_lines[0].strip():
+                    new_lines = ["\n"] + new_lines
                 lines[s:e] = new_lines
 
         # ── Post-splice syntax sanity check (Python only) ──
@@ -905,6 +921,23 @@ class ChunkEditor:
                                 edit.file_path, edit.chunk_id, sub[0], sub[1],
                                 chunk.line_start, chunk.line_end)
                             return sub
+                        # An ADDITION replaces nothing, so there is nothing
+                        # to align it against — matching was always going
+                        # to fail. Observed: diagnosis correctly answered a
+                        # missing attribute with two new @property methods
+                        # and the edit was discarded twice, then the run
+                        # halted.
+                        ins = ChunkEditor._additive_insertion(
+                            edit, chunk, original_lines)
+                        if ins:
+                            logger.info(
+                                "[ChunkEditor] Resolved %s:%s to an "
+                                "insertion at line %d (adds %s to chunk "
+                                "%d-%d)", edit.file_path, edit.chunk_id,
+                                ins[0], ", ".join(_defined_names(
+                                    edit.new_content)) or "content",
+                                chunk.line_start, chunk.line_end)
+                            return ins
                         raise ValueError(
                             f"Cannot place partial edit for "
                             f"{edit.file_path}:{edit.chunk_id} — {new_span} "
@@ -1188,6 +1221,67 @@ class ChunkEditor:
                 edit.file_path, edit.chunk_id, best, runner_up)
             return None
         return line_no, line_no
+
+    @staticmethod
+    def _additive_insertion(
+        edit: ChunkEditResponse,
+        chunk: FileChunk,
+        original_lines: list[str] | None,
+    ) -> tuple[int, int] | None:
+        """Insertion point for a fragment that ADDS to *chunk*.
+
+        Returns an empty range ``(n+1, n)`` so the splice inserts at line
+        ``n+1`` without deleting anything, or None when the content is not
+        provably additive.
+
+        The test is names, not similarity: a fragment defining only
+        symbols the chunk does not already have can be appended safely.
+        The moment it redefines something, it is a REPLACEMENT of that
+        member — and appending would leave two definitions with the last
+        one silently winning, which is worse than the refusal it replaces.
+        """
+        if not original_lines:
+            return None
+        names = _defined_names(edit.new_content)
+        if not names:
+            # No definitions to reason about — could be anything, and
+            # appending arbitrary statements to a class body is a good way
+            # to corrupt it.
+            return None
+
+        # The fragment must be indented deeper than the chunk's own
+        # declaration, i.e. actually be a MEMBER of it. Content at the
+        # declaration's own level is a SIBLING that happens to carry this
+        # chunk's marker — appending `class Other:` to `class Map` would
+        # silently graft an unrelated class into the file.
+        decl = chunk.signature or ""
+        decl_indent = len(decl) - len(decl.lstrip()) if decl.strip() else 0
+        frag_indents = [len(l) - len(l.lstrip())
+                        for l in edit.new_content.splitlines() if l.strip()]
+        if not frag_indents or min(frag_indents) <= decl_indent:
+            logger.info(
+                "[ChunkEditor] Not additive for %s:%s — content sits at the "
+                "declaration's own indent, so it is a sibling, not a member",
+                edit.file_path, edit.chunk_id)
+            return None
+
+        end = min(chunk.line_end, len(original_lines))
+        body = "".join(original_lines[chunk.line_start - 1:end])
+        existing = set(_defined_names(body))
+        clashes = [n for n in names if n in existing]
+        if clashes:
+            logger.info(
+                "[ChunkEditor] Not additive for %s:%s — already defines %s",
+                edit.file_path, edit.chunk_id, ", ".join(sorted(clashes)))
+            return None
+
+        # Append after the chunk's last non-blank line, so the insertion
+        # lands inside the chunk rather than after any trailing blanks
+        # that belong to whatever follows it.
+        at = end
+        while at > chunk.line_start and not original_lines[at - 1].strip():
+            at -= 1
+        return at + 1, at
 
     @staticmethod
     def _python_const_chunks(
