@@ -122,5 +122,93 @@ class TestPartialEditPlacement(unittest.TestCase):
         compile(out, "config.py", "exec")
 
 
+CLASS_SRC = ("import os\n\n\nclass Map:\n"
+             + "".join(f"    def m{i}(self):\n        return {i}\n"
+                       for i in range(40))
+             + "\n\nclass Game:\n    pass\n")
+
+
+class TestWholeSymbolRewrite(unittest.TestCase):
+    """Shape decides whole-vs-partial, not size.
+
+    From a real run: the model rewrote a 179-line `class Map` as 101
+    correct lines. The size heuristic read "shorter" as "partial",
+    refused to place it, and the run halted — a correct fix discarded.
+    Models routinely shorten code when they fix it.
+    """
+
+    def _rewrite(self, methods):
+        body = "".join(f"    def m{i}(self):\n        return {i}\n"
+                       for i in range(methods))
+        return f"class Map:\n{body}"
+
+    def _apply(self, new_content, marker="game.py:Map (rewritten)"):
+        ce = ChunkEditor()
+        diag = (f"FIX:\n#### [EDIT]: {marker}\n```python\n{new_content}```\n")
+        edits = ce.parse_chunk_response(diag)
+        known = ce.chunk_file("game.py", CLASS_SRC)
+        return ce, ce.apply_chunk_edits(CLASS_SRC, edits, known_chunks=known)
+
+    def test_a_shorter_rewrite_replaces_the_whole_class(self):
+        ce, out = self._apply(self._rewrite(15))
+        self.assertFalse(ce.last_apply_rejected)
+        self.assertNotEqual(out, CLASS_SRC)
+        self.assertEqual(out.count("class Map:"), 1)
+        self.assertEqual(out.count("def m"), 15)
+        compile(out, "game.py", "exec")
+
+    def test_neighbouring_code_survives(self):
+        _, out = self._apply(self._rewrite(15))
+        self.assertIn("class Game:", out)
+        self.assertIn("import os", out)
+
+    def test_a_fragment_is_still_treated_as_partial(self):
+        """The guard must not be disarmed — a body-only snippet that does
+        NOT reopen the declaration stays on the partial path."""
+        ce = ChunkEditor()
+        diag = ("FIX:\n#### [EDIT]: game.py:Map (one method)\n"
+                "```python\n    def m7(self):\n        return 99\n```\n")
+        edits = ce.parse_chunk_response(diag)
+        known = ce.chunk_file("game.py", CLASS_SRC)
+        # Two lines, no declaration: the single-line aligner declines, so
+        # this raises rather than overwriting all 40 methods.
+        with self.assertRaises(ValueError):
+            ce.apply_chunk_edits(CLASS_SRC, edits, known_chunks=known)
+
+    def test_a_renamed_symbol_is_not_a_reopen(self):
+        """`class Other:` is not a rewrite of `class Map:`."""
+        ce = ChunkEditor()
+        diag = ("FIX:\n#### [EDIT]: game.py:Map (rewritten)\n```python\n"
+                "class Other:\n    def z(self):\n        return 1\n```\n")
+        edits = ce.parse_chunk_response(diag)
+        known = ce.chunk_file("game.py", CLASS_SRC)
+        with self.assertRaises(ValueError):
+            ce.apply_chunk_edits(CLASS_SRC, edits, known_chunks=known)
+
+    def test_a_signature_change_still_counts_as_a_reopen(self):
+        """Same symbol, different parameters, is still that symbol."""
+        src = "def f(a):\n" + "".join(f"    x{i} = {i}\n" for i in range(20))
+        ce = ChunkEditor()
+        diag = ("FIX:\n#### [EDIT]: m.py:f (fixed)\n```python\n"
+                "def f(a, b=2):\n    return a + b\n```\n")
+        edits = ce.parse_chunk_response(diag)
+        known = ce.chunk_file("m.py", src)
+        out = ce.apply_chunk_edits(src, edits, known_chunks=known)
+        self.assertIn("def f(a, b=2):", out)
+        self.assertEqual(out.count("def f("), 1)
+
+    def test_a_constant_reopen_is_recognised(self):
+        """`MAZE = [` replacing a `MAZE = [` chunk is a whole rewrite."""
+        src = "MAZE = [\n" + "".join(f"    [{i}],\n" for i in range(20)) + "]\n"
+        ce = ChunkEditor()
+        diag = ("FIX:\n#### [EDIT]: c.py:MAZE (rebuilt)\n```python\n"
+                "MAZE = [\n    [0],\n    [1],\n]\n```\n")
+        edits = ce.parse_chunk_response(diag)
+        known = ce.chunk_file("c.py", src)
+        out = ce.apply_chunk_edits(src, edits, known_chunks=known)
+        self.assertEqual(out.count("MAZE = ["), 1)
+        compile(out, "c.py", "exec")
+
+
 if __name__ == "__main__":
     unittest.main()

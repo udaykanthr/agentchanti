@@ -203,6 +203,39 @@ class ChunkEditResponse:
     insert_after: int = 0      # line number to insert after (for new chunks)
 
 
+def _reopens_declaration(new_content: str, chunk: FileChunk) -> bool:
+    """True when *new_content* restates the chunk's own declaration.
+
+    ``class Map:`` replacing a ``class Map:`` chunk is a whole-symbol
+    rewrite, even at a third of the original length — models shorten code
+    when they fix it. A fragment (one row of a maze literal, one entry of
+    a dict) never opens with the declaration, which is what makes this a
+    reliable discriminator where line count is not.
+    """
+    sig = (chunk.signature or "").strip().rstrip(":").rstrip()
+    if not sig:
+        return False
+    for line in new_content.strip().splitlines():
+        first = line.strip()
+        if not first:
+            continue
+        # Compare declaration heads: `def f(self, a=1)` vs `def f(self)`
+        # is still the same symbol being reopened.
+        head = first.rstrip(":").rstrip()
+        if head == sig:
+            return True
+        for kw in ("class ", "def ", "async def "):
+            if sig.startswith(kw) and head.startswith(kw):
+                name_a = sig[len(kw):].split("(")[0].strip()
+                name_b = head[len(kw):].split("(")[0].strip()
+                return bool(name_a) and name_a == name_b
+        # A module-level constant chunk: `MAZE = [` reopened as `MAZE = [`.
+        if "=" in sig and "=" in head:
+            return sig.split("=")[0].strip() == head.split("=")[0].strip()
+        return False
+    return False
+
+
 def _chunk_id_matches(chunk_id: str, edit_id: str) -> bool:
     """Check if a chunk_id matches an edit's chunk_id.
 
@@ -852,7 +885,17 @@ class ChunkEditor:
                     # with it would splice a single row over a 21-row
                     # constant: silent corruption, strictly worse than the
                     # silent no-op this branch used to produce.
-                    if chunk_span > 2 and new_span < chunk_span * 0.7:
+                    #
+                    # SHAPE decides that, not size. A rewrite that reopens
+                    # the chunk's own declaration is a whole-symbol
+                    # replacement however much shorter it is — a 101-line
+                    # `class Map:` replacing a 179-line one is a rewrite,
+                    # not a fragment, and treating it as partial rejected a
+                    # correct fix and halted the run. A genuine fragment
+                    # (one maze row) never opens with the declaration.
+                    if (chunk_span > 2 and new_span < chunk_span * 0.7
+                            and not _reopens_declaration(edit.new_content,
+                                                         chunk)):
                         sub = ChunkEditor._align_within_chunk(
                             edit, chunk, original_lines)
                         if sub:
