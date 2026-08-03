@@ -3942,7 +3942,86 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         return success, error_info
     return False, (
         f"Step acceptance command failed: `{cmd}`\n"
-        f"{(out or '(no output)')[-2000:]}")
+        f"{(out or '(no output)')[-2000:]}"
+        + _broken_export_promise(plan_step, memory, out or ""))
+
+
+def _broken_export_promise(plan_step, memory: FileMemory, out: str) -> str:
+    """Name the declared exports the written files do not define.
+
+    A plan step declares ``exports:`` and its ``verify:`` imports exactly
+    those names, so a coder that invents its own naming produces a gate
+    that CANNOT pass, however many times it is retried. Observed: the
+    step promised ``tile_to_pixel_center`` / ``is_at_tile_center``, the
+    file defined ``pixel_center_for_tile`` / ``is_aligned_to_tile_center``
+    — same behaviour, different words — and two diagnosis rounds went by
+    without either of them being told the contract was the problem.
+
+    Only fires on an import/attribute error naming a declared export, so
+    an unrelated gate failure is never mislabelled. Returns "" when there
+    is nothing solid to say.
+    """
+    declared = [s for s in (getattr(plan_step, "exports", None) or []) if s]
+    if not declared:
+        return ""
+    # The error must actually be about a name, not a logic failure.
+    named = set(re.findall(r"cannot import name '([^']+)'", out))
+    named |= set(re.findall(r"has no attribute '([^']+)'", out))
+    named |= set(re.findall(r"name '([^']+)' is not defined", out))
+    blocked = [s for s in declared if s in named]
+    if not blocked:
+        return ""
+
+    try:
+        from ..language_backend import get_backend
+        backend = get_backend(getattr(plan_step, "language", None) or "python")
+    except Exception:
+        return ""
+
+    defined: set[str] = set()
+    files = {}
+    try:
+        files = memory.as_dict() or {}
+    except Exception:
+        pass
+    for target in getattr(plan_step, "target_files", None) or []:
+        content = (files.get(target)
+                   or files.get(str(target).replace("\\", "/")))
+        if not content:
+            continue
+        try:
+            defined.update(backend.extract_exports(content) or [])
+        except Exception:
+            continue
+    # No evidence beats bad evidence: an extractor that saw nothing must
+    # not be read as "the file defines nothing".
+    if not defined:
+        return ""
+    if not any(s not in defined for s in blocked):
+        return ""
+    # Once ONE declared export is provably absent the contract is broken,
+    # so report every missing one. Python raises on the first bad name
+    # only, and fixing them one per round trip wastes a diagnosis attempt
+    # each time.
+    missing = [s for s in declared if s not in defined]
+
+    # Deliberately NOT guessing which existing name replaces which missing
+    # one: difflib matched `tile_to_pixel_center` to
+    # `is_aligned_to_tile_center` here, and a confident wrong hint would
+    # rename the wrong function. The two lists are facts; the mapping is
+    # the model's to make.
+    return (
+        "\n\nBROKEN EXPORT CONTRACT — this is why the command failed:\n"
+        "The step declared these exports and the acceptance command "
+        "imports them by those exact names, but the written file(s) do "
+        "not define them:\n"
+        + "".join(f"  missing: {s}\n" for s in missing)
+        + "\nThe file(s) currently define:\n"
+        + f"  {', '.join(sorted(defined)[:25])}\n"
+        + "\nThe declared names are the contract. Rename the matching "
+        "definitions to the declared names (do NOT change the acceptance "
+        "command, and do NOT rewrite working logic — a rename, or an "
+        "alias assignment, is usually the whole fix).")
 
 
 def _django_lint_gate(success: bool, error_info: str, memory: FileMemory,
