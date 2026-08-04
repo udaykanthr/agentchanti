@@ -282,9 +282,17 @@ class TestNoTestsCollected(AgentToolsTestCase):
         self.assertFalse(self._detect("python -m pytest", 0, "2 passed"))
 
     def test_the_hint_reaches_the_tool_result(self):
-        import os
+        # Deliberately does NOT assert the "exit: FAILED" prefix. Whether a
+        # zero-test run exits non-zero is CPython policy, not this hint's
+        # behaviour: unittest gained that exit status in 3.12, so on 3.10
+        # and 3.11 the same run reports "exit: success" and the assertion
+        # failed on four CI jobs while the hint itself was present and
+        # correct. The detector fires on the "Ran 0 tests" output marker,
+        # which every version prints, so the hint is what this test is
+        # named for and all this test should check. The FAILED prefix stays
+        # covered by test_a_real_failure_gets_no_hint_through_the_tool,
+        # which runs a genuinely failing assertion and so fails everywhere.
         result = self._call("run_command", command="python -m unittest -v")
-        self.assertIn("exit: FAILED", result)
         self.assertIn("COLLECTED NO TESTS", result)
         self.assertIn("test_*.py", result)
         self.assertIn("__init__.py", result)
