@@ -1886,6 +1886,23 @@ def _main_impl():
     set_status(display, "")
 
     # ── 16. Finish ──
+    _cached = token_tracker.total_cached_tokens
+    _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
+    if _cached > 0:
+        # Show gross vs. cached-net so the prompt-cache discount is
+        # visible: of the tokens sent, how many were cache hits (billed
+        # at a discount) vs. full-price.
+        _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
+        _sent_breakdown += (
+            f" [cached={_cached} ({_pct}%), "
+            f"full-price={token_tracker.full_price_prompt_tokens}]")
+    # Built before the branch: a FAILED run is the expensive one, and it
+    # used to report a bare total with no send/cache breakdown — exactly
+    # the number needed to tell a cheap failure from a runaway one.
+    _token_line = (f"Total tokens: {token_tracker.total_tokens} "
+                   f"({_sent_breakdown}, "
+                   f"recv={token_tracker.total_completion_tokens})")
+
     if pipeline_success:
         display.finish(success=True)
         clear_checkpoint(checkpoint_file)
@@ -1893,19 +1910,7 @@ def _main_impl():
         _als = _als_fn()
         if _als:
             log.info(_als)
-        _cached = token_tracker.total_cached_tokens
-        _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
-        if _cached > 0:
-            # Show gross vs. cached-net so the prompt-cache discount is
-            # visible: of the tokens sent, how many were cache hits (billed
-            # at a discount) vs. full-price.
-            _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
-            _sent_breakdown += (
-                f" [cached={_cached} ({_pct}%), "
-                f"full-price={token_tracker.full_price_prompt_tokens}]")
-        log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
-                 f"({_sent_breakdown}, "
-                 f"recv={token_tracker.total_completion_tokens})")
+        log.info(f"Finished. {_token_line}")
 
         # Generate HTML report
         if args.report and not args.no_report:
@@ -1945,7 +1950,7 @@ def _main_impl():
         _als_fail = _als_fail_fn()
         if _als_fail:
             log.info(_als_fail)
-        log.info(f"Pipeline failed. Total tokens: {token_tracker.total_tokens}")
+        log.info(f"Pipeline failed. {_token_line}")
 
         # Generate HTML report even on failure
         if args.report and not args.no_report:

@@ -6,6 +6,7 @@ from benchmarks.run_ab import (
     _build_config,
     parse_loop_stats,
     parse_pipeline_claim,
+    parse_token_breakdown,
     parse_total_tokens,
 )
 from benchmarks.tasks import TASKS
@@ -42,6 +43,48 @@ class TestParsers(unittest.TestCase):
     def test_loop_stats(self):
         self.assertIn("2 loop run(s)", parse_loop_stats(LOG_SUCCESS))
         self.assertIsNone(parse_loop_stats(LOG_FAILURE))
+
+
+class TestTokenBreakdown(unittest.TestCase):
+    """Totals hide what moves cost: cached input bills at a discount, so
+    full-price and completion are the comparable numbers across runs."""
+
+    # Real summary lines from a Pac-Man A/B pair.
+    OK = ("Finished. Total tokens: 229288 "
+          "(sent=174835 [cached=116224 (66%), full-price=58611], "
+          "recv=54453)")
+    FAILED = ("Pipeline failed. Total tokens: 65773 "
+              "(sent=36696 [cached=1792 (4%), full-price=34904], "
+              "recv=29077)")
+
+    def test_parses_success_line(self):
+        self.assertEqual(parse_token_breakdown(self.OK), {
+            "sent": 174835, "cached": 116224, "cached_pct": 66,
+            "full_price": 58611, "recv": 54453})
+
+    def test_parses_failure_line(self):
+        """The failure path reports the same breakdown — a failed run is
+        the expensive one, so it must not degrade to a bare total."""
+        self.assertEqual(parse_token_breakdown(self.FAILED), {
+            "sent": 36696, "cached": 1792, "cached_pct": 4,
+            "full_price": 34904, "recv": 29077})
+
+    def test_no_cache_detail_means_nothing_was_cached(self):
+        got = parse_token_breakdown(
+            "Finished. Total tokens: 900 (sent=600, recv=300)")
+        self.assertEqual(got["cached"], 0)
+        self.assertEqual(got["full_price"], 600)
+        self.assertEqual(got["recv"], 300)
+
+    def test_absent_line_yields_nones(self):
+        got = parse_token_breakdown("nothing to see here")
+        self.assertIsNone(got["sent"])
+        self.assertIsNone(got["recv"])
+        self.assertIsNone(got["cached_pct"])
+
+    def test_last_run_wins(self):
+        got = parse_token_breakdown(self.FAILED + "\n" + self.OK)
+        self.assertEqual(got["sent"], 174835)
 
 
 class TestBuildConfig(unittest.TestCase):

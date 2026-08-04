@@ -45,13 +45,51 @@ _LOOP_STATS_RE = re.compile(r"\[AgentLoop\] session: (.+)")
 _FAILED_RE = re.compile(r"Pipeline failed")
 _FINISHED_RE = re.compile(r"Finished\. Total tokens")
 
+# The final summary line, emitted on BOTH the success and failure paths:
+#   Total tokens: N (sent=S [cached=C (P%), full-price=F], recv=R)
+# The bracketed cache detail is absent when nothing was cached, so it is
+# optional here and `cached` reports 0 rather than None in that case.
+_SENT_RE = re.compile(r"Total tokens:\s*[\d,]+\s*\(sent=([\d,]+)")
+_CACHED_RE = re.compile(r"cached=([\d,]+)\s*\(\d+%\)")
+_FULL_PRICE_RE = re.compile(r"full-price=([\d,]+)")
+_RECV_RE = re.compile(r"recv=([\d,]+)")
 
-def parse_total_tokens(log_text: str) -> int | None:
-    """Last 'Total tokens: N' in the log (final summary line)."""
-    matches = _TOKENS_RE.findall(log_text)
+
+def _last_int(pattern: re.Pattern, log_text: str) -> int | None:
+    matches = pattern.findall(log_text)
     if not matches:
         return None
     return int(matches[-1].replace(",", ""))
+
+
+def parse_total_tokens(log_text: str) -> int | None:
+    """Last 'Total tokens: N' in the log (final summary line)."""
+    return _last_int(_TOKENS_RE, log_text)
+
+
+def parse_token_breakdown(log_text: str) -> dict:
+    """Sent / cached / full-price / received split from the summary line.
+
+    Totals alone hide the thing that actually moves cost: a run can send
+    far more tokens than another and still be cheaper if the prompt cache
+    absorbed them. Cached tokens bill at a discount, so `full_price` is
+    the number to compare across runs, and `recv` (completion) is billed
+    highest of all — a reasoning burn shows up there and nowhere else.
+    """
+    sent = _last_int(_SENT_RE, log_text)
+    cached = _last_int(_CACHED_RE, log_text)
+    full_price = _last_int(_FULL_PRICE_RE, log_text)
+    if sent is not None and cached is None:
+        # No bracketed detail => the run had no cache hits at all.
+        cached, full_price = 0, sent
+    pct = (cached * 100 // sent) if sent else None
+    return {
+        "sent": sent,
+        "cached": cached,
+        "cached_pct": pct,
+        "full_price": full_price,
+        "recv": _last_int(_RECV_RE, log_text),
+    }
 
 
 def parse_pipeline_claim(log_text: str) -> bool | None:
@@ -281,6 +319,7 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
         "ground_truth": ground_truth,
         "pipeline_claim": parse_pipeline_claim(log_text),
         "tokens": parse_total_tokens(log_text),
+        **parse_token_breakdown(log_text),
         "wall_s": wall_s,
         "timed_out": timed_out,
         "returncode": returncode,
@@ -297,21 +336,31 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
     return result
 
 
+def _fmt(n) -> str:
+    return f"{n:,}" if isinstance(n, int) else "-"
+
+
 def print_table(results: list[dict]) -> None:
     hdr = (f"{'task':<20} {'loop':<5} {'plan':<9} {'truth':<6} {'claim':<6} "
-           f"{'tokens':>8} {'time_s':>7}  loop_stats")
+           f"{'total':>9} {'sent':>9} {'cached':>9} {'cch%':>5} "
+           f"{'fullpr':>9} {'recv':>8} {'time_s':>7}  loop_stats")
     print("\n" + hdr)
     print("-" * len(hdr))
     for r in results:
         plan = r.get("plan_mode") or "-"
         if plan == "(config default)":
             plan = "-"
+        pct = r.get("cached_pct")
         print(f"{r['task']:<20} {'on' if r['agent_loop'] else 'off':<5} "
               f"{plan:<9} "
               f"{'PASS' if r['ground_truth'] else 'FAIL':<6} "
               f"{str(r['pipeline_claim']):<6} "
-              f"{str(r['tokens'] or '-'):>8} {r['wall_s']:>7}  "
-              f"{(r['loop_stats'] or '-')[:60]}")
+              f"{_fmt(r['tokens']):>9} {_fmt(r.get('sent')):>9} "
+              f"{_fmt(r.get('cached')):>9} "
+              f"{(f'{pct}%' if isinstance(pct, int) else '-'):>5} "
+              f"{_fmt(r.get('full_price')):>9} {_fmt(r.get('recv')):>8} "
+              f"{r['wall_s']:>7}  "
+              f"{(r['loop_stats'] or '-')[:40]}")
 
 
 def main() -> None:
