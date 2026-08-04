@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentchanti"
-version = "0.5.1"
+version = "0.6.0"
 description = "A multi-agent AI coding system with built-in RAG — local or cloud, CLI or API."
 readme = "README.md"
 requires-python = ">=3.10"
