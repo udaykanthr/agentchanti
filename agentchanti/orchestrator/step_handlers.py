@@ -4524,6 +4524,35 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
 
         if memory.summary() != "(no files yet)":
             context += f"\nAll project files: {memory.summary()}"
+
+        # Show the coder the command this step will be GRADED by.
+        #
+        # _gate_on_declared_verify runs plan_step.verify_cmd as the
+        # pass/fail gate right after this call, but nothing was telling the
+        # coder what it says — so the step was judged against a contract it
+        # never saw. That gate is usually an exact API specification
+        # (`p=Player(m); p.pixel_pos(); p.set_direction((1,0))`), and a
+        # coder that has not read it invents a different signature and
+        # fails. Observed on a Pac-Man run: the coder wrote
+        # `Player(spawn_tile, game_map)` with no pixel_pos(), and three
+        # diagnosis rounds were spent reverse-engineering the contract
+        # out of error messages before the step halted.
+        #
+        # Cheap in tokens (one line) and it removes whole diagnosis rounds,
+        # so it pays for itself many times over.
+        try:
+            _gate_cmd = _declared_verify_cmd(plan_step, memory, task=task)
+        except Exception:
+            _gate_cmd = None
+        if _gate_cmd:
+            context += (
+                f"\n\nACCEPTANCE CHECK — this step is judged by running:\n"
+                f"    {_gate_cmd}\n"
+                "Your code MUST satisfy it exactly: the names, call "
+                "signatures and return types it uses are the required API, "
+                "not suggestions. Match them even if you would have chosen "
+                "differently.")
+
         if feedback:
             context += f"\nFeedback: {feedback}"
             # On retry, tell the coder to ONLY fix the flagged issues
@@ -6559,15 +6588,15 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                         for _fp, _fc in fix_files.items():
                             _ext = os.path.splitext(_fp)[1].lower()
                             if _ext in ('.py', '.pyw'):
-                                try:
-                                    ast.parse(_fc, filename=_fp)
-                                    _syntax_ok[_fp] = _fc
-                                except SyntaxError as _se:
+                                from ..py_syntax import check_python_syntax
+                                _se = check_python_syntax(_fc, _fp)
+                                if _se:
                                     log.warning(
                                         "Step %d: Syntax error in fix for "
-                                        "%s: %s (line %s) — skipping",
-                                        step_idx + 1, _fp,
-                                        _se.msg, _se.lineno)
+                                        "%s: %s — skipping",
+                                        step_idx + 1, _fp, _se)
+                                else:
+                                    _syntax_ok[_fp] = _fc
                             else:
                                 _syntax_ok[_fp] = _fc
                         fix_files = _syntax_ok

@@ -26,7 +26,19 @@ from .error_router import classify_error
 _logger = logging.getLogger(__name__)
 
 
-MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
+# Outer retries: diagnose failure → fix → re-run step.
+#
+# Raised from 2 once attempts stopped discarding each other's work (see the
+# progress check in _run_diagnosis_loop). While every attempt began by
+# restoring the pre-diagnosis snapshot, a third was near-worthless — each
+# one could only ever land a single fix. Now that a fix which moves the
+# error on is KEPT, attempts compound, and a gate built from a chain of
+# asserts needs about one attempt per condition it checks.
+#
+# Attempts that change nothing still revert and still burn budget, so this
+# stays small: the cost of a wrong step is bounded by this number times one
+# diagnosis round trip.
+MAX_DIAGNOSIS_RETRIES = 3
 
 
 _RESOLVE_SKIP_DIRS = frozenset({
@@ -170,12 +182,9 @@ def _syntax_gate(path: str, content: str) -> str | None:
     import os
     ext = os.path.splitext(path)[1].lower()
     if ext in (".py", ".pyw"):
-        import ast
-        try:
-            ast.parse(content)
-        except SyntaxError as exc:
-            return f"python syntax error: {exc}"
-        return None
+        from ..py_syntax import check_python_syntax
+        err = check_python_syntax(content, path)
+        return f"python syntax error: {err}" if err else None
     if ext == ".json":
         # tsconfig*.json is JSONC (comments/trailing commas allowed) —
         # strict parsing would reject legitimate content.
@@ -3011,15 +3020,44 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
     # if a fix attempt corrupts source code (compounding failures).
     _diag_snapshot = memory.snapshot()
 
+    # Error the loop is currently working against, used to tell a fix that
+    # ADVANCED the step from one that achieved nothing.
+    _prev_error_sig = _error_signature(error_info)
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
             # Restore snapshot at the start of each attempt so that a
-            # bad fix from the previous attempt doesn't compound.
+            # bad fix from the previous attempt doesn't compound —
+            # but ONLY when that attempt achieved nothing.
+            #
+            # A gate is usually a chain of asserts, so each fix uncovers
+            # the next failing condition. Restoring unconditionally threw
+            # away every good fix: observed on a Pac-Man run where attempt
+            # 1 correctly fixed `Map.is_walkable`'s arity, attempt 2
+            # reverted it and fixed the *next* error instead, and the step
+            # halted having never held both fixes at once. Worse, the
+            # revert left the file in state A while error_info still
+            # described state B, so the second diagnosis reasoned from a
+            # premise that no longer matched the disk.
+            #
+            # A CHANGED error means the previous fix moved the step
+            # forward — keep it and build on it. An unchanged error means
+            # the fix did nothing, so revert it before trying again.
             if diag_attempt > 1:
-                memory.restore(_diag_snapshot, executor=executor)
-                log.info(
-                    "Task %d: Restored file snapshot before diagnosis "
-                    "attempt %d", step_idx + 1, diag_attempt)
+                _cur_sig = _error_signature(error_info)
+                if _cur_sig != _prev_error_sig:
+                    _diag_snapshot = memory.snapshot()
+                    log.info(
+                        "Task %d: diagnosis attempt %d moved the error on — "
+                        "keeping the fix and building on it",
+                        step_idx + 1, diag_attempt - 1)
+                else:
+                    memory.restore(_diag_snapshot, executor=executor)
+                    log.info(
+                        "Task %d: Restored file snapshot before diagnosis "
+                        "attempt %d (previous fix changed nothing)",
+                        step_idx + 1, diag_attempt)
+                _prev_error_sig = _cur_sig
 
             display.step_info(
                 step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")

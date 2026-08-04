@@ -332,12 +332,15 @@ class AgentTools:
         updated = content.replace(old_text, new_text, 1)
 
         # Syntax-validate Python edits before committing them to disk.
+        # compile(), not ast.parse: the latter accepts a `from __future__
+        # import ...` that is no longer at the top of the file, which the
+        # interpreter rejects outright.
         if full.endswith(".py"):
-            try:
-                ast.parse(updated)
-            except SyntaxError as e:
+            from .py_syntax import check_python_syntax
+            err = check_python_syntax(updated, full)
+            if err:
                 return (f"ERROR: edit rejected — resulting Python has a "
-                        f"syntax error at line {e.lineno}: {e.msg}")
+                        f"syntax error: {err}")
         # Same for JSON: a structurally broken package.json breaks every
         # subsequent npm/node invocation with a confusing downstream error.
         # tsconfig*.json is JSONC (comments/trailing commas allowed) — skip.

@@ -549,6 +549,33 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             f"CSS files to review and fix: {', '.join(_diag_css_injected)}\n\n"
         )
 
+    # ── Scope constraint ────────────────────────────────────────────────
+    # The scope guard silently discards a fix written to a file outside the
+    # step's scope, and nothing told the model what that scope was — so it
+    # invents a plausible-but-wrong module name and every attempt repeats
+    # the mistake. Observed on a Pac-Man run: three diagnosis attempts in a
+    # row wrote `maze.py` while the step owned `map.py`, all three were
+    # filtered ("Scope guard filtered 1/1"), and the pipeline halted having
+    # never applied a single fix. Listing the real files up front is a few
+    # tokens and removes the whole failure mode.
+    try:
+        _scope_files = sorted({
+            *(p for p in (_diag_targets or [])
+              if p and "." in os.path.basename(p) and " " not in p),
+            *memory.all_files(),
+        })
+    except Exception:
+        _scope_files = []
+    if _scope_files:
+        prompt += (
+            "\nFILES YOU MAY MODIFY (these already exist — use these exact "
+            "paths):\n"
+            + "\n".join(f"  - {p}" for p in _scope_files[:40])
+            + "\nDo NOT invent a new filename and do NOT rename a module. A "
+              "fix written to any other path is rejected outright and the "
+              "whole diagnosis is wasted.\n\n"
+        )
+
     # ── Enhancement #3: extract file paths from error output ──────
     # Parse file paths mentioned in the error (e.g. tracebacks, lint output)
     # and inject matching full source files from memory so the LLM sees the
@@ -752,11 +779,11 @@ def _check_syntax(filepath: str, content: str) -> str | None:
     ext = os.path.splitext(filepath)[1].lower()
     if ext not in ('.py', '.pyw'):
         return None
-    try:
-        ast.parse(content, filename=filepath)
-        return None
-    except SyntaxError as exc:
-        return f"{exc.msg} (line {exc.lineno})"
+    # compile(), not ast.parse — see agentchanti.py_syntax. A diagnosis fix
+    # that restates a module header leaves a mid-file `from __future__`
+    # import, which ast.parse accepts and the interpreter rejects.
+    from ..py_syntax import check_python_syntax
+    return check_python_syntax(content, filepath)
 
 
 def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
@@ -798,8 +825,13 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
 
     # ── Preferred: parse [EDIT]: chunk markers (surgical, avoids unintended changes) ──
     files: dict[str, str] = {}
+    # Files whose fix came from a chunk edit scoped to a NAMED symbol. Such
+    # an edit is surgical by construction, so the diff-size guard below
+    # must not reject it purely on how many lines it moved.
+    _chunk_scoped_paths: set[str] = set()
     try:
-        from ..editing.chunk_editor import ChunkEditor as _CE
+        from ..editing.chunk_editor import (ChunkEditor as _CE,
+                                            DESCRIPTIVE_CHUNK_ID)
         _ce = _CE()
         _chunk_edits = _ce.parse_chunk_response(diagnosis)
         if _chunk_edits:
@@ -838,6 +870,20 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                                 "full-file parsing", step_idx + 1, _fpath)
                         else:
                             files[_fpath] = _spliced
+                            # A chunk edit that resolved to a NAMED symbol
+                            # is scoped to that symbol by construction, so
+                            # it cannot be the runaway full-file rewrite
+                            # the diff-size guard exists to catch. Record
+                            # it so that guard does not reject it on line
+                            # count alone: rewriting one 80-line method in
+                            # a 180-line file legitimately changes 44% of
+                            # the lines, and that was enough to throw away
+                            # a correctly targeted fix (observed on
+                            # src/player.py:Player.update).
+                            if any(e.chunk_id and e.chunk_id not in
+                                   ("top_level", DESCRIPTIVE_CHUNK_ID, "new")
+                                   for e in _file_edits):
+                                _chunk_scoped_paths.add(_fpath)
                     except Exception as _exc:
                         log.warning(
                             "Step %d: ChunkEdit apply failed for %s: %s",
@@ -948,6 +994,18 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                 files = {p: c for p, c in files.items()
                          if p not in _py_fixes}
 
+    # Files rebuilt by the symbol merge in the structural guard below.
+    # They are exempt from the diff-size guard after it: that guard is a
+    # proxy for "did the model rewrite the whole component instead of
+    # fixing it", and the merge answers that question directly and far
+    # more strictly — every original definition is provably still present
+    # and the result compiles. Without the exemption the merge is
+    # pointless: the merged file legitimately changes most of its lines
+    # (observed: 66%, threshold 40%) and was rejected immediately after
+    # being built. Declared out here so the two guards cannot fall out of
+    # scope with each other.
+    _merged_paths: set[str] = set()
+
     if files:
         # ── Structural preservation guard ──
         # Reject diagnosis edits that delete too many functions/classes
@@ -980,6 +1038,28 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                 _lost_ratio = len(_lost) / len(_orig_defs)
                 if _lost_ratio > 0.5:
                     _lost_names = [d.strip() for d in sorted(_lost)][:5]
+                    # A body that drops most of the file is a set of
+                    # rewritten definitions mislabelled as a whole file,
+                    # not an instruction to delete the rest. Merge it by
+                    # symbol instead of throwing the fix away — dropping
+                    # it leaves the step with nothing and halts the run
+                    # (observed twice: "would delete 25/30 definitions").
+                    from ..editing.symbol_merge import merge_module_symbols
+                    _merged = merge_module_symbols(_orig, _new_content)
+                    if _merged is not None:
+                        log.info(
+                            "Step %d: Fix for %s rewrote %d definition(s) "
+                            "but omitted %d — merged by symbol instead of "
+                            "rejecting it",
+                            step_idx + 1, _fp,
+                            len(_new_defs), len(_lost))
+                        display.step_info(
+                            step_idx,
+                            f"Merged partial fix for "
+                            f"{os.path.basename(_fp)} by symbol")
+                        _struct_ok[_fp] = _merged
+                        _merged_paths.add(_fp)
+                        continue
                     log.warning(
                         "Step %d: Structural guard rejected fix for %s — "
                         "would delete %d/%d definitions: %s",
@@ -1010,7 +1090,14 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
         for _fp, _new_content in files.items():
             _is_test = any(seg in _fp for seg in (
                 '__tests__', '/tests/', '/test/', '.test.', '.spec.', 'test_'))
-            if _is_test:
+            if _is_test or _fp in _merged_paths or _fp in _chunk_scoped_paths:
+                # Merged files already passed the structural check this
+                # guard only approximates — see _merged_paths above.
+                # Symbol-scoped chunk edits are surgical by construction:
+                # rewriting one 80-line method in a 180-line file changes
+                # 44% of the lines and is exactly the targeted fix this
+                # guard is meant to allow, not the full rewrite it is
+                # meant to block.
                 _diff_ok[_fp] = _new_content
                 continue
             _orig = memory.get(_fp)
