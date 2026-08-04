@@ -22,10 +22,26 @@ import re
 from collections import Counter
 from threading import Lock
 
-from ..agent_tools import AgentTools, _truncate
+from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
 from ..llm.chat_types import Message, ToolCall
 
 _logger = logging.getLogger(__name__)
+
+
+def verify_passed(result: str) -> bool:
+    """True when a verify command actually proved something.
+
+    ``exit: success`` alone is not proof. A test runner that collected
+    NOTHING exits 0 on CPython below 3.12 (unittest only gained a non-zero
+    status for a zero-test run in 3.12), so a step whose discovery quietly
+    broke would satisfy its own gate having executed no tests at all —
+    the exact false-green this project's verification layers exist to
+    prevent, arrived at through the gate rather than around it.
+
+    ``AgentTools.run_command`` already labels that case; the gate just has
+    to stop ignoring the label.
+    """
+    return result.startswith("exit: success") and NO_TESTS_MARKER not in result
 
 
 def truncate_middle(text: str, limit: int) -> str:
@@ -778,7 +794,7 @@ def run_agent_loop(
             if display is not None:
                 display.step_info(step_idx, f"Verifying: {verify_cmd}")
             result = _run_verify()
-            if result.startswith("exit: success"):
+            if verify_passed(result):
                 _logger.info("[AgentLoop] step %d verified in %d turn(s)",
                              step_idx + 1, turn)
                 return _finish("verified", turn, (True, summary))
@@ -793,12 +809,24 @@ def run_agent_loop(
                 return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
                     f"{truncate_middle(result, 1000)}")))
-            _logger.info("[AgentLoop] step %d: verification failed on "
-                         "turn %d — feeding back", step_idx + 1, turn)
+            # A zero-test run may have exited 0, so "failed" would be a
+            # confusing thing to tell the model — name the real problem.
+            _no_tests = NO_TESTS_MARKER in result
+            _logger.info(
+                "[AgentLoop] step %d: %s on turn %d — feeding back",
+                step_idx + 1,
+                "verify collected no tests" if _no_tests
+                else "verification failed", turn)
             messages.append(response.to_message())
             messages.append(Message(role="user", content=(
-                f"Verification command failed:\n{verify_cmd}\n\n{result}\n\n"
-                "The step is not complete. Fix the problem and verify again.")))
+                (f"Verification command COLLECTED NO TESTS:\n{verify_cmd}\n\n"
+                 f"{result}\n\nIt may have exited 0, but nothing ran, so it "
+                 "proves nothing. Make the tests discoverable and verify "
+                 "again."
+                 ) if _no_tests else
+                (f"Verification command failed:\n{verify_cmd}\n\n{result}\n\n"
+                 "The step is not complete. Fix the problem and verify "
+                 "again."))))
             continue
 
         _logger.info("[AgentLoop] step %d finished in %d turn(s)",
@@ -810,7 +838,7 @@ def run_agent_loop(
     # deterministic check have the last word.
     if verify_cmd and any_tool_used:
         result = _run_verify()
-        if result.startswith("exit: success"):
+        if verify_passed(result):
             _logger.info("[AgentLoop] step %d: turns exhausted but "
                          "verification passes — accepting", step_idx + 1)
             return _finish("exhausted-verified", max_turns, (True, (

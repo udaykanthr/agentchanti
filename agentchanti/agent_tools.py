@@ -69,8 +69,12 @@ def _no_tests_collected(command: str, exit_code, output: str) -> bool:
     return any(m in low_out for m in _NO_TESTS_OUTPUT_MARKERS)
 
 
+# Sentinel the agent loop's exit gate greps for: a verify command that
+# collected nothing has proved nothing, whatever it exited with.
+NO_TESTS_MARKER = "COLLECTED NO TESTS"
+
 _NO_TESTS_HINT = (
-    "\n\nNOTE: the runner exited having COLLECTED NO TESTS. This is a "
+    f"\n\nNOTE: the runner exited having {NO_TESTS_MARKER}. This is a "
     "discovery problem, not a failing assertion — nothing was executed, so "
     "there is no bug in the code under test to chase here, and a zero exit "
     "status above is NOT evidence that anything passed. Check that the "

@@ -308,7 +308,21 @@ def entity_in_wall(entity, game):
     row_first = _takes_row_first(raw)
 
     def query(col, row):
-        v = raw(row, col) if row_first else raw(col, row)
+        a, b = (row, col) if row_first else (col, row)
+        try:
+            v = raw(a, b)
+        except TypeError:
+            # Some generated maps take a single (x, y) tuple rather than
+            # two positional args. Refusing to try it made this verifier
+            # report VERDICT: FAIL on a game that drives perfectly well —
+            # a vocabulary mismatch recorded as a defect, which is exactly
+            # what the exit-2 "cannot verify" path exists to prevent.
+            try:
+                v = raw((a, b))
+            except TypeError:
+                raise SystemExit(
+                    "wall query accepts neither (x, y) nor ((x, y)) — "
+                    "refusing to guess")
         return (not v) if invert else v
 
     def as_pixels(col, row):

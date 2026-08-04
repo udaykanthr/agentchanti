@@ -3933,6 +3933,21 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         return success, error_info
     display.step_info(step_idx, f"Step gate: {cmd}")
     ok, out = executor.run_command(cmd, timeout=300)
+    # A gate that collected NOTHING has proved nothing, whatever it exited
+    # with. unittest only gained a non-zero status for a zero-test run in
+    # CPython 3.12, so below that a step whose discovery quietly broke
+    # passes its own acceptance command having executed no tests. Same
+    # defect the agent loop's gate had; fixed on both paths so the two
+    # cannot disagree about what "verified" means.
+    from ..agent_tools import _no_tests_collected
+    if ok and _no_tests_collected(
+            cmd, getattr(executor, "last_exit_code", None), out or ""):
+        display.step_info(step_idx, "Step gate collected no tests ✖")
+        return False, (
+            f"Step acceptance command COLLECTED NO TESTS: `{cmd}`\n"
+            f"{(out or '(no output)')[-2000:]}\n"
+            "It may have exited 0, but nothing ran, so it proves nothing. "
+            "Make the tests discoverable.")
     if ok:
         display.step_info(step_idx, "Step gate passed ✔")
         # Stash the exact command that passed so _record_passed_gate logs
