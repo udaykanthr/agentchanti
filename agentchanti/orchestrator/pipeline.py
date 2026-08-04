@@ -26,7 +26,19 @@ from .error_router import classify_error
 _logger = logging.getLogger(__name__)
 
 
-MAX_DIAGNOSIS_RETRIES = 2   # outer retries: diagnose failure → fix → re-run step
+# Outer retries: diagnose failure → fix → re-run step.
+#
+# Raised from 2 once attempts stopped discarding each other's work (see the
+# progress check in _run_diagnosis_loop). While every attempt began by
+# restoring the pre-diagnosis snapshot, a third was near-worthless — each
+# one could only ever land a single fix. Now that a fix which moves the
+# error on is KEPT, attempts compound, and a gate built from a chain of
+# asserts needs about one attempt per condition it checks.
+#
+# Attempts that change nothing still revert and still burn budget, so this
+# stays small: the cost of a wrong step is bounded by this number times one
+# diagnosis round trip.
+MAX_DIAGNOSIS_RETRIES = 3
 
 
 _RESOLVE_SKIP_DIRS = frozenset({
@@ -170,12 +182,9 @@ def _syntax_gate(path: str, content: str) -> str | None:
     import os
     ext = os.path.splitext(path)[1].lower()
     if ext in (".py", ".pyw"):
-        import ast
-        try:
-            ast.parse(content)
-        except SyntaxError as exc:
-            return f"python syntax error: {exc}"
-        return None
+        from ..py_syntax import check_python_syntax
+        err = check_python_syntax(content, path)
+        return f"python syntax error: {err}" if err else None
     if ext == ".json":
         # tsconfig*.json is JSONC (comments/trailing commas allowed) —
         # strict parsing would reject legitimate content.
@@ -2927,24 +2936,27 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             return False
         display.step_info(step_idx, "Agent loop: recovering from failure")
         _rec_step_type = display.steps[step_idx].get("type", "CODE")
-        _rec_verify = None
-        if _rec_step_type == "TEST":
+        # The plan-declared gate wins, for every step type. Recovery runs
+        # AFTER the main loop failed its gate, so a recovery held to a
+        # weaker gate does not recover the step — it redefines success.
+        # Observed: a TEST step declaring `python -m unittest -v` (the
+        # task's own stated acceptance criterion) failed, recovery was
+        # handed the language default instead, pip-installed pytest, went
+        # green on `python -m pytest -q`, and the ledger recorded the
+        # SUBSTITUTE. `unittest` was never checked again and the run
+        # reported Finished. CODE steps used to recover with no gate at
+        # all, resting entirely on the model's own summary — an honest
+        # "the verification is still failing" that happened not to end
+        # with the RECOVERY: blocked marker counted as success.
+        from .step_handlers import _declared_verify_cmd
+        _rec_verify = _declared_verify_cmd(plan_step, memory, task=task)
+        if _rec_verify is None and _rec_step_type == "TEST":
+            # No declared gate: fall back to the language-level default so
+            # a TEST recovery is still held to something deterministic.
             _rec_sub = _detect_subproject_root(memory)
             _rec_verify = verify_cmd_for_language(language, _rec_sub or ".")
             if _rec_verify and _rec_sub:
                 _rec_verify = f"cd {_rec_sub} && {_rec_verify}"
-        if _rec_verify is None:
-            # CODE steps used to recover with NO gate at all, so the exit
-            # rested entirely on the model's own summary — and an honest
-            # "the verification is still failing" that happens not to end
-            # with the RECOVERY: blocked marker counted as success. Observed:
-            # a ghost step whose declared gate asserted the ghost moves was
-            # marked recovered while the ghost stayed stationary, its gate
-            # was never recorded, and the run reported Finished over a game
-            # whose ghosts never move. The plan already declares the gate;
-            # hold recovery to it.
-            from .step_handlers import _declared_verify_cmd
-            _rec_verify = _declared_verify_cmd(plan_step, memory, task=task)
         _rec_tools = build_step_tools(
             executor, memory, kb_context_builder=kb_context_builder)
         try:
@@ -3008,15 +3020,44 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
     # if a fix attempt corrupts source code (compounding failures).
     _diag_snapshot = memory.snapshot()
 
+    # Error the loop is currently working against, used to tell a fix that
+    # ADVANCED the step from one that achieved nothing.
+    _prev_error_sig = _error_signature(error_info)
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
             # Restore snapshot at the start of each attempt so that a
-            # bad fix from the previous attempt doesn't compound.
+            # bad fix from the previous attempt doesn't compound —
+            # but ONLY when that attempt achieved nothing.
+            #
+            # A gate is usually a chain of asserts, so each fix uncovers
+            # the next failing condition. Restoring unconditionally threw
+            # away every good fix: observed on a Pac-Man run where attempt
+            # 1 correctly fixed `Map.is_walkable`'s arity, attempt 2
+            # reverted it and fixed the *next* error instead, and the step
+            # halted having never held both fixes at once. Worse, the
+            # revert left the file in state A while error_info still
+            # described state B, so the second diagnosis reasoned from a
+            # premise that no longer matched the disk.
+            #
+            # A CHANGED error means the previous fix moved the step
+            # forward — keep it and build on it. An unchanged error means
+            # the fix did nothing, so revert it before trying again.
             if diag_attempt > 1:
-                memory.restore(_diag_snapshot, executor=executor)
-                log.info(
-                    "Task %d: Restored file snapshot before diagnosis "
-                    "attempt %d", step_idx + 1, diag_attempt)
+                _cur_sig = _error_signature(error_info)
+                if _cur_sig != _prev_error_sig:
+                    _diag_snapshot = memory.snapshot()
+                    log.info(
+                        "Task %d: diagnosis attempt %d moved the error on — "
+                        "keeping the fix and building on it",
+                        step_idx + 1, diag_attempt - 1)
+                else:
+                    memory.restore(_diag_snapshot, executor=executor)
+                    log.info(
+                        "Task %d: Restored file snapshot before diagnosis "
+                        "attempt %d (previous fix changed nothing)",
+                        step_idx + 1, diag_attempt)
+                _prev_error_sig = _cur_sig
 
             display.step_info(
                 step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")
@@ -4258,12 +4299,33 @@ def run_bulk_test_execution_and_fix(
     # resolves under `unittest discover -s src` but not `pytest` from the
     # repo root). Run the declared command first; only fall back to the
     # framework runner if it genuinely does not pass.
+    from .wave_snapshots import is_abnormal_exit
     _declared_suite = _plan_declared_suite_cmd(all_plan_steps, test_files)
     if _declared_suite and _declared_suite != " ".join(base_cmd.split()):
         _logger.info("[BulkTest] Running plan-declared suite gate first: %s",
                      _declared_suite)
         _pf_ok, _pf_out = executor.run_command(
             _declared_suite, cwd=subproject_cwd)
+        if not _pf_ok and is_abnormal_exit(
+                getattr(executor, "last_exit_code", None)):
+            # The process died rather than reporting failures — on Windows
+            # a pygame suite fast-fails (0xC0000409) or access-violates
+            # (0xC0000005) roughly one invocation in three. Believing that
+            # demotes the plan's declared gate to the framework default,
+            # which is a different command with different import roots;
+            # observed flipping a suite that had just passed four times
+            # into two failures. Retry once, exactly as the gate ledger
+            # does, before falling back.
+            from .wave_snapshots import (describe_abnormal_exit,
+                                         log_crash_diagnostics)
+            _code = getattr(executor, "last_exit_code", None)
+            _logger.warning(
+                "[BulkTest] Plan-declared gate terminated abnormally "
+                "(%s) — retrying once before believing it: %s",
+                describe_abnormal_exit(_code) or _code, _declared_suite)
+            log_crash_diagnostics(_code, _declared_suite)
+            _pf_ok, _pf_out = executor.run_command(
+                _declared_suite, cwd=subproject_cwd)
         if _pf_ok:
             _logger.info("[BulkTest] Suite passed via plan-declared gate — "
                          "skipping framework re-run.")
@@ -5880,15 +5942,15 @@ def run_wiring_verification(
 
     ver_line = ""
     try:
-        from .api_grounding import get_installed_package_versions
+        from .api_grounding import (get_installed_package_versions,
+                                    grounding_packages)
         _versions = get_installed_package_versions(
             cwd=project_root or None, executor=executor, language=language)
-        _pkgs = [f"{n}=={v}" for n, v in sorted(_versions.items())
-                 if n not in ("pip", "setuptools", "wheel")]
+        _pkgs = grounding_packages(_versions, memory)
         if _pkgs:
             ver_line = (
                 "Installed packages — any fix must only use APIs that exist "
-                "in these EXACT versions: " + ", ".join(_pkgs[:40]) + "\n\n"
+                "in these EXACT versions: " + ", ".join(_pkgs) + "\n\n"
             )
     except Exception:
         pass

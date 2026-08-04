@@ -142,5 +142,110 @@ class TestExecutionClearsPlannerStatus(unittest.TestCase):
         )
 
 
+class TestSetStatusHelper(unittest.TestCase):
+    """``set_status`` must never be the thing that fails a run."""
+
+    def test_sets_message_on_a_real_display(self):
+        from agentchanti.cli_display import set_status
+        d = _make_headless_display()
+        set_status(d, "Running the full test suite...")
+        self.assertEqual(d.status_message, "Running the full test suite...")
+
+    def test_tolerates_none_and_statusless_displays(self):
+        from agentchanti.cli_display import set_status
+        set_status(None, "x")
+        set_status(object(), "x")          # no show_status attribute
+
+    def test_tolerates_a_raising_display(self):
+        from agentchanti.cli_display import set_status
+
+        class Broken:
+            def show_status(self, _m):
+                raise RuntimeError("renderer died")
+
+        set_status(Broken(), "x")
+
+
+class TestStatusOnlyProxy(unittest.TestCase):
+    """Post-wave loops must not write into a finished step's row.
+
+    Regression: the smoke-test repair loops are not plan steps, but they
+    call the agent loop with ``step_idx=0``, so their per-turn progress
+    overwrote the row of step 1 — which had finished minutes earlier.
+    Observed: step 1 ("Create the virtual environment", long green)
+    reading "Agent loop 3/8: edit_file".
+    """
+
+    def test_step_info_becomes_a_status_message(self):
+        from agentchanti.cli_display import status_only
+        d = _make_headless_display()
+        d.set_steps(["step one", "step two"])
+        proxy = status_only(d, "Smoke test")
+        proxy.step_info(0, "Agent loop 3/8: edit_file")
+        self.assertEqual(d.status_message,
+                         "Smoke test: Agent loop 3/8: edit_file")
+        self.assertNotIn("Agent loop", d.steps[0].get("info", "") or "")
+
+    def test_other_attributes_pass_through(self):
+        from agentchanti.cli_display import status_only
+        d = _make_headless_display()
+        proxy = status_only(d, "Smoke test")
+        self.assertIs(proxy.show_status.__self__, d)
+
+    def test_none_display_stays_none(self):
+        from agentchanti.cli_display import status_only
+        self.assertIsNone(status_only(None, "Smoke test"))
+
+
+class TestPostWaveStagesReportProgress(unittest.TestCase):
+    """Every stage after the wave loop must drive the STATUS footer.
+
+    Regression: the footer plumbing existed (see TestPostStepStatusFooter)
+    but nothing called it once the waves ended. Bulk test, smoke test, the
+    gate rechecks and learning extraction ran for a minute or more while
+    the UI showed a finished step list and only the clock and token
+    counters moved — indistinguishable from a hang.
+    """
+
+    def _read(self, relpath: str) -> str:
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parent.parent
+        return (root / relpath).read_text(encoding="utf-8")
+
+    def test_cli_sets_status_for_each_post_wave_stage(self):
+        src = self._read("agentchanti/orchestrator/cli.py")
+        tail = src[src.find("# ── 13.5. Bulk test execution"):]
+        self.assertGreater(len(tail), 0, "post-wave section not found")
+        for fragment in ("Running the full test suite",
+                         "Launching the app to check it starts",
+                         "Extracting learnings from this run"):
+            self.assertIn(fragment, tail,
+                          f"no status message for stage: {fragment}")
+
+    def test_gate_recheck_reports_and_clears(self):
+        from unittest.mock import MagicMock
+
+        from agentchanti.orchestrator.cli import _enforce_monotonic_gates
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+
+        get_gate_ledger().reset()
+        get_gate_ledger().record("python -m pytest -q", "1.1")
+        seen = []
+        display = MagicMock()
+        display.show_status.side_effect = seen.append
+        snapshots = MagicMock()
+        snapshots.managed = True
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "")
+
+        self.assertTrue(_enforce_monotonic_gates(
+            snapshots, executor, "bulk-test fixes", display=display))
+        self.assertTrue(any("Re-checking" in m for m in seen),
+                        f"no recheck progress message: {seen}")
+        self.assertEqual(seen[-1], "",
+                         "footer must be cleared once gates are green")
+        get_gate_ledger().reset()
+
+
 if __name__ == "__main__":
     unittest.main()

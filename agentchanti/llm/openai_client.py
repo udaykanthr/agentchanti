@@ -4,6 +4,8 @@ and any other provider that implements the OpenAI chat/completions API.
 """
 
 import json
+import os
+import time
 import requests
 from typing import List, Optional
 
@@ -25,6 +27,67 @@ _TOOLS_REJECTED_MARKERS = (
     "invalid parameter: 'tools'",
     "unknown parameter: 'tools'",
 )
+
+
+# ── Durable reasoning-effort floor ────────────────────────────────────
+# A reasoning burn (whole completion budget spent on hidden reasoning,
+# nothing returned) is a fact about the MODEL at a given effort, not about
+# one run — so it is remembered per model in the user's home cache rather
+# than rediscovered every time. The in-session latch alone still cost one
+# full burn per run: measured on a Pac-Man run, 16,384 completion tokens
+# returned with tool_calls=0 and no text, ~8% of the whole run, before the
+# retry at 'low' did the same work in 5,540.
+#
+# Expires so a model that improves (or a re-pointed alias) gets retested
+# instead of being pinned to 'low' forever.
+_EFFORT_FLOOR_TTL_SECONDS = 30 * 24 * 3600
+
+
+def _effort_floor_store() -> str:
+    return os.path.join(os.path.expanduser("~"), ".agentchanti",
+                        "effort_floors.json")
+
+
+def _read_effort_floors() -> dict:
+    try:
+        with open(_effort_floor_store(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_effort_floor(model: str) -> Optional[str]:
+    """Remembered effort floor for *model*, or None when unknown/expired."""
+    entry = _read_effort_floors().get(model)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        if time.time() - float(entry.get("ts", 0)) > _EFFORT_FLOOR_TTL_SECONDS:
+            return None
+    except (TypeError, ValueError):
+        return None
+    floor = entry.get("floor")
+    return floor if isinstance(floor, str) else None
+
+
+def save_effort_floor(model: str, floor: str) -> None:
+    """Remember that *model* burns its budget above *floor*.
+
+    Best-effort: a cache that cannot be written must never break a run,
+    so every failure path is swallowed.
+    """
+    try:
+        floors = _read_effort_floors()
+        floors[model] = {"floor": floor, "ts": time.time()}
+        path = _effort_floor_store()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(floors, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.debug("[OpenAI] could not persist effort floor: %s", exc)
 
 
 def _looks_like_tools_rejection(response) -> bool:
@@ -138,6 +201,24 @@ class OpenAIClient(LLMClient):
         # One-shot reasoning-effort downgrade: armed by
         # _prepare_token_limit_retry, consumed by the next _chat call.
         self._retry_reasoning_effort: Optional[str] = None
+        # Session-sticky downgrade, latched after the FIRST reasoning burn.
+        # The one-shot alone only rescued the call that burned: every later
+        # request went back to the configured effort and burned again.
+        # Measured on one Pac-Man run: 4 burns x 16384 = 65,536 completion
+        # tokens for zero visible output — 43% of everything received.
+        # Mirrors _native_tools_ok: once the model has demonstrated it
+        # cannot work at this setting, stop paying to rediscover that.
+        # Seeded from the durable store: a model that burned its budget on
+        # a previous run burns it again on this one, and rediscovering that
+        # costs a full completion cap every time.
+        self._session_effort_floor: Optional[str] = load_effort_floor(model)
+        if self._session_effort_floor and reasoning_effort:
+            log.info(
+                "[OpenAI] %s previously spent its whole output budget on "
+                "reasoning — starting at effort='%s' instead of the "
+                "configured '%s'. Delete %s to retest.",
+                model, self._session_effort_floor, reasoning_effort,
+                _effort_floor_store())
         # Latched once the model reports that function tools and reasoning
         # cannot be combined on /chat/completions. Tool-calling turns then
         # go to /v1/responses, which supports both, instead of paying the
@@ -177,6 +258,8 @@ class OpenAIClient(LLMClient):
             effort = self._retry_reasoning_effort
             self._retry_reasoning_effort = None
             return effort
+        if self._session_effort_floor:
+            return self._session_effort_floor
         if self.reasoning_effort and self._is_reasoning_model():
             return self.reasoning_effort
         return None
@@ -185,9 +268,25 @@ class OpenAIClient(LLMClient):
         """Reasoning models can burn the whole completion budget on hidden
         reasoning tokens, returning an empty response with
         ``finish_reason: length``. Retrying verbatim is a coin flip —
-        request low reasoning effort for the retry instead."""
-        if self.model.lower().startswith(self._REASONING_MODEL_PREFIXES):
-            self._retry_reasoning_effort = "low"
+        request low reasoning effort for the retry instead.
+
+        The downgrade also latches for the rest of the session. A model
+        that burned its entire budget once will do it again on the next
+        comparable request, and each repeat costs a full completion cap
+        plus a wasted round trip before the retry rescues it.
+        """
+        if not self._is_reasoning_model():
+            return
+        self._retry_reasoning_effort = "low"
+        if self._session_effort_floor is None:
+            self._session_effort_floor = "low"
+            save_effort_floor(self.model, "low")
+            log.warning(
+                "[OpenAI] %s spent its entire output budget on reasoning at "
+                "effort=%s — dropping to 'low' for this session and "
+                "remembering it, rather than paying the same burn on every "
+                "later call and again on every future run.",
+                self.model, self.reasoning_effort or "provider default")
 
     def _headers(self) -> dict:
         return {
@@ -239,6 +338,8 @@ class OpenAIClient(LLMClient):
         prompt_tokens = usage.get("prompt_tokens", est_tokens)
         completion_tokens = usage.get("completion_tokens", 0)
         cached_tokens = self._cached_tokens(usage)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else 0,
@@ -330,6 +431,8 @@ class OpenAIClient(LLMClient):
                         continue
 
         result = "".join(content_parts)
+        self._last_completion_tokens = (
+            completion_tokens if isinstance(completion_tokens, int) else 0)
         token_tracker.record(
             prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
             completion_tokens if isinstance(completion_tokens, int) else tokens_generated,

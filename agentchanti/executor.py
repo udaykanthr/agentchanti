@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import subprocess
@@ -8,6 +9,12 @@ from .cli_display import log
 class Executor:
     def __init__(self):
         self._background_processes: List[subprocess.Popen] = []
+        # Exit status of the most recent run_command. The (success, output)
+        # return loses it, and the code is the only way to tell a genuine
+        # test failure from a process that died abnormally — a native
+        # fast-fail prints ordinary-looking output and then exits
+        # 0xC0000409, which read as "the tests regressed".
+        self.last_exit_code: int | None = None
 
     # Phrases that indicate the model is producing generic filler instead
     # of an actual plan.  Matched case-insensitively against each step.
@@ -212,19 +219,44 @@ class Executor:
         avg_len = sum(len(l) for l in lines) / len(lines)
         if avg_len > 120:
             return False
-        # Prose indicator: majority of lines start with uppercase letter
-        # (sentences) rather than code-like characters (import, def, {, <, etc.)
+        # Prose indicator: majority of lines read as sentences rather than
+        # code. "Starts with a capital" alone is NOT that test: an
+        # idiomatic constants module is nothing but capital-initial lines
+        # (`TILE_SIZE = 24`, `BLACK = (0, 0, 0)`), so the old check
+        # rejected every constants.py a coder ever produced — the step
+        # then failed with "No files parsed from coder response" and no
+        # retry could win, because the code was correct all along.
         if len(lines) >= 3:
-            prose_starts = sum(
-                1 for l in lines
-                if l.strip() and l.strip()[0].isupper()
-                and not l.strip().startswith(('I', 'If', 'In'))  # allow some keywords
-                or l.strip().startswith(('The ', 'This ', 'It ', 'Please ', 'Here ',
-                                         'A ', 'An ', 'I am ', 'I can '))
-            )
+            prose_starts = sum(1 for l in lines
+                               if Executor._looks_like_sentence(l))
             if prose_starts > len(lines) * 0.5:
                 return False
         return True
+
+    # Punctuation that is everywhere in code and essentially absent from an
+    # English sentence. One occurrence is enough to settle a line as code.
+    # The trailing alternative is a `Key: value` mapping (YAML, and the
+    # capitalised keys a workflow file uses): a colon with content after it
+    # is structure, whereas a prose colon ends its line ("Here is why:").
+    _CODE_PUNCT_RE = re.compile(r"[=(){}\[\];]|->|::|^\S+:\s+\S")
+
+    # Openers strong enough to mark a line as prose on their own.
+    _PROSE_OPENERS = ('The ', 'This ', 'It ', 'Please ', 'Here ',
+                      'A ', 'An ', 'I am ', 'I can ')
+
+    @staticmethod
+    def _looks_like_sentence(line: str) -> bool:
+        """True when *line* reads as English prose rather than code."""
+        s = line.strip()
+        if not s:
+            return False
+        # Code punctuation outranks any capitalisation signal.
+        if Executor._CODE_PUNCT_RE.search(s):
+            return False
+        if s.startswith(Executor._PROSE_OPENERS):
+            return True
+        # Bare capital-initial line with no code punctuation at all.
+        return s[0].isupper() and not s.startswith(('I', 'If', 'In'))
 
     @staticmethod
     def parse_code_blocks(text: str) -> Dict[str, str]:
@@ -266,6 +298,61 @@ class Executor:
             log.warning(f"[Executor] Skipping '{filename}': content looks like prose, not code")
             return
         files[filename] = content
+
+    @staticmethod
+    def parse_blocks_for_single_target(text: str, target: str) -> Dict[str, str]:
+        """Attribute an unlabelled code block to the step's only target.
+
+        Every other extractor needs the model to name the file — a
+        ``#### [FILE]:`` marker, a path after the fence language, or a
+        ``# path`` first line. Pattern 5 needs an existing KB symbol
+        index, which a blank project does not have at step 2.
+
+        So a model that answers with prose and a bare ``` fence produces
+        nothing at all. Observed on Gemini: correct, complete code, no
+        filename anywhere, "No files parsed from coder response" twice,
+        two diagnosis rounds, then the pipeline halted after 12 minutes
+        and 129k tokens having written nothing.
+
+        When the step declares exactly ONE target there is nothing to
+        guess: the code belongs to that file. Deterministic, no LLM call.
+        The largest block wins, because explanatory snippets are short and
+        the implementation is not.
+        """
+        if not text or not target:
+            return {}
+        blocks = [m.group(1) for m in
+                  re.finditer(r"```(?:[a-zA-Z0-9_+\-]*)\n(.*?)```", text,
+                              re.DOTALL)]
+        # A response cut at the output-token cap ends mid-block, so its
+        # final fence never closes and the pattern above misses it
+        # entirely. Observed on Gemini: truncated at 16,384 tokens with
+        # one unterminated fence, and the step produced nothing at all.
+        if text.count("```") % 2 == 1:
+            tail = re.split(r"```(?:[a-zA-Z0-9_+\-]*)\n", text)[-1]
+            if tail.strip():
+                blocks.append(tail)
+        blocks = [b for b in blocks if b.strip()]
+        if not blocks:
+            return {}
+        best = max(blocks, key=len)
+        # A couple of lines is a fragment being discussed, not a file.
+        if len(best.strip().splitlines()) < 3:
+            return {}
+        # Never write source that cannot parse. A truncated block is the
+        # common case here, and half a module is worse than none: it
+        # fails at import with a SyntaxError that reads like a code bug
+        # rather than a truncated response.
+        if target.endswith(".py"):
+            from .py_syntax import check_python_syntax
+            if check_python_syntax(best, target):
+                log.warning(
+                    "[Executor] Unlabelled block for '%s' does not parse "
+                    "(likely a truncated response) — not writing it", target)
+                return {}
+        files: Dict[str, str] = {}
+        Executor._try_add_file(files, target, best.rstrip("\n"))
+        return files
 
     @staticmethod
     def parse_code_blocks_fuzzy(text: str) -> Dict[str, str]:
@@ -1055,6 +1142,7 @@ class Executor:
 
             stdout_bytes, _ = proc.communicate(timeout=timeout)
             output = Executor._decode_output(stdout_bytes)
+            self.last_exit_code = proc.returncode
             log.info(f"[Executor] Exit code: {proc.returncode}, "
                      f"output={len(output)} chars")
 

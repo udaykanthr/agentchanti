@@ -1125,6 +1125,12 @@ def _llm_guess_parent_file(
 _MAIN_GUARD_RE = re.compile(r'if\s+__name__\s*==\s*["\']__main__["\']')
 
 
+def _is_package_initializer(path: str) -> bool:
+    """True for files a package exposes implicitly rather than by name."""
+    return os.path.basename((path or "").replace("\\", "/")).lower() in (
+        "__init__.py", "index.js", "index.ts", "index.jsx", "index.tsx")
+
+
 def _plan_declares_import(nf: str, declared_imports: set[str]) -> bool:
     """True if a plan step declares it will import file *nf*.
 
@@ -1204,6 +1210,23 @@ def find_gaps(
             _logger.debug(
                 "[DepCheck] Skipping orphaned_export for '%s': "
                 "entry-point module (__main__ guard)", nf)
+            continue
+
+        # A package initializer is never imported BY NAME — Python imports
+        # it implicitly when the package is imported, and JS resolves
+        # `index.js` from the directory. "No other file imports it" is
+        # therefore always true and always meaningless here.
+        #
+        # Observed: a run where this fired on `pacman/__init__.py`,
+        # reported "Likely parent: 'pacman/__init__.py'" (the file as its
+        # own parent — a nonsense diagnosis), spent 1,496 tokens
+        # generating a fix, wrote the file, and broke the already-green
+        # `from pacman.map import Map` gate. The monotonic guard rolled
+        # the wave back and the run reported failure.
+        if _is_package_initializer(nf):
+            _logger.debug(
+                "[DepCheck] Skipping orphaned_export for '%s': package "
+                "initializer — nothing imports it by name", nf)
             continue
 
         # A pending plan step already declares it will import this file —

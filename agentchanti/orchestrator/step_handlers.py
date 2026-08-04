@@ -1285,20 +1285,26 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
                                      f"from CMD output ({manifest}): {candidate}/")
                             return candidate
 
-    # Only consider real source files, not internal tracking paths.
-    # Internal paths use underscore-prefixed directories (_cmd_output/,
-    # _fix_output/, _search_context/) and must be excluded from sub-project
-    # detection.  Directories like __tests__/ and __mocks__/ are legitimate.
+    # A sub-project root can only exist if some file lives in a
+    # SUBDIRECTORY, so root-level files tell us nothing here and the
+    # `'/' in p` filter is the real question being asked.
+    # Internal tracking paths use underscore-prefixed directories
+    # (_cmd_output/, _fix_output/, _search_context/) and are excluded;
+    # directories like __tests__/ and __mocks__/ are legitimate.
     _internal = ('_cmd_output/', '_fix_output/', '_search_context/')
-    source_paths = [
+    nested_paths = [
         p for p in all_files
         if not p.startswith(_internal) and '/' in p
     ]
-    if not source_paths:
+    if not nested_paths:
+        # This is the normal, correct outcome for a flat project — not a
+        # failure. The previous wording ("No source files in memory")
+        # contradicted the memory keys printed alongside it, which read as
+        # a bug in the pipeline every time a flat project ran.
         log.debug(
-            "[SubProject] No source files in memory — "
-            "Fallback 0 did not detect a scaffold cmd. "
-            "Memory keys: %s",
+            "[SubProject] Every file is at the project root (no path has a "
+            "directory component), so there is no sub-project — scanning "
+            "disk for a nested manifest before giving up. Memory keys: %s",
             list(all_files.keys())[:10],
         )
         # Last-resort: scan immediate subdirectories on disk for project
@@ -1345,7 +1351,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
 
     # Extract first path component from each file
     first_components: set[str] = set()
-    for p in source_paths:
+    for p in nested_paths:
         parts = p.replace('\\', '/').split('/')
         if len(parts) >= 2:  # must have at least dir/file
             first_components.add(parts[0])
@@ -1414,7 +1420,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
     # (e.g. search provider added files), look for a known project manifest
     from ..executor import Executor
     manifest_dirs = set()
-    for p in source_paths:
+    for p in nested_paths:
         if os.path.basename(p) in Executor._PROTECTED_FILENAMES:
             dirname = os.path.dirname(p)
             if dirname:  # Must be a subdirectory
@@ -1449,7 +1455,7 @@ def _detect_subproject_root(memory: FileMemory) -> str | None:
         from collections import Counter
         counts = Counter(
             p.replace('\\', '/').split('/')[0]
-            for p in source_paths
+            for p in nested_paths
             if len(p.replace('\\', '/').split('/')) >= 2
         )
         if counts:
@@ -3927,6 +3933,21 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         return success, error_info
     display.step_info(step_idx, f"Step gate: {cmd}")
     ok, out = executor.run_command(cmd, timeout=300)
+    # A gate that collected NOTHING has proved nothing, whatever it exited
+    # with. unittest only gained a non-zero status for a zero-test run in
+    # CPython 3.12, so below that a step whose discovery quietly broke
+    # passes its own acceptance command having executed no tests. Same
+    # defect the agent loop's gate had; fixed on both paths so the two
+    # cannot disagree about what "verified" means.
+    from ..agent_tools import _no_tests_collected
+    if ok and _no_tests_collected(
+            cmd, getattr(executor, "last_exit_code", None), out or ""):
+        display.step_info(step_idx, "Step gate collected no tests ✖")
+        return False, (
+            f"Step acceptance command COLLECTED NO TESTS: `{cmd}`\n"
+            f"{(out or '(no output)')[-2000:]}\n"
+            "It may have exited 0, but nothing ran, so it proves nothing. "
+            "Make the tests discoverable.")
     if ok:
         display.step_info(step_idx, "Step gate passed ✔")
         # Stash the exact command that passed so _record_passed_gate logs
@@ -3936,7 +3957,86 @@ def _gate_on_declared_verify(success: bool, error_info: str, plan_step,
         return success, error_info
     return False, (
         f"Step acceptance command failed: `{cmd}`\n"
-        f"{(out or '(no output)')[-2000:]}")
+        f"{(out or '(no output)')[-2000:]}"
+        + _broken_export_promise(plan_step, memory, out or ""))
+
+
+def _broken_export_promise(plan_step, memory: FileMemory, out: str) -> str:
+    """Name the declared exports the written files do not define.
+
+    A plan step declares ``exports:`` and its ``verify:`` imports exactly
+    those names, so a coder that invents its own naming produces a gate
+    that CANNOT pass, however many times it is retried. Observed: the
+    step promised ``tile_to_pixel_center`` / ``is_at_tile_center``, the
+    file defined ``pixel_center_for_tile`` / ``is_aligned_to_tile_center``
+    — same behaviour, different words — and two diagnosis rounds went by
+    without either of them being told the contract was the problem.
+
+    Only fires on an import/attribute error naming a declared export, so
+    an unrelated gate failure is never mislabelled. Returns "" when there
+    is nothing solid to say.
+    """
+    declared = [s for s in (getattr(plan_step, "exports", None) or []) if s]
+    if not declared:
+        return ""
+    # The error must actually be about a name, not a logic failure.
+    named = set(re.findall(r"cannot import name '([^']+)'", out))
+    named |= set(re.findall(r"has no attribute '([^']+)'", out))
+    named |= set(re.findall(r"name '([^']+)' is not defined", out))
+    blocked = [s for s in declared if s in named]
+    if not blocked:
+        return ""
+
+    try:
+        from ..language_backend import get_backend
+        backend = get_backend(getattr(plan_step, "language", None) or "python")
+    except Exception:
+        return ""
+
+    defined: set[str] = set()
+    files = {}
+    try:
+        files = memory.as_dict() or {}
+    except Exception:
+        pass
+    for target in getattr(plan_step, "target_files", None) or []:
+        content = (files.get(target)
+                   or files.get(str(target).replace("\\", "/")))
+        if not content:
+            continue
+        try:
+            defined.update(backend.extract_exports(content) or [])
+        except Exception:
+            continue
+    # No evidence beats bad evidence: an extractor that saw nothing must
+    # not be read as "the file defines nothing".
+    if not defined:
+        return ""
+    if not any(s not in defined for s in blocked):
+        return ""
+    # Once ONE declared export is provably absent the contract is broken,
+    # so report every missing one. Python raises on the first bad name
+    # only, and fixing them one per round trip wastes a diagnosis attempt
+    # each time.
+    missing = [s for s in declared if s not in defined]
+
+    # Deliberately NOT guessing which existing name replaces which missing
+    # one: difflib matched `tile_to_pixel_center` to
+    # `is_aligned_to_tile_center` here, and a confident wrong hint would
+    # rename the wrong function. The two lists are facts; the mapping is
+    # the model's to make.
+    return (
+        "\n\nBROKEN EXPORT CONTRACT — this is why the command failed:\n"
+        "The step declared these exports and the acceptance command "
+        "imports them by those exact names, but the written file(s) do "
+        "not define them:\n"
+        + "".join(f"  missing: {s}\n" for s in missing)
+        + "\nThe file(s) currently define:\n"
+        + f"  {', '.join(sorted(defined)[:25])}\n"
+        + "\nThe declared names are the contract. Rename the matching "
+        "definitions to the declared names (do NOT change the acceptance "
+        "command, and do NOT rewrite working logic — a rename, or an "
+        "alias assignment, is usually the whole fix).")
 
 
 def _django_lint_gate(success: bool, error_info: str, memory: FileMemory,
@@ -4000,6 +4100,42 @@ def _plan_step_brief(plan_step) -> str:
         ]
         lines.append("Imports to use: " + "; ".join(pairs))
     return "\n".join(lines)
+
+
+def _loop_preload_paths(plan_step) -> list[str]:
+    """Files to hand the agent loop up front: targets AND declared imports.
+
+    Only ``target_files`` used to be preloaded, so a step creating a NEW
+    file had nothing to preload — its targets do not exist yet — and the
+    loop spent its first turn calling read_file on the very dependencies
+    the plan had already named. Observed repeatedly, including a step that
+    burned turn 1 on three read_file calls plus list_files, and the
+    "2 read-only turns — injecting act-now nudge" path that follows from
+    it. Those reads then ride along in every later turn anyway, so the
+    round-trip buys nothing but a turn out of a budget of eight.
+
+    ``build_step_context`` has already resolved the step's declared
+    imports (including ghost contracts for files a later step will
+    create); reuse its keys rather than re-deriving them. Non-existent
+    paths are skipped by the preloader, so ghosts cost nothing.
+
+    Targets come first: for a step EDITING an existing file, that file is
+    the most important thing in the budget.
+    """
+    paths: list[str] = list(getattr(plan_step, "target_files", None) or [])
+    try:
+        from .memory import get_plan_context_files
+        paths.extend(get_plan_context_files() or {})
+    except Exception:
+        pass
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in paths:
+        key = str(p).replace("\\", "/")
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(p)
+    return ordered
 
 
 def _record_passed_gate(success: bool, plan_step, memory: FileMemory,
@@ -4108,7 +4244,9 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
-            preload_files=getattr(plan_step, "target_files", None),
+            preload_files=_loop_preload_paths(plan_step),
+            preload_full_paths=set(
+                getattr(plan_step, 'target_files', None) or ()),
         )
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
@@ -4401,6 +4539,35 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
 
         if memory.summary() != "(no files yet)":
             context += f"\nAll project files: {memory.summary()}"
+
+        # Show the coder the command this step will be GRADED by.
+        #
+        # _gate_on_declared_verify runs plan_step.verify_cmd as the
+        # pass/fail gate right after this call, but nothing was telling the
+        # coder what it says — so the step was judged against a contract it
+        # never saw. That gate is usually an exact API specification
+        # (`p=Player(m); p.pixel_pos(); p.set_direction((1,0))`), and a
+        # coder that has not read it invents a different signature and
+        # fails. Observed on a Pac-Man run: the coder wrote
+        # `Player(spawn_tile, game_map)` with no pixel_pos(), and three
+        # diagnosis rounds were spent reverse-engineering the contract
+        # out of error messages before the step halted.
+        #
+        # Cheap in tokens (one line) and it removes whole diagnosis rounds,
+        # so it pays for itself many times over.
+        try:
+            _gate_cmd = _declared_verify_cmd(plan_step, memory, task=task)
+        except Exception:
+            _gate_cmd = None
+        if _gate_cmd:
+            context += (
+                f"\n\nACCEPTANCE CHECK — this step is judged by running:\n"
+                f"    {_gate_cmd}\n"
+                "Your code MUST satisfy it exactly: the names, call "
+                "signatures and return types it uses are the required API, "
+                "not suggestions. Match them even if you would have chosen "
+                "differently.")
+
         if feedback:
             context += f"\nFeedback: {feedback}"
             # On retry, tell the coder to ONLY fix the flagged issues
@@ -4438,6 +4605,25 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
                            if l.strip().startswith(('>', '$', 'echo '))]
             if _echo_lines:
                 files = _parse_echo_resp(_echo_lines)
+        if not files:
+            # Last resort before giving up: when the step declares exactly
+            # ONE target there is nothing to guess, so an unlabelled code
+            # block belongs to that file. Every earlier extractor needs the
+            # model to name the file, and Pattern 5 needs a KB symbol index
+            # a blank project does not have yet — so a model that answers
+            # in prose with a bare fence produced nothing at all and halted
+            # the run. Observed on Gemini: correct code, no filename, two
+            # failed attempts plus two diagnosis rounds, 12 minutes and
+            # 129k tokens for zero files written.
+            _targets = list(getattr(plan_step, "target_files", None) or [])
+            if len(_targets) == 1:
+                files = executor.parse_blocks_for_single_target(
+                    response, _targets[0])
+                if files:
+                    log.info(
+                        "Step %d: response had no file markers — attributing "
+                        "its code block to the step's only target (%s)",
+                        step_idx + 1, _targets[0])
         if not files:
             feedback = "No file markers found. Use #### [FILE]: path/to/file.py format."
             display.step_info(step_idx, "No files parsed, retrying...")
@@ -5383,7 +5569,8 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                 from .agent_loop import attempt_env_self_heal
                 _healed: set = set()
                 while not _pre_ok and attempt_env_self_heal(
-                        tools, _pre_out or "", language, _healed, verify_cmd):
+                        tools, _pre_out or "", language, _healed, verify_cmd,
+                        planned_files=_loop_preload_paths(plan_step)):
                     _pre_ok, _pre_out = executor.run_command(
                         verify_cmd, timeout=300)
             _status = "PASSING" if _pre_ok else "FAILING"
@@ -5400,7 +5587,9 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=verify_cmd,
             context=loop_context,
-            preload_files=getattr(plan_step, "target_files", None),
+            preload_files=_loop_preload_paths(plan_step),
+            preload_full_paths=set(
+                getattr(plan_step, 'target_files', None) or ()),
         )
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge
@@ -6414,15 +6603,15 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                         for _fp, _fc in fix_files.items():
                             _ext = os.path.splitext(_fp)[1].lower()
                             if _ext in ('.py', '.pyw'):
-                                try:
-                                    ast.parse(_fc, filename=_fp)
-                                    _syntax_ok[_fp] = _fc
-                                except SyntaxError as _se:
+                                from ..py_syntax import check_python_syntax
+                                _se = check_python_syntax(_fc, _fp)
+                                if _se:
                                     log.warning(
                                         "Step %d: Syntax error in fix for "
-                                        "%s: %s (line %s) — skipping",
-                                        step_idx + 1, _fp,
-                                        _se.msg, _se.lineno)
+                                        "%s: %s — skipping",
+                                        step_idx + 1, _fp, _se)
+                                else:
+                                    _syntax_ok[_fp] = _fc
                             else:
                                 _syntax_ok[_fp] = _fc
                         fix_files = _syntax_ok

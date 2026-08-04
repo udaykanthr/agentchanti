@@ -309,7 +309,7 @@ def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
 
 
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
-                             repair=None) -> bool:
+                             repair=None, display=None) -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
 
     Must be called after **every** stage that can write source files —
@@ -333,6 +333,7 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     so the caller fails the run instead of reporting success over a red
     gate.
     """
+    from ..cli_display import set_status
     from .wave_snapshots import get_gate_ledger
 
     if not snapshots.managed:
@@ -345,9 +346,13 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
         return ", ".join(f"step {label or '?'}: `{cmd}`"
                          for cmd, label, _out in regs)
 
+    _n_gates = len(get_gate_ledger().gates())
+    set_status(display,
+               f"Re-checking {_n_gates} acceptance gate(s) after {stage}...")
     regressions = get_gate_ledger().recheck(executor)
 
     if regressions and repair is not None:
+        set_status(display, f"Gate regression after {stage} — repairing...")
         log.warning(
             "[Monotonic] %s broke %d previously-passing gate(s): %s — "
             "attempting one repair round before rolling back.",
@@ -364,8 +369,10 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     if not regressions:
         snapshots.commit_wave(stage)
         snapshots.mark_green()
+        set_status(display, "")
         return True
 
+    set_status(display, f"Rolling back — {stage} left gate(s) red")
     log.warning("[Monotonic] %s left %d gate(s) red: %s",
                 stage, len(regressions), _names(regressions))
     rb_ok, rb_msg = snapshots.rollback_to_last()
@@ -503,8 +510,11 @@ def _main_impl():
 
     provider = args.provider or cfg.PROVIDER
     if provider == "ollama":
+        # read_timeout is Ollama-only — it cannot go in llm_kwargs, which
+        # every provider shares.
         llm_client = OllamaClient(
-            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
+            base_url=cfg.OLLAMA_BASE_URL, model=model,
+            read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
     elif provider == "openai":
         from ..llm.openai_client import OpenAIClient
         api_key = cfg.OPENAI_API_KEY
@@ -668,7 +678,8 @@ def _main_impl():
         # Create a separate client with the agent-specific provider + model
         if agent_provider == "ollama":
             return OllamaClient(
-                base_url=cfg.OLLAMA_BASE_URL, model=agent_model, **llm_kwargs)
+                base_url=cfg.OLLAMA_BASE_URL, model=agent_model,
+                read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
         elif agent_provider == "openai":
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
@@ -991,10 +1002,30 @@ def _main_impl():
             display.show_status(
                 f"Requesting steps from planner...{f' (retry {plan_attempt})' if plan_attempt > 1 else ''}"
             )
-            plan = planner.process(args.task, context=planner_context,
-                                   language=language,
-                                   plan_mode=getattr(cfg, "PLAN_MODE",
-                                                     "content"))
+            try:
+                plan = planner.process(args.task, context=planner_context,
+                                       language=language,
+                                       plan_mode=getattr(cfg, "PLAN_MODE",
+                                                         "content"))
+            except LLMError as exc:
+                # A model that spends its whole output budget on hidden
+                # reasoning returns nothing, every retry, deterministically
+                # (observed: minimax-m3:cloud, 3 x 16384 tokens, 7.5
+                # minutes, no plan).  That is a configuration problem the
+                # user can act on — a raw traceback tells them nothing
+                # about which model failed or what to change.
+                _model = getattr(llm_client, "model", "?")
+                _tries = getattr(llm_client, "max_retries", "?")
+                log.error("Planner produced no usable plan with model %s: %s",
+                          _model, exc)
+                print(f"\nPlanning failed: no usable response from "
+                      f"'{_model}' after {_tries} attempts.")
+                print(f"  Cause: {exc}")
+                print("  If this model reasons before answering, it may be "
+                      "spending its whole output budget on hidden thinking.")
+                print("  Try a larger max_output_tokens, or set a different "
+                      "planner model under `models:` in .agentchanti.yaml.")
+                sys.exit(1)
             log.info(f"Plan (attempt {plan_attempt}):\n{plan}")
 
             # ── Planner no-op signal ──
@@ -1683,7 +1714,7 @@ def _main_impl():
         # without this, HEAD (and so the rollback target) silently advances
         # onto the commit that introduced the regression.
         if not _enforce_monotonic_gates(
-                snapshots, executor, f"wave {wave_idx + 1}"):
+                snapshots, executor, f"wave {wave_idx + 1}", display=display):
             pipeline_success = False
             break
 
@@ -1692,9 +1723,11 @@ def _main_impl():
     #   • parallel wave steps don't race to run the full suite simultaneously
     #   • source fixes for one test can't break another before it's verified
     # Run all test files once; fix failing ones one at a time; final run-all.
+    from ..cli_display import set_status
     verif_ok = False
     if pipeline_success:
         from .pipeline import run_bulk_test_execution_and_fix
+        set_status(display, "Running the full test suite...")
         verif_ok, verif_err = run_bulk_test_execution_and_fix(
             memory=memory,
             executor=executor,
@@ -1717,7 +1750,8 @@ def _main_impl():
         # previously-green per-step gate red is a regression. Re-run the
         # recorded gates and roll the workdir back to the last green
         # snapshot rather than shipping the regression.
-        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes"):
+        if not _enforce_monotonic_gates(snapshots, executor, "bulk-test fixes",
+                                        display=display):
             pipeline_success = False
             verif_ok = False
 
@@ -1761,6 +1795,7 @@ def _main_impl():
     # loop.  Skips silently when there is no runnable entry point.
     if pipeline_success:
         from .smoke_test import run_smoke_verification
+        set_status(display, "Launching the app to check it starts...")
         smoke_ok, smoke_err = run_smoke_verification(
             memory=memory,
             executor=executor,
@@ -1774,20 +1809,32 @@ def _main_impl():
             pipeline_success = False
             log.warning(f"[SmokeTest] Pipeline marked failed: {smoke_err[:300]}")
 
-        # The smoke-test repair loop rewrites source files to fix a launch
-        # crash, and it is the LAST stage that can do so. Its edits were
-        # previously never gate-checked: a repair that changed
-        # `Player.update()`'s signature turned the green
-        # `python -m unittest discover` gate red, and the run still printed
-        # `Finished`. Re-check here so success always means every gate is
-        # green — this is the final word on the run.
-        #
-        # A red gate here usually means the repair was RIGHT and a test
-        # still encodes the old API (observed: a test stubbing
-        # `update(self, game_map)` after the real signature changed), so
-        # give the test-fix machinery one round to catch the tests up
-        # rather than reflexively discarding a fix that made the app run.
+        # An adversarial property check used to run here — one bounded loop
+        # authoring a randomised-dt invariant test, aimed at the class of
+        # defect a fixed timestep hides (a Pac-Man run shipped with ghosts
+        # walking through walls while every gate was green). It was removed:
+        # over three runs it never once produced its test file, cost ~33%
+        # of a run's tokens (147k sent / 10k received on the last one),
+        # falsely failed a pipeline whose gates were all green, and
+        # overwrote a verified test file from an earlier wave. The idea is
+        # sound; a loop that authors the test is not the way to get it.
+        # See git history for the implementation.
         else:
+            # The smoke-test repair loop rewrites source files to fix a
+            # launch crash, and it is the LAST thing that can do so.
+            # Those edits were
+            # previously never gate-checked: a repair that changed
+            # `Player.update()`'s signature turned the green
+            # `python -m unittest discover` gate red, and the run still
+            # printed `Finished`. Re-check here so success always means
+            # every gate is green — this is the final word on the run.
+            #
+            # A red gate here usually means the repair was RIGHT and a
+            # test still encodes the old API (observed: a test stubbing
+            # `update(self, game_map)` after the real signature changed),
+            # so give the test-fix machinery one round to catch the tests
+            # up rather than reflexively discarding a fix that made the
+            # app run.
             from .pipeline import run_bulk_test_execution_and_fix as _btf
 
             def _repair_tests_after_smoke():
@@ -1807,7 +1854,7 @@ def _main_impl():
 
             if not _enforce_monotonic_gates(
                     snapshots, executor, "smoke-test fixes",
-                    repair=_repair_tests_after_smoke):
+                    repair=_repair_tests_after_smoke, display=display):
                 pipeline_success = False
                 log.warning(
                     "[SmokeTest] The launch fix left a previously-passing "
@@ -1828,13 +1875,34 @@ def _main_impl():
     # Patterns/fixes from completed steps are valuable regardless of
     # overall pipeline outcome — especially fixes learned from failures.
     if knowledge_base:
+        set_status(display, "Extracting learnings from this run...")
         try:
             knowledge_base.extract_from_run(
                 args.task, steps, memory.as_dict(), llm_client)
         except Exception as e:
             log.warning(f"Knowledge extraction failed: {e}")
+    # Every post-wave stage is done; clear the footer so the finish screen
+    # is not printed under a stale "still working" message.
+    set_status(display, "")
 
     # ── 16. Finish ──
+    _cached = token_tracker.total_cached_tokens
+    _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
+    if _cached > 0:
+        # Show gross vs. cached-net so the prompt-cache discount is
+        # visible: of the tokens sent, how many were cache hits (billed
+        # at a discount) vs. full-price.
+        _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
+        _sent_breakdown += (
+            f" [cached={_cached} ({_pct}%), "
+            f"full-price={token_tracker.full_price_prompt_tokens}]")
+    # Built before the branch: a FAILED run is the expensive one, and it
+    # used to report a bare total with no send/cache breakdown — exactly
+    # the number needed to tell a cheap failure from a runaway one.
+    _token_line = (f"Total tokens: {token_tracker.total_tokens} "
+                   f"({_sent_breakdown}, "
+                   f"recv={token_tracker.total_completion_tokens})")
+
     if pipeline_success:
         display.finish(success=True)
         clear_checkpoint(checkpoint_file)
@@ -1842,19 +1910,7 @@ def _main_impl():
         _als = _als_fn()
         if _als:
             log.info(_als)
-        _cached = token_tracker.total_cached_tokens
-        _sent_breakdown = f"sent={token_tracker.total_prompt_tokens}"
-        if _cached > 0:
-            # Show gross vs. cached-net so the prompt-cache discount is
-            # visible: of the tokens sent, how many were cache hits (billed
-            # at a discount) vs. full-price.
-            _pct = _cached * 100 // max(1, token_tracker.total_prompt_tokens)
-            _sent_breakdown += (
-                f" [cached={_cached} ({_pct}%), "
-                f"full-price={token_tracker.full_price_prompt_tokens}]")
-        log.info(f"Finished. Total tokens: {token_tracker.total_tokens} "
-                 f"({_sent_breakdown}, "
-                 f"recv={token_tracker.total_completion_tokens})")
+        log.info(f"Finished. {_token_line}")
 
         # Generate HTML report
         if args.report and not args.no_report:
@@ -1894,7 +1950,7 @@ def _main_impl():
         _als_fail = _als_fail_fn()
         if _als_fail:
             log.info(_als_fail)
-        log.info(f"Pipeline failed. Total tokens: {token_tracker.total_tokens}")
+        log.info(f"Pipeline failed. {_token_line}")
 
         # Generate HTML report even on failure
         if args.report and not args.no_report:

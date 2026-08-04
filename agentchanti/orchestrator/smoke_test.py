@@ -18,6 +18,8 @@ import logging
 import os
 import re
 
+from ..cli_display import status_only as _status_only
+
 _logger = logging.getLogger(__name__)
 
 # A module with a __main__ guard is a runnable entry point
@@ -176,20 +178,20 @@ def _same_crash(a: str, b: str) -> bool:
     return a.strip()[-400:] == b.strip()[-400:]
 
 
-def _installed_versions_line(executor) -> str:
+def _installed_versions_line(executor, memory_files=None) -> str:
     """Installed-packages prompt block so fixes target the real versions."""
     try:
-        from .api_grounding import get_installed_package_versions
+        from .api_grounding import (get_installed_package_versions,
+                                    grounding_packages)
         versions = get_installed_package_versions(executor=executor)
+        pkgs = grounding_packages(versions, memory_files)
     except Exception:
         return ""
-    pkgs = [f"{n}=={v}" for n, v in sorted(versions.items())
-            if n not in ("pip", "setuptools", "wheel")]
     if not pkgs:
         return ""
     return (
         "=== INSTALLED PACKAGES (write code against these EXACT versions) "
-        "===\n" + ", ".join(pkgs[:40]) + "\n\n"
+        "===\n" + ", ".join(pkgs) + "\n\n"
     )
 
 
@@ -240,7 +242,7 @@ def _attempt_fix(
     prompt = (
         f"The application crashed when launched with `{cmd}`.\n\n"
         f"=== CRASH OUTPUT ===\n{crash_output[-3000:]}\n\n"
-        + _installed_versions_line(executor)
+        + _installed_versions_line(executor, memory_files)
         + "=== SOURCE FILES ===\n" + "\n\n".join(sources) + "\n\n"
         "Fix the crash. Pay close attention to the exact error message — it "
         "often states the correct API to use. Reply with the COMPLETE "
@@ -565,7 +567,8 @@ def _run_django_verification(memory, executor, coder, display,
                                "rendered HTML)."),
                     task=task,
                     error_info=f"Django verification failed:\n{out}",
-                    display=display, step_idx=0, language=language,
+                    display=_status_only(display, "Django verification"),
+                    step_idx=0, language=language,
                     max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
                     verify_cmd=verify_cmd,
                     escalation_client=getattr(coder, "escalation_client", None))
@@ -670,7 +673,8 @@ def _run_js_build_verification(memory, executor, coder, display,
             step_text=f"Make the production build pass: {build_cmd}",
             task=task,
             error_info=f"Command `{build_cmd}` failed.\nOutput:\n{out}",
-            display=display, step_idx=0, language=language,
+            display=_status_only(display, "Production build"),
+            step_idx=0, language=language,
             max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
             verify_cmd=build_cmd,
             escalation_client=getattr(coder, "escalation_client", None))

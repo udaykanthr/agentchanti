@@ -36,6 +36,54 @@ _MAX_LIST_ENTRIES = 300
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?\w+['\"]?")
 
 
+# Both `python -m unittest` and `python -m pytest` exit 5 when the runner
+# COLLECTED NOTHING — a discovery problem, not a failing assertion. The
+# tool result only ever said "exit: FAILED", so the model could not tell
+# the two apart and debugged the wrong thing: observed a loop spending
+# four consecutive run_command turns re-running a suite that had no tests
+# to run, then editing source that was never the problem. 19 occurrences
+# across 7 of 8 measured runs.
+_NO_TESTS_EXIT = 5
+# Substring match, not a regex: the command only has to LOOK like a test
+# runner for exit 5 to be meaningful.
+_TEST_RUNNER_TOKENS = ("pytest", "unittest", "nose2", "tox",
+                       "manage.py test", "go test", "npm test")
+_NO_TESTS_OUTPUT_MARKERS = ("no tests ran", "ran 0 tests",
+                            "collected 0 items")
+
+
+def _no_tests_collected(command: str, exit_code, output: str) -> bool:
+    """True when a test runner found nothing to run.
+
+    Exit 5 alone is not enough — it is an ordinary failure code for other
+    programs — so the command must look like a test runner, or the output
+    must say so outright.
+    """
+    low = (command or "").lower()
+    if not any(tok in low for tok in _TEST_RUNNER_TOKENS):
+        return False
+    if (isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            and exit_code == _NO_TESTS_EXIT):
+        return True
+    low_out = (output or "").lower()
+    return any(m in low_out for m in _NO_TESTS_OUTPUT_MARKERS)
+
+
+# Sentinel the agent loop's exit gate greps for: a verify command that
+# collected nothing has proved nothing, whatever it exited with.
+NO_TESTS_MARKER = "COLLECTED NO TESTS"
+
+_NO_TESTS_HINT = (
+    f"\n\nNOTE: the runner exited having {NO_TESTS_MARKER}. This is a "
+    "discovery problem, not a failing assertion — nothing was executed, so "
+    "there is no bug in the code under test to chase here, and a zero exit "
+    "status above is NOT evidence that anything passed. Check that the "
+    "test file exists, is named test_*.py, sits in a directory with an "
+    "__init__.py if you are importing it as a package, and that you are "
+    "running from the project root."
+)
+
+
 def _truncate(text: str, limit: int, what: str = "output") -> str:
     if len(text) <= limit:
         return text
@@ -289,12 +337,15 @@ class AgentTools:
         updated = content.replace(old_text, new_text, 1)
 
         # Syntax-validate Python edits before committing them to disk.
+        # compile(), not ast.parse: the latter accepts a `from __future__
+        # import ...` that is no longer at the top of the file, which the
+        # interpreter rejects outright.
         if full.endswith(".py"):
-            try:
-                ast.parse(updated)
-            except SyntaxError as e:
+            from .py_syntax import check_python_syntax
+            err = check_python_syntax(updated, full)
+            if err:
                 return (f"ERROR: edit rejected — resulting Python has a "
-                        f"syntax error at line {e.lineno}: {e.msg}")
+                        f"syntax error: {err}")
         # Same for JSON: a structurally broken package.json breaks every
         # subsequent npm/node invocation with a confusing downstream error.
         # tsconfig*.json is JSONC (comments/trailing commas allowed) — skip.
@@ -324,7 +375,21 @@ class AgentTools:
         success, output = self._executor.run_command(
             command, timeout=self._command_timeout, cwd=self.project_root)
         status = "exit: success" if success else "exit: FAILED"
-        return f"{status}\n{_truncate(output or '(no output)', _MAX_CMD_OUTPUT_CHARS)}"
+        body = _truncate(output or "(no output)", _MAX_CMD_OUTPUT_CHARS)
+        # "exit: FAILED" reads identically whether an assertion failed or
+        # the runner never found a test to run. Say which.
+        #
+        # NOT gated on failure. Whether a zero-test run exits non-zero is
+        # CPython policy: unittest only gained that status in 3.12, so on
+        # 3.10 and 3.11 discovering nothing reports "exit: success" — a
+        # green result backed by zero executed tests, which is the more
+        # dangerous of the two cases and the one that most needs saying.
+        hint = ""
+        if _no_tests_collected(
+                command, getattr(self._executor, "last_exit_code", None),
+                output):
+            hint = _NO_TESTS_HINT
+        return f"{status}\n{body}{hint}"
 
     def _tool_search_code(self, query: str) -> str:
         if self._searcher is None:

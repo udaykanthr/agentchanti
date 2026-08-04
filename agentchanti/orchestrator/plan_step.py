@@ -28,6 +28,7 @@ Format
 from __future__ import annotations
 
 import logging
+import ast
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -1857,20 +1858,67 @@ def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
     return issues
 
 
+def unrunnable_gate_reason(cmd: str) -> Optional[str]:
+    """Explain why *cmd* can never run at all, or None.
+
+    A gate is executed on every monotonic recheck, so one that cannot even
+    parse is a permanent, unsatisfiable blocker rather than a test of the
+    code. Observed: a planner wrote a `python -c` payload containing a
+    literal backslash-n to fake a multi-line loop —
+
+        ...; changed=False; \nfor _ in range(40): g.update(0.05, ...)
+
+    — which Python rejects with "unexpected character after line
+    continuation character". No implementation of ghost.py could satisfy
+    it. Three attempts across two models spent 24 turns and ~20 command
+    runs on it before the run was abandoned.
+
+    Only the inline `python -c` payload is judged; a real newline inside
+    it is perfectly legal and must not be flagged.
+    """
+    if not cmd:
+        return None
+    match = _INLINE_SCRIPT_RE.search(cmd)
+    if not match:
+        return None
+    payload = match.groupdict().get("py")
+    if not payload:
+        return None
+    try:
+        ast.parse(payload)
+    except SyntaxError as exc:
+        return (f"the verify command's python -c payload is not valid "
+                f"Python ({exc.msg}) — it can never pass, whatever the "
+                f"code does. Write it as a single line of statements "
+                f"separated by ';', or move the logic into a test file")
+    except ValueError as exc:          # e.g. embedded null bytes
+        return (f"the verify command's python -c payload cannot be parsed "
+                f"({exc}) — it can never pass")
+    return None
+
+
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
     """Find CODE steps whose ``verify:`` cannot detect a behavioural defect.
 
     Returns ``(step_id, reason)`` pairs, empty when every gate has teeth.
-    TEST steps are exempt: their gate is normally the suite itself, and the
-    assertions live in the test file rather than the command.
+
+    Shallowness is judged for CODE steps only: a TEST step's gate is
+    normally the suite itself, with the assertions in the test file rather
+    than the command. Being UNRUNNABLE is checked for every step type —
+    a gate that cannot parse is impossible to satisfy no matter what the
+    step produces, and exempting TEST steps from that would leave the
+    worst kind of gate in place.
     """
     gaps: list[tuple[str, str]] = []
     for step in steps:
-        if step.step_type != "CODE":
-            continue
         if not step.verify_cmd:
             continue  # missing verify entirely is a separate check
-        reason = shallow_gate_reason(step.verify_cmd)
+        # Unrunnable outranks shallow: a gate that cannot parse is not
+        # weak, it is impossible, and reporting "too shallow" would send
+        # the planner to fix the wrong thing.
+        reason = unrunnable_gate_reason(step.verify_cmd)
+        if reason is None and step.step_type == "CODE":
+            reason = shallow_gate_reason(step.verify_cmd)
         if reason:
             gaps.append((step.id, reason))
     return gaps
@@ -1929,15 +1977,70 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
 
     # Safety: verify we didn't introduce a cycle
     if fixes and _has_cycle(steps):
-        # Roll back all injected deps (unlikely but safe)
-        _rollback = {f.split(" — ")[0]: f.split("depends:")[1] for f in fixes}
-        for step in steps:
-            for desc, dep_id in _rollback.items():
-                if dep_id in step.depends_on and f"Step {step.id}" in desc:
-                    step.depends_on.remove(dep_id)
-        fixes.append("WARNING: rolled back fixes — injecting deps would create a cycle")
+        # A package initializer that re-exports its siblings is the usual
+        # cause, and the cycle is one-sided: `pacman/__init__.py` genuinely
+        # needs pacman/map.py etc. to exist, but nothing needs the
+        # initializer written before them — Python makes the package from
+        # the directory. Drop the edges INTO the initializer and the order
+        # resolves correctly, with __init__ last.
+        #
+        # Rolling everything back instead left the initializer scheduled
+        # FIRST, which is the one order guaranteed to break. Observed: a
+        # plan where 3.1 declared depends:2.1 and 2.1 imported Game from
+        # 3.1; the rollback ran 2.1 in wave 2, its gate
+        # `from pacman import Player, Ghost, Map, Game` passed against
+        # placeholder classes the model wrote to satisfy it, the real
+        # map.py landed in wave 3, the gate regressed, and the run rolled
+        # back and reported failure having spent 133k tokens.
+        freed = _break_cycle_at_package_inits(steps)
+        if freed:
+            fixes.extend(freed)
+        if _has_cycle(steps):
+            # Still cyclic — fall back to the blunt rollback.
+            _rollback = {f.split(" — ")[0]: f.split("depends:")[1]
+                         for f in fixes if "depends:" in f}
+            for step in steps:
+                for desc, dep_id in _rollback.items():
+                    if dep_id in step.depends_on and f"Step {step.id}" in desc:
+                        step.depends_on.remove(dep_id)
+            fixes.append("WARNING: rolled back fixes — injecting deps "
+                         "would create a cycle")
 
     return fixes
+
+
+def _is_package_init(step: PlanStep) -> bool:
+    """True when *step* only produces package ``__init__`` files."""
+    targets = [t.replace("\\", "/") for t in (step.target_files or [])]
+    return bool(targets) and all(
+        t.rsplit("/", 1)[-1] in ("__init__.py", "index.js", "index.ts")
+        for t in targets
+    )
+
+
+def _break_cycle_at_package_inits(steps: list[PlanStep]) -> list[str]:
+    """Remove dependencies *on* package initializers to break a cycle.
+
+    Returns a description of each edge removed. Only touches steps that
+    produce nothing but ``__init__``-style files, so an ordinary module
+    keeps every edge it declared.
+    """
+    init_ids = {s.id for s in steps if _is_package_init(s)}
+    if not init_ids:
+        return []
+    removed: list[str] = []
+    for step in steps:
+        if step.id in init_ids:
+            continue        # the initializer's own deps are the real ones
+        for dep in list(step.depends_on):
+            if dep in init_ids:
+                step.depends_on.remove(dep)
+                removed.append(
+                    f"Step {step.id} no longer waits on package initializer "
+                    f"step {dep} — nothing needs __init__ written first, and "
+                    f"the reverse edge is real (it re-exports this module)"
+                )
+    return removed
 
 
 def _has_cycle(steps: list[PlanStep]) -> bool:
@@ -1972,6 +2075,34 @@ def _has_cycle(steps: list[PlanStep]) -> bool:
 # Wave builder
 # ---------------------------------------------------------------------------
 
+def _phase_of(step_id: str) -> int:
+    """Primary step number, e.g. 2 for ``2.3``. Non-numeric IDs sort first."""
+    head = (step_id or "").split(".")[0]
+    return int(head) if head.isdigit() else 0
+
+
+def _effective_phases(steps: list[PlanStep]) -> dict[str, int]:
+    """Phase per step, raised so no step precedes something it depends on.
+
+    A step keeps its declared phase unless a dependency sits in a later
+    one, in which case it joins that phase — the intra-phase topological
+    sort then orders the two correctly. Only ever moves steps later, so
+    the "setup phases finish first" guarantee is untouched.
+    """
+    known = {s.id for s in steps}
+    eff = {s.id: _phase_of(s.id) for s in steps}
+    for _ in range(len(steps) + 1):        # fixed point, bounded
+        changed = False
+        for s in steps:
+            for dep in s.depends_on:
+                if dep in known and eff[dep] > eff[s.id]:
+                    eff[s.id] = eff[dep]
+                    changed = True
+        if not changed:
+            break
+    return eff
+
+
 def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
     """Topological sort into parallel execution waves, respecting phase order.
 
@@ -1988,11 +2119,21 @@ def build_waves(steps: list[PlanStep]) -> list[list[PlanStep]]:
     step_map = {s.id: s for s in steps}
 
     # ── Group steps by primary number ──
+    # A step that depends on a LATER phase is promoted to that phase.
+    # Phases are otherwise walked in ID order, so such a dependency could
+    # never be satisfied: the step fell into the "circular or missing
+    # deps" escape hatch below and ran anyway, in the one order guaranteed
+    # to fail. Observed with a package initializer — `pacman/__init__.py`
+    # re-exports Game from a phase-3 step, so it belongs after it, but it
+    # ran in phase 2 against classes that did not exist yet, passed its
+    # gate on placeholders, then regressed when the real module landed and
+    # took the whole run down with it.
+    _eff = _effective_phases(steps)
+
     from collections import OrderedDict
-    phase_groups: OrderedDict[str, list[PlanStep]] = OrderedDict()
-    for s in steps:
-        primary = s.id.split(".")[0] if "." in s.id else s.id
-        phase_groups.setdefault(primary, []).append(s)
+    phase_groups: OrderedDict[int, list[PlanStep]] = OrderedDict()
+    for s in sorted(steps, key=lambda s: (_eff[s.id], s.id)):
+        phase_groups.setdefault(_eff[s.id], []).append(s)
 
     # ── Infer implicit deps: within a phase, steps with no declared deps
     #    should wait for any CMD steps that precede them (by step ID).
@@ -2076,8 +2217,25 @@ def build_step_context(
     """
     files: dict[str, str] = {}
 
+    # `imports:` entries keep the spelling the planner used, which for
+    # Python is almost always the DOTTED module (`pacman_game.map`) — not
+    # a path any lookup here can hit. Every `memory.get()` and every disk
+    # read below therefore missed, this function returned {}, and the two
+    # things that consume its output (the classic path's plan-context
+    # block and the agent loop's preload) silently got nothing. Observed:
+    # every CODE step opening with `read_file, read_file, read_file` to
+    # fetch files the pipeline had already resolved and loaded. Resolve
+    # through the plan graph, which knows all six spellings.
+    from .plan_graph import PlanGraph
+    _graph = PlanGraph(all_steps or [])
+
+    def _declared_path(spec: str, symbols) -> str:
+        node = _graph.resolve(spec, symbols)
+        return node.path if node is not None else spec
+
     # 1. Plan-declared imports (real or ghost)
-    for file_path, symbols in step.imports_from.items():
+    for _spec, symbols in step.imports_from.items():
+        file_path = _declared_path(_spec, symbols)
         # Compute the correct Python import path relative to each target file.
         # The first target is used as the reference; if there are no targets,
         # fall back to a simple path→module conversion.
@@ -2085,7 +2243,15 @@ def build_step_context(
         import_hint = ""
         _JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
         if ref_target and file_path.endswith(".py"):
-            import_module = _relative_import_path(ref_target, file_path)
+            # When the planner wrote a dotted module, that spelling IS the
+            # answer — it is the same one its `verify:` gate imports, run
+            # from the project root. _relative_import_path assumes a flat
+            # script layout and would turn `pacman_game.map` into a bare
+            # `from map import Map`, which fails inside a package.
+            if _is_dotted_module_spec(_spec):
+                import_module = _spec
+            else:
+                import_module = _relative_import_path(ref_target, file_path)
             symbol_str = ", ".join(symbols) if symbols else "..."
             import_hint = f"# Correct Python import: from {import_module} import {symbol_str}\n"
         elif ref_target and any(file_path.endswith(ext) for ext in _JS_EXTS):
@@ -2097,14 +2263,17 @@ def build_step_context(
             import_hint = f"// Correct import: import {{ {symbol_str} }} from '{import_module}'\n"
 
         content = memory.get(file_path) if memory else None
+        if not content and read_from_disk:
+            content = read_from_disk(file_path)
         if content:
             files[file_path] = import_hint + content
-        elif read_from_disk:
-            disk_content = read_from_disk(file_path)
-            if disk_content:
-                files[file_path] = import_hint + disk_content
         else:
-            # Ghost contract: file not yet created, include planned info
+            # Ghost contract: file not yet created, include planned info.
+            # Reached whenever the file has no content yet — the `elif
+            # read_from_disk:` this replaces made the ghost branch dead
+            # code for every caller that supplies a reader (i.e. all of
+            # them), so a step importing a not-yet-written file got no
+            # contract at all.
             producer = _find_producer(file_path, all_steps)
             if producer and producer.status != "completed":
                 ghost = (
@@ -2180,6 +2349,23 @@ def _relative_import_path(target_file: str, dep_file: str) -> str:
     # If dep is directly accessible from the same directory, use the remainder
     remaining = dep_parts[common:]
     return ".".join(remaining) if remaining else dep_module.replace("/", ".")
+
+
+_SOURCE_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+                ".mts", ".cts", ".go", ".rs", ".java", ".rb")
+
+
+def _is_dotted_module_spec(spec: str) -> bool:
+    """True when *spec* is a dotted module path (``pacman_game.map``).
+
+    Distinguishes the planner's dotted spelling from a file path — a path
+    names a directory or carries a source extension, a module does
+    neither.
+    """
+    s = (spec or "").replace("\\", "/")
+    if not s or "/" in s or "." not in s:
+        return False
+    return not s.endswith(_SOURCE_EXTS)
 
 
 def _find_producer(file_path: str, steps: list[PlanStep]) -> Optional[PlanStep]:

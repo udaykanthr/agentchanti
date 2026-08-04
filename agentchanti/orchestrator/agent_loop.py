@@ -15,16 +15,33 @@ prefix.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
 from collections import Counter
 from threading import Lock
 
-from ..agent_tools import AgentTools
+from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
 from ..llm.chat_types import Message, ToolCall
 
 _logger = logging.getLogger(__name__)
+
+
+def verify_passed(result: str) -> bool:
+    """True when a verify command actually proved something.
+
+    ``exit: success`` alone is not proof. A test runner that collected
+    NOTHING exits 0 on CPython below 3.12 (unittest only gained a non-zero
+    status for a zero-test run in 3.12), so a step whose discovery quietly
+    broke would satisfy its own gate having executed no tests at all —
+    the exact false-green this project's verification layers exist to
+    prevent, arrived at through the gate rather than around it.
+
+    ``AgentTools.run_command`` already labels that case; the gate just has
+    to stop ignoring the label.
+    """
+    return result.startswith("exit: success") and NO_TESTS_MARKER not in result
 
 
 def truncate_middle(text: str, limit: int) -> str:
@@ -99,6 +116,11 @@ _JOURNAL_SUMMARY_CHARS = 240
 
 _journal_lock = Lock()
 _attempts: dict[int, list[dict]] = {}
+
+
+# Journal label for a run on the escalation (stronger) model. Checked by
+# escalation_already_failed() to keep the ladder monotonic.
+ESCALATION_ATTEMPT_LABEL = "escalation (stronger model)"
 
 
 def record_attempt(step_idx: int, label: str, outcome: str,
@@ -209,6 +231,12 @@ _WITHHOLD_READONLY_AT = 3
 # Pre-load caps: keep the injected file bundle from dominating the prompt.
 _PRELOAD_MAX_FILES = 6
 _PRELOAD_MAX_CHARS = 12_000
+# Below this much remaining budget a truncated file is more confusing than
+# useful — skip it and let the loop read_file if it actually needs it.
+_PRELOAD_MIN_USEFUL_CHARS = 1_500
+# A file listing longer than this belongs to a tree the model should
+# explore with filtered calls, not carry in full in every turn.
+_PRELOAD_MAX_LISTING_CHARS = 3_000
 
 # Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
@@ -250,7 +278,8 @@ def _platform_note() -> str:
 
 
 def _build_user_message(step_text: str, task: str, language: str | None,
-                        context: str, preloaded: str = "") -> str:
+                        context: str, preloaded: str = "",
+                        listing: str = "") -> str:
     parts = [f"Overall task: {task}", f"Current step: {step_text}"]
     if language:
         parts.append(f"Project language: {language}")
@@ -259,16 +288,129 @@ def _build_user_message(step_text: str, task: str, language: str | None,
         parts.append(note)
     if context:
         parts.append(f"Project state:\n{context}")
+    if listing:
+        parts.append(listing)
     if preloaded:
         parts.append(preloaded)
     return "\n\n".join(parts)
 
 
+def _preload_listing(tools: AgentTools) -> str:
+    """The project's file list, up front.
+
+    Orientation is the loop's reflex first move: measured on a 7-step run,
+    every single step opened with ``list_files`` — a whole turn out of
+    eight spent learning a layout the harness can hand over for free. The
+    answer also rides along in every later turn once fetched, so paying a
+    round trip for it buys nothing.
+
+    Kept small and skipped when it would be large: a listing long enough
+    to need truncating is one the model should explore with its own
+    filtered calls rather than read in full.
+    """
+    try:
+        body = tools._tool_list_files()
+    except Exception:
+        return ""
+    if not body or body.startswith("ERROR"):
+        return ""
+    if len(body) > _PRELOAD_MAX_LISTING_CHARS:
+        return ""
+    return ("Project files (already listed for you — do NOT call "
+            "list_files again unless you have changed the tree):\n" + body)
+
+
+# A dependency smaller than this is cheaper to send whole than to outline,
+# and the values matter: a constants module IS its assignments.
+_OUTLINE_MIN_CHARS = 2_000
+# Longest literal kept inline in an outline (e.g. a maze layout is elided).
+_OUTLINE_MAX_LITERAL = 80
+
+
+def _py_signature_outline(source: str) -> str | None:
+    """API surface of a Python module: declarations, no bodies.
+
+    A step importing `map.py` needs to know that `Map.is_walkable(x, y)`
+    exists, not how it is implemented — and bodies are ~95% of the bytes.
+    Measured on a generated game module: 21,364 chars of source reduce to
+    1,138 chars of signatures.
+
+    Returns ``None`` when the source will not parse, so the caller falls
+    back to sending the real text rather than a half-outline.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+    lines: list[str] = []
+
+    def render_def(node, indent: str) -> None:
+        a = node.args
+        names = [x.arg for x in getattr(a, "posonlyargs", [])] +                 [x.arg for x in a.args]
+        if a.vararg:
+            names.append("*" + a.vararg.arg)
+        names += [x.arg for x in a.kwonlyargs]
+        if a.kwarg:
+            names.append("**" + a.kwarg.arg)
+        kw = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        lines.append(f"{indent}{kw} {node.name}({', '.join(names)})")
+
+    def literal(node) -> str:
+        try:
+            text = ast.unparse(node)
+        except Exception:
+            return "..."
+        text = " ".join(text.split())
+        return text if len(text) <= _OUTLINE_MAX_LITERAL else "..."
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            render_def(node, "")
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(literal(b) for b in node.bases)
+            lines.append(f"class {node.name}" + (f"({bases})" if bases else ""))
+            members = [b for b in node.body
+                       if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.Assign, ast.AnnAssign))]
+            if not members:
+                lines.append("    ...")
+            for b in members:
+                if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    render_def(b, "    ")
+                elif isinstance(b, ast.AnnAssign) and isinstance(b.target, ast.Name):
+                    lines.append(f"    {b.target.id} = {literal(b.value) if b.value else '...'}")
+                elif isinstance(b, ast.Assign):
+                    for t in b.targets:
+                        if isinstance(t, ast.Name):
+                            lines.append(f"    {t.id} = {literal(b.value)}")
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            lines.append(f"{node.target.id} = "
+                         + (literal(node.value) if node.value else "..."))
+        elif isinstance(node, ast.Assign):
+            # Module-level constants are the whole point of a constants
+            # module, so keep short values verbatim.
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    lines.append(f"{t.id} = {literal(node.value)}")
+
+    return "\n".join(lines) if lines else None
+
+
 def _preload_target_files(tools: AgentTools,
-                          paths: list[str] | None) -> str:
-    """Read the step's existing target files up front so the loop doesn't
-    burn its first turns on read_file round-trips — whose output then rides
-    along, re-sent, in every later turn.
+                          paths: list[str] | None,
+                          full_paths: set[str] | None = None) -> str:
+    """Read the step's context up front so the loop doesn't burn its first
+    turns on read_file round-trips — whose output then rides along,
+    re-sent, in every later turn.
+
+    Files in *full_paths* (the step's own targets — what it is about to
+    edit) are sent verbatim. Everything else is a DEPENDENCY, and a
+    dependency is only consulted for its API: what a step importing
+    `map.py` needs is that `Map.is_walkable(x, y)` exists, not how it is
+    implemented. Those are reduced to a signature outline, which measured
+    8% of source size on a generated game module (21,364 -> 1,750 chars)
+    while keeping every constant's value.
 
     Only existing, non-empty files inside the project root are included;
     files the step will *create* are skipped (nothing to read yet). The
@@ -277,6 +419,12 @@ def _preload_target_files(tools: AgentTools,
     """
     if not paths:
         return ""
+    # ``None`` means "no dependency information available", so every
+    # file is sent whole — the previous behaviour. Outlining is opt-in
+    # via an explicit set, so a caller that cannot say which file is
+    # being edited never gets an outline of the file it must modify.
+    outline_ok = full_paths is not None
+    full_set = {str(p).replace("\\", "/") for p in (full_paths or ())}
     seen: set[str] = set()
     blocks: list[str] = []
     total = 0
@@ -294,8 +442,36 @@ def _preload_target_files(tools: AgentTools,
         body = tools._tool_read_file(path)
         if body.startswith("ERROR"):
             continue
-        if total + len(body) > _PRELOAD_MAX_CHARS:
-            break
+        if (outline_ok and rel not in full_set and rel.endswith(".py")
+                and len(body) >= _OUTLINE_MIN_CHARS):
+            try:
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    outline = _py_signature_outline(fh.read())
+            except OSError:
+                outline = None
+            # An unparseable module falls through to the real text: half an
+            # outline is worse than none.
+            if outline:
+                body = (f"{rel} (API outline — signatures only, bodies "
+                        f"omitted; read_file it if you need an "
+                        f"implementation)\n{outline}")
+        room = _PRELOAD_MAX_CHARS - total
+        if len(body) > room:
+            # This used to `break`, so ONE oversized file emptied the whole
+            # bundle — including every smaller file behind it. Generated
+            # modules routinely run 20-40 KB, so in practice nothing was
+            # ever preloaded: `[PlanStep] Injected 3 plan-context files`
+            # would log while the loop's opening message stayed under
+            # 1.1k tokens and the model still spent turn 1 on read_file.
+            #
+            # Truncate to the remaining budget instead. read_file itself
+            # truncates at _MAX_READ_CHARS, so a head-of-file is exactly
+            # what the model would have got from the round-trip we are
+            # replacing — with the same explicit truncation notice, so it
+            # knows to read the rest if it needs it.
+            if room < _PRELOAD_MIN_USEFUL_CHARS:
+                continue        # no room left worth spending; try the next
+            body = _truncate(body, room, f"{rel} preload")
         total += len(body)
         blocks.append(body)
         if len(blocks) >= _PRELOAD_MAX_FILES:
@@ -431,6 +607,7 @@ def run_agent_loop(
     verify_cmd: str | None = None,
     context: str = "",
     preload_files: list[str] | None = None,
+    preload_full_paths: set[str] | None = None,
     _recovery: bool = False,
     attempt_label: str = "first attempt",
 ) -> tuple[bool, str]:
@@ -448,12 +625,14 @@ def run_agent_loop(
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
     """
-    preloaded = _preload_target_files(tools, preload_files)
+    preloaded = _preload_target_files(tools, preload_files,
+                                      preload_full_paths)
+    listing = _preload_listing(tools)
     messages = [
         Message(role="system", content=AGENT_LOOP_SYSTEM_PROMPT),
         Message(role="user",
                 content=_build_user_message(step_text, task, language,
-                                            context, preloaded)),
+                                            context, preloaded, listing)),
     ]
     definitions = tools.definitions()
     action_definitions = [d for d in definitions
@@ -492,13 +671,37 @@ def run_agent_loop(
         return (_recovery and verify_cmd is not None
                 and commands_equivalent_modulo_flags(last_ok_cmd, verify_cmd))
 
+    from .wave_snapshots import (describe_abnormal_exit, is_abnormal_exit,
+                                 log_crash_diagnostics)
+
+    def _verify_once() -> str:
+        return tools.execute_all([_verify_call(verify_cmd)])[0].content
+
     def _run_verify() -> str:
-        result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+        result = _verify_once()
+        # A crashed verifier produced no verdict, so failing the step on it
+        # is a category error — the same one already guarded in
+        # GateLedger.recheck and the BulkTest plan gate, and missing here.
+        # Observed: three consecutive attempts where `python -m unittest -v`
+        # PASSED seconds earlier and then the exit verification
+        # access-violated (0xC0000005), so a run whose tests were green was
+        # reported as failed. The model itself spotted the flakiness and
+        # ran the suite ten times in a loop to prove it.
+        if not result.startswith("exit: success"):
+            code = getattr(getattr(tools, "_executor", None),
+                           "last_exit_code", None)
+            if is_abnormal_exit(code):
+                _logger.warning(
+                    "[AgentLoop] step %d: verification process terminated "
+                    "abnormally (%s) — retrying once before believing it",
+                    step_idx + 1, describe_abnormal_exit(code) or code)
+                log_crash_diagnostics(code, verify_cmd)
+                result = _verify_once()
         while (not result.startswith("exit: success")
                and attempt_env_self_heal(tools, result, language, healed,
                                          verify_cmd,
                                          planned_files=preload_files)):
-            result = tools.execute_all([_verify_call(verify_cmd)])[0].content
+            result = _verify_once()
         return result
 
     for turn in range(1, max_turns + 1):
@@ -591,7 +794,7 @@ def run_agent_loop(
             if display is not None:
                 display.step_info(step_idx, f"Verifying: {verify_cmd}")
             result = _run_verify()
-            if result.startswith("exit: success"):
+            if verify_passed(result):
                 _logger.info("[AgentLoop] step %d verified in %d turn(s)",
                              step_idx + 1, turn)
                 return _finish("verified", turn, (True, summary))
@@ -606,12 +809,24 @@ def run_agent_loop(
                 return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
                     f"{truncate_middle(result, 1000)}")))
-            _logger.info("[AgentLoop] step %d: verification failed on "
-                         "turn %d — feeding back", step_idx + 1, turn)
+            # A zero-test run may have exited 0, so "failed" would be a
+            # confusing thing to tell the model — name the real problem.
+            _no_tests = NO_TESTS_MARKER in result
+            _logger.info(
+                "[AgentLoop] step %d: %s on turn %d — feeding back",
+                step_idx + 1,
+                "verify collected no tests" if _no_tests
+                else "verification failed", turn)
             messages.append(response.to_message())
             messages.append(Message(role="user", content=(
-                f"Verification command failed:\n{verify_cmd}\n\n{result}\n\n"
-                "The step is not complete. Fix the problem and verify again.")))
+                (f"Verification command COLLECTED NO TESTS:\n{verify_cmd}\n\n"
+                 f"{result}\n\nIt may have exited 0, but nothing ran, so it "
+                 "proves nothing. Make the tests discoverable and verify "
+                 "again."
+                 ) if _no_tests else
+                (f"Verification command failed:\n{verify_cmd}\n\n{result}\n\n"
+                 "The step is not complete. Fix the problem and verify "
+                 "again."))))
             continue
 
         _logger.info("[AgentLoop] step %d finished in %d turn(s)",
@@ -623,7 +838,7 @@ def run_agent_loop(
     # deterministic check have the last word.
     if verify_cmd and any_tool_used:
         result = _run_verify()
-        if result.startswith("exit: success"):
+        if verify_passed(result):
             _logger.info("[AgentLoop] step %d: turns exhausted but "
                          "verification passes — accepting", step_idx + 1)
             return _finish("exhausted-verified", max_turns, (True, (
@@ -675,8 +890,25 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
         + (("\n\n" + _digest) if _digest else "")
         + "\n\nA previous attempt by another model FAILED:\n"
         + truncate_middle(info, 2000))
-    kw["attempt_label"] = "escalation (stronger model)"
+    kw["attempt_label"] = ESCALATION_ATTEMPT_LABEL
     return run_agent_loop(escalation_client, tools, step_text, task, **kw)
+
+
+def escalation_already_failed(step_idx: int) -> bool:
+    """True when the stronger model has already had a failed run at this step.
+
+    The ladder used to be loop(weak) -> loop(strong) -> recovery(weak) ->
+    recovery(strong): after the stronger model failed, the next attempt
+    went back to the weaker one. Observed on a Pac-Man run, step 7 spent
+    32 turns across those four attempts — 47% of the whole run's turns —
+    and only the final strong attempt succeeded. Each attempt re-sends the
+    conversation, so turns are the dominant driver of prompt tokens.
+    """
+    return any(
+        a.get("label") == ESCALATION_ATTEMPT_LABEL
+        and a.get("outcome") != "verified"
+        for a in get_attempts(step_idx)
+    )
 
 
 def _verify_call(verify_cmd: str):
@@ -851,11 +1083,25 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     # failure the stronger model should get a shot at (observed: a
     # blocked npx-tailwind recovery never escalated because the wrapper
     # saw the self-reported success).
+    _escalation_usable = (
+        escalation_client is not None
+        and escalation_client is not llm_client
+        and getattr(escalation_client, "supports_tools", lambda: False)())
+
+    # Keep the ladder monotonic. If the stronger model already failed this
+    # step in the main loop, a recovery run on the WEAKER one is the least
+    # likely rung to succeed and costs a full turn budget to find out —
+    # observed step 7 spending 8 turns there between two strong-model
+    # attempts, inside a 32-turn step that was 47% of the run's turns.
+    if _escalation_usable and escalation_already_failed(step_idx):
+        _logger.info(
+            "[AgentLoop] step %d: the stronger model already failed this "
+            "step — starting recovery there instead of re-trying the "
+            "weaker one", step_idx + 1)
+        return _attempt(escalation_client, "recovery + escalation")
+
     success, info = _attempt(llm_client, "recovery")
-    if (not success and escalation_client is not None
-            and escalation_client is not llm_client
-            and getattr(escalation_client, "supports_tools",
-                        lambda: False)()):
+    if not success and _escalation_usable:
         _logger.info(
             "[AgentLoop] step %d: recovery failed — escalating to "
             "stronger model", step_idx + 1)

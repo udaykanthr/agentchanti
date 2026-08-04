@@ -10,6 +10,7 @@ from agentchanti.orchestrator.plan_step import (
     is_structured_plan, build_waves,
     plan_looks_truncated,
     shallow_gate_reason, check_gate_quality, check_gate_consistency,
+    build_step_context,
 )
 
 
@@ -1177,3 +1178,300 @@ imports: src/snake.py:Snake
         steps = parse_structured_plan(text)
         producer = next(s for s in steps if s.id == "2.1")
         self.assertIn("tests/test_game_logic.py", producer.imported_by)
+
+
+class TestBuildStepContext(unittest.TestCase):
+    """The step's declared imports must actually reach the model.
+
+    ``build_step_context`` resolves a step's ``imports:`` into file
+    contents; ``pipeline.py`` stashes the result and both the classic
+    generate/review path and the agent loop's preload consume it. It had
+    no test coverage, and it was returning ``{}`` for essentially every
+    Python plan: the dict is keyed by the planner's spelling, which is
+    the DOTTED module (``pacman_game.map``), so every ``memory.get()``
+    and every disk read missed. Observed: each CODE step opening with
+    ``read_file, read_file, read_file`` to fetch files the pipeline had
+    already resolved and loaded.
+    """
+
+    PLAN = """==PLAN==
+
+--STEP 4.1 [CODE] depends:none
+Constants.
+target: pacman_game/constants.py
+exports: TILE_SIZE, Direction
+imports: none
+verify: python -c "import pacman_game.constants"
+
+--STEP 5.1 [CODE] depends:4.1
+Map.
+target: pacman_game/map.py
+exports: Map
+imports: pacman_game.constants:Tile
+verify: python -c "import pacman_game.map"
+
+--STEP 6.1 [CODE] depends:5.1
+Entities.
+target: pacman_game/entities.py
+exports: Player, Ghost
+imports: pacman_game.map:Map, pacman_game.constants:Direction
+verify: python -c "import pacman_game.entities"
+
+--STEP 7.1 [CODE] depends:none
+Flat script.
+target: main.py
+exports: run
+imports: helpers.py:util
+verify: python -c "import main"
+
+==END==
+"""
+
+    class _Mem:
+        def __init__(self, files=None):
+            self._files = files or {}
+
+        def get(self, path):
+            return self._files.get(path)
+
+    def _steps(self):
+        return parse_structured_plan(self.PLAN)
+
+    def _step(self, sid):
+        return next(s for s in self._steps() if s.id == sid)
+
+    def test_dotted_imports_resolve_to_real_file_contents(self):
+        disk = {
+            "pacman_game/map.py": "class Map: pass",
+            "pacman_game/constants.py": "TILE_SIZE = 20",
+        }
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=disk.get)
+        self.assertEqual(set(files),
+                         {"pacman_game/map.py", "pacman_game/constants.py"})
+        self.assertIn("class Map: pass", files["pacman_game/map.py"])
+
+    def test_memory_content_is_preferred_over_disk(self):
+        mem = self._Mem({"pacman_game/map.py": "MEMORY VERSION"})
+        files = build_step_context(
+            self._step("6.1"), self._steps(), mem,
+            read_from_disk=lambda p: "DISK VERSION")
+        self.assertIn("MEMORY VERSION", files["pacman_game/map.py"])
+
+    def test_package_import_hint_keeps_the_planner_spelling(self):
+        """`from map import Map` fails inside a package.
+
+        _relative_import_path assumes a flat script layout. The planner's
+        dotted spec is the spelling its own `verify:` gate imports, run
+        from the project root, so it is the one to hand the model.
+        """
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: "code")
+        hint = files["pacman_game/map.py"].splitlines()[0]
+        self.assertIn("from pacman_game.map import Map", hint)
+
+    def test_flat_layout_still_gets_a_relative_hint(self):
+        files = build_step_context(
+            self._step("7.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: "def util(): pass")
+        hint = files["helpers.py"].splitlines()[0]
+        self.assertIn("from helpers import util", hint)
+
+    def test_missing_file_falls_through_to_a_ghost_contract(self):
+        """The ghost branch was dead code whenever a reader was supplied.
+
+        It hung off `elif read_from_disk:` / `else:`, so any caller that
+        passed a reader (i.e. all of them) skipped it entirely and a step
+        importing a not-yet-written file got no contract at all.
+        """
+        files = build_step_context(
+            self._step("6.1"), self._steps(), self._Mem(),
+            read_from_disk=lambda p: None)
+        ghost = files["pacman_game/map.py"]
+        self.assertIn("PLANNED FILE", ghost)
+        self.assertIn("step 5.1", ghost)
+        self.assertIn("Map", ghost)
+
+    def test_completed_producer_with_no_content_yields_no_ghost(self):
+        steps = self._steps()
+        for s in steps:
+            s.status = "completed"
+        step6 = next(s for s in steps if s.id == "6.1")
+        files = build_step_context(step6, steps, self._Mem(),
+                                   read_from_disk=lambda p: None)
+        self.assertEqual(files, {})
+
+
+class TestPackageInitOrdering(unittest.TestCase):
+    """A package initializer that re-exports siblings must be written LAST.
+
+    Observed live: the planner put `pacman/__init__.py` in phase 2 with
+    other steps declaring depends:2.1, while the initializer itself
+    imported Game from a phase-3 step. fix_import_dependencies detected
+    the cycle and rolled back EVERY injected edge, leaving the
+    initializer scheduled first — the one order guaranteed to break. Its
+    gate `from pacman import Player, Ghost, Map, Game` passed against
+    placeholder classes the model wrote to satisfy it, the real modules
+    landed in later waves, the gate regressed, and the run rolled back
+    and reported failure after 133k tokens.
+    """
+
+    PLAN = """==PLAN==
+
+--STEP 2.1 [CODE] depends:none
+Package initializer re-exporting the game classes.
+target: pacman/__init__.py
+exports: Player, Map, Game
+imports: pacman.map:Map, pacman.player:Player, pacman.game:Game
+verify: python -c "from pacman import Player, Map, Game"
+
+--STEP 2.2 [CODE] depends:none
+Map module.
+target: pacman/map.py
+exports: Map
+imports: none
+verify: python -c "import pacman.map"
+
+--STEP 2.3 [CODE] depends:2.2
+Player module.
+target: pacman/player.py
+exports: Player
+imports: pacman.map:Map
+verify: python -c "import pacman.player"
+
+--STEP 3.1 [CODE] depends:2.1, 2.2, 2.3
+Game module.
+target: pacman/game.py
+exports: Game
+imports: pacman.map:Map, pacman.player:Player
+verify: python -c "import pacman.game"
+
+==END==
+"""
+
+    def _ordered(self):
+        steps = parse_structured_plan(self.PLAN)
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        return steps, [s.id for w in waves for s in w]
+
+    def test_the_cycle_is_broken_without_discarding_every_edge(self):
+        steps, _ = self._ordered()
+        from agentchanti.orchestrator.plan_step import _has_cycle
+        self.assertFalse(_has_cycle(steps))
+        init = next(s for s in steps if s.id == "2.1")
+        self.assertIn("2.2", init.depends_on,
+                      "the initializer's real dependencies must survive")
+        self.assertIn("3.1", init.depends_on)
+
+    def test_nothing_waits_on_the_package_initializer(self):
+        steps, _ = self._ordered()
+        game = next(s for s in steps if s.id == "3.1")
+        self.assertNotIn("2.1", game.depends_on,
+                         "Python builds the package from the directory; "
+                         "no module needs __init__ written first")
+
+    def test_the_initializer_is_scheduled_last(self):
+        _, order = self._ordered()
+        self.assertEqual(order[-1], "2.1", f"order was {order}")
+
+    def test_every_reexported_module_precedes_it(self):
+        _, order = self._ordered()
+        init_at = order.index("2.1")
+        for produced in ("2.2", "2.3", "3.1"):
+            self.assertLess(order.index(produced), init_at,
+                            f"{produced} must precede the initializer")
+
+
+class TestEffectivePhases(unittest.TestCase):
+    """Phases are walked in ID order, so a later-phase dependency could
+    never be satisfied — the step hit the missing-deps escape hatch and
+    ran anyway, before the thing it needed."""
+
+    def test_a_later_phase_dependency_promotes_the_step(self):
+        from agentchanti.orchestrator.plan_step import _effective_phases
+        steps = parse_structured_plan(TestPackageInitOrdering.PLAN)
+        fix_import_dependencies(steps)
+        eff = _effective_phases(steps)
+        self.assertEqual(eff["2.1"], 3,
+                         "2.1 depends on the phase-3 step, so it joins it")
+        self.assertEqual(eff["2.2"], 2, "untouched steps keep their phase")
+
+    def test_steps_are_never_promoted_earlier(self):
+        from agentchanti.orchestrator.plan_step import (
+            _effective_phases, _phase_of)
+        steps = parse_structured_plan(TestPackageInitOrdering.PLAN)
+        eff = _effective_phases(steps)
+        for s in steps:
+            self.assertGreaterEqual(eff[s.id], _phase_of(s.id))
+
+
+class TestUnrunnableGate(unittest.TestCase):
+    """A gate that cannot parse is impossible, not merely weak.
+
+    Observed in a live run: the planner wrote a `python -c` payload with a
+    literal backslash-n to fake a multi-line loop. Python rejects it with
+    "unexpected character after line continuation character", so no
+    implementation of ghost.py could ever satisfy it. Two models made
+    three attempts — 24 turns and ~20 command runs — before the run was
+    abandoned. The gate is re-run on every monotonic recheck, so this is a
+    permanent blocker, not a one-off.
+    """
+
+    BROKEN = ('python -c "from map import Map; from ghost import Ghost; '
+              'm=Map(); g=Ghost(m, index=0); changed=False; '
+              + chr(92) + 'nfor _ in range(40): g.update(0.05); assert changed"')
+
+    def _reason(self, cmd):
+        from agentchanti.orchestrator.plan_step import unrunnable_gate_reason
+        return unrunnable_gate_reason(cmd)
+
+    def test_catches_the_gate_from_the_failing_run(self):
+        reason = self._reason(self.BROKEN)
+        self.assertIsNotNone(reason)
+        self.assertIn("not valid Python", reason)
+        self.assertIn("can never pass", reason)
+
+    def test_a_real_newline_in_the_payload_is_legal(self):
+        """python -c accepts genuine multi-line source — never flag it."""
+        self.assertIsNone(
+            self._reason('python -c "import a' + chr(10) + 'assert a.f() == 2"'))
+
+    def test_valid_gates_are_untouched(self):
+        for cmd in ('python -c "from a import B; assert B().x == 1"',
+                    'python -c "assert True"',
+                    'python -m unittest -v',
+                    'python -m pytest -q',
+                    'npm test --silent',
+                    'go test ./...',
+                    ''):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._reason(cmd))
+
+    def test_other_syntax_errors_are_caught(self):
+        self.assertIsNotNone(self._reason('python -c "def f(: pass"'))
+
+    def test_a_pathed_interpreter_is_still_judged(self):
+        cmd = ('venv' + chr(92) + 'Scripts' + chr(92) + 'python.exe -c '
+               '"x = ' + chr(92) + 'nfor i in []: pass"')
+        self.assertIsNotNone(self._reason(cmd))
+
+    def test_unrunnable_is_reported_for_TEST_steps_too(self):
+        """Shallowness is CODE-only; impossibility is not."""
+        steps = [PlanStep(id="4.1", step_type="TEST", index=0,
+                          verify_cmd=self.BROKEN)]
+        gaps = check_gate_quality(steps)
+        self.assertEqual([g[0] for g in gaps], ["4.1"])
+        self.assertIn("not valid Python", gaps[0][1])
+
+    def test_unrunnable_outranks_shallow(self):
+        """Reporting 'too shallow' would send the planner to fix the wrong
+        thing — the gate is broken, not weak."""
+        steps = [PlanStep(id="2.1", step_type="CODE", index=0,
+                          verify_cmd='python -c "import main' + chr(92) + 'nx"')]
+        gaps = check_gate_quality(steps)
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("not valid Python", gaps[0][1])
+        self.assertNotIn("only imports", gaps[0][1])

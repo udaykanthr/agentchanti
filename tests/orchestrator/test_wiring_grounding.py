@@ -8,6 +8,7 @@ current interpreter — ``json.laods`` is always missing, ``json.loads``
 always present.
 """
 
+import re
 from agentchanti.executor import Executor
 from agentchanti.orchestrator.pipeline import (
     _resolve_fix_scope_files,
@@ -87,8 +88,11 @@ class TestWiringGrounding:
         coder = _Coder("NO_ISSUES_FOUND")
         ok, _ = _run(coder, memory, tmp_path)
         assert ok
-        assert "pytest==" in coder.prompts[0]
-        assert "EXACT versions" in coder.prompts[0]
+        prompt = coder.prompts[0]
+        # Populated, not a specific unrelated package — see the note in
+        # tests/orchestrator/test_smoke_test.py::test_fix_prompt_is_grounded.
+        assert re.search(r"\w+==\d", prompt), prompt[:400]
+        assert "EXACT versions" in prompt
 
 
 class TestWiringScopeGuard:

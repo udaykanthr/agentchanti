@@ -9,6 +9,57 @@ from .chat_types import ChatResponse, Message, ToolDef, flatten_messages
 
 
 # Matches well-formed <think>...</think> blocks (including newlines).
+_TRUSTSTORE_APPLIED = False
+
+
+def ensure_system_trust_store() -> None:
+    """Route TLS verification through the OS trust store, once per process.
+
+    certifi's bundle does not contain the issuing CA on machines where a
+    corporate proxy or endpoint-security product terminates TLS, so every
+    provider call dies with:
+
+        SSLError: certificate verify failed: unable to get local issuer
+        certificate
+
+    — at the first LLM request, with nothing pointing at the cause. The
+    `truststore` package resolves it by validating against the platform
+    store, which does have the injected root. Idempotent, best-effort, and
+    a no-op when truststore is absent or already active.
+    """
+    global _TRUSTSTORE_APPLIED
+    if _TRUSTSTORE_APPLIED:
+        return
+    _TRUSTSTORE_APPLIED = True
+    try:
+        import truststore
+    except ImportError:
+        return
+    try:
+        truststore.inject_into_ssl()
+        log.debug("[LLM] TLS verification routed through the OS trust store")
+    except Exception as exc:      # never block a run on this
+        log.debug("[LLM] truststore injection skipped: %s", exc)
+
+
+def explain_tls_failure(exc: Exception) -> str:
+    """Extra guidance appended to a certificate-verification error."""
+    text = str(exc)
+    if "certificate verify failed" not in text.lower():
+        return ""
+    try:
+        import truststore     # noqa: F401
+        hint = ("truststore is installed but did not resolve it — check "
+                "whether the intercepting CA is in the OS trust store")
+    except ImportError:
+        hint = "install it with `pip install truststore` and re-run"
+    return (
+        "\n\nTLS certificate verification failed. This usually means a "
+        "proxy or endpoint-security product is terminating TLS and its CA "
+        "is not in certifi's bundle; " + hint + "."
+    )
+
+
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
 # Matches a leading reasoning block where the opening <think> was lost
 # (e.g. truncated by streaming) but the closing tag survived.
@@ -81,8 +132,19 @@ class LLMClient(ABC):
     #: cap" (OpenAI ``length``, Anthropic ``max_tokens``, Ollama ``length``).
     _TOKEN_LIMIT_REASONS = ("length", "max_tokens", "max_output_tokens")
 
+    # Below this share of the output budget, VISIBLE output is a sliver and
+    # a cap hit means the budget was spent on hidden reasoning rather than
+    # on an answer that was genuinely too long. Deliberately low: a real
+    # long answer cut short sits near 100%, a burn near zero, so anything
+    # in between stays on the truncation path and is returned to the caller.
+    _HIDDEN_BURN_MAX_VISIBLE_SHARE = 0.25
+
     def __init__(self, max_retries: int = 3, retry_delay: float = 2.0,
                  stream: bool = True, max_output_tokens: int = 16384):
+        # Before any provider call: on a TLS-intercepted machine certifi
+        # cannot build a chain and every request fails with an opaque
+        # SSLError.
+        ensure_system_trust_store()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.stream = stream
@@ -100,6 +162,12 @@ class LLMClient(ABC):
         # that was cut at the token cap — a truncated result the caller
         # (e.g. the planner) should treat as incomplete.
         self._last_truncated: bool = False
+        # VISIBLE completion tokens of the last call, as the provider
+        # reported them. Hidden reasoning/thinking is charged to the same
+        # output budget but excluded here, which is what makes a burn
+        # distinguishable from an answer that was genuinely too long.
+        # 0 means "not reported" and disables the burn check.
+        self._last_completion_tokens: int = 0
 
     def set_stream_callback(self, callback: Callable[[int], None]) -> None:
         """Set a callback that receives ``(tokens_generated)`` during streaming."""
@@ -167,6 +235,26 @@ class LLMClient(ABC):
                         f"{attempt}/{self.max_retries}")
                     raise LLMError("LLM returned empty response after all retries")
 
+                # A cap hit with only a sliver of VISIBLE output means the
+                # budget went somewhere invisible — hidden thinking. That
+                # is the same burn handled above for empty responses, and
+                # it was falling through here simply because a few tokens
+                # of prose escaped. Observed on Gemini: 654 visible tokens
+                # of a 16,384 budget, cut mid-file, twice with identical
+                # counts — a verbatim retry reproduces it exactly, so the
+                # step failed having written nothing.
+                if (hit_cap and attempt < self.max_retries
+                        and self._looks_like_hidden_burn()):
+                    log.warning(
+                        "[LLM] Only %d visible tokens of a %d budget before "
+                        "the cap on attempt %d/%d — the rest went to hidden "
+                        "reasoning; retrying with it dialled down",
+                        self._last_completion_tokens, self.max_output_tokens,
+                        attempt, self.max_retries)
+                    self._prepare_token_limit_retry()
+                    self._backoff(attempt)
+                    continue
+
                 # Non-empty. Flag truncation (cut at the token cap) so callers
                 # that need a complete answer — the planner — can detect a
                 # partial result instead of running with a silent stub.
@@ -198,7 +286,8 @@ class LLMClient(ABC):
                     self._backoff(attempt, error=e)
 
         raise LLMError(
-            f"LLM failed after {self.max_retries} retries: {last_error}")
+            f"LLM failed after {self.max_retries} retries: {last_error}"
+            + explain_tls_failure(last_error))
 
     def chat(self, messages: List[Message],
              tools: Optional[List[ToolDef]] = None) -> ChatResponse:
@@ -232,9 +321,21 @@ class LLMClient(ABC):
                         # 16384 tokens, ~110s, empty text, zero tool
                         # calls). A verbatim retry is a coin flip; let
                         # the provider dial reasoning down first.
+                        # Report what the provider ACTUALLY produced, not
+                        # only what we asked for: Ollama's cloud silently
+                        # caps generation at 32,768 whatever num_predict
+                        # says, so logging the configured 81,920 as "the
+                        # limit" sends the reader chasing the wrong number.
+                        _stopped_at = (
+                            f"{self._last_completion_tokens} of "
+                            f"{self.max_output_tokens}"
+                            if self._last_completion_tokens
+                            and self._last_completion_tokens
+                            < self.max_output_tokens
+                            else f"{self.max_output_tokens}")
                         log.warning(
                             f"[LLM] Chat hit the output-token limit "
-                            f"({self.max_output_tokens}) with no visible "
+                            f"({_stopped_at}) with no visible "
                             f"output on attempt {attempt}/"
                             f"{self.max_retries} — reasoning burn; "
                             f"requesting reduced effort for the retry")
@@ -277,6 +378,21 @@ class LLMClient(ABC):
         cap (OpenAI ``length``, Anthropic ``max_tokens``, Ollama
         ``length``)."""
         return (result.stop_reason or "").lower() in cls._TOKEN_LIMIT_REASONS
+
+    def _looks_like_hidden_burn(self) -> bool:
+        """True when a cap hit produced only a sliver of visible output.
+
+        The remaining budget went to hidden reasoning, so retrying the
+        same prompt reproduces it exactly — the fix is to dial reasoning
+        down, which is what the empty-response path already does. Returns
+        False when the provider does not report completion tokens, so an
+        unknown count never triggers a retry.
+        """
+        visible = self._last_completion_tokens
+        if not visible or self.max_output_tokens <= 0:
+            return False
+        return (visible / self.max_output_tokens
+                ) < self._HIDDEN_BURN_MAX_VISIBLE_SHARE
 
     def _generate_hit_token_limit(self) -> bool:
         """Text-path counterpart of :meth:`_hit_token_limit`, reading the

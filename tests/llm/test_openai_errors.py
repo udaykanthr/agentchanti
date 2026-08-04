@@ -337,13 +337,37 @@ class TestConfiguredReasoningEffort(unittest.TestCase):
         self.assertIsNone(self._client(model="gpt-4o-mini")._effort())
 
     def test_burn_downgrade_outranks_configured_effort(self):
-        """The one-shot downgrade exists because the model just spent its
-        whole budget thinking — honouring 'high' again would repeat it."""
+        """The downgrade exists because the model just spent its whole
+        budget thinking — honouring 'high' again would repeat it."""
         client = self._client()
         client._prepare_token_limit_retry()
         self.assertEqual(client._effort(), "low")
-        # One-shot: the configured value applies again afterwards.
+
+    def test_burn_downgrade_latches_for_the_session(self):
+        """It used to be one-shot, so only the rescuing retry benefited.
+
+        Every later request went back to the configured effort and burned
+        again: measured 4 burns x 16384 = 65,536 completion tokens in one
+        Pac-Man run, 43% of everything received, all for empty responses.
+        A model that burned once will burn on the next comparable request.
+        """
+        client = self._client()
+        client._prepare_token_limit_retry()
+        self.assertEqual(client._effort(), "low")      # the rescuing retry
+        self.assertEqual(client._effort(), "low")      # and every call after
+        self.assertEqual(client._effort(), "low")
+
+    def test_no_downgrade_before_a_burn(self):
+        """The configured effort must apply until the model proves it can't."""
+        client = self._client()
         self.assertEqual(client._effort(), "high")
+        self.assertEqual(client._effort(), "high")
+
+    def test_a_non_reasoning_model_never_latches(self):
+        """Sending reasoning_effort to a model without it is a 400."""
+        client = self._client(model="gpt-4o-mini")
+        client._prepare_token_limit_retry()
+        self.assertIsNone(client._effort())
 
     def test_reaches_the_chat_completions_payload(self):
         client = self._client()
@@ -473,3 +497,4 @@ class TestTokenParamFallbackTrigger(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

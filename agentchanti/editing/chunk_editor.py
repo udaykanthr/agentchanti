@@ -8,6 +8,7 @@ any language using simple indent + keyword heuristics.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -142,8 +143,17 @@ _EDIT_FULL_FILE_MARKER = re.compile(
 # must then be resolved by symbol name against known_chunks at apply time
 # (sentinel line range 0-0).  Without the parens, the suffix is only a
 # symbol when it is not a language tag ("file.py:python" stays full-file).
+# The parenthetical is a HINT, not a range: "(lines 5-30)" is caught by
+# _EDIT_MARKER above, so anything reaching here is prose the model chose
+# to describe WHERE inside the symbol it is editing. Restricting it to
+# the literal word "lines" meant a diagnosis that correctly wrote
+#   #### [EDIT]: config.py:MAZE (row 16)
+# matched none of the three markers, was silently dropped, and the run
+# halted with "Diagnosis produced no actionable fix" — twice, on a
+# correct diagnosis. Any parenthetical is accepted now; the chunk is
+# resolved by symbol name regardless of what it says.
 _EDIT_SYMBOL_MARKER = re.compile(
-    r"####\s*\[EDIT\]:\s*(\S+?):([\w.]+)\s*(?:(\(\s*lines?\b[^)]*\))\s*)?$",
+    r"####\s*\[EDIT\]:\s*(\S+?):([\w.]+)\s*(?:(\([^)]*\))\s*)?$",
     re.IGNORECASE,
 )
 
@@ -160,8 +170,77 @@ _LANGUAGE_TAGS = frozenset({
 _NEW_MARKER = re.compile(
     r"####\s*\[NEW\]:\s*(\S+)\s*\(after\s+line\s+(\d+)\)",
 )
+# `self.name = ...` / `self.name: T = ...`, the anchor used to realign a
+# fragment that rewrites attribute assignments inside a method body.
+# `==` must not match, hence the explicit exclusion of a trailing `=`.
+_SELF_ASSIGN_RE = re.compile(r"^\s*self\.(\w+)\s*(?::[^=\n]+)?=(?!=)")
+
 _FULL_FILE_MARKER = re.compile(r"####\s*\[FILE\]:")
 _CODE_BLOCK = re.compile(r"```\w*\n(.*?)```", re.DOTALL)
+
+# "#### [EDIT]: `src/map.py` (export contract / layout alias)"
+#
+# A marker naming a file followed by a FREE-TEXT parenthetical. The
+# template shows "(lines start-end)", so models generalise the parens to a
+# description of the change — and every stricter pattern above then fails,
+# leaving the block anonymous and the whole fix silently discarded.
+# Observed on a Pac-Man run: diagnosis found the real cause (the module
+# exported BUILTIN_MAZE while the gate imported MAZE_LAYOUT), wrote a
+# correct fix, and it was dropped on the floor twice before the pipeline
+# halted. Backticks/quotes around the path are stripped for the same
+# reason — the parser must be mechanical about formatting the model was
+# never reliably going to get right.
+_EDIT_DESCRIPTIVE_MARKER = re.compile(
+    r"####\s*\[EDIT\]:\s*[`'\"]?([^\s`'\"]+?)[`'\"]?\s*\([^)]*\)\s*$",
+)
+
+# chunk_id marking an edit recovered by _EDIT_DESCRIPTIVE_MARKER. Such an
+# edit claims the whole file, so it is accepted ONLY when it provably
+# rewrites the whole file (see _drops_module_symbols).
+DESCRIPTIVE_CHUNK_ID = "top_level_descriptive"
+
+
+def _module_level_names(source: str) -> set[str] | None:
+    """Top-level names *source* binds, or None when it will not parse."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    return names
+
+
+def _drops_module_symbols(original: str, replacement: str) -> set[str]:
+    """Top-level names the *replacement* would delete from *original*.
+
+    A descriptive marker cannot say whether the block is the whole file or
+    one section of it. Applying a SECTION as a whole-file replacement
+    silently deletes everything else — in the observed case a fragment of
+    module constants would have taken the entire ``Map`` class with it,
+    and no syntax check can catch that because the truncated file is still
+    valid Python. Names, not length, settle it.
+
+    An empty set means the replacement keeps everything and is safe to
+    apply whole.
+    """
+    before = _module_level_names(original)
+    after = _module_level_names(replacement)
+    if before is None or after is None:
+        # Unparseable either side — cannot prove it is safe, so treat it
+        # as dropping everything the caller knew about.
+        return before or {"<unparseable>"}
+    return before - after
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +272,48 @@ class ChunkEditResponse:
     insert_after: int = 0      # line number to insert after (for new chunks)
 
 
+_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)|^\s*class\s+(\w+)",
+                     re.MULTILINE)
+
+
+def _defined_names(text: str) -> list[str]:
+    """Names of functions/classes *text* defines, in order."""
+    return [a or b for a, b in _DEF_RE.findall(text)]
+
+
+def _reopens_declaration(new_content: str, chunk: FileChunk) -> bool:
+    """True when *new_content* restates the chunk's own declaration.
+
+    ``class Map:`` replacing a ``class Map:`` chunk is a whole-symbol
+    rewrite, even at a third of the original length — models shorten code
+    when they fix it. A fragment (one row of a maze literal, one entry of
+    a dict) never opens with the declaration, which is what makes this a
+    reliable discriminator where line count is not.
+    """
+    sig = (chunk.signature or "").strip().rstrip(":").rstrip()
+    if not sig:
+        return False
+    for line in new_content.strip().splitlines():
+        first = line.strip()
+        if not first:
+            continue
+        # Compare declaration heads: `def f(self, a=1)` vs `def f(self)`
+        # is still the same symbol being reopened.
+        head = first.rstrip(":").rstrip()
+        if head == sig:
+            return True
+        for kw in ("class ", "def ", "async def "):
+            if sig.startswith(kw) and head.startswith(kw):
+                name_a = sig[len(kw):].split("(")[0].strip()
+                name_b = head[len(kw):].split("(")[0].strip()
+                return bool(name_a) and name_a == name_b
+        # A module-level constant chunk: `MAZE = [` reopened as `MAZE = [`.
+        if "=" in sig and "=" in head:
+            return sig.split("=")[0].strip() == head.split("=")[0].strip()
+        return False
+    return False
+
+
 def _chunk_id_matches(chunk_id: str, edit_id: str) -> bool:
     """Check if a chunk_id matches an edit's chunk_id.
 
@@ -222,6 +343,11 @@ def _chunk_id_matches(chunk_id: str, edit_id: str) -> bool:
 
 class ChunkEditor:
     """Regex-based file chunking and chunk-level edit application."""
+
+    #: Set by :meth:`apply_chunk_edits` when a splice was rejected and the
+    #: original content returned unchanged.  Reset at the start of every
+    #: call, so it always describes the most recent one.
+    last_apply_rejected: bool = False
 
     def chunk_file(self, file_path: str, content: str) -> list[FileChunk]:
         """Split a file into logical chunks using regex patterns.
@@ -318,6 +444,16 @@ class ChunkEditor:
                 signature=sig,
                 parent=parent,
             ))
+
+        # Module-level constants are edit targets in their own right — a
+        # maze layout, a config dict, a lookup table.  Without a named
+        # chunk they land in an anonymous top_level gap, so an
+        # "[EDIT]: f.py:DEFAULT_MAZE" cannot resolve by symbol and falls
+        # back to the LLM's line arithmetic, which is routinely a line or
+        # two short and leaves an orphan tail behind the splice.
+        if lang == "python":
+            chunks.extend(
+                self._python_const_chunks(file_path, content, lines, chunks))
 
         # Fill gaps: any lines not covered by chunks become "top_level" chunks
         chunks = self._fill_gaps(chunks, lines, file_path, imports_end, total)
@@ -526,6 +662,28 @@ class ChunkEditor:
                         i = end_i
                         continue
 
+                # Last resort: a marker whose parenthetical is free text.
+                # Recovering the path here is what stops the block going
+                # anonymous; whether it may be applied WHOLE is decided at
+                # apply time by _drops_module_symbols.
+                desc_match = _EDIT_DESCRIPTIVE_MARKER.match(line_stripped)
+                if desc_match:
+                    fpath = desc_match.group(1)
+                    code, end_i = self._extract_code_block(lines, i + 1)
+                    if code is not None:
+                        logger.info(
+                            "[ChunkEditor] Recovered %s from a descriptive "
+                            "[EDIT] marker: %s", fpath, line_stripped[:100])
+                        edits.append(ChunkEditResponse(
+                            file_path=fpath,
+                            chunk_id=DESCRIPTIVE_CHUNK_ID,
+                            line_start=1,
+                            line_end=999999,
+                            new_content=code,
+                        ))
+                        i = end_i
+                        continue
+
             # Check for [NEW] marker
             new_match = _NEW_MARKER.match(line_stripped)
             if new_match:
@@ -564,8 +722,32 @@ class ChunkEditor:
         against the known chunks first.  This corrects hallucinated line
         numbers from the LLM that would otherwise corrupt the file.
         """
+        self.last_apply_rejected = False
         lines = original_content.splitlines(True)
         total_lines = len(lines)
+
+        # A descriptive-marker edit claims the whole file on the strength
+        # of a free-text parenthetical, so it has to prove it really is the
+        # whole file. A section applied as a full replacement deletes
+        # everything it omits, and the result is still valid Python — no
+        # later syntax gate can catch it.
+        for edit in list(edits):
+            if edit.chunk_id != DESCRIPTIVE_CHUNK_ID:
+                continue
+            if not edit.file_path.endswith(('.py', '.pyw')):
+                continue
+            dropped = _drops_module_symbols(original_content,
+                                            edit.new_content)
+            if dropped:
+                logger.warning(
+                    "[ChunkEditor] Refusing descriptive-marker edit for %s: "
+                    "applying it whole would delete %s — the block is a "
+                    "section, not the file",
+                    edit.file_path, ", ".join(sorted(dropped)[:6]))
+                edits = [e for e in edits if e is not edit]
+                self.last_apply_rejected = True
+        if not edits:
+            return original_content
 
         # Resolve line ranges before sorting
         resolved_edits: list[tuple[int, int, ChunkEditResponse]] = []
@@ -761,6 +943,13 @@ class ChunkEditor:
                 # Replace line range (1-indexed to 0-indexed)
                 s = max(0, start - 1)
                 e = min(len(lines), end)
+                # An empty range is a pure INSERTION (see
+                # _additive_insertion). Butting a new `def` straight
+                # against the previous method's last line is valid Python
+                # but fails every style gate, so separate them.
+                if e <= s and s > 0 and lines[s - 1].strip() \
+                        and new_lines and new_lines[0].strip():
+                    new_lines = ["\n"] + new_lines
                 lines[s:e] = new_lines
 
         # ── Post-splice syntax sanity check (Python only) ──
@@ -770,16 +959,26 @@ class ChunkEditor:
         # files when the caller trusts apply_chunk_edits.
         result = "".join(lines)
         if any(e.file_path.endswith(('.py', '.pyw')) for _, _, e in resolved_edits):
-            import ast as _ast
-            try:
-                _ast.parse(result, filename=edits[0].file_path if edits else "<chunk>")
-            except SyntaxError as _se:
+            from ..py_syntax import check_python_syntax
+            _path = edits[0].file_path if edits else "<chunk>"
+            # compile(), not ast.parse: splicing a chunk whose replacement
+            # restates the module header leaves a second
+            # `from __future__ import ...` mid-file, which ast.parse
+            # accepts and the interpreter rejects. That exact splice was
+            # written to disk and cost two diagnosis attempts and a halted
+            # pipeline before it was caught by a test run.
+            _err = check_python_syntax(result, _path)
+            if _err:
                 logger.warning(
                     "[ChunkEditor] Post-splice syntax error in %s: %s "
-                    "(line %s) — returning original content",
-                    edits[0].file_path if edits else "?",
-                    _se.msg, _se.lineno,
-                )
+                    "— returning original content", _path, _err)
+                # Returning the original silently is indistinguishable from
+                # a successful edit: the caller writes it back, reports
+                # "applied", and the next diagnosis attempt re-derives the
+                # same fix against an unchanged file.  Record the rejection
+                # so the caller can fall through to its own fallback now
+                # instead of spending another round trip to learn nothing.
+                self.last_apply_rejected = True
                 return original_content
         return result
 
@@ -811,6 +1010,64 @@ class ChunkEditor:
             for chunk in (known_chunks or []):
                 if (chunk.file_path == edit.file_path
                         and _chunk_id_matches(chunk.chunk_id, edit.chunk_id)):
+                    new_span = len(edit.new_content.strip().splitlines())
+                    chunk_span = chunk.line_end - chunk.line_start + 1
+                    # A symbol edit carrying far less content than the
+                    # chunk holds is editing PART of it — one row of a
+                    # maze, one entry of a dict. Replacing the whole chunk
+                    # with it would splice a single row over a 21-row
+                    # constant: silent corruption, strictly worse than the
+                    # silent no-op this branch used to produce.
+                    #
+                    # SHAPE decides that, not size. A rewrite that reopens
+                    # the chunk's own declaration is a whole-symbol
+                    # replacement however much shorter it is — a 101-line
+                    # `class Map:` replacing a 179-line one is a rewrite,
+                    # not a fragment, and treating it as partial rejected a
+                    # correct fix and halted the run. A genuine fragment
+                    # (one maze row) never opens with the declaration.
+                    if (chunk_span > 2 and new_span < chunk_span * 0.7
+                            and not _reopens_declaration(edit.new_content,
+                                                         chunk)):
+                        sub = ChunkEditor._align_within_chunk(
+                            edit, chunk, original_lines)
+                        if sub:
+                            logger.info(
+                                "[ChunkEditor] Resolved %s:%s to a partial "
+                                "edit → lines %d-%d (of chunk %d-%d)",
+                                edit.file_path, edit.chunk_id, sub[0], sub[1],
+                                chunk.line_start, chunk.line_end)
+                            return sub
+                        # An ADDITION replaces nothing, so there is nothing
+                        # to align it against — matching was always going
+                        # to fail. Observed: diagnosis correctly answered a
+                        # missing attribute with two new @property methods
+                        # and the edit was discarded twice, then the run
+                        # halted.
+                        ins = ChunkEditor._additive_insertion(
+                            edit, chunk, original_lines)
+                        if ins:
+                            logger.info(
+                                "[ChunkEditor] Resolved %s:%s to an "
+                                "insertion at line %d (adds %s to chunk "
+                                "%d-%d)", edit.file_path, edit.chunk_id,
+                                ins[0], ", ".join(_defined_names(
+                                    edit.new_content)) or "content",
+                                chunk.line_start, chunk.line_end)
+                            return ins
+                        rep = ChunkEditor._assignment_realignment(
+                            edit, chunk, original_lines)
+                        if rep:
+                            logger.info(
+                                "[ChunkEditor] Resolved %s:%s to lines %d-%d "
+                                "by matching assignment targets",
+                                edit.file_path, edit.chunk_id, rep[0], rep[1])
+                            return rep
+                        raise ValueError(
+                            f"Cannot place partial edit for "
+                            f"{edit.file_path}:{edit.chunk_id} — {new_span} "
+                            f"line(s) into a {chunk_span}-line chunk with no "
+                            f"unambiguous match; refusing to overwrite it")
                     logger.info(
                         "[ChunkEditor] Resolved %s:%s by symbol → lines %d-%d",
                         edit.file_path, edit.chunk_id,
@@ -1040,6 +1297,260 @@ class ChunkEditor:
                 break
 
         return last_import
+
+    @staticmethod
+    def _align_within_chunk(
+        edit: ChunkEditResponse,
+        chunk: FileChunk,
+        original_lines: list[str] | None,
+    ) -> tuple[int, int] | None:
+        """Locate the sub-range of *chunk* that *edit* replaces.
+
+        The replacement text is the EDITED version, so it will not appear
+        in the original — exact anchoring cannot work here. Similarity
+        can: a rewritten maze row still resembles the row it replaces far
+        more than it resembles any other row.
+
+        Returns None unless one line is both a strong match and clearly
+        better than the runner-up. Maze rows look alike, and a confident
+        guess between two near-equal candidates silently edits the wrong
+        line, which is exactly the failure this guard exists to prevent.
+        """
+        if not original_lines:
+            return None
+        new_lines = [l for l in edit.new_content.strip().splitlines()
+                     if l.strip()]
+        if len(new_lines) != 1:
+            # Multi-line partial edits need real anchors, not similarity.
+            return None
+
+        import difflib
+        target = new_lines[0].strip()
+        scored: list[tuple[float, int]] = []
+        for i in range(chunk.line_start - 1,
+                       min(chunk.line_end, len(original_lines))):
+            cand = original_lines[i].strip()
+            if not cand:
+                continue
+            ratio = difflib.SequenceMatcher(None, target, cand).ratio()
+            scored.append((ratio, i + 1))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        best, line_no = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0.0
+        if best < 0.6 or (best - runner_up) < 0.05:
+            logger.warning(
+                "[ChunkEditor] Ambiguous partial edit for %s:%s — best match "
+                "%.2f vs runner-up %.2f; refusing to guess which line",
+                edit.file_path, edit.chunk_id, best, runner_up)
+            return None
+        return line_no, line_no
+
+    @staticmethod
+    def _assignment_realignment(
+        edit: ChunkEditResponse,
+        chunk: FileChunk,
+        original_lines: list[str] | None,
+    ) -> tuple[int, int] | None:
+        """Place a fragment that rewrites a run of ``self.X = ...`` lines.
+
+        A diagnosis fix inside a method body is usually a handful of
+        attribute assignments with fresh values and fresh comments, so no
+        line of it matches the original textually and the content aligner
+        has nothing to anchor on — the edit was refused and the whole fix
+        discarded. Observed on a Pac-Man run: three consecutive attempts
+        offered the same 7-line rewrite of ``Map.__init__``'s spawn
+        coordinates and all three were dropped with "no unambiguous
+        match", ending the run.
+
+        What the fragment DOES say unambiguously is which attributes it
+        sets. Those names locate the span to replace — the same "names,
+        not similarity" rule :meth:`_additive_insertion` uses.
+
+        Refuses unless the span is exactly the matched assignments plus
+        their continuation lines, comments and blanks: anything else in
+        between would be silently deleted.
+        """
+        if not original_lines:
+            return None
+        names = {m.group(1) for ln in edit.new_content.splitlines()
+                 if (m := _SELF_ASSIGN_RE.match(ln))}
+        if not names:
+            return None
+
+        start = max(1, chunk.line_start)
+        end = min(chunk.line_end, len(original_lines))
+        hits: dict[int, str] = {}
+        for i in range(start, end + 1):
+            m = _SELF_ASSIGN_RE.match(original_lines[i - 1])
+            if m and m.group(1) in names:
+                hits[i] = m.group(1)
+        # Every attribute the fragment sets must already exist here;
+        # a fragment introducing new ones is additive, not a replacement,
+        # and guessing where to add it is not this function's job.
+        if not hits or set(hits.values()) != names:
+            return None
+
+        first, last = min(hits), max(hits)
+        # A value can span lines (a list literal over several rows). Walk
+        # the brackets from the last assignment so the span covers it all.
+        depth = 0
+        i = last
+        while i <= end:
+            line = original_lines[i - 1]
+            depth += (line.count("(") + line.count("[") + line.count("{")
+                      - line.count(")") - line.count("]") - line.count("}"))
+            if depth <= 0:
+                break
+            i += 1
+        last = min(i, end)
+
+        # Pull in the comment block directly above, so the fragment's own
+        # comments replace it instead of stacking on top of it.
+        while first > start and original_lines[first - 2].strip().startswith("#"):
+            first -= 1
+
+        # Nothing may be inside the span except what we mean to replace.
+        # "Indented" is NOT a test for a continuation line — every
+        # statement in a method body is indented, so that would wave
+        # through a `self.compute()` sitting between two assignments and
+        # delete it. A line is a continuation only while the brackets of
+        # the assignment above it are still open.
+        depth = 0
+        for j in range(first, last + 1):
+            text = original_lines[j - 1]
+            stripped = text.strip()
+            if depth <= 0 and not (
+                    not stripped or stripped.startswith("#") or j in hits
+                    or _SELF_ASSIGN_RE.match(text)):
+                logger.info(
+                    "[ChunkEditor] Not realigning %s:%s — line %d inside the "
+                    "target span is not an assignment being replaced",
+                    edit.file_path, edit.chunk_id, j)
+                return None
+            depth += (text.count("(") + text.count("[") + text.count("{")
+                      - text.count(")") - text.count("]") - text.count("}"))
+        return first, last
+
+    @staticmethod
+    def _additive_insertion(
+        edit: ChunkEditResponse,
+        chunk: FileChunk,
+        original_lines: list[str] | None,
+    ) -> tuple[int, int] | None:
+        """Insertion point for a fragment that ADDS to *chunk*.
+
+        Returns an empty range ``(n+1, n)`` so the splice inserts at line
+        ``n+1`` without deleting anything, or None when the content is not
+        provably additive.
+
+        The test is names, not similarity: a fragment defining only
+        symbols the chunk does not already have can be appended safely.
+        The moment it redefines something, it is a REPLACEMENT of that
+        member — and appending would leave two definitions with the last
+        one silently winning, which is worse than the refusal it replaces.
+        """
+        if not original_lines:
+            return None
+        names = _defined_names(edit.new_content)
+        if not names:
+            # No definitions to reason about — could be anything, and
+            # appending arbitrary statements to a class body is a good way
+            # to corrupt it.
+            return None
+
+        # The fragment must be indented deeper than the chunk's own
+        # declaration, i.e. actually be a MEMBER of it. Content at the
+        # declaration's own level is a SIBLING that happens to carry this
+        # chunk's marker — appending `class Other:` to `class Map` would
+        # silently graft an unrelated class into the file.
+        decl = chunk.signature or ""
+        decl_indent = len(decl) - len(decl.lstrip()) if decl.strip() else 0
+        frag_indents = [len(l) - len(l.lstrip())
+                        for l in edit.new_content.splitlines() if l.strip()]
+        if not frag_indents or min(frag_indents) <= decl_indent:
+            logger.info(
+                "[ChunkEditor] Not additive for %s:%s — content sits at the "
+                "declaration's own indent, so it is a sibling, not a member",
+                edit.file_path, edit.chunk_id)
+            return None
+
+        end = min(chunk.line_end, len(original_lines))
+        body = "".join(original_lines[chunk.line_start - 1:end])
+        existing = set(_defined_names(body))
+        clashes = [n for n in names if n in existing]
+        if clashes:
+            logger.info(
+                "[ChunkEditor] Not additive for %s:%s — already defines %s",
+                edit.file_path, edit.chunk_id, ", ".join(sorted(clashes)))
+            return None
+
+        # Append after the chunk's last non-blank line, so the insertion
+        # lands inside the chunk rather than after any trailing blanks
+        # that belong to whatever follows it.
+        at = end
+        while at > chunk.line_start and not original_lines[at - 1].strip():
+            at -= 1
+        return at + 1, at
+
+    @staticmethod
+    def _python_const_chunks(
+        file_path: str,
+        content: str,
+        lines: list[str],
+        existing: list[FileChunk],
+    ) -> list[FileChunk]:
+        """Named chunks for module-level assignments (``const:NAME``).
+
+        The span comes from ``ast``, not from counting brackets, so a
+        multi-line literal ends where it actually ends.  That precision is
+        the whole point: the regex chunker would run a constant up to the
+        next ``def``, and a span that is too wide fails the 70% "full chunk
+        replacement" test just as surely as one that is too narrow.
+
+        Files that do not parse yield nothing — a syntax error is exactly
+        when line numbers are least trustworthy, but guessing spans from
+        broken source would be worse than leaving the edit to the existing
+        content-alignment fallback.
+        """
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            return []
+
+        covered: set[int] = set()
+        for c in existing:
+            covered.update(range(c.line_start, c.line_end + 1))
+
+        out: list[FileChunk] = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+
+            start, end = node.lineno, (node.end_lineno or node.lineno)
+            # Never overlap a def/class chunk: two chunks claiming the same
+            # lines make the splice order-dependent.
+            if any(ln in covered for ln in range(start, end + 1)):
+                continue
+
+            out.append(FileChunk(
+                file_path=file_path,
+                chunk_id=f"const:{targets[0].id}",
+                line_start=start,
+                line_end=end,
+                content="".join(lines[start - 1:end]),
+                chunk_type="const",
+                signature=lines[start - 1].rstrip(),
+            ))
+            covered.update(range(start, end + 1))
+        return out
 
     @staticmethod
     def _fill_gaps(

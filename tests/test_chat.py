@@ -1,6 +1,7 @@
-"""Tests for the chat-native LLM layer: LLMClient.chat(), Message/ToolDef
+﻿"""Tests for the chat-native LLM layer: LLMClient.chat(), Message/ToolDef
 serialization for Ollama and Anthropic, and the text-flattening fallback."""
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,29 @@ from agentchanti.llm.openai_client import OpenAIClient
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _mock_ollama_chat_stream(json_data, status_code=200, text=""):
+    """Ollama's /api/chat response, in its streamed (NDJSON) form.
+
+    The endpoint is called with stream=True so the read timeout resets on
+    every chunk â€” non-streaming had to deliver a whole reasoning-model
+    response inside one window, and a measured run lost 12 calls to that.
+    The reassembled result is identical, so these tests still describe the
+    same behaviour; only the wire shape changed.
+    """
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = text
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            f"{status_code} error")
+        resp.iter_lines.return_value = iter([])
+    else:
+        resp.raise_for_status.return_value = None
+        resp.iter_lines.return_value = iter(
+            [json.dumps({**json_data, "done": True})])
+    return resp
+
+
 def _mock_response(json_data, status_code=200, text=""):
     resp = MagicMock()
     resp.status_code = status_code
@@ -37,7 +61,7 @@ def _mock_response(json_data, status_code=200, text=""):
 
 
 class _TextOnlyClient(LLMClient):
-    """Provider without native chat — exercises the fallback path."""
+    """Provider without native chat â€” exercises the fallback path."""
 
     def __init__(self, reply="hello", **kwargs):
         kwargs.setdefault("max_retries", 1)
@@ -140,7 +164,7 @@ class TestOllamaChat(unittest.TestCase):
 
     @patch("agentchanti.llm.ollama.requests.post")
     def test_payload_serialization(self, mock_post):
-        mock_post.return_value = _mock_response({
+        mock_post.return_value = _mock_ollama_chat_stream({
             "message": {"role": "assistant", "content": "ok"},
             "done_reason": "stop",
             "prompt_eval_count": 10, "eval_count": 5,
@@ -158,7 +182,9 @@ class TestOllamaChat(unittest.TestCase):
         url = mock_post.call_args[0][0]
         payload = mock_post.call_args[1]["json"]
         self.assertEqual(url, "http://localhost:11434/api/chat")
-        self.assertFalse(payload["stream"])
+        # Streamed so the read timeout resets per chunk — a whole
+        # reasoning-model response cannot fit in one non-streaming window.
+        self.assertTrue(payload["stream"])
         self.assertEqual(payload["messages"][0],
                          {"role": "system", "content": "Rules."})
         self.assertEqual(
@@ -173,7 +199,7 @@ class TestOllamaChat(unittest.TestCase):
 
     @patch("agentchanti.llm.ollama.requests.post")
     def test_tool_calls_parsed(self, mock_post):
-        mock_post.return_value = _mock_response({
+        mock_post.return_value = _mock_ollama_chat_stream({
             "message": {
                 "role": "assistant", "content": "",
                 "tool_calls": [
@@ -191,7 +217,7 @@ class TestOllamaChat(unittest.TestCase):
 
     @patch("agentchanti.llm.ollama.requests.post")
     def test_string_arguments_decoded(self, mock_post):
-        mock_post.return_value = _mock_response({
+        mock_post.return_value = _mock_ollama_chat_stream({
             "message": {
                 "role": "assistant", "content": "",
                 "tool_calls": [
@@ -232,7 +258,7 @@ class TestOllamaChat(unittest.TestCase):
 
     @patch("agentchanti.llm.ollama.requests.post")
     def test_reasoning_stripped_from_chat_text(self, mock_post):
-        mock_post.return_value = _mock_response({
+        mock_post.return_value = _mock_ollama_chat_stream({
             "message": {"role": "assistant",
                         "content": "<think>hmm</think>answer"},
         })
@@ -343,7 +369,7 @@ class TestAnthropicChat(unittest.TestCase):
             Message(role="user", content="also fix the tests"),
         ])
         messages = mock_post.call_args[1]["json"]["messages"]
-        # user, assistant, merged user (tool_result + text) — roles alternate
+        # user, assistant, merged user (tool_result + text) â€” roles alternate
         self.assertEqual([m["role"] for m in messages],
                          ["user", "assistant", "user"])
         blocks = messages[2]["content"]

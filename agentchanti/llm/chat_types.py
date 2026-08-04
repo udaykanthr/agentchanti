@@ -35,8 +35,14 @@ class ToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     #: Provider-assigned call id (Anthropic ``tool_use.id``). Empty for
-    #: providers that don't assign ids (Ollama).
+    #: providers that don't assign ids (Ollama, Gemini).
     id: str = ""
+    #: Opaque provider state that must be echoed back verbatim when this
+    #: call is replayed in conversation history. Gemini 3.x rejects a
+    #: replayed ``functionCall`` without its ``thoughtSignature``:
+    #: "Function call is missing a thought_signature ... required for
+    #: tools to work correctly". Ignored by providers that do not use it.
+    provider_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

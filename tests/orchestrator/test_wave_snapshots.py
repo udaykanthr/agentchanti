@@ -56,6 +56,63 @@ class TestGateLedger(unittest.TestCase):
         regressions = ledger.recheck(executor)
         self.assertEqual(regressions, [])
 
+    def test_abnormal_exit_is_retried_then_treated_as_inconclusive(self):
+        """A crashed gate produced no verdict, so it is not a regression.
+
+        Observed: a green `python -m unittest -v` gate was re-run by the
+        monotonic check, the interpreter fast-failed with 0xC0000409
+        (3221226505) after printing ordinary test output, and the ledger
+        read that as "the tests regressed" — rolling back a correct test
+        file that had passed twice moments earlier.
+        """
+        from agentchanti.orchestrator.wave_snapshots import is_abnormal_exit
+        self.assertTrue(is_abnormal_exit(3221226505))   # 0xC0000409
+        self.assertTrue(is_abnormal_exit(3221225477))   # 0xC0000005
+        self.assertTrue(is_abnormal_exit(-11))          # SIGSEGV
+        self.assertFalse(is_abnormal_exit(1))           # ordinary failure
+        self.assertFalse(is_abnormal_exit(0))
+        self.assertFalse(is_abnormal_exit(None))
+
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (False, "ran 7 tests")
+        executor.last_exit_code = 3221226505
+        self.assertEqual(ledger.recheck(executor), [])
+        # Retried once before believing the crash.
+        self.assertEqual(executor.run_command.call_count, 2)
+
+    def test_a_crash_that_passes_on_retry_is_clean(self):
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = MagicMock()
+        outcomes = [(False, "died"), (True, "OK")]
+        codes = [3221226505, 0]
+
+        def _run(cmd, timeout=300):
+            executor.last_exit_code = codes.pop(0)
+            return outcomes.pop(0)
+
+        executor.run_command.side_effect = _run
+        self.assertEqual(ledger.recheck(executor), [])
+
+    def test_a_real_failure_after_a_crash_still_regresses(self):
+        """The retry must not swallow a genuine failure."""
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = MagicMock()
+        outcomes = [(False, "died"), (False, "FAILED (errors=1)")]
+        codes = [3221226505, 1]
+
+        def _run(cmd, timeout=300):
+            executor.last_exit_code = codes.pop(0)
+            return outcomes.pop(0)
+
+        executor.run_command.side_effect = _run
+        regressions = ledger.recheck(executor)
+        self.assertEqual(len(regressions), 1)
+        self.assertIn("FAILED", regressions[0][2])
+
     def test_recheck_real_failure_still_regresses(self):
         """A genuine code failure (assertion / non-zero test exit) is still
         a regression even alongside the harness-error guard."""
@@ -404,3 +461,74 @@ class TestProjectSnapshots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCrashDiagnostics(unittest.TestCase):
+    """A bare exit code tells nobody anything.
+
+    Runs died with "exit code 3221226505" repeatedly across sessions and
+    it read as a mystery, when it is a native crash inside the child
+    interpreter that the pipeline already retries around.
+    """
+
+    def setUp(self):
+        from agentchanti.orchestrator.wave_snapshots import reset_crash_hint
+        reset_crash_hint()
+
+    def test_names_the_codes_seen_in_real_runs(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        self.assertIn("0xC0000409", describe_abnormal_exit(3221226505))
+        self.assertIn("fast-fail", describe_abnormal_exit(3221226505))
+        self.assertIn("0xC0000005", describe_abnormal_exit(3221225477))
+        self.assertIn("ACCESS_VIOLATION", describe_abnormal_exit(3221225477))
+
+    def test_an_unknown_native_code_still_renders_as_hex(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        out = describe_abnormal_exit(0xC0000123)
+        self.assertIn("0xC0000123", out)
+        self.assertIn("native crash", out)
+
+    def test_posix_signals(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        self.assertIn("signal 11", describe_abnormal_exit(-11))
+
+    def test_ordinary_exits_describe_nothing(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            describe_abnormal_exit,
+        )
+        for code in (0, 1, 5, None, True, "1"):
+            with self.subTest(code=code):
+                self.assertEqual(describe_abnormal_exit(code), "")
+
+    def test_the_dump_instructions_appear_once_per_run(self):
+        import os
+
+        from agentchanti.orchestrator.wave_snapshots import (
+            log_crash_diagnostics,
+        )
+        with self.assertLogs("agentchanti", level="WARNING") as first:
+            log_crash_diagnostics(3221226505, "python -m unittest -v")
+        joined = "\n".join(first.output)
+        self.assertIn("0xC0000409", joined)
+        self.assertIn("python -m unittest -v", joined)
+        if os.name == "nt":
+            self.assertIn("LocalDumps", joined)
+
+        with self.assertLogs("agentchanti", level="WARNING") as second:
+            log_crash_diagnostics(3221226505, "python -m unittest -v")
+        self.assertNotIn("LocalDumps", "\n".join(second.output),
+                         "the dump instructions must not repeat every crash")
+
+    def test_a_clean_exit_logs_nothing(self):
+        from agentchanti.orchestrator.wave_snapshots import (
+            log_crash_diagnostics,
+        )
+        import logging
+        with self.assertNoLogs("agentchanti", level="WARNING"):
+            log_crash_diagnostics(1, "python -m unittest -v")

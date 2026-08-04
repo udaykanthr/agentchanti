@@ -408,6 +408,64 @@ class TestLoopTelemetry(AgentLoopTestCase):
         self.assertEqual(get_loop_stats()[0]["outcome"], "exhausted")
 
 
+class TestLoopPreloadPaths(unittest.TestCase):
+    """The loop should not spend a turn reading what the plan already named.
+
+    Only target_files were preloaded, so a step creating a NEW file had
+    nothing to preload and burned turn 1 on read_file calls for its own
+    declared imports — observed as `turn 1/8: read_file, read_file,
+    read_file, list_files`, and the act-now nudge that follows.
+    """
+
+    def setUp(self):
+        from agentchanti.orchestrator import memory as _m
+        _m.clear_plan_context_files()
+        self.addCleanup(_m.clear_plan_context_files)
+
+    def _step(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        return PlanStep(
+            id="3.1", step_type="CODE", index=0,
+            target_files=["pkg/entities.py"],
+            imports_from={"pkg/map.py": ["Map"],
+                          "pkg/constants.py": ["TILE_SIZE"]})
+
+    def test_includes_declared_imports_not_just_targets(self):
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/map.py": "m", "pkg/constants.py": "c"})
+        self.assertEqual(
+            _loop_preload_paths(self._step()),
+            ["pkg/entities.py", "pkg/map.py", "pkg/constants.py"])
+
+    def test_target_comes_first(self):
+        """For a step EDITING a file, that file matters most in the budget."""
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/map.py": "m"})
+        self.assertEqual(_loop_preload_paths(self._step())[0],
+                         "pkg/entities.py")
+
+    def test_deduplicates_across_targets_and_context(self):
+        from agentchanti.orchestrator.memory import set_plan_context_files
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        set_plan_context_files({"pkg/entities.py": "e", "pkg/map.py": "m"})
+        self.assertEqual(_loop_preload_paths(self._step()),
+                         ["pkg/entities.py", "pkg/map.py"])
+
+    def test_works_without_plan_context(self):
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        self.assertEqual(_loop_preload_paths(self._step()),
+                         ["pkg/entities.py"])
+
+    def test_step_without_targets_or_context_is_empty(self):
+        from agentchanti.orchestrator.plan_step import PlanStep
+        from agentchanti.orchestrator.step_handlers import _loop_preload_paths
+        self.assertEqual(
+            _loop_preload_paths(PlanStep(id="1", step_type="CODE", index=0)),
+            [])
+
+
 class TestEnvSelfHeal(AgentLoopTestCase):
     """Missing-dependency verify failures are healed with one install
     instead of being fed to the model (the observed run burned 16 turns
@@ -429,6 +487,38 @@ class TestEnvSelfHeal(AgentLoopTestCase):
             planned_files=["test_main.py"])
         self.assertFalse(fired)
         self.executor.run_command.assert_not_called()
+
+    def test_a_planned_package_directory_is_never_pip_installed(self):
+        """Same hazard, one level up: the module is a PACKAGE the step makes.
+
+        Observed: a step targeting `tests/__init__.py, tests/test_map.py`
+        failed its gate with "No module named 'tests'" before either file
+        existed, and the pre-loop heal fired
+        `pip install tests` — a real name on PyPI.
+        """
+        healed: set[str] = set()
+        fired = attempt_env_self_heal(
+            self.tools, "ModuleNotFoundError: No module named 'tests'",
+            "python", healed, verify_cmd="python -m unittest -v tests.test_map",
+            planned_files=["tests/__init__.py", "tests/test_map.py"])
+        self.assertFalse(fired)
+        self.executor.run_command.assert_not_called()
+
+    def test_test_step_preloop_heal_passes_the_planned_targets(self):
+        """The guard only works if the call site actually supplies them.
+
+        The in-loop `_run_verify` heal passed `planned_files`; the pre-loop
+        heal in `_handle_test_step` did not, which is how `pip install
+        tests` still reached the network.
+        """
+        import inspect
+
+        from agentchanti.orchestrator import step_handlers
+        src = inspect.getsource(step_handlers)
+        idx = src.find("while not _pre_ok and attempt_env_self_heal(")
+        self.assertGreater(idx, 0, "pre-loop heal call not found")
+        self.assertIn("planned_files=", src[idx:idx + 300],
+                      "the pre-loop heal must pass the step's planned files")
 
     def test_a_real_missing_package_still_heals(self):
         self.executor.run_command.return_value = (True, "installed")
@@ -889,6 +979,49 @@ class TestDiagnosisLoopRecovery(unittest.TestCase):
         _run_diagnosis_loop(0, "step text", "assertion failed",
                             plan_step=step, **kwargs)
         self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_test_step_recovery_keeps_the_declared_gate(self, mock_rec):
+        """A TEST step's recovery used to get the LANGUAGE DEFAULT instead.
+
+        Recovery runs only after the main loop already failed the declared
+        gate, so handing recovery a different command does not recover the
+        step — it redefines success. Observed: a step declaring
+        `python -m unittest -v` (the task's own stated acceptance
+        criterion) failed on a native crash, recovery was gated on
+        `python -m pytest -q`, pip-installed pytest, went green, and the
+        ledger recorded the SUBSTITUTE. `unittest` was never checked again
+        and the run reported Finished.
+        """
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        gate = "python -m unittest -v"
+        step = PlanStep(id="11.1", step_type="TEST", index=0, verify_cmd=gate)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["display"].steps = [{"type": "TEST"}]
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "suite failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"], gate)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
+           return_value=(True, "fixed"))
+    def test_test_step_recovery_falls_back_when_nothing_declared(
+            self, mock_rec):
+        """With no declared gate, a TEST recovery still gets a real one."""
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        from agentchanti.orchestrator.plan_step import PlanStep
+        step = PlanStep(id="11.1", step_type="TEST", index=0, verify_cmd=None)
+        kwargs = self._kwargs(self._cfg())
+        kwargs["display"].steps = [{"type": "TEST"}]
+        kwargs["llm_client"].supports_tools.return_value = True
+        kwargs["memory"].as_dict.return_value = {}
+        _run_diagnosis_loop(0, "step text", "suite failed",
+                            plan_step=step, **kwargs)
+        self.assertEqual(mock_rec.call_args[1]["verify_cmd"],
+                         "python -m pytest -q")
 
     @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop",
            return_value=(True, "fixed"))
@@ -1550,3 +1683,397 @@ class TestDeclaredVerifyGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPreloadBudget(unittest.TestCase):
+    """One oversized file must not empty the whole preload bundle.
+
+    The char-budget check used to `break`, so a single file larger than
+    _PRELOAD_MAX_CHARS discarded every block — including the smaller files
+    behind it. Generated modules routinely run 20-40 KB, so in practice
+    nothing was ever preloaded: `[PlanStep] Injected 3 plan-context files`
+    logged while the loop's opening message stayed under 1.1k tokens and
+    the model still spent turn 1 on read_file.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.makedirs("src", exist_ok=True)
+        # Sizes matching a real run: a 40 KB module and a 3 KB one.
+        with open("src/game.py", "w", encoding="utf-8") as fh:
+            fh.write("class Game:\n" + "    x = 1\n" * 4000)
+        with open("src/map.py", "w", encoding="utf-8") as fh:
+            fh.write("class Map:\n" + "    y = 2\n" * 300)
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def _preload(self, paths):
+        from agentchanti.orchestrator.agent_loop import _preload_target_files
+        return _preload_target_files(self.tools, paths)
+
+    def test_an_oversized_file_still_preloads_truncated(self):
+        from agentchanti.orchestrator.agent_loop import _PRELOAD_MAX_CHARS
+        blob = self._preload(["src/game.py"])
+        self.assertGreater(len(blob), _PRELOAD_MAX_CHARS // 2,
+                           "an oversized file preloaded nothing at all")
+        self.assertIn("truncated at", blob,
+                      "a truncated preload must say so, like read_file does")
+
+    def test_a_big_file_first_does_not_discard_the_bundle(self):
+        blob = self._preload(["main.py", "src/game.py", "src/map.py"])
+        self.assertIn("src/game.py", blob)
+
+    def test_smaller_files_behind_a_big_one_are_reached(self):
+        """The budget is spent, not abandoned, when a file does not fit."""
+        from agentchanti.orchestrator.agent_loop import _PRELOAD_MAX_CHARS
+        blob = self._preload(["src/map.py", "src/game.py"])
+        self.assertIn("src/map.py", blob)
+        self.assertIn("src/game.py", blob)
+        self.assertLessEqual(len(blob), _PRELOAD_MAX_CHARS + 500,
+                             "the char budget must still bound the bundle")
+
+    def test_nonexistent_paths_cost_nothing(self):
+        self.assertEqual(self._preload(["main.py", "nope.py"]), "")
+
+    def test_empty_input_is_empty(self):
+        self.assertEqual(self._preload([]), "")
+        self.assertEqual(self._preload(None), "")
+
+
+class TestPreloadListing(unittest.TestCase):
+    """Orientation is the loop's reflex first move — hand it over for free.
+
+    Measured on a 7-step run, every single step opened with `list_files`:
+    a whole turn out of eight spent learning a layout the harness already
+    knows. The answer also rides along in every later turn once fetched,
+    so the round trip buys nothing.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+        os.makedirs("src", exist_ok=True)
+        with open("src/map.py", "w", encoding="utf-8") as fh:
+            fh.write("class Map:\n    pass\n")
+        with open("main.py", "w", encoding="utf-8") as fh:
+            fh.write("def main():\n    pass\n")
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def test_lists_the_tree_and_tells_the_model_not_to_repeat_it(self):
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        out = _preload_listing(self.tools)
+        self.assertIn("main.py", out)
+        self.assertIn("src/map.py", out)
+        self.assertIn("do NOT call list_files", out)
+
+    def test_a_large_tree_is_skipped_not_truncated(self):
+        """A half-listing is worse than none — it reads as complete."""
+        import os
+
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        for i in range(400):
+            with open(f"f{i}_with_a_longish_name.py", "w",
+                      encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+        self.assertEqual(_preload_listing(self.tools), "")
+
+    def test_a_broken_tools_object_is_survivable(self):
+        from unittest.mock import MagicMock
+
+        from agentchanti.orchestrator.agent_loop import _preload_listing
+        broken = MagicMock()
+        broken._tool_list_files.side_effect = RuntimeError("boom")
+        self.assertEqual(_preload_listing(broken), "")
+
+    def test_it_reaches_the_opening_message(self):
+        from agentchanti.orchestrator.agent_loop import _build_user_message
+        msg = _build_user_message("step", "task", "python", "",
+                                  preloaded="PRELOADED",
+                                  listing="LISTING")
+        self.assertIn("LISTING", msg)
+        self.assertIn("PRELOADED", msg)
+
+
+class TestMonotonicEscalationLadder(unittest.TestCase):
+    """Never step back down to the weaker model mid-ladder.
+
+    The ladder was loop(weak) -> loop(strong) -> recovery(weak) ->
+    recovery(strong). Once the stronger model had failed, the next rung
+    went back to the weaker one — the least likely attempt to succeed, at
+    a full turn budget to find out. Observed on a Pac-Man run: step 7 took
+    32 turns across those four attempts, 47% of the whole run's turns,
+    and only the final strong attempt worked.
+    """
+
+    def _clients(self):
+        weak, strong = MagicMock(), MagicMock()
+        weak.supports_tools.return_value = True
+        strong.supports_tools.return_value = True
+        return weak, strong
+
+    def test_detects_a_failed_escalation_in_the_journal(self):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, escalation_already_failed,
+            record_attempt,
+        )
+        self.assertFalse(escalation_already_failed(3))
+        record_attempt(3, "first attempt", "verify-failed", [], [], "")
+        self.assertFalse(escalation_already_failed(3))
+        record_attempt(3, ESCALATION_ATTEMPT_LABEL, "verify-failed", [], [], "")
+        self.assertTrue(escalation_already_failed(3))
+
+    def test_a_successful_escalation_does_not_count(self):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, escalation_already_failed,
+            record_attempt,
+        )
+        record_attempt(4, ESCALATION_ATTEMPT_LABEL, "verified", [], [], "")
+        self.assertFalse(escalation_already_failed(4))
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_recovery_starts_strong_after_a_failed_escalation(self, mock_loop):
+        from agentchanti.orchestrator.agent_loop import (
+            ESCALATION_ATTEMPT_LABEL, record_attempt, run_recovery_loop,
+        )
+        mock_loop.return_value = (True, "fixed")
+        weak, strong = self._clients()
+        record_attempt(7, ESCALATION_ATTEMPT_LABEL, "verify-failed", [], [], "")
+        ok, _ = run_recovery_loop(weak, MagicMock(), "step", "task", "err",
+                                  step_idx=7, escalation_client=strong)
+        self.assertTrue(ok)
+        self.assertEqual(mock_loop.call_count, 1,
+                         "the weaker model must not get a recovery run")
+        self.assertIs(mock_loop.call_args[0][0], strong)
+
+    @patch("agentchanti.orchestrator.agent_loop.run_agent_loop")
+    def test_without_a_failed_escalation_recovery_starts_weak(self, mock_loop):
+        """The normal ladder is unchanged — the weak model still gets a go."""
+        from agentchanti.orchestrator.agent_loop import run_recovery_loop
+        mock_loop.return_value = (True, "fixed")
+        weak, strong = self._clients()
+        ok, _ = run_recovery_loop(weak, MagicMock(), "step", "task", "err",
+                                  step_idx=8, escalation_client=strong)
+        self.assertTrue(ok)
+        self.assertIs(mock_loop.call_args[0][0], weak)
+
+
+class TestSignatureOutline(unittest.TestCase):
+    """A dependency is consulted for its API, not its implementation.
+
+    Bodies are ~92% of a module's bytes. A step importing `map.py` needs
+    to know `Map.is_walkable(x, y)` exists, not how it is written — and
+    the preload budget was being spent on, and truncated by, code the
+    model never reads.
+    """
+
+    SRC = (
+        "import os\n"
+        "TILE_SIZE = 24\n"
+        # A real maze layout runs to hundreds of characters — bulk, not
+        # interface — so it must be elided rather than carried.
+        "LAYOUT = [" + ", ".join(["'#" + "." * 30 + "#'"] * 8) + "]\n"
+        "def helper(a, b=2, *rest, key=None, **kw):\n"
+        "    total = 0\n"
+        "    for i in range(1000):\n"
+        "        total += i\n"
+        "    return total\n"
+        "class Map(Base):\n"
+        "    MAX = 9\n"
+        "    def __init__(self, layout):\n"
+        "        self.layout = layout\n"
+        "    async def load(self, path):\n"
+        "        return None\n"
+        "class Empty:\n"
+        "    pass\n"
+    )
+
+    def _outline(self, src=None):
+        from agentchanti.orchestrator.agent_loop import _py_signature_outline
+        return _py_signature_outline(self.SRC if src is None else src)
+
+    def test_keeps_the_api_surface(self):
+        out = self._outline()
+        self.assertIn("def helper(a, b, *rest, key, **kw)", out)
+        self.assertIn("class Map(Base)", out)
+        self.assertIn("    def __init__(self, layout)", out)
+        self.assertIn("    async def load(self, path)", out)
+
+    def test_drops_the_bodies(self):
+        out = self._outline()
+        self.assertNotIn("total += i", out)
+        self.assertNotIn("self.layout = layout", out)
+
+    def test_constants_keep_their_values(self):
+        """A constants module IS its assignments — the value is the API."""
+        self.assertIn("TILE_SIZE = 24", self._outline())
+
+    def test_a_long_literal_is_elided(self):
+        """A maze layout is bulk, not interface."""
+        out = self._outline()
+        self.assertIn("LAYOUT = ...", out)
+
+    def test_an_empty_class_still_renders(self):
+        self.assertIn("class Empty", self._outline())
+
+    def test_unparseable_source_returns_none(self):
+        """Half an outline is worse than none — caller sends real text."""
+        self.assertIsNone(self._outline("def f(:\n"))
+
+    def test_it_is_much_smaller(self):
+        out = self._outline()
+        self.assertLess(len(out), len(self.SRC) * 0.6)
+
+
+class TestPreloadOutlinesDependencies(unittest.TestCase):
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from agentchanti.executor import Executor
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+
+        self._prev = os.getcwd()
+        os.chdir(tempfile.mkdtemp())
+        body = "\n".join(f"        x{i} = {i}" for i in range(400))
+        with open("dep.py", "w", encoding="utf-8") as fh:
+            fh.write("CONST = 7\nclass Dep:\n    def api(self, n):\n" + body + "\n")
+        with open("target.py", "w", encoding="utf-8") as fh:
+            fh.write("def main():\n    return 1\n")
+        self.tools = build_step_tools(Executor(), FileMemory())
+
+    def tearDown(self):
+        import os
+        os.chdir(self._prev)
+
+    def _pre(self, **kw):
+        from agentchanti.orchestrator.agent_loop import _preload_target_files
+        return _preload_target_files(self.tools, ["target.py", "dep.py"], **kw)
+
+    def test_dependencies_are_outlined_and_targets_are_not(self):
+        out = self._pre(full_paths={"target.py"})
+        self.assertIn("API outline", out)
+        self.assertIn("def api(self, n)", out)
+        self.assertNotIn("x399 = 399", out)
+        self.assertIn("def main()", out)      # the target, in full
+
+    def test_it_shrinks_the_bundle(self):
+        self.assertLess(len(self._pre(full_paths={"target.py"})),
+                        len(self._pre()) * 0.5)
+
+    def test_outlining_is_opt_in(self):
+        """Without an explicit target set the caller cannot say which file
+        is being edited, so nothing is outlined."""
+        self.assertNotIn("API outline", self._pre())
+
+    def test_a_file_being_edited_is_never_outlined(self):
+        out = self._pre(full_paths={"target.py", "dep.py"})
+        self.assertNotIn("API outline", out)
+
+    def test_small_dependencies_are_sent_whole(self):
+        """Below the threshold an outline saves nothing and loses detail."""
+        out = self._pre(full_paths={"dep.py"})
+        self.assertIn("def main()", out)
+        self.assertNotIn("API outline", out)
+
+
+class TestVerifyCrashRetry(unittest.TestCase):
+    """A crashed verifier produced no verdict — do not fail the step on it.
+
+    GateLedger.recheck and the BulkTest plan gate already guard this; the
+    loop's own exit verification did not. Observed live: three consecutive
+    attempts where `python -m unittest -v` PASSED and the exit
+    verification then access-violated (0xC0000005), so a run whose tests
+    were green was reported as failed and the pipeline gave up. The model
+    even ran the suite ten times in a loop to demonstrate the flakiness.
+    """
+
+    def _tools(self, codes, outputs):
+        """AgentTools whose run_command yields scripted (ok, out) pairs."""
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        from agentchanti.orchestrator.memory import FileMemory
+        ex = MagicMock()
+        seq = list(zip(codes, outputs))
+
+        def run_command(cmd, **kw):
+            code, out = seq.pop(0)
+            ex.last_exit_code = code
+            return (code == 0, out)
+
+        ex.run_command.side_effect = run_command
+        return build_step_tools(ex, FileMemory()), ex
+
+    def _run(self, tools, llm):
+        from agentchanti.orchestrator.agent_loop import run_agent_loop
+        return run_agent_loop(llm, tools, "step", "task",
+                              verify_cmd="python -m unittest -v",
+                              max_turns=2)
+
+    def _llm(self):
+        """Does one real edit, then claims done — the loop only runs the
+        exit verification after at least one tool call."""
+        from agentchanti.llm.chat_types import ToolCall
+        acting = MagicMock()
+        acting.has_tool_calls = True
+        acting.tool_calls = [ToolCall(name="write_file",
+                                      arguments={"path": "a.py",
+                                                 "content": "x = 1"},
+                                      id="t1")]
+        acting.to_message.return_value = MagicMock(role="assistant")
+        done = MagicMock()
+        done.has_tool_calls = False
+        done.content = "done"
+        llm = MagicMock()
+        llm.chat.side_effect = [acting, done, done, done]
+        return llm
+
+    def test_a_crashed_verify_is_retried_and_can_pass(self):
+        # first verify access-violates, retry succeeds
+        tools, ex = self._tools([3221225477, 0], ["", "OK"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertTrue(ok, "a green retry must rescue a crashed verify")
+        self.assertEqual(ex.run_command.call_count, 2)
+
+    def test_an_ordinary_failure_is_not_retried(self):
+        """exit 1 is a verdict — retrying it just costs a suite run."""
+        tools, ex = self._tools([1], ["FAILED (failures=1)"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertFalse(ok)
+        self.assertEqual(ex.run_command.call_count, 1)
+
+    def test_a_repeat_crash_still_fails(self):
+        tools, ex = self._tools([3221225477, 3221225477], ["", ""])
+        ok, _ = self._run(tools, self._llm())
+        self.assertFalse(ok)
+        self.assertEqual(ex.run_command.call_count, 2)
+
+    def test_a_clean_pass_runs_the_verify_once(self):
+        tools, ex = self._tools([0], ["OK"])
+        ok, _ = self._run(tools, self._llm())
+        self.assertTrue(ok)
+        self.assertEqual(ex.run_command.call_count, 1)
