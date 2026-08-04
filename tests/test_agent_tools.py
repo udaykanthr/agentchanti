@@ -297,6 +297,18 @@ class TestNoTestsCollected(AgentToolsTestCase):
         self.assertIn("test_*.py", result)
         self.assertIn("__init__.py", result)
 
+    def test_the_hint_appears_even_when_the_runner_exits_zero(self):
+        """The dangerous case, and the one CI caught.
+
+        unittest only started exiting non-zero for a zero-test run in
+        3.12. On 3.10/3.11 the same empty project reports "exit: success",
+        so gating the hint on failure hid it exactly where a green result
+        is backed by zero executed tests.
+        """
+        from agentchanti.agent_tools import _no_tests_collected
+        self.assertTrue(_no_tests_collected(
+            "python -m unittest -v", 0, "Ran 0 tests in 0.000s\n\nOK\n"))
+
     def test_a_real_failure_gets_no_hint_through_the_tool(self):
         self._write("tests/__init__.py", "")
         self._write("tests/test_x.py",

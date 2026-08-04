@@ -72,7 +72,8 @@ def _no_tests_collected(command: str, exit_code, output: str) -> bool:
 _NO_TESTS_HINT = (
     "\n\nNOTE: the runner exited having COLLECTED NO TESTS. This is a "
     "discovery problem, not a failing assertion — nothing was executed, so "
-    "there is no bug in the code under test to chase here. Check that the "
+    "there is no bug in the code under test to chase here, and a zero exit "
+    "status above is NOT evidence that anything passed. Check that the "
     "test file exists, is named test_*.py, sits in a directory with an "
     "__init__.py if you are importing it as a package, and that you are "
     "running from the project root."
@@ -373,8 +374,14 @@ class AgentTools:
         body = _truncate(output or "(no output)", _MAX_CMD_OUTPUT_CHARS)
         # "exit: FAILED" reads identically whether an assertion failed or
         # the runner never found a test to run. Say which.
+        #
+        # NOT gated on failure. Whether a zero-test run exits non-zero is
+        # CPython policy: unittest only gained that status in 3.12, so on
+        # 3.10 and 3.11 discovering nothing reports "exit: success" — a
+        # green result backed by zero executed tests, which is the more
+        # dangerous of the two cases and the one that most needs saying.
         hint = ""
-        if not success and _no_tests_collected(
+        if _no_tests_collected(
                 command, getattr(self._executor, "last_exit_code", None),
                 output):
             hint = _NO_TESTS_HINT
