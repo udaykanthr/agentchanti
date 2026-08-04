@@ -125,5 +125,68 @@ class MergeTest(unittest.TestCase):
             ORIGINAL, "def totally_unrelated():\n    return 0\n"))
 
 
+
+class MergeClassMembersTest(unittest.TestCase):
+    """A fragment redefining EXISTING methods must be merged by member name.
+
+    It cannot be appended (two definitions, last one wins) and has no
+    textual anchor to align to, so it fell through to the fuzzy fallback,
+    which treated the indented fragment as a whole file and died with
+    "unexpected indent (line 1)". Seen three times across runs; the fix was
+    correct every time and never landed.
+    """
+
+    CLS = '''\
+class Map:
+    def __init__(self, g):
+        self.g = g
+
+    def is_walkable(self, x, y):
+        return False
+
+    def other(self):
+        return 1
+
+
+def helper():
+    return 2
+'''
+
+    FRAG = ("    def is_walkable(self, x, y):\n"
+            "        return self.g[y][x] != 1\n")
+
+    def test_replaces_the_member(self):
+        from agentchanti.editing.symbol_merge import merge_class_members
+        merged = merge_class_members(self.CLS, "Map", self.FRAG)
+        self.assertIsNotNone(merged)
+        self.assertIn("!= 1", merged)
+        self.assertEqual(merged.count("def is_walkable"), 1)
+
+    def test_keeps_everything_unmentioned(self):
+        from agentchanti.editing.symbol_merge import merge_class_members
+        merged = merge_class_members(self.CLS, "Map", self.FRAG)
+        for kept in ("def __init__", "def other", "def helper"):
+            self.assertIn(kept, merged)
+
+    def test_result_compiles(self):
+        from agentchanti.editing.symbol_merge import merge_class_members
+        self.assertTrue(is_valid_python(
+            merge_class_members(self.CLS, "Map", self.FRAG)))
+
+    def test_refuses_a_new_member(self):
+        """Introducing a name belongs to the additive path, which knows
+        where to append it."""
+        from agentchanti.editing.symbol_merge import merge_class_members
+        self.assertIsNone(merge_class_members(
+            self.CLS, "Map", "    def brand_new(self):\n        return 0\n"))
+
+    def test_refuses_unknown_class(self):
+        from agentchanti.editing.symbol_merge import merge_class_members
+        self.assertIsNone(merge_class_members(self.CLS, "Nope", self.FRAG))
+
+    def test_refuses_unparseable_fragment(self):
+        from agentchanti.editing.symbol_merge import merge_class_members
+        self.assertIsNone(merge_class_members(self.CLS, "Map", "    def f(:\n"))
+
 if __name__ == "__main__":
     unittest.main()

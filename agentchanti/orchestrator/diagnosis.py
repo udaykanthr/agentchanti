@@ -677,6 +677,13 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
             "CRITICAL: Do NOT use diff/patch format. "
             "Use [EDIT]: for targeted fixes, [FILE]: only when truly needed.\n"
             "The [EDIT]: marker MUST be OUTSIDE and BEFORE the code block.\n"
+            "NEVER elide content with a placeholder comment such as "
+            "`# ... rows above unchanged ...`, `# rest of the file`, or "
+            "`...`. Every block is applied literally, so an elided block "
+            "either destroys the omitted content or is refused outright and "
+            "wastes the whole attempt. If a literal (e.g. a maze table) is "
+            "too long to restate in full, edit a DIFFERENT, smaller scope — "
+            "the function that builds or validates it — instead.\n"
         )
 
     sent_before, recv_before = token_tracker.snapshot()
@@ -885,9 +892,38 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                                    for e in _file_edits):
                                 _chunk_scoped_paths.add(_fpath)
                     except Exception as _exc:
-                        log.warning(
-                            "Step %d: ChunkEdit apply failed for %s: %s",
-                            step_idx + 1, _fpath, _exc)
+                        # A fragment that REDEFINES existing members of a
+                        # class cannot be appended (two definitions, last
+                        # one wins) and has no textual anchor to align to,
+                        # so it lands here. Merge it by member name instead
+                        # of dropping it: without this the fuzzy fallback
+                        # treats the indented fragment as a whole file and
+                        # it dies as "unexpected indent (line 1)".
+                        _merged_cls = None
+                        try:
+                            from ..editing.symbol_merge import (
+                                merge_class_members)
+                            _cls = (_file_edits[0].chunk_id or "").split(
+                                ".")[-1].split(":")[-1]
+                            for _e in _file_edits:
+                                _src = _merged_cls or _existing
+                                _try = merge_class_members(
+                                    _src, _cls, _e.new_content)
+                                if _try:
+                                    _merged_cls = _try
+                        except Exception:
+                            _merged_cls = None
+                        if _merged_cls:
+                            log.info(
+                                "Step %d: %s did not align, but the fragment "
+                                "redefines existing members of %s — merged "
+                                "by member name", step_idx + 1, _fpath, _cls)
+                            files[_fpath] = _merged_cls
+                            _chunk_scoped_paths.add(_fpath)
+                        else:
+                            log.warning(
+                                "Step %d: ChunkEdit apply failed for %s: %s",
+                                step_idx + 1, _fpath, _exc)
             if files:
                 log.info("Step %d: Diagnosis applied chunk edits to %d "
                          "file(s): %s",

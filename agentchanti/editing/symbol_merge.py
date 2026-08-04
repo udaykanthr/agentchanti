@@ -19,10 +19,11 @@ either side failing to parse, or a merged result that does not compile.
 from __future__ import annotations
 
 import ast
+import textwrap
 
 from ..py_syntax import check_python_syntax
 
-__all__ = ["merge_module_symbols"]
+__all__ = ["merge_module_symbols", "merge_class_members"]
 
 
 def _defined_name(node: ast.stmt) -> str | None:
@@ -100,6 +101,70 @@ def _last_import_end(source: str) -> int:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             end = max(end, _span(node)[1])
     return end
+
+
+def merge_class_members(original: str, class_name: str,
+                        fragment: str) -> str | None:
+    """Replace *class_name*'s members with the ones *fragment* redefines.
+
+    A diagnosis fix for `map.py:Map` is usually a couple of methods at
+    class-body indentation and nothing else — no `class` line. It is a
+    REPLACEMENT of those methods, so the additive path refuses it (rightly:
+    appending would leave two definitions with the last one winning), the
+    chunk aligner has no textual anchor, and the fuzzy fallback then treats
+    the indented fragment as a whole file, which cannot even parse
+    ("unexpected indent (line 1)"). Observed three times across runs; the
+    fix was correct every time and never landed.
+
+    Names settle it, as everywhere else here: every member the fragment
+    defines is swapped for its namesake, everything unmentioned is kept.
+    Returns ``None`` unless the result is provably sound.
+    """
+    body = _nodes(original)
+    if body is None or not class_name:
+        return None
+    target = next((n for n in body
+                   if isinstance(n, ast.ClassDef) and n.name == class_name),
+                  None)
+    if target is None:
+        return None
+
+    # The fragment is a bare class body: dedent it and re-parse under a
+    # synthetic class so member spans can be located.
+    text = textwrap.dedent(fragment)
+    if not text.strip():
+        return None
+    wrapped = "class _F:\n" + textwrap.indent(text, "    ")
+    holder = _nodes(wrapped)
+    if not holder or not isinstance(holder[0], ast.ClassDef):
+        return None
+    frag_lines = wrapped.splitlines(True)
+    frag_members = _index_body(holder[0].body)
+    orig_members = _index_body(target.body)
+    if not frag_members:
+        return None
+    # Only a replacement of EXISTING members is unambiguous. A fragment
+    # introducing new names belongs to the additive path, which knows
+    # where to append them.
+    if not set(frag_members) <= set(orig_members):
+        return None
+
+    orig_lines = original.splitlines(True)
+    edits: list[tuple[int, int, str]] = []
+    for name, (fs, fe) in frag_members.items():
+        chunk = "".join(frag_lines[fs - 1:fe])
+        if not chunk.endswith("\n"):
+            chunk += "\n"
+        os_, oe = orig_members[name]
+        edits.append((os_ - 1, oe, chunk))
+
+    merged = list(orig_lines)
+    for start, end, chunk in sorted(edits, key=lambda t: -t[0]):
+        merged[start:end] = [chunk]
+    result = "".join(merged)
+    if check_python_syntax(result, "<merged>"):
+        return None
+    return result
 
 
 def merge_module_symbols(original: str, replacement: str) -> str | None:
