@@ -416,6 +416,26 @@ class TestRawTaskTopicFallback(unittest.TestCase):
         self.assertNotIn({"pac"}, topics)
 
 
+def _shipped_registry_docs():
+    """Paths of the shipped KB registry docs, or [] when absent.
+
+    `agentchanti/kb/global_kb/registry/` is gitignored — its own .gitignore
+    says "Registry content is pulled at runtime; do not commit" — so it is
+    present on a working machine and ABSENT in CI. A test that reads it must
+    therefore skip rather than fail, and must not pass vacuously on an empty
+    directory either (an empty scan makes "no offenders found" trivially
+    true, which looks green while checking nothing).
+    """
+    import glob
+    import os
+
+    import agentchanti.kb.global_kb.store as _store
+    registry = os.path.join(
+        os.path.dirname(os.path.abspath(_store.__file__)), "registry")
+    return sorted(glob.glob(os.path.join(registry, "**", "*.md"),
+                            recursive=True))
+
+
 class TestFrameworkScopedDocs(unittest.TestCase):
     """A doc written FOR a framework needs that framework in the project.
 
@@ -476,18 +496,21 @@ class TestFrameworkScopedDocs(unittest.TestCase):
             self.assertNotIn(lang, _DOC_FRAMEWORK_TOKENS)
 
     def test_the_shipped_registry_splits_the_way_we_expect(self):
-        """Guards the real frontmatter, not just the token set."""
-        import glob
-        import os
+        """Guards the real frontmatter, not just the token set.
+
+        Skipped where the registry is not on disk — see
+        _shipped_registry_docs(). This is a data check on runtime-pulled
+        content, not a CI-enforceable invariant; the filter logic itself is
+        covered by the literal-title tests above.
+        """
         import re as _re
 
-        import agentchanti.kb.global_kb.store as _store
-        registry = os.path.join(
-            os.path.dirname(os.path.abspath(_store.__file__)),
-            "registry")
+        paths = _shipped_registry_docs()
+        if not paths:
+            self.skipTest("KB registry is gitignored/pulled at runtime — "
+                          "not present here")
         verdicts = {}
-        for path in glob.glob(os.path.join(registry, "**", "*.md"),
-                              recursive=True):
+        for path in paths:
             with open(path, encoding="utf-8") as fh:
                 head = fh.read(800)
             title = _re.search(r'^title:\s*"([^"]*)"', head, _re.M)

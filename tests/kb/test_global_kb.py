@@ -753,16 +753,26 @@ class TestLanguageScopedDocs(unittest.TestCase):
                                           "typescript"))
 
     def test_shipped_react_docs_no_longer_reach_python_projects(self):
-        """The registry metadata itself must be right, not just the helper."""
+        """The registry metadata itself must be right, not just the helper.
+
+        `agentchanti/kb/global_kb/registry/` is gitignored and pulled at
+        runtime, so it is absent in CI. Skip there rather than scan an empty
+        directory: an empty scan finds no offenders, which would report
+        green while asserting nothing.
+        """
         import glob
         import os
         registry = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(
                 agentchanti.kb.global_kb.store.__file__))),
             "global_kb", "registry")
+        paths = sorted(glob.glob(os.path.join(registry, "**", "*.md"),
+                                 recursive=True))
+        if not paths:
+            self.skipTest("KB registry is gitignored/pulled at runtime — "
+                          "not present here")
         offenders = []
-        for path in glob.glob(os.path.join(registry, "**", "*.md"),
-                              recursive=True):
+        for path in paths:
             with open(path, encoding="utf-8") as fh:
                 head = fh.read(600)
             name = os.path.basename(path)
