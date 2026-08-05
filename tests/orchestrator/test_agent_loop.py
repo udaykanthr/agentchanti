@@ -2077,3 +2077,122 @@ class TestVerifyCrashRetry(unittest.TestCase):
         ok, _ = self._run(tools, self._llm())
         self.assertTrue(ok)
         self.assertEqual(ex.run_command.call_count, 1)
+
+
+class TestEarlyGateExit(AgentLoopTestCase):
+    """The loop asks the gate as soon as an edit lands, not only when the
+    model volunteers a summary or the turn budget runs out.
+
+    "The gate passes" was already the loop's definition of a completed
+    step — applied when the model claimed done and again at exhaustion.
+    Nothing asked earlier, so a step finished at turn 4 kept probing to
+    turn 8. Measured on a Pac-Man run: 53 turns over 7 loop runs, avg 7.6
+    of a max 8, and the late turns are the expensive ones (~27k prompt
+    tokens each against ~2k at the start) because the whole conversation
+    is resent every turn.
+    """
+
+    def _edit(self, n=1):
+        return _tool_response(ToolCall(name="write_file",
+                                       arguments={"path": f"a{n}.py",
+                                                  "content": "x = 1"},
+                                       id=f"t{n}"))
+
+    def test_a_passing_gate_ends_the_loop_immediately(self):
+        self.executor.run_command.return_value = (True, "2 passed")
+        llm = self._llm(self._edit(), self._edit(2), _final())
+        ok, _ = run_agent_loop(llm, self.tools, "step", "task", max_turns=8,
+                               verify_cmd="python -m pytest -q")
+        self.assertTrue(ok)
+        self.assertEqual(llm.chat.call_count, 1,
+                         "the loop must stop at the turn the gate went green")
+
+    def test_a_red_gate_does_not_end_the_loop(self):
+        self.executor.run_command.return_value = (False, "1 failed")
+        llm = self._llm(self._edit(), self._edit(2), _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=3,
+                       verify_cmd="python -m pytest -q")
+        self.assertGreater(llm.chat.call_count, 1)
+
+    def test_inspection_alone_never_triggers_the_gate(self):
+        """Nothing changed, so running the suite would prove nothing."""
+        read = _tool_response(ToolCall(name="read_file",
+                                       arguments={"path": "a.py"}, id="r"))
+        self.executor.run_command.return_value = (True, "2 passed")
+        llm = self._llm(read, read, _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=3,
+                       verify_cmd="python -m pytest -q")
+        # Only the exit verification runs — no gate after the read turns.
+        self.assertEqual(self.executor.run_command.call_count, 1)
+
+    def test_a_gate_collecting_no_tests_is_not_an_early_pass(self):
+        """Exit 0 with nothing collected proves nothing — the loop must
+        keep working rather than bank it as a completed step."""
+        from agentchanti.agent_tools import NO_TESTS_MARKER
+        self.executor.run_command.return_value = (True, NO_TESTS_MARKER)
+        llm = self._llm(self._edit(), self._edit(2), _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=3,
+                       verify_cmd="python -m pytest -q")
+        self.assertGreater(llm.chat.call_count, 1)
+
+    def test_the_gate_is_not_run_twice_over_identical_files(self):
+        """The early gate and the exit check ask the same question; when
+        no edit lands in between, the second run is pure wall-clock."""
+        self.executor.run_command.return_value = (False, "1 failed")
+        llm = self._llm(self._edit(), _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=2,
+                       verify_cmd="python -m pytest -q")
+        self.assertEqual(self.executor.run_command.call_count, 1)
+
+
+class TestSelfRunGateReuse(AgentLoopTestCase):
+    """When the model runs the gate itself, don't run it again.
+
+    Observed as back-to-back identical `python -m unittest -v` lines
+    seconds apart: the model ran the gate, that marked the tree dirty,
+    and the early gate re-asked the same question over the same files.
+    """
+
+    def _edit_then_gate(self):
+        return _tool_response(
+            ToolCall(name="write_file",
+                     arguments={"path": "a.py", "content": "x = 1"}, id="w"),
+            ToolCall(name="run_command",
+                     arguments={"command": "python -m pytest -q"}, id="c"))
+
+    def test_a_green_self_run_ends_the_loop_without_rerunning(self):
+        self.executor.run_command.return_value = (True, "2 passed")
+        llm = self._llm(self._edit_then_gate(), _final())
+        ok, _ = run_agent_loop(llm, self.tools, "step", "task", max_turns=8,
+                               verify_cmd="python -m pytest -q")
+        self.assertTrue(ok)
+        self.assertEqual(self.executor.run_command.call_count, 1,
+                         "the model's own green gate run is the verdict")
+        self.assertEqual(llm.chat.call_count, 1)
+
+    def test_a_red_self_run_is_not_reused(self):
+        """_run_verify self-heals the environment on failure; reusing a
+        cached red result would skip that repair."""
+        self.executor.run_command.side_effect = [
+            (False, "1 failed"),   # the model's own run
+            (False, "1 failed"),   # the gate, run properly
+            (False, "1 failed"),
+            (False, "1 failed"),
+        ]
+        llm = self._llm(self._edit_then_gate(), _final(), _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=3,
+                       verify_cmd="python -m pytest -q")
+        self.assertGreater(self.executor.run_command.call_count, 1)
+
+    def test_a_different_command_is_not_mistaken_for_the_gate(self):
+        self.executor.run_command.return_value = (True, "ok")
+        resp = _tool_response(
+            ToolCall(name="write_file",
+                     arguments={"path": "a.py", "content": "x = 1"}, id="w"),
+            ToolCall(name="run_command",
+                     arguments={"command": "python -c 'print(1)'"}, id="c"))
+        llm = self._llm(resp, _final())
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=8,
+                       verify_cmd="python -m pytest -q")
+        # The probe plus a real gate run — the probe is not the gate.
+        self.assertEqual(self.executor.run_command.call_count, 2)

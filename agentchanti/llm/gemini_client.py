@@ -9,6 +9,10 @@ from typing import List, Optional
 from .base import (LLMClient, LLMError, NonRetryableLLMError,
                    ToolsNotSupportedError)
 from .cancellation import streaming_response, check_cancelled
+# Shared home-cache store. Imported from the OpenAI client rather than
+# copied so both providers read and write one file — and so the suite's
+# single isolation patch keeps covering both.
+from .openai_client import load_effort_floor, save_effort_floor
 from .chat_types import ChatResponse, Message, ToolCall, ToolDef
 from ..cli_display import token_tracker, log
 
@@ -51,6 +55,27 @@ class GeminiClient(LLMClient):
         # whole output budget on hidden thoughts. Mirrors the OpenAI
         # client's reasoning-effort latch.
         self._thinking_budget: Optional[int] = None
+        # ...and, like that latch, remembered across runs. The in-session
+        # version still paid one full burn per run: measured on a Pac-Man
+        # run, the very first call (intent analysis) spent a 16,384 budget
+        # to return 655 visible tokens, then retried — 90s of wall clock
+        # and a wasted call, on every single run.
+        _remembered = load_effort_floor(self._floor_key())
+        if _remembered:
+            try:
+                self._thinking_budget = int(_remembered)
+                log.info(
+                    "[Gemini] %s burned its output budget on thinking in an "
+                    "earlier run — starting with thinkingBudget=%d instead "
+                    "of paying that burn again.",
+                    self.model, self._thinking_budget)
+            except (TypeError, ValueError):
+                pass
+
+    def _floor_key(self) -> str:
+        """Namespaced so a Gemini thinking budget and an OpenAI effort
+        string can never be read as one another in the shared store."""
+        return f"gemini:{self.model}"
 
     # ── Native chat (structured tool calling) ──
 
@@ -98,10 +123,12 @@ class GeminiClient(LLMClient):
         """
         if self._thinking_budget is None:
             self._thinking_budget = 512
+            save_effort_floor(self._floor_key(), "512")
             log.warning(
                 "[Gemini] %s spent its entire output budget on thinking "
                 "(finishReason MAX_TOKENS, no visible text) — capping "
-                "thinkingBudget at 512 for the rest of this session.",
+                "thinkingBudget at 512 for this session and remembering it, "
+                "rather than paying the same burn on every future run.",
                 self.model)
 
     @staticmethod

@@ -268,37 +268,75 @@ def _takes_row_first(fn):
                                 or names[0].lower() in ("r", "y", "ty"))
 
 
+# A "wall"-named method whose name also carries one of these reads as the
+# COMPLEMENT: is_rect_wall_free(x, y, r) is true where there is NO wall.
+# Taking the name at face value inverts every frame of the run.
+_NEGATED = ("free", "clear", "open", "no_wall", "not_wall", "without")
+_COMPLEMENT_WORDS = ("walkable", "is_open", "can_move", "passable")
+
+
+def _positional_arity(fn):
+    """Number of REQUIRED positional parameters, or None if unreadable.
+
+    A coordinate query takes 2 (col,row) or 1 (a single (x,y) tuple).
+    Anything else — is_rect_wall_free(x, y, radius) — is a different
+    question wearing a matching name, and calling it either explodes or,
+    worse, silently answers something else.
+    """
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    return sum(1 for p in params
+               if p.default is inspect.Parameter.empty
+               and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                              inspect.Parameter.POSITIONAL_OR_KEYWORD))
+
+
 def _wall_query(game):
     """Find the wall test by CAPABILITY, not by name.
 
     Returns (fn, takes_pixels, invert). Refuses rather than guesses.
     """
     for _, obj in vars(game).items():
-        methods = [m for m in dir(obj)
-                   if "wall" in m.lower() and not m.startswith("_")
-                   and callable(getattr(obj, m, None))]
-        if methods:
-            for m in methods:            # pixel-native: no conversion
-                if "pixel" in m.lower():
-                    return getattr(obj, m), True, False
-            for m in methods:
-                low = m.lower()
-                if "tile" in low or low in ("is_wall", "wall_at"):
-                    return getattr(obj, m), False, False
-            return getattr(obj, methods[0]), False, False
+        cands = []
+        for m in dir(obj):
+            if m.startswith("_"):
+                continue
+            fn = getattr(obj, m, None)
+            if not callable(fn):
+                continue
+            low = m.lower()
+            is_wall_named = "wall" in low
+            is_complement = any(w in low for w in _COMPLEMENT_WORDS)
+            if not (is_wall_named or is_complement):
+                continue
+            # Arity is checked BEFORE the name is trusted: a 3-arg
+            # is_rect_wall_free used to outrank a perfectly good
+            # is_walkable purely because it spelled "wall", and the
+            # verifier then refused on a game it could drive.
+            arity = _positional_arity(fn)
+            if arity not in (1, 2):
+                continue
+            invert = is_complement or (is_wall_named
+                                       and any(n in low for n in _NEGATED))
+            cands.append((m, fn, invert, arity))
 
-        # Some artifacts expose only the COMPLEMENT (is_walkable/is_open).
-        # Same information, opposite sign; reading one as the other
-        # inverts every frame, so polarity is explicit and proved below.
-        inv = [m for m in dir(obj)
-               if not m.startswith("_") and callable(getattr(obj, m, None))
-               and any(w in m.lower() for w in
-                       ("walkable", "is_open", "can_move", "passable"))]
-        if inv:
-            for m in inv:
-                if "pixel" in m.lower():
-                    return getattr(obj, m), True, True
-            return getattr(obj, inv[0]), False, True
+        if not cands:
+            continue
+
+        def rank(c):
+            name, _fn, invert, arity = c
+            low = name.lower()
+            return (
+                0 if "pixel" in low else 1,       # pixel-native first
+                0 if arity == 2 else 1,           # two coords beat a tuple
+                0 if not invert else 1,           # direct wall test first
+                0 if ("tile" in low or low in ("is_wall", "wall_at")) else 1,
+            )
+
+        name, fn, invert, _ = sorted(cands, key=rank)[0]
+        return fn, "pixel" in name.lower(), invert
     raise SystemExit("no wall query found on the game — refusing to guess")
 
 
