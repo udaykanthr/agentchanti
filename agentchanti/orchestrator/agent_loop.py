@@ -228,6 +228,56 @@ _READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 _ACT_NOW_NUDGE_AT = 2
 _WITHHOLD_READONLY_AT = 3
 
+# Re-running a command that already failed, without having changed anything
+# in between, cannot produce a different answer — but models do it anyway,
+# usually by fiddling with the working directory. Observed on a Pygame run:
+# turns 4-7 of an 8-turn budget spent re-running one identical failing gate
+# from four directories (`cd /d %TEMP%\...`, bare, again, `cd .`), ~38k sent
+# tokens, while the actual defect — an unreachable pellet its own maze
+# validator was reporting — went untouched.
+#
+# The system prompt already says "do not retry the same command unchanged".
+# These make it a mechanism rather than a request, on the same escalation
+# ladder as the read-only intervention above.
+_REPEAT_CMD_NUDGE_AT = 1
+_WITHHOLD_RUN_COMMAND_AT = 2
+
+# Wrappers that change how a command's output is delivered but not what it
+# does. A model that has been told to stop re-running something tends to
+# re-run it *dressed differently* instead, so an exact-string comparison
+# sees three distinct commands where there is one. Observed verbatim:
+#
+#   cd /d %CD% && python -m unittest test_pacman -v 2>&1 | head -100
+#   cd /d %CD% && python -m unittest test_pacman -v 2>&1 | head -150
+#   python -m unittest test_pacman -v
+#
+_CD_PREFIX_RE = re.compile(r"^\s*cd\s+(?:/d\s+)?(?:\"[^\"]*\"|\S+)\s*&&\s*",
+                           re.IGNORECASE)
+_OUTPUT_PIPE_RE = re.compile(
+    r"\s*(?:2>&1\s*)?\|\s*(?:head|tail|more)\b[^|]*$", re.IGNORECASE)
+
+
+def normalize_command(cmd: str) -> str:
+    """*cmd* reduced to what it actually runs, for repeat detection.
+
+    Strips ``cd <dir> &&`` prefixes and trailing output-limiting pipes, so
+    the same work dressed up differently compares equal. Deliberately
+    conservative: only wrappers that cannot change the command's effect are
+    removed, because a false match would suppress a legitimate re-run.
+    """
+    out = (cmd or "").strip()
+    while True:
+        stripped = _CD_PREFIX_RE.sub("", out, count=1)
+        if stripped == out:
+            break
+        out = stripped.strip()
+    prev = None
+    while prev != out:
+        prev = out
+        out = _OUTPUT_PIPE_RE.sub("", out).strip()
+    out = re.sub(r"\s*2>&1\s*$", "", out).strip()
+    return " ".join(out.split())
+
 # Pre-load caps: keep the injected file bundle from dominating the prompt.
 _PRELOAD_MAX_FILES = 6
 _PRELOAD_MAX_CHARS = 12_000
@@ -637,9 +687,15 @@ def run_agent_loop(
     definitions = tools.definitions()
     action_definitions = [d for d in definitions
                           if d.name not in _READ_ONLY_TOOLS]
+    editing_definitions = [d for d in definitions if d.name != "run_command"]
     any_tool_used = False
     tool_counts: Counter = Counter()
     read_only_streak = 0
+    repeat_cmd_streak = 0
+    # Commands that have failed and whose cause nobody has touched since.
+    # An edit clears it: re-running after a change is verification, not a
+    # rut, and must not be penalised.
+    failed_since_edit: set[str] = set()
     healed: set[str] = set()
 
     # Last run_command the model executed that exited 0 — evidence for
@@ -740,6 +796,12 @@ def run_agent_loop(
             # The act-now nudge was ignored — withhold inspection tools so
             # the only moves left are the ones that change something.
             tools_for_turn = action_definitions
+        elif repeat_cmd_streak >= _WITHHOLD_RUN_COMMAND_AT:
+            # Stuck re-running a failing command. Take the command away and
+            # the only remaining moves edit the code — which is where the
+            # defect is. The harness runs the gate itself after every turn,
+            # so nothing is lost by the model not running it.
+            tools_for_turn = editing_definitions
         else:
             tools_for_turn = definitions
         response = llm_client.chat(messages, tools=tools_for_turn)
@@ -756,6 +818,7 @@ def run_agent_loop(
             messages.append(response.to_message())
             _tool_msgs = tools.execute_all(response.tool_calls)
             messages.extend(_tool_msgs)
+            _repeated_cmd: str | None = None
             # A green gate the model ran itself, as the last thing it did
             # this turn. Without this the early gate below re-ran the very
             # command the model had just run seconds earlier — observed as
@@ -768,6 +831,11 @@ def run_agent_loop(
                     _cmd = _tc.arguments.get("command", "")
                     _ok = _content.startswith("exit: success")
                     if _cmd:
+                        if not _ok:
+                            _norm = normalize_command(_cmd)
+                            if _norm and _norm in failed_since_edit:
+                                _repeated_cmd = _cmd
+                            failed_since_edit.add(_norm)
                         commands_run.append((_cmd, _ok))
                     if _ok:
                         last_ok_cmd = _cmd
@@ -789,6 +857,9 @@ def run_agent_loop(
                     if _path and not _content.lower().startswith("error"):
                         edited_files.append(_path)
                         _dirty_since_gate = True
+                        # The world changed — every prior failure is now
+                        # worth re-testing, so nothing counts as a repeat.
+                        failed_since_edit.clear()
             if _self_gate is not None:
                 _gate_cache = _self_gate
                 _dirty_since_gate = False
@@ -822,6 +893,35 @@ def run_agent_loop(
                     "Inspection tools are now disabled. Only write_file, "
                     "edit_file and run_command are available — apply the "
                     "fix or run the completing command now.")))
+
+            # Repeated-command intervention: same ladder, different rut.
+            # A command that failed before and failed again with nothing
+            # edited in between has told the model everything it is going
+            # to tell it.
+            if _repeated_cmd:
+                repeat_cmd_streak += 1
+            else:
+                repeat_cmd_streak = 0
+            if repeat_cmd_streak == _REPEAT_CMD_NUDGE_AT:
+                _logger.info("[AgentLoop] step %d: re-ran a failing command "
+                             "unchanged — injecting fix-the-cause nudge",
+                             step_idx + 1)
+                messages.append(Message(role="user", content=(
+                    f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                    "this step and it failed the same way. Re-running it, or "
+                    "running it from a different directory, cannot change "
+                    "the result — the failure is in the code, not in how the "
+                    "command is invoked. Read the error above and edit the "
+                    f"source that produced it. {max_turns - turn} turn(s) "
+                    "remain.")))
+            elif repeat_cmd_streak == _WITHHOLD_RUN_COMMAND_AT:
+                _logger.info("[AgentLoop] step %d: still re-running a failing "
+                             "command — withholding run_command",
+                             step_idx + 1)
+                messages.append(Message(role="user", content=(
+                    "run_command is now disabled. Fix the cause with "
+                    "edit_file or write_file — the step's command is run for "
+                    "you after every turn, so you do not need to run it.")))
 
             # Early gate: the loop already treats "the gate passes" as the
             # definition of a completed step — when the model claims done

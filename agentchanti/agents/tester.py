@@ -1,3 +1,5 @@
+import re
+
 from .base import Agent
 from ..language import (
     get_code_block_lang, get_test_framework, get_language_name,
@@ -10,7 +12,8 @@ class TesterAgent(Agent):
                 language: str | None = None,
                 env_info: dict | None = None,
                 test_root: str | None = None,
-                pre_analysis_results: str | None = None) -> str:
+                pre_analysis_results: str | None = None,
+                test_command: str | None = None) -> str:
         # Infer language from context file paths when not explicitly provided
         if language is None:
             file_paths = self._extract_file_paths(context)
@@ -34,6 +37,15 @@ class TesterAgent(Agent):
         if (language in (None, "python")
                 and self._is_django_project(context)):
             fw = dict(fw, command="python manage.py test")
+        # The handler resolved the runner the suite will actually be run
+        # with (which may come from the plan's own acceptance gate rather
+        # than the language default). Announcing a different one here
+        # produces tests the run cannot execute — pytest-style bare test
+        # functions are invisible to `python -m unittest`.
+        _unittest_mode = False
+        if test_command:
+            fw = dict(fw, command=test_command)
+            _unittest_mode = bool(re.search(r"\bunittest\b", test_command))
         lang_tag = get_code_block_lang(language)
         lang_name = get_language_name(language)
         # Use detected test_root from project analysis when available,
@@ -72,7 +84,9 @@ Language: {lang_name}
             prompt += self._js_test_rules(language, fw, env_info=env_info,
                                           test_runner=test_runner)
         elif language == "python" or language is None:
-            prompt += self._python_test_rules(django=self._is_django_project(context))
+            prompt += self._python_test_rules(
+                django=self._is_django_project(context),
+                unittest_runner=_unittest_mode)
         else:
             from ..language_backend import get_backend
             _test_backend = get_backend(language)
@@ -338,8 +352,32 @@ JAVASCRIPT/TYPESCRIPT TEST RULES (critical for Vitest):
         return os.path.isfile("manage.py")
 
     @staticmethod
-    def _python_test_rules(django: bool = False) -> str:
+    def _python_test_rules(django: bool = False,
+                           unittest_runner: bool = False) -> str:
         """Return Python-specific test guidance."""
+        if unittest_runner and not django:
+            # `python -m unittest` only collects TestCase methods. Bare
+            # `def test_x()` functions, `pytest.raises` and `@pytest.fixture`
+            # are invisible to it — a pytest-flavoured suite written against
+            # a unittest gate collects zero tests and the gate can never go
+            # green no matter how correct the code is.
+            return """
+PYTHON TEST RULES (critical — the suite is run with `python -m unittest`):
+1. Use `from <module_path> import <name>` matching the EXACT source file path.
+2. Do NOT create or modify source files — ONLY write test files.
+3. Use stdlib `unittest`: classes subclassing `unittest.TestCase`, methods
+   named `test_*`, and `self.assertEqual` / `self.assertTrue` / etc.
+   Do NOT import pytest and do NOT write bare `def test_x()` functions —
+   `python -m unittest` does not collect them.
+4. For exceptions use `with self.assertRaises(ExceptionType):`.
+5. For shared setup use `setUp` / `setUpClass`, not `@pytest.fixture`.
+6. Do NOT install packages or modify requirements.txt.
+7. If the source imports a GUI/hardware package that may be headless
+   (e.g. `pygame`), initialise it in `setUpClass` with a dummy driver
+   (`os.environ.setdefault("SDL_VIDEODRIVER", "dummy")`) rather than
+   stubbing `sys.modules` — the stub leaks across every test module in
+   the run.
+"""
         if django:
             # Django suites run through `manage.py test` (stdlib unittest
             # runner) — pytest is usually NOT installed, and an

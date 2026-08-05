@@ -920,6 +920,35 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                                 "by member name", step_idx + 1, _fpath, _cls)
                             files[_fpath] = _merged_cls
                             _chunk_scoped_paths.add(_fpath)
+                            continue
+                        # Last resort before discarding the fix: a chunk id
+                        # like `maze.py:_generate_grid` names ONE symbol, and
+                        # a named symbol does not need the line range that
+                        # just failed to match. Replace it where it actually
+                        # lives. Without this the model's fix is thrown away
+                        # and the attempt is spent — two of three attempts
+                        # died exactly this way on a Pac-Man run, halting the
+                        # pipeline with a usable fix in hand.
+                        _spliced = None
+                        try:
+                            from ..editing.symbol_merge import (
+                                replace_symbol_anywhere)
+                            _src = _existing
+                            for _e in _file_edits:
+                                _try = replace_symbol_anywhere(
+                                    _src, _e.new_content)
+                                if _try:
+                                    _src = _try
+                                    _spliced = _try
+                        except Exception:
+                            _spliced = None
+                        if _spliced:
+                            log.info(
+                                "Step %d: %s chunk range did not match, but "
+                                "the fragment defines a named symbol — "
+                                "replaced it in place", step_idx + 1, _fpath)
+                            files[_fpath] = _spliced
+                            _chunk_scoped_paths.add(_fpath)
                         else:
                             log.warning(
                                 "Step %d: ChunkEdit apply failed for %s: %s",

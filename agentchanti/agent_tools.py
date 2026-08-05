@@ -35,6 +35,13 @@ _MAX_LIST_ENTRIES = 300
 # the model retries variations of the same broken syntax.
 _HEREDOC_RE = re.compile(r"<<-?\s*['\"]?\w+['\"]?")
 
+# Trailing `| head -N` / `| tail -N` / `| more`, optionally preceded by
+# `2>&1`. These only limit how much output is shown — which this module
+# already does — and the binaries do not exist on Windows, so the whole
+# pipeline dies before the real command's output is ever seen.
+_POSIX_OUTPUT_PIPE_RE = re.compile(
+    r"\s*\|\s*(?:head|tail|more)\b[^|]*$", re.IGNORECASE)
+
 
 # Both `python -m unittest` and `python -m pytest` exit 5 when the runner
 # COLLECTED NOTHING — a discovery problem, not a failing assertion. The
@@ -364,6 +371,20 @@ class AgentTools:
         return f"OK: replaced 1 occurrence in {path}"
 
     def _tool_run_command(self, command: str) -> str:
+        stripped_pipe = ""
+        if os.name == "nt":
+            _clean = _POSIX_OUTPUT_PIPE_RE.sub("", command).strip()
+            if _clean and _clean != command.strip():
+                # `head`/`tail` do not exist on Windows, so the whole
+                # pipeline fails and the model learns nothing about the
+                # command it was actually trying to run — observed on a
+                # Pygame run, three turns spent on `... | head -100` and
+                # `... | head -150` against a test suite whose output it
+                # never saw. Drop the pipe and run the real command; the
+                # output is length-capped here anyway, which is all the
+                # pipe was for.
+                stripped_pipe = command.strip()[len(_clean):].strip()
+                command = _clean
         if os.name == "nt" and _HEREDOC_RE.search(command):
             return ("ERROR: POSIX heredoc syntax (<<) does not work on "
                     "Windows cmd — the command would fail without a useful "
@@ -389,6 +410,11 @@ class AgentTools:
                 command, getattr(self._executor, "last_exit_code", None),
                 output):
             hint = _NO_TESTS_HINT
+        if stripped_pipe:
+            hint += (f"\n[note] Dropped `{stripped_pipe}` — head/tail/more do "
+                     f"not exist on Windows and the pipeline would have "
+                     f"failed before running anything. Output is length-"
+                     f"capped here already; do not add output pipes.")
         return f"{status}\n{body}{hint}"
 
     def _tool_search_code(self, query: str) -> str:

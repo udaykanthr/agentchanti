@@ -1735,6 +1735,31 @@ _INLINE_SCRIPT_RE = re.compile(
 _JS_ASSERTION_RE = re.compile(
     r"\bassert\b|\bthrow\b|process\.exit\s*\(\s*[1-9]", re.IGNORECASE)
 
+# The assertion is not always inside the payload. A gate can put the teeth
+# in the SHELL — pipe the script's output through a matcher and turn a hit
+# into a failing status:
+#
+#   python -c "import main" 2>&1 | findstr /i "error" && exit 1 || exit 0
+#
+# That command fails when main.py raises at import time, which is exactly
+# the behavioural defect the step could have. Judging it on its Python
+# payload alone ("imports and prints but never asserts") is wrong, and the
+# cost of being wrong is not academic: it triggers a full re-plan, and the
+# planner's second try replaced a real smoke gate with `assert True` —
+# a vacuous gate that satisfies the checker. Recognise the shell form so
+# the pressure lands only on gates that genuinely cannot fail.
+_SHELL_TEETH_RE = re.compile(
+    r"(?:\|\s*(?:findstr|grep|Select-String)\b[^|&]*(?:&&|\|\|)\s*exit\s+[1-9])"
+    r"|(?:\|\|\s*exit\s+[1-9])"
+    r"|(?:&&\s*exit\s+[1-9])",
+    re.IGNORECASE,
+)
+
+
+def shell_level_assertion(cmd: str) -> bool:
+    """True when *cmd* converts the script's output into a failing status."""
+    return bool(cmd) and bool(_SHELL_TEETH_RE.search(cmd))
+
 
 def shallow_gate_reason(cmd: str) -> Optional[str]:
     """Explain why *cmd* cannot detect a behavioural defect, or None.
@@ -1756,6 +1781,8 @@ def shallow_gate_reason(cmd: str) -> Optional[str]:
     if not cmd or not cmd.strip():
         return None
     if _TEST_RUNNER_RE.search(cmd):
+        return None
+    if shell_level_assertion(cmd):
         return None
 
     match = _INLINE_SCRIPT_RE.search(cmd)
@@ -1796,6 +1823,14 @@ def _shallow_python_reason(payload: str) -> Optional[str]:
 
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Assert):
+            # `assert True` is not an assertion, it is punctuation. The
+            # gate-quality pressure produces these: told its smoke gate
+            # "never asserts", a planner appended `assert True` and the
+            # check went quiet — a gate that CANNOT fail, arrived at by
+            # the machinery meant to prevent exactly that. Only an assert
+            # over a runtime value counts.
+            if isinstance(node.test, _ast.Constant):
+                continue
             return None
         # `sys.exit(1)` / `raise` on a bad value are assertions in spirit.
         if isinstance(node, _ast.Raise):
@@ -1922,6 +1957,98 @@ def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
         if reason:
             gaps.append((step.id, reason))
     return gaps
+
+
+# One line per repaired gate: `<step id>: <command>`. The prompt asks for a
+# bare id, but the model echoes the label it was given the gap under —
+# `step 2.5: python -c ...` — so a parser that insists on a bare id throws
+# away a correct answer and falls back to the re-plan it exists to avoid
+# (measured: 506/140 tokens discarded, 8,214/3,219 spent instead).
+_VERIFY_REPLY_RE = re.compile(
+    r"^\s*(?:step\s+)?#?([0-9]+(?:\.[0-9]+)*)\s*[:.\-]\s*(\S.*)$",
+    re.IGNORECASE)
+
+
+def repair_verify_commands(steps: list[PlanStep],
+                           gaps: list[tuple[str, str]],
+                           llm_client,
+                           task: str = "") -> list[str]:
+    """Rewrite only the offending ``verify:`` lines, in place.
+
+    A weak gate used to send the WHOLE plan back to the planner. That is
+    the wrong shape of correction twice over. It is expensive — a re-plan
+    costs a full generation (measured: 7.7k sent / 2.1k received) to fix
+    one line — and it is destructive: each re-plan is a fresh generation,
+    so the step list, the targets and the dependency graph all churn while
+    the only thing wrong was a single command. Observed on a Pac-Man run:
+    three plan attempts, three different step decompositions, ~20k tokens,
+    to replace one smoke gate.
+
+    Ask for the commands instead. Returns the ids actually repaired, so
+    the caller can fall back to a re-plan when this yields nothing.
+    """
+    if not gaps or llm_client is None:
+        return []
+    by_id = {s.id: s for s in steps}
+    wanted = [(sid, why) for sid, why in gaps if sid in by_id]
+    if not wanted:
+        return []
+
+    lines = [
+        "Some acceptance gates in the plan you wrote are unusable. "
+        "Rewrite ONLY those gate commands — the rest of the plan stands.",
+    ]
+    if task:
+        lines.append(f"\nOverall task: {task.strip()[:600]}")
+    lines.append("\nGates to fix:")
+    for sid, why in wanted:
+        step = by_id[sid]
+        lines.append(f"\nstep {sid} ({step.step_type})")
+        lines.append(f"  does: {step.description.strip()[:300]}")
+        if step.target_files:
+            lines.append(f"  target: {', '.join(step.target_files[:4])}")
+        if step.exports:
+            lines.append(f"  exports: {', '.join(step.exports[:8])}")
+        lines.append(f"  current verify: {step.verify_cmd}")
+        lines.append(f"  problem: {why}")
+    lines.append(
+        "\nRules for each replacement:\n"
+        "- It must FAIL (non-zero exit) if the step's promise is broken, "
+        "and pass otherwise.\n"
+        "- It runs from the PROJECT ROOT — imports must resolve from "
+        "there, not from a subdirectory.\n"
+        "- Assert a concrete value the step produces, or run the step's "
+        "test suite. `assert True` is not an assertion.\n"
+        "- One line, runnable from the project root, no shell heredocs.\n"
+        "- Do not invent APIs the step does not export.\n"
+        "\nReply with one line per gate and nothing else:\n"
+        "<step id>: <command>")
+
+    try:
+        reply = llm_client.generate_response("\n".join(lines))
+    except Exception:                       # network, provider, parse — all
+        return []                           # fall back to the full re-plan
+    if not reply:
+        return []
+
+    repaired: list[str] = []
+    for raw in reply.splitlines():
+        m = _VERIFY_REPLY_RE.match(raw.strip().lstrip("-* ").strip())
+        if not m:
+            continue
+        sid, cmd = m.group(1), m.group(2).strip().strip("`").strip()
+        step = by_id.get(sid)
+        if step is None or not cmd:
+            continue
+        # Never accept a replacement that has the same defect — that would
+        # burn the call and leave the gate toothless anyway.
+        if unrunnable_gate_reason(cmd):
+            continue
+        if step.step_type == "CODE" and shallow_gate_reason(cmd):
+            continue
+        step.verify_cmd = cmd
+        repaired.append(sid)
+    return repaired
 
 
 # ---------------------------------------------------------------------------

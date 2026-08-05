@@ -23,7 +23,8 @@ import textwrap
 
 from ..py_syntax import check_python_syntax
 
-__all__ = ["merge_module_symbols", "merge_class_members"]
+__all__ = ["merge_module_symbols", "merge_class_members",
+           "replace_symbol_anywhere"]
 
 
 def _defined_name(node: ast.stmt) -> str | None:
@@ -253,3 +254,74 @@ def merge_module_symbols(original: str, replacement: str) -> str | None:
     if check_python_syntax(result, "<merged>"):
         return None
     return result
+
+
+def replace_symbol_anywhere(original: str, fragment: str) -> str | None:
+    """Replace the symbol *fragment* defines, wherever it lives in *original*.
+
+    The chunk editor addresses a chunk as ``maze.py:_generate_grid`` and
+    splices it back by line range. When the range no longer matches — the
+    file moved on since the chunk was cut — it refuses, correctly: an
+    ambiguous splice would corrupt the file. But refusing loses the fix
+    AND burns one of three diagnosis attempts, so a single unplaceable
+    edit can consume the whole retry budget. Observed on a Pac-Man run:
+    attempts 1 and 3 both died as "Cannot place partial edit for
+    maze.py:_generate_grid ... refusing to overwrite it", and the pipeline
+    halted with the model's fix in hand.
+
+    A named symbol does not need a line range. Find it by name — at module
+    level or inside any class — and replace its span, re-indented to the
+    definition it replaces. ``merge_class_members`` covers the sibling case
+    where the fragment redefines several members of a known class; this
+    covers one definition whose owner is not known up front, which is what
+    a chunk id like ``file.py:method`` gives you.
+
+    Returns ``None`` unless the result parses, so a guess is never applied.
+    """
+    body = _nodes(original)
+    if body is None:
+        return None
+
+    dedented = textwrap.dedent(fragment)
+    repl_body = _nodes(dedented)
+    if not repl_body:
+        return None
+    # One definition only: with several, which owner to search for each is
+    # a guess, and merge_class_members / merge_module_symbols handle that
+    # case with more context than this has.
+    named = [n for n in repl_body if _defined_name(n)]
+    if len(named) != 1 or len(repl_body) != 1:
+        return None
+    name = _defined_name(named[0])
+
+    # Candidate owners: module level first, then each class body. A method
+    # name that also exists at module level is replaced at module level —
+    # the shallower binding is the one an unqualified name refers to.
+    candidates: list[tuple[int, int]] = []
+    module_idx = _index_body(body)
+    if name in module_idx:
+        candidates.append(module_idx[name])
+    else:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                inner = _index_body(node.body)
+                if name in inner:
+                    candidates.append(inner[name])
+    # Exactly one home, or we cannot say which one was meant.
+    if len(candidates) != 1:
+        return None
+
+    start, end = candidates[0]
+    lines = original.splitlines(True)
+    if start < 1 or end > len(lines):
+        return None
+
+    # Re-indent the fragment to the definition it is replacing.
+    existing = lines[start - 1]
+    indent = existing[:len(existing) - len(existing.lstrip())]
+    new_text = textwrap.indent(dedented.rstrip("\n"), indent) + "\n"
+
+    merged = "".join(lines[:start - 1]) + new_text + "".join(lines[end:])
+    if check_python_syntax(merged, "<merged>"):
+        return None
+    return merged
