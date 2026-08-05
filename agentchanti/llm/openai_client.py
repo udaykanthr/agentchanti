@@ -43,6 +43,22 @@ _TOOLS_REJECTED_MARKERS = (
 _EFFORT_FLOOR_TTL_SECONDS = 30 * 24 * 3600
 
 
+# Read timeout for STREAMING requests. requests applies this to the gap
+# BETWEEN bytes, not to the whole call, so it must cover the longest
+# silence the server can produce — and a reasoning model emits nothing at
+# all while it thinks. At 120s a long planner think tripped it, the stream
+# was aborted, the prompt was re-billed on retry, and the retry then
+# downgraded to the non-streaming path: up to 3x the tokens of one call
+# plus ~2 minutes of dead wall-clock. Observed on a Pac-Man planner call,
+# timing out at exactly 120s. `ollama.py` carries the same lesson (it lost
+# 12 calls and two whole steps to it); this client never got the fix.
+#
+# Matches the non-streaming budget used elsewhere in this module. Streaming
+# resets the window on every chunk, so once tokens start flowing a long
+# generation stays alive regardless of total duration.
+_STREAM_READ_TIMEOUT = 300
+
+
 def _effort_floor_store() -> str:
     return os.path.join(os.path.expanduser("~"), ".agentchanti",
                         "effort_floors.json")
@@ -385,7 +401,7 @@ class OpenAIClient(LLMClient):
         self._last_stop_reason = ""
 
         response = requests.post(url, headers=self._headers(), json=payload,
-                                 stream=True, timeout=(10, 120))
+                                 stream=True, timeout=(10, _STREAM_READ_TIMEOUT))
         if response.status_code == 400 and \
                 _param_rejected(response, "max_completion_tokens"):
             # Legacy parameter name for older models/APIs (see _chat).
@@ -393,7 +409,8 @@ class OpenAIClient(LLMClient):
             del payload["max_completion_tokens"]
             payload["max_tokens"] = self.max_output_tokens
             response = requests.post(url, headers=self._headers(), json=payload,
-                                     stream=True, timeout=(10, 120))
+                                     stream=True,
+                                     timeout=(10, _STREAM_READ_TIMEOUT))
             if response.status_code >= 400:
                 response = first_failure
         _raise_for_status_with_body(response, model=self.model,

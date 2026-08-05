@@ -7,6 +7,26 @@ from .base import Agent, uniquify_context
 
 _logger = logging.getLogger(__name__)
 
+# Structural English only. Domain words stay in — the topic filter needs
+# "test" and "python" to keep "Python Test Generation Instructions" while
+# "Django Test Generation Instructions" scores a single match and is
+# dropped. Adding domain words here would start filtering out useful docs.
+_TOPIC_STOPWORDS = frozenset({
+    "the", "and", "with", "for", "use", "using", "that", "this", "these",
+    "those", "from", "into", "have", "has", "had", "are", "was", "were",
+    "not", "but", "all", "any", "its", "each", "must", "should", "can",
+    "will", "new", "one", "two", "more", "than", "over", "also", "only",
+    "when", "while", "every", "some", "such", "them", "they", "their",
+    "there", "here", "what", "which", "who", "how", "why", "you", "your",
+    "our", "out", "off", "per", "via", "yet", "own", "may", "get", "let",
+    "make", "made", "add", "adds", "added", "create", "creates", "created",
+    "build", "builds", "provide", "provides", "include", "includes",
+    "required", "requires", "need", "needs", "example", "examples",
+    "short", "simple", "basic", "complete", "full", "just", "like",
+    "both", "same", "other", "another", "between", "during", "after",
+    "before", "above", "below", "under", "again", "once", "does", "done",
+})
+
 
 def _shell_example() -> str:
     """Return an OS-appropriate file-listing command example."""
@@ -597,10 +617,18 @@ class PlannerAgent(Agent):
                     kb_context_builder._ensure_global()
                     _gs = kb_context_builder._global_store
                     if _gs is not None:
+                        # Scope to the project language. This list is what
+                        # the IntentAgent picks `KB docs:` from AND what the
+                        # force-include safety net scans, so a foreign-stack
+                        # title that surfaces here can be pulled all the way
+                        # into the planner prompt. Observed on this Pygame
+                        # run: "Vitest React Testing Library Setup" surfaced
+                        # here and was then force-included into the plan.
                         _title_hits = _gs.search(
                             query=_raw_task,
                             categories=["doc", "pattern"],
                             top_k=12,
+                            language=language,
                             api_client=kb_context_builder._api_client,
                         )
                         _available_kb_titles = [
@@ -1463,6 +1491,43 @@ class PlannerAgent(Agent):
                             "[PreAnalysis] %d doc(s) injected into planner context",
                             len(doc_hints),
                         )
+
+                    # ── Last resort: arm the per-step topic filter ──
+                    # _passes_topic_filter admits EVERYTHING when
+                    # _intent_topics is empty, so every path out of this
+                    # block must leave it armed. The fallback branch was
+                    # fixed for that; the title fast-path still assigns
+                    # `_fp_per_topic_kws or []` and the no-docs path never
+                    # assigns at all. Observed on this Pygame run: the
+                    # fast-path fired, topics parsed empty, and "React
+                    # Component Export Instructions" was injected into
+                    # every single step alongside Django and Vitest docs
+                    # (2.8k-3.9k KB tokens per step).
+                    #
+                    # Each keyword becomes its OWN topic set, mirroring how
+                    # real parsed topics arrive ("pygame", "unittest").
+                    # One combined set would raise the filter's threshold to
+                    # 2 and drop "Pygame Setup Guide" — a single strong match
+                    # — while admitting titles that scrape together two weak
+                    # ones. Verified against the live registry: this keeps
+                    # the Pygame/Python guides and drops React (x2), npm,
+                    # Three.js and the SQLite ADR.
+                    #
+                    # 4-char minimum because the stem matcher compares the
+                    # first 3-5 characters: "pac" (from "Pac-Man") otherwise
+                    # matches "packages" and readmits the Vitest doc.
+                    if not getattr(kb_context_builder, "_intent_topics", None):
+                        _task_topic_kws = {
+                            w.lower()
+                            for w in re.findall(r'[a-zA-Z]{4,}', _raw_task)
+                        } - _TOPIC_STOPWORDS
+                        if _task_topic_kws:
+                            kb_context_builder._intent_topics = [
+                                {k} for k in sorted(_task_topic_kws)]
+                            _logger.debug(
+                                "[PreAnalysis] Topic filter armed from the "
+                                "raw task (%d keywords) — no KB topics were "
+                                "parsed", len(_task_topic_kws))
             except Exception as e:
                 _logger.debug(f"[PreAnalysis] Global KB doc search failed: {e}")
 

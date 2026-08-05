@@ -26,6 +26,19 @@ _CORE_DIR = os.path.join(_GLOBAL_DIR, "core")
 MIN_RELEVANCE_SCORE = 0.25
 
 
+def _language_matches(doc_lang: str, project_lang: str) -> bool:
+    """True when a doc tagged *doc_lang* belongs in a *project_lang* project.
+
+    ``language:`` accepts a comma-separated list so one doc can serve a
+    family — React material is equally valid for ``javascript`` and
+    ``typescript``, and before this it had to claim ``all`` to reach both.
+    ``all`` still means "any project".
+    """
+    langs = {p.strip().lower() for p in (doc_lang or "all").split(",")}
+    langs.discard("")
+    return (not langs) or ("all" in langs) or (project_lang.lower() in langs)
+
+
 # ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
@@ -744,7 +757,7 @@ class GlobalKBStore:
                     self._fm_cache[filepath] = (mtime, meta)
 
                 doc_lang = meta.get("language", "all")
-                if language and doc_lang != "all" and doc_lang != language:
+                if language and not _language_matches(doc_lang, language):
                     continue
 
                 title_lower = meta.get("title", "").lower()

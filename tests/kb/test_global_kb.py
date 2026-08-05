@@ -12,10 +12,14 @@ Covers:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import unittest
+
+import agentchanti.kb.global_kb.store
+from agentchanti.kb.global_kb.store import _language_matches
 
 # ---------------------------------------------------------------------------
 # ErrorDict tests
@@ -712,3 +716,156 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLanguageScopedDocs(unittest.TestCase):
+    """`language: "all"` on framework-specific docs disabled every filter.
+
+    Live evidence, a Python/Pygame run: "React Component Export
+    Instructions" was injected into EVERY step, alongside Django and
+    Vitest material, at 2.8k-3.9k KB tokens per step. The filter reads
+    `doc_lang != "all" and doc_lang != language`, and all six behavioral
+    docs claimed "all" -- so it could never fire. React docs had to claim
+    "all" because a single value cannot cover javascript AND typescript.
+    """
+
+    def test_all_still_matches_every_project(self):
+        self.assertTrue(_language_matches("all", "python"))
+        self.assertTrue(_language_matches("all", "javascript"))
+
+    def test_missing_or_blank_language_is_permissive(self):
+        self.assertTrue(_language_matches("", "python"))
+        self.assertTrue(_language_matches(None, "python"))
+
+    def test_single_language_scopes_correctly(self):
+        self.assertTrue(_language_matches("python", "python"))
+        self.assertFalse(_language_matches("python", "javascript"))
+
+    def test_a_list_covers_a_family(self):
+        for lang in ("javascript", "typescript"):
+            self.assertTrue(
+                _language_matches("javascript, typescript", lang))
+        self.assertFalse(
+            _language_matches("javascript, typescript", "python"))
+
+    def test_case_and_spacing_are_ignored(self):
+        self.assertTrue(_language_matches("  JavaScript ,TypeScript ",
+                                          "typescript"))
+
+    def test_shipped_react_docs_no_longer_reach_python_projects(self):
+        """The registry metadata itself must be right, not just the helper.
+
+        `agentchanti/kb/global_kb/registry/` is gitignored and pulled at
+        runtime, so it is absent in CI. Skip there rather than scan an empty
+        directory: an empty scan finds no offenders, which would report
+        green while asserting nothing.
+        """
+        import glob
+        import os
+        registry = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(
+                agentchanti.kb.global_kb.store.__file__))),
+            "global_kb", "registry")
+        paths = sorted(glob.glob(os.path.join(registry, "**", "*.md"),
+                                 recursive=True))
+        if not paths:
+            self.skipTest("KB registry is gitignored/pulled at runtime — "
+                          "not present here")
+        offenders = []
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(600)
+            name = os.path.basename(path)
+            if not any(t in name for t in ("react", "vitest", "npm",
+                                           "threejs", "testing-library")):
+                continue
+            m = re.search(r'^language:\s*"([^"]*)"', head, re.M)
+            if m and _language_matches(m.group(1), "python"):
+                offenders.append((name, m.group(1)))
+        self.assertEqual(offenders, [],
+                         f"JS/TS-only docs still reachable from Python: "
+                         f"{offenders}")
+
+
+class TestSeededDocLanguages(unittest.TestCase):
+    """The seeder is where the mistagged docs actually came from.
+
+    `agentchanti/kb/global_kb/registry/` is gitignored and looked like the
+    place to fix -- it is not. Its content is written by `seeder.py`, which
+    passed a hardcoded `"all"` for the language of EVERY doc it emitted:
+    patterns, ADRs, docs and behavioral alike. That single literal is why
+    `store._language_matches` could never exclude anything, and why "React
+    Component Export Instructions" reached every step of a Pygame run.
+
+    (The upstream agentchanti-kb-registry repo does NOT have this bug -- its
+    docs are already scoped react=javascript, django=python, and so on.)
+
+    Seeds into a temp dir so the developer's own registry is untouched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import glob
+        import tempfile
+
+        from agentchanti.kb.global_kb import seeder
+
+        cls._dir = tempfile.mkdtemp()
+        seeder.seed(embed=False, base_dir=cls._dir)
+        cls.langs = {}
+        for path in glob.glob(os.path.join(cls._dir, "**", "*.md"),
+                              recursive=True):
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(600)
+            m = re.search(r'^language:\s*"([^"]*)"', head, re.M)
+            cls.langs[os.path.basename(path)] = m.group(1) if m else None
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def test_it_seeded_something(self):
+        self.assertGreater(len(self.langs), 10)
+
+    def test_js_ecosystem_docs_do_not_reach_python(self):
+        for name in ("react-export-default-instructions.md",
+                     "react-router-setup-instructions.md",
+                     "react-component-test-generation-instructions.md",
+                     "npm-scripts-instructions.md",
+                     "vitest-react-testing-setup.md",
+                     "testing-library-errors-guide.md",
+                     "threejs-webgl-error-fix.md"):
+            lang = self.langs.get(name)
+            self.assertIsNotNone(lang, f"{name} was not seeded")
+            self.assertFalse(_language_matches(lang, "python"),
+                             f"{name} is tagged {lang!r}")
+
+    def test_js_ecosystem_docs_serve_both_js_and_ts(self):
+        """A single value cannot cover both — this is why lists exist."""
+        for name in ("react-export-default-instructions.md",
+                     "vitest-react-testing-setup.md"):
+            lang = self.langs[name]
+            for project in ("javascript", "typescript"):
+                self.assertTrue(_language_matches(lang, project),
+                                f"{name} ({lang!r}) must serve {project}")
+
+    def test_python_only_docs_do_not_reach_javascript(self):
+        for name in ("django-test-generation-instructions.md",
+                     "python-test-generation-instructions.md",
+                     "django-page-creation-pattern.md"):
+            lang = self.langs.get(name)
+            self.assertIsNotNone(lang, f"{name} was not seeded")
+            self.assertTrue(_language_matches(lang, "python"))
+            self.assertFalse(_language_matches(lang, "javascript"),
+                             f"{name} is tagged {lang!r}")
+
+    def test_genuinely_generic_docs_stay_all(self):
+        """Over-scoping is the opposite failure and just as bad."""
+        for name in ("async-patterns.md", "clean-code-naming-conventions.md",
+                     "error-handling-best-practices.md",
+                     "tree-sitter-usage-guide.md"):
+            self.assertEqual(self.langs.get(name), "all", name)
+
+    def test_no_seeded_doc_is_missing_a_language(self):
+        missing = [n for n, v in self.langs.items() if not v]
+        self.assertEqual(missing, [])

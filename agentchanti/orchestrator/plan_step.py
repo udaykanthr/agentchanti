@@ -1975,6 +1975,8 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
                 f"(produced by step {producer_id}) — added depends:{producer_id}"
             )
 
+    fixes.extend(_infer_package_init_export_deps(steps))
+
     # Safety: verify we didn't introduce a cycle
     if fixes and _has_cycle(steps):
         # A package initializer that re-exports its siblings is the usual
@@ -2016,6 +2018,81 @@ def _is_package_init(step: PlanStep) -> bool:
         t.rsplit("/", 1)[-1] in ("__init__.py", "index.js", "index.ts")
         for t in targets
     )
+
+
+def _package_dir_of(step: PlanStep) -> Optional[str]:
+    """Directory a package-initializer step writes into, ``""`` for root."""
+    targets = [t.replace("\\", "/") for t in (step.target_files or [])]
+    if not targets:
+        return None
+    head = targets[0].rsplit("/", 1)
+    return head[0] if len(head) == 2 else ""
+
+
+def _infer_package_init_export_deps(steps: list[PlanStep]) -> list[str]:
+    """Make a package initializer wait for whoever implements its exports.
+
+    ``fix_import_dependencies`` derives edges from the plan's ``imports:``
+    line. An initializer that declares ``imports: none`` therefore gets no
+    edge at all — even though re-exporting is the only thing it does, so
+    some other step must define those symbols. Its ``exports:`` line still
+    names them, and the step producing the same symbol under the same
+    package is the producer no spelling can disguise.
+
+    Observed live on a Pac-Man run: 2.1 wrote ``src/__init__.py``
+    (``exports: Player, Ghost, Map, Game``, ``imports: none``) and 2.2 wrote
+    ``src/pacman.py`` exporting the same four. Both declared only
+    ``depends:1.1``, so they shared a wave. 2.1 ran with nothing to import
+    and satisfied its gate — ``from src import Player, Ghost, Map, Game;
+    assert all(x is not None ...)`` — by writing four ``class X: pass``
+    stub modules. Every gate passed, the smoke test passed, 8/8 unittests
+    passed (they import ``src.pacman`` directly), and the run was reported
+    green while ``from src import Game`` returned an empty shell.
+
+    Only ever adds edges INTO the initializer: Python builds the package
+    from the directory, so nothing needs ``__init__`` written first. Any
+    edge that would close a cycle is dropped rather than kept.
+    """
+    inits = [s for s in steps if _is_package_init(s) and s.exports]
+    if not inits:
+        return []
+
+    added: list[str] = []
+    for init in inits:
+        pkg_dir = _package_dir_of(init)
+        if pkg_dir is None:
+            continue
+        wanted = {e.strip() for e in init.exports if e and e.strip()}
+        for other in steps:
+            if other.id == init.id or _is_package_init(other):
+                continue
+            if other.id in init.depends_on:
+                continue
+            produced = {e.strip() for e in (other.exports or []) if e.strip()}
+            shared = wanted & produced
+            if not shared:
+                continue
+            # Only siblings under the initializer's own package: a step
+            # elsewhere in the tree that happens to export "Game" is a
+            # different Game.
+            in_package = any(
+                (t.replace("\\", "/").rsplit("/", 1)[0]
+                 if "/" in t.replace("\\", "/") else "") == pkg_dir
+                or t.replace("\\", "/").startswith(f"{pkg_dir}/")
+                for t in (other.target_files or [])
+            ) if pkg_dir else bool(other.target_files)
+            if not in_package:
+                continue
+
+            init.depends_on.append(other.id)
+            if _has_cycle(steps):
+                init.depends_on.remove(other.id)
+                continue
+            added.append(
+                f"Step {init.id} re-exports {', '.join(sorted(shared))} "
+                f"(produced by step {other.id}) — added depends:{other.id}"
+            )
+    return added
 
 
 def _break_cycle_at_package_inits(steps: list[PlanStep]) -> list[str]:

@@ -308,6 +308,29 @@ def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
                 "import them", step.id, ", ".join(sorted(missing)[:8]))
 
 
+def _green_suites_contradicting(regressions) -> list[tuple[str, str]]:
+    """Green suite gates that a rollback would sacrifice, else ``[]``.
+
+    Returns non-empty only when ALL of:
+    - a test-suite gate is recorded and is NOT among the regressions, and
+    - no regressing gate is itself a suite.
+
+    Both conditions matter. A red suite means the stage broke real
+    behaviour and ordinary rollback is right; this is strictly the case
+    where inline assertions and the suite disagree and the suite wins.
+    Returning [] is always the safe answer — the caller rolls back as
+    before.
+    """
+    from .wave_snapshots import get_gate_ledger, is_suite_gate
+
+    failed = {cmd for cmd, _label, _out in regressions}
+    if any(is_suite_gate(cmd) for cmd in failed):
+        return []
+    return [(cmd, label)
+            for cmd, label in get_gate_ledger().gates().items()
+            if is_suite_gate(cmd) and cmd not in failed]
+
+
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
                              repair=None, display=None) -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
@@ -371,6 +394,41 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
         snapshots.mark_green()
         set_status(display, "")
         return True
+
+    # ── Gate/suite contradiction: report it, do not undo the work ──
+    # Some gates cannot be satisfied without violating the task. Observed:
+    # a plan gated step 3 on `assert p.can_move()` against a `can_move()`
+    # implemented as `direction != STOP` — i.e. "is MOVING" — so it demanded
+    # a freshly-built Pac-Man already be in motion, while the brief demanded
+    # "2000+ frames without the player moving". Diagnosis duly made the
+    # player auto-start ("# Ensure the player starts in a valid moving state
+    # for acceptance/tests"), the suite's idle test then failed, its fix
+    # removed the auto-start, and THAT regressed the gate. Rollback then
+    # discarded the fix and restored the artifact that violates the brief.
+    #
+    # When the suite is green and only inline gates are red, the suite is
+    # the better authority — it is where the task's own invariants live.
+    # Keep the work and name both sides. Still returns False: an unresolved
+    # red gate must never be reported as success.
+    _conflict = _green_suites_contradicting(regressions)
+    if _conflict:
+        set_status(display, "")
+        log.error(
+            "[Monotonic] GATE CONFLICT after %s — %d inline gate(s) are red "
+            "while the task's own test suite is GREEN. The suite encodes the "
+            "task's stated invariants, so the gate is the suspect, not the "
+            "code. NOT rolling back — the working tree that satisfies the "
+            "suite is preserved for inspection.", stage, len(regressions))
+        for _cmd, _label, _out in regressions:
+            log.error("[Monotonic]   red gate (step %s): %s",
+                      _label or "?", _cmd)
+        for _cmd, _label in _conflict:
+            log.error("[Monotonic]   green suite (step %s): %s",
+                      _label or "?", _cmd)
+        log.error(
+            "[Monotonic] Fix the plan's verify: line for the step(s) above — "
+            "it asserts live behaviour on a freshly-constructed object.")
+        return False
 
     set_status(display, f"Rolling back — {stage} left gate(s) red")
     log.warning("[Monotonic] %s left %d gate(s) red: %s",
