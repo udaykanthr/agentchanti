@@ -2040,6 +2040,7 @@ Install NumPy for optimized vector operations: `pip install numpy`
     "testing-library-errors-guide.md": {
         "title": "Testing Library Common Errors Guide",
         "tags": "testing-library, react, errors, testing, guide",
+        "language": "javascript, typescript",
         "content": """## Overview
 
 React Testing Library helps you test your UI in a user-centric way. However, tests often fail with `TestingLibraryElementError` due to mismatched roles, incorrect assumptions about the rendered DOM, or async timing issues. This guide helps you properly fix these errors.
@@ -2084,6 +2085,7 @@ expect(screen.getByText((content, element) => {
     "vitest-react-testing-setup.md": {
         "title": "Vitest React Testing Library Setup — Required Packages",
         "tags": "vitest, react, testing-library, jsdom, setup, packages, npm, install, required, jest-dom",
+        "language": "javascript, typescript",
         "content": """## Overview
 
 When setting up a React project with Vitest and @testing-library/react, the following
@@ -2147,6 +2149,7 @@ with Vitest's `expect`.
     "threejs-webgl-error-fix.md": {
         "title": "Three.js + Vitest: Fixing WebGL Context Errors",
         "tags": "threejs, webgl, vitest, jest, jsdom, mock, canvas, renderer, setup",
+        "language": "javascript, typescript",
         "content": """## Overview
 
 When testing components that use Three.js (like `WebGLRenderer`) in a headless environment 
@@ -2245,6 +2248,7 @@ throwing the WebGL context error, allowing you to test other aspects of the comp
     "django-page-creation-pattern.md": {
         "title": "Django Page Creation Pattern",
         "tags": "django, view, url, template, page, routing, INSTALLED_APPS, python",
+        "language": "python",
         "content": """## Overview
 
 Creating a new page in a Django project requires three coordinated changes.
@@ -2345,6 +2349,7 @@ _BEHAVIORAL_DOCS = {
     "npm-scripts-instructions.md": {
         "title": "NPM Scripts Instructions",
         "tags": "npm, scripts, package.json, set-script, commands, behavioral, instructions, javascript, typescript",
+        "language": "javascript, typescript",
         "content": """## CRITICAL: NPM Scripts Rules
 
 When generating terminal commands to add or modify scripts in a `package.json` file, you MUST follow these rules.
@@ -2382,6 +2387,7 @@ You can set multiple scripts in a single command if needed:
     "react-component-test-generation-instructions.md": {
         "title": "React Component Test Generation Instructions",
         "tags": "react, testing, vitest, jest, component, test-generation, behavioral, testing-library, getByText, getByRole, within, render, instructions",
+        "language": "javascript, typescript",
         "content": """## Overview
 
 When generating tests for React components, you MUST follow these rules to avoid
@@ -2847,6 +2853,7 @@ occurrences of the text in both desktop and mobile elements.
     "react-export-default-instructions.md": {
         "title": "React Component Export Instructions",
         "tags": "react, jsx, tsx, export, default, naming, consistency, behavioral, instructions, component, create, modify, edit, generate",
+        "language": "javascript, typescript",
         "content": """## CRITICAL: React Component Export Rules
 
 When generating or modifying React JSX/TSX component files, you MUST follow these rules.
@@ -2910,6 +2917,7 @@ Use `export default` for the main component. Named exports for helpers/constants
     "react-router-setup-instructions.md": {
         "title": "React Router Setup Instructions",
         "tags": "react, react-router, BrowserRouter, HashRouter, MemoryRouter, main.jsx, App.jsx, entry-point, singleton, nested, router, behavioral, instructions, javascript, typescript",
+        "language": "javascript, typescript",
         "content": """## CRITICAL: React Router Setup Rules
 
 When generating or modifying React apps that use React Router, follow these rules to
@@ -3034,6 +3042,7 @@ CHECKLIST before writing main.jsx inline code:
     "django-test-generation-instructions.md": {
         "title": "Django Test Generation Instructions",
         "tags": "django, testing, pytest, test-generation, behavioral, instructions, python, allowed_hosts, template, settings",
+        "language": "python",
         "content": """## Overview
 
 When generating or fixing tests for Django projects, follow these rules to avoid
@@ -3264,6 +3273,7 @@ If `home/` is a sibling of `manage.py`, the import is `from home import ...`.
     "python-test-generation-instructions.md": {
         "title": "Python Test Generation Instructions",
         "tags": "python, testing, pytest, test-generation, mock, patch, deterministic, behavioral, instructions",
+        "language": "python",
         "content": """## Overview
 
 When generating tests for Python projects, follow these rules to avoid the most
@@ -3558,7 +3568,7 @@ def seed(
             meta["title"],
             "pattern",
             meta["tags"],
-            "all",
+            meta.get("language", "all"),
             meta["content"],
         )
         md_files.append((path, "pattern", meta["title"]))
@@ -3570,7 +3580,7 @@ def seed(
             meta["title"],
             "adr",
             meta["tags"],
-            "all",
+            meta.get("language", "all"),
             meta["content"],
         )
         md_files.append((path, "adr", meta["title"]))
@@ -3582,7 +3592,7 @@ def seed(
             meta["title"],
             "doc",
             meta["tags"],
-            "all",
+            meta.get("language", "all"),
             meta["content"],
         )
         md_files.append((path, "doc", meta["title"]))
@@ -3594,7 +3604,7 @@ def seed(
             meta["title"],
             "behavioral",
             meta["tags"],
-            "all",
+            meta.get("language", "all"),
             meta["content"],
         )
         md_files.append((path, "behavioral", meta["title"]))

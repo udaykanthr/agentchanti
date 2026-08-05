@@ -785,3 +785,87 @@ class TestLanguageScopedDocs(unittest.TestCase):
         self.assertEqual(offenders, [],
                          f"JS/TS-only docs still reachable from Python: "
                          f"{offenders}")
+
+
+class TestSeededDocLanguages(unittest.TestCase):
+    """The seeder is where the mistagged docs actually came from.
+
+    `agentchanti/kb/global_kb/registry/` is gitignored and looked like the
+    place to fix -- it is not. Its content is written by `seeder.py`, which
+    passed a hardcoded `"all"` for the language of EVERY doc it emitted:
+    patterns, ADRs, docs and behavioral alike. That single literal is why
+    `store._language_matches` could never exclude anything, and why "React
+    Component Export Instructions" reached every step of a Pygame run.
+
+    (The upstream agentchanti-kb-registry repo does NOT have this bug -- its
+    docs are already scoped react=javascript, django=python, and so on.)
+
+    Seeds into a temp dir so the developer's own registry is untouched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import glob
+        import tempfile
+
+        from agentchanti.kb.global_kb import seeder
+
+        cls._dir = tempfile.mkdtemp()
+        seeder.seed(embed=False, base_dir=cls._dir)
+        cls.langs = {}
+        for path in glob.glob(os.path.join(cls._dir, "**", "*.md"),
+                              recursive=True):
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(600)
+            m = re.search(r'^language:\s*"([^"]*)"', head, re.M)
+            cls.langs[os.path.basename(path)] = m.group(1) if m else None
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def test_it_seeded_something(self):
+        self.assertGreater(len(self.langs), 10)
+
+    def test_js_ecosystem_docs_do_not_reach_python(self):
+        for name in ("react-export-default-instructions.md",
+                     "react-router-setup-instructions.md",
+                     "react-component-test-generation-instructions.md",
+                     "npm-scripts-instructions.md",
+                     "vitest-react-testing-setup.md",
+                     "testing-library-errors-guide.md",
+                     "threejs-webgl-error-fix.md"):
+            lang = self.langs.get(name)
+            self.assertIsNotNone(lang, f"{name} was not seeded")
+            self.assertFalse(_language_matches(lang, "python"),
+                             f"{name} is tagged {lang!r}")
+
+    def test_js_ecosystem_docs_serve_both_js_and_ts(self):
+        """A single value cannot cover both — this is why lists exist."""
+        for name in ("react-export-default-instructions.md",
+                     "vitest-react-testing-setup.md"):
+            lang = self.langs[name]
+            for project in ("javascript", "typescript"):
+                self.assertTrue(_language_matches(lang, project),
+                                f"{name} ({lang!r}) must serve {project}")
+
+    def test_python_only_docs_do_not_reach_javascript(self):
+        for name in ("django-test-generation-instructions.md",
+                     "python-test-generation-instructions.md",
+                     "django-page-creation-pattern.md"):
+            lang = self.langs.get(name)
+            self.assertIsNotNone(lang, f"{name} was not seeded")
+            self.assertTrue(_language_matches(lang, "python"))
+            self.assertFalse(_language_matches(lang, "javascript"),
+                             f"{name} is tagged {lang!r}")
+
+    def test_genuinely_generic_docs_stay_all(self):
+        """Over-scoping is the opposite failure and just as bad."""
+        for name in ("async-patterns.md", "clean-code-naming-conventions.md",
+                     "error-handling-best-practices.md",
+                     "tree-sitter-usage-guide.md"):
+            self.assertEqual(self.langs.get(name), "all", name)
+
+    def test_no_seeded_doc_is_missing_a_language(self):
+        missing = [n for n, v in self.langs.items() if not v]
+        self.assertEqual(missing, [])
