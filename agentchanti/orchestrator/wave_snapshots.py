@@ -18,10 +18,40 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from threading import Lock
 
 _logger = logging.getLogger(__name__)
+
+# A gate that runs a whole SUITE, as opposed to one inline assertion.
+# Kept deliberately separate from classification._TEST_CMD_RE: that one
+# matches step *prose* ("run the tests") and omits `unittest`, which is
+# exactly the runner a plain-Python task asks for.
+_SUITE_GATE_RE = re.compile(
+    r'(?<![-\w])(?:'
+    r'python[0-9.]*\s+-m\s+unittest'
+    r'|python[0-9.]*\s+-m\s+pytest'
+    r'|pytest'
+    r'|npm\s+(?:run\s+)?test|yarn\s+test|pnpm\s+test'
+    r'|npx\s+(?:vitest|jest)'
+    r'|(?:vitest|jest|mocha|rspec|phpunit)'
+    r'|go\s+test'
+    r'|cargo\s+test'
+    r')(?![-\w])',
+    re.IGNORECASE,
+)
+
+
+def is_suite_gate(cmd: str) -> bool:
+    """True when *cmd* runs a test suite rather than one inline assertion.
+
+    A suite is the task's own statement of correctness — it is where
+    requirements like "2000+ frames without the player moving" end up.
+    An inline `python -c "assert ..."` gate is a planner's guess at the
+    same thing, and the two can contradict each other.
+    """
+    return bool(cmd) and bool(_SUITE_GATE_RE.search(cmd))
 
 # Identity flags so snapshot commits work on machines with no git
 # user configured; --no-verify at the call sites keeps user-level
