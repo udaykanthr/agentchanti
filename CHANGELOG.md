@@ -4,6 +4,65 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.1 — 2026-08-05
+
+Correctness and context-hygiene fixes found by an A/B benchmark of
+`agent_loop` on/off over eight runs of a Pac-Man task with adversarial
+delta-time invariants. Every fix carries a regression test that fails on
+the previous code.
+
+### Fixed
+
+- **A package initializer no longer runs before the module it re-exports.**
+  A plan gave `src/__init__.py` and `src/pacman.py` the same `exports:` but
+  only `depends:1.1`, so they shared a wave. The initializer ran with
+  nothing to import and satisfied its gate — `assert all(x is not None
+  ...)`, which is true of `class Game: pass` — by writing four stub
+  modules. Every gate, the smoke test and 8/8 unit tests passed while
+  `from src import Game` returned an empty shell. The missing edge is now
+  inferred from `exports:` overlap; `fix_import_dependencies` could not
+  help because it derives edges from `imports:`, and that plan declared
+  `imports: none`.
+- **A gate that contradicts the task no longer costs the work that
+  satisfies it.** A plan gated a step on `assert p.can_move()` against a
+  `can_move()` meaning "is currently moving", so it demanded a
+  freshly-built player already be in motion — while the task demanded
+  "2000+ frames without the player moving". Diagnosis made the player
+  auto-start, the suite's idle test then failed, its fix regressed the
+  gate, and rollback discarded the correct fix. When a test suite is green
+  and only inline gates are red, the conflict is now reported and the
+  working tree kept. The run still fails: an unresolved red gate is never
+  reported as success.
+- **KB docs are scoped to the language they are for.** `seeder.py` passed a
+  hardcoded `"all"` as the language of every doc it emitted, so the filter
+  in `GlobalKBStore` could never exclude anything — "React Component Export
+  Instructions" was injected into every step of a Python/Pygame run,
+  alongside Django and Vitest material, at 2.8k–3.9k tokens per step. Docs
+  now declare their real language, `language:` accepts a comma-separated
+  list (`"javascript, typescript"`), and a doc naming a framework the task
+  never mentions is dropped — which the language filter alone cannot do,
+  since the Django docs are correctly tagged `python`. Measured on the same
+  task: foreign-stack docs injected per run went from 5 to 0.
+- **Streaming calls survive a reasoning model's silence.** The OpenAI
+  streaming POST used a 120s read timeout, which `requests` applies to the
+  gap *between* bytes; a reasoning model emits nothing while it thinks. A
+  planner call died at exactly 120s, was retried (re-billing the prompt)
+  and then downgraded to the non-streaming path — up to 3× the tokens of
+  one call. `ollama.py` already carried this lesson; this client did not.
+- **No setup-guide web search for a bare language.** The blank-project
+  pre-seed asks for frameworks and routinely gets the language back too
+  ("Python, Pygame"), spending a web fetch plus a summarisation call
+  (~2.7k tokens) to learn `pip install`. Languages are skipped; frameworks
+  are still searched.
+
+### Compatibility
+
+`language:` in KB frontmatter now accepts a comma-separated list. Registry
+**v1.5.0** uses it to scope React/Vite docs to `"javascript, typescript"`.
+Older agentchanti releases compare the field by exact string and will not
+match a list, so **0.6.1 or newer is required to see those docs** — pin the
+registry version on older clients.
+
 ## 0.5.1 — 2026-07-21
 
 Fixes for a shared failure theme found by running 0.5.0 on a fresh
