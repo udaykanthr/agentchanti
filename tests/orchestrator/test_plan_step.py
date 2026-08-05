@@ -1475,3 +1475,93 @@ class TestUnrunnableGate(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("not valid Python", gaps[0][1])
         self.assertNotIn("only imports", gaps[0][1])
+
+
+class TestInitReexportsWithoutDeclaredImports(unittest.TestCase):
+    """An `__init__.py` declaring `imports: none` still re-exports siblings.
+
+    The live plan below shipped a FALSE GREEN: 2.1 and 2.2 both declared
+    only `depends:1.1`, so they shared a wave. 2.1 ran with `src/pacman.py`
+    not yet written and satisfied its own gate --
+    `from src import Player, Ghost, Map, Game; assert all(x is not None ...)`
+    -- by writing four `class X: pass` stub modules. Every pipeline gate
+    passed, the smoke test passed and 8/8 unittests passed (they import
+    `src.pacman` directly), while `from src import Game` returned an empty
+    shell and the task's "Organize code into classes" requirement was
+    silently violated.
+
+    `fix_import_dependencies` could not help: it derives edges from the
+    `imports:` line, and this initializer declared `imports: none`. The
+    `exports:` overlap is what carries the signal.
+    """
+
+    PLAN = """==PLAN==
+
+--STEP 1.1 [CMD] depends:none
+Create venv and folders.
+> python -m venv venv && mkdir src tests
+produces: venv, src, tests
+
+--STEP 2.1 [CODE] depends:1.1
+Create the package initializer so the game classes are importable from `src`.
+target: src/__init__.py
+exports: Player, Ghost, Map, Game
+imports: none
+verify: python -c "from src import Player, Ghost, Map, Game"
+
+--STEP 2.2 [CODE] depends:1.1
+Implement the full Pac-Man game module.
+target: src/pacman.py
+exports: Player, Ghost, Map, Game
+imports: pygame, random, collections
+verify: python -c "from src.pacman import Game"
+
+--STEP 2.3 [CODE] depends:2.2
+Executable entry point.
+target: main.py
+exports: main
+imports: src.pacman:Game
+verify: python -c "import main"
+
+==END==
+"""
+
+    def _ordered(self):
+        steps = parse_structured_plan(self.PLAN)
+        fix_import_dependencies(steps)
+        waves = build_waves(steps)
+        return steps, [[s.id for s in w] for w in waves]
+
+    def test_initializer_depends_on_the_module_defining_its_exports(self):
+        steps, _ = self._ordered()
+        init = next(s for s in steps if s.id == "2.1")
+        self.assertIn("2.2", init.depends_on,
+                      "the initializer re-exports what 2.2 defines")
+
+    def test_initializer_never_shares_a_wave_with_that_module(self):
+        _, waves = self._ordered()
+        wave_of = {sid: i for i, w in enumerate(waves) for sid in w}
+        self.assertGreater(
+            wave_of["2.1"], wave_of["2.2"],
+            f"2.1 must run after 2.2, waves were {waves}")
+
+    def test_nothing_waits_on_the_initializer(self):
+        steps, _ = self._ordered()
+        impl = next(s for s in steps if s.id == "2.2")
+        self.assertNotIn("2.1", impl.depends_on,
+                         "Python builds the package from the directory")
+
+    def test_no_cycle_introduced(self):
+        from agentchanti.orchestrator.plan_step import _has_cycle
+        steps, _ = self._ordered()
+        self.assertFalse(_has_cycle(steps))
+
+    def test_unrelated_exports_elsewhere_are_not_linked(self):
+        """A same-named symbol outside the package is a different symbol."""
+        plan = self.PLAN.replace("target: src/pacman.py",
+                                 "target: other/pacman.py")
+        steps = parse_structured_plan(plan)
+        fix_import_dependencies(steps)
+        init = next(s for s in steps if s.id == "2.1")
+        self.assertNotIn("2.2", init.depends_on,
+                         "other/pacman.py is not part of the src package")

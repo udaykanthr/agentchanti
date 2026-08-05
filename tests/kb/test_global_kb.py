@@ -12,10 +12,14 @@ Covers:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import unittest
+
+import agentchanti.kb.global_kb.store
+from agentchanti.kb.global_kb.store import _language_matches
 
 # ---------------------------------------------------------------------------
 # ErrorDict tests
@@ -712,3 +716,62 @@ class TestSeedPreservesUpdateFiles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLanguageScopedDocs(unittest.TestCase):
+    """`language: "all"` on framework-specific docs disabled every filter.
+
+    Live evidence, a Python/Pygame run: "React Component Export
+    Instructions" was injected into EVERY step, alongside Django and
+    Vitest material, at 2.8k-3.9k KB tokens per step. The filter reads
+    `doc_lang != "all" and doc_lang != language`, and all six behavioral
+    docs claimed "all" -- so it could never fire. React docs had to claim
+    "all" because a single value cannot cover javascript AND typescript.
+    """
+
+    def test_all_still_matches_every_project(self):
+        self.assertTrue(_language_matches("all", "python"))
+        self.assertTrue(_language_matches("all", "javascript"))
+
+    def test_missing_or_blank_language_is_permissive(self):
+        self.assertTrue(_language_matches("", "python"))
+        self.assertTrue(_language_matches(None, "python"))
+
+    def test_single_language_scopes_correctly(self):
+        self.assertTrue(_language_matches("python", "python"))
+        self.assertFalse(_language_matches("python", "javascript"))
+
+    def test_a_list_covers_a_family(self):
+        for lang in ("javascript", "typescript"):
+            self.assertTrue(
+                _language_matches("javascript, typescript", lang))
+        self.assertFalse(
+            _language_matches("javascript, typescript", "python"))
+
+    def test_case_and_spacing_are_ignored(self):
+        self.assertTrue(_language_matches("  JavaScript ,TypeScript ",
+                                          "typescript"))
+
+    def test_shipped_react_docs_no_longer_reach_python_projects(self):
+        """The registry metadata itself must be right, not just the helper."""
+        import glob
+        import os
+        registry = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(
+                agentchanti.kb.global_kb.store.__file__))),
+            "global_kb", "registry")
+        offenders = []
+        for path in glob.glob(os.path.join(registry, "**", "*.md"),
+                              recursive=True):
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(600)
+            name = os.path.basename(path)
+            if not any(t in name for t in ("react", "vitest", "npm",
+                                           "threejs", "testing-library")):
+                continue
+            m = re.search(r'^language:\s*"([^"]*)"', head, re.M)
+            if m and _language_matches(m.group(1), "python"):
+                offenders.append((name, m.group(1)))
+        self.assertEqual(offenders, [],
+                         f"JS/TS-only docs still reachable from Python: "
+                         f"{offenders}")

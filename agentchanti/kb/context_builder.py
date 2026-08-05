@@ -13,11 +13,35 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# Frameworks a KB doc can be ABOUT. A doc naming one of these is written for
+# that stack specifically, so it only belongs in a project that names it too.
+# Deliberately excludes bare languages (python, javascript): those are handled
+# by the `language:` filter, and treating them as frameworks here would drop
+# genuinely generic docs like "Python Test Generation Instructions".
+_DOC_FRAMEWORK_TOKENS = frozenset({
+    "django", "flask", "fastapi", "pyramid", "tornado", "celery",
+    "sqlalchemy", "pandas", "numpy", "pytorch", "tensorflow", "keras",
+    "scikit-learn", "sklearn", "pygame", "kivy", "pyglet", "arcade",
+    "react", "preact", "angular", "vue", "svelte", "solid", "ember",
+    "next", "nextjs", "nuxt", "remix", "astro", "gatsby",
+    "vite", "vitest", "jest", "mocha", "jasmine", "karma", "cypress",
+    "playwright", "puppeteer", "selenium", "webpack", "rollup", "parcel",
+    "esbuild", "babel", "eslint", "prettier",
+    "express", "nestjs", "koa", "hapi", "fastify",
+    "rails", "sinatra", "laravel", "symfony", "spring", "quarkus",
+    "micronaut", "gin", "echo", "fiber", "actix", "rocket", "axum",
+    "tailwind", "tailwindcss", "bootstrap", "bulma", "chakra", "mui",
+    "three.js", "threejs", "webgl", "d3", "redux", "mobx", "zustand",
+    "graphql", "apollo", "prisma", "mongoose", "sequelize",
+    "testing-library", "enzyme", "storybook",
+})
 
 # ---------------------------------------------------------------------------
 # Intent detection keywords
@@ -349,7 +373,47 @@ class ContextBuilder:
                         return False
                     return a[:min(n, 5)] == b[:min(n, 5)]
 
+                _topic_vocab: set = set()
+                for _t in _intent_topics:
+                    _topic_vocab |= set(_t)
+
+                def _passes_framework_filter(item) -> bool:
+                    """Drop docs written FOR a framework this project lacks.
+
+                    Asymmetric on purpose: it only has to recognise the
+                    framework the *doc* is about, never the one the project
+                    uses. "Django Test Generation Instructions" names django;
+                    a Pac-Man task never does; so it goes — while "Python
+                    Test Generation Instructions" names no framework at all
+                    and is kept, and "Pygame Setup Guide" is kept because the
+                    task does say pygame.
+
+                    The language filter cannot do this: the Django docs are
+                    correctly tagged `language: "python"`, and this IS a
+                    Python project. Measured cost of getting it wrong: 11.2KB
+                    (~2.8k tokens) of Django material per affected step of a
+                    Pygame game.
+                    """
+                    if not _topic_vocab:
+                        return True
+                    haystack = (getattr(item, "title", "") or "").lower()
+                    tags = getattr(item, "tags", None) or []
+                    if isinstance(tags, str):
+                        tags = tags.split(",")
+                    haystack += " " + " ".join(str(t).lower() for t in tags)
+                    words = set(re.findall(r"[a-z0-9.+#]+", haystack))
+                    doc_frameworks = words & _DOC_FRAMEWORK_TOKENS
+                    if not doc_frameworks:
+                        return True          # framework-agnostic — keep
+                    return bool(doc_frameworks & _topic_vocab)
+
                 def _passes_topic_filter(item) -> bool:
+                    if not _passes_framework_filter(item):
+                        logger.debug(
+                            "[KB] Dropping '%s' — targets a framework this "
+                            "project does not use",
+                            getattr(item, "title", "?"))
+                        return False
                     if not _intent_topics:
                         return True
                     title_kws = set(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import unittest
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
 from dataclasses import dataclass, field
@@ -339,3 +340,172 @@ class TestFormatContext:
         output = builder.format_context_for_prompt(ctx)
         assert "CODING PATTERNS" in output
         assert "Repository Pattern" in output
+
+
+class TestRawTaskTopicFallback(unittest.TestCase):
+    """An unarmed topic filter admits every doc in the registry.
+
+    `_passes_topic_filter` returns True when `_intent_topics` is empty.
+    The vector-search branch was fixed to arm it even on a 0-doc search;
+    the title fast-path still assigned `_fp_per_topic_kws or []` and the
+    no-docs path assigned nothing. Live result on a Pygame run: React,
+    Django, Vitest and Three.js docs injected into every step.
+
+    These assert the *shape* the planner's fallback must produce, and the
+    discrimination it has to achieve on the real shipped titles.
+    """
+
+    TASK = (
+        "Build a Pac-Man clone using Python and Pygame. Tile-based maze, "
+        "ghosts, pellets and power pellets. Organize code into classes. "
+        "Test with randomised delta-time and assert no entity enters a "
+        "wall. python -m unittest must pass."
+    )
+
+    def _topics(self):
+        import re as _re
+        from agentchanti.agents.planner import _TOPIC_STOPWORDS
+        kws = {w.lower() for w in _re.findall(r'[a-zA-Z]{4,}', self.TASK)}
+        kws -= _TOPIC_STOPWORDS
+        return [{k} for k in sorted(kws)]
+
+    @staticmethod
+    def _passes(title, topics):
+        def stem(a, b):
+            n = min(len(a), len(b))
+            if n < 3:
+                return a == b
+            return a[:min(n, 5)] == b[:min(n, 5)]
+        words = {w.lower() for w in title.replace("-", " ").split()
+                 if len(w) >= 3}
+        for topic in topics:
+            threshold = max(1, min(2, len(topic)))
+            hits = sum(1 for w in words
+                       if any(stem(w, t) for t in topic))
+            if hits >= threshold:
+                return True
+        return False
+
+    def test_each_keyword_is_its_own_topic(self):
+        """One combined set raises the threshold to 2 and drops good docs."""
+        topics = self._topics()
+        self.assertTrue(all(len(t) == 1 for t in topics))
+        self.assertTrue(
+            self._passes("Pygame Setup Guide", topics),
+            "a single strong match must survive; combining every keyword "
+            "into one set makes the threshold 2 and drops this")
+
+    def test_relevant_docs_survive(self):
+        topics = self._topics()
+        for title in ("Pygame Setup Guide", "Python Setup Guide",
+                      "Python Test Generation Instructions"):
+            self.assertTrue(self._passes(title, topics), title)
+
+    def test_foreign_stack_docs_are_dropped(self):
+        topics = self._topics()
+        for title in ("React Component Export Instructions",
+                      "React Router Setup Instructions",
+                      "NPM Scripts Instructions",
+                      "Three.js + Vitest: Fixing WebGL Context Errors",
+                      "ADR-001: Use SQLite for Vector Store"):
+            self.assertFalse(self._passes(title, topics), title)
+
+    def test_short_keywords_cannot_stem_match_junk(self):
+        """"pac" would otherwise match "packages" and readmit Vitest docs."""
+        topics = self._topics()
+        self.assertNotIn({"pac"}, topics)
+
+
+class TestFrameworkScopedDocs(unittest.TestCase):
+    """A doc written FOR a framework needs that framework in the project.
+
+    The language filter cannot catch this case: the Django docs are
+    correctly tagged `language: "python"` and a Pygame game IS a Python
+    project. Live evidence -- "Django Page Creation Pattern" and "Django
+    Test Generation Instructions" (11.2KB, ~2.8k tokens) injected into
+    steps of a Pac-Man clone.
+
+    The rule is asymmetric on purpose: it only recognises the framework
+    the DOC is about, so it never needs a vocabulary of every stack a
+    project might use.
+    """
+
+    TASK_WORDS = {"pacman", "clone", "python", "pygame", "maze", "ghosts",
+                  "pellets", "tile", "unittest", "test", "wall", "sprite"}
+
+    def _passes(self, title, tags=()):
+        from agentchanti.kb.context_builder import _DOC_FRAMEWORK_TOKENS
+        import re as _re
+        hay = title.lower() + " " + " ".join(t.lower() for t in tags)
+        words = set(_re.findall(r"[a-z0-9.+#]+", hay))
+        doc_fw = words & _DOC_FRAMEWORK_TOKENS
+        if not doc_fw:
+            return True
+        return bool(doc_fw & self.TASK_WORDS)
+
+    def test_django_docs_are_dropped_from_a_pygame_project(self):
+        self.assertFalse(self._passes(
+            "Django Test Generation Instructions",
+            ("django", "testing", "pytest", "python")))
+        self.assertFalse(self._passes("Django Page Creation Pattern",
+                                      ("django", "python")))
+
+    def test_framework_agnostic_python_docs_survive(self):
+        self.assertTrue(self._passes(
+            "Python Test Generation Instructions",
+            ("python", "testing", "pytest", "mock")))
+        self.assertTrue(self._passes("Clean Code Naming Conventions"))
+        self.assertTrue(self._passes("Async Programming Patterns"))
+
+    def test_the_projects_own_framework_survives(self):
+        self.assertTrue(self._passes("Pygame Setup Guide", ("pygame",)))
+
+    def test_foreign_js_frameworks_are_dropped(self):
+        for title, tags in (
+            ("React Component Export Instructions", ("react", "jsx")),
+            ("Vitest React Testing Library Setup", ("vitest", "react")),
+            ("Three.js + Vitest: Fixing WebGL Context Errors",
+             ("threejs", "webgl", "vitest")),
+        ):
+            self.assertFalse(self._passes(title, tags), title)
+
+    def test_a_bare_language_is_not_treated_as_a_framework(self):
+        """Otherwise generic Python docs would be dropped from Python."""
+        from agentchanti.kb.context_builder import _DOC_FRAMEWORK_TOKENS
+        for lang in ("python", "javascript", "typescript", "java", "go"):
+            self.assertNotIn(lang, _DOC_FRAMEWORK_TOKENS)
+
+    def test_the_shipped_registry_splits_the_way_we_expect(self):
+        """Guards the real frontmatter, not just the token set."""
+        import glob
+        import os
+        import re as _re
+
+        import agentchanti.kb.global_kb.store as _store
+        registry = os.path.join(
+            os.path.dirname(os.path.abspath(_store.__file__)),
+            "registry")
+        verdicts = {}
+        for path in glob.glob(os.path.join(registry, "**", "*.md"),
+                              recursive=True):
+            with open(path, encoding="utf-8") as fh:
+                head = fh.read(800)
+            title = _re.search(r'^title:\s*"([^"]*)"', head, _re.M)
+            tags = _re.search(r'^tags:\s*"([^"]*)"', head, _re.M)
+            if not title:
+                continue
+            verdicts[title.group(1)] = self._passes(
+                title.group(1),
+                tuple(t.strip() for t in (tags.group(1) if tags
+                                          else "").split(",")))
+        dropped = {t for t, ok in verdicts.items() if not ok}
+        self.assertTrue(
+            any("Django" in t for t in dropped),
+            f"Django docs must not reach a Pygame project; dropped={dropped}")
+        self.assertTrue(
+            any("React" in t for t in dropped),
+            f"React docs must not reach a Pygame project; dropped={dropped}")
+        kept = {t for t, ok in verdicts.items() if ok}
+        self.assertTrue(
+            any("Python Test Generation" in t for t in kept),
+            f"generic Python docs must survive; kept={kept}")

@@ -7,6 +7,19 @@ from .base import Agent
 
 _logger = logging.getLogger(__name__)
 
+# Languages and runtimes, as opposed to frameworks. A setup-guide web
+# search for one of these returns "install the interpreter" — something
+# the model already knows and the plan's own CMD step already does.
+# Frameworks built ON these (django, react, pygame, …) are NOT here and
+# are still searched, because their scaffolds and config formats move.
+_BASE_LANGUAGES = frozenset({
+    "python", "python3", "javascript", "js", "typescript", "ts",
+    "java", "go", "golang", "rust", "c", "c++", "cpp", "c#", "csharp",
+    "ruby", "php", "swift", "kotlin", "scala", "r", "lua", "perl",
+    "bash", "shell", "sh", "powershell", "html", "css", "sql",
+    "node", "node.js", "nodejs", "dotnet", ".net",
+})
+
 # ── Safe-command allowlist for RUN_CMD ───────────────────────────────────────
 # Only patterns listed here are ever executed.  The list is intentionally
 # narrow: read-only git operations, directory listing, file search, and test
@@ -767,6 +780,23 @@ class IntentAgent(Agent):
                             _techs_needing_web.append(_tech)
 
                     # ── Step 2: Web search for frameworks without KB docs ────
+                    # A bare language is not a framework. The detector is
+                    # asked for "framework/library names" but routinely
+                    # returns the language too ("Python, Pygame"), and each
+                    # one costs a Perplexity fetch plus a summarisation call
+                    # — measured at ~2.7k tokens and ~10s for "Python", to
+                    # learn `pip install`. Whatever the guide says about
+                    # scaffolds and config-file formats belongs to the
+                    # frameworks in the list, which are still searched.
+                    _skipped_base = [t for t in _techs_needing_web
+                                     if t.strip().lower() in _BASE_LANGUAGES]
+                    if _skipped_base:
+                        _techs_needing_web = [
+                            t for t in _techs_needing_web
+                            if t.strip().lower() not in _BASE_LANGUAGES]
+                        _logger.info(
+                            "[IntentAnalysis] Skipping setup-guide search for "
+                            "base language(s): %s", ", ".join(_skipped_base))
                     if _techs_needing_web and search_agent is not None:
                         for _tech in _techs_needing_web[:3]:
                             _setup_query = (
