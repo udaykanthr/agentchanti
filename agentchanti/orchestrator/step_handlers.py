@@ -3834,6 +3834,52 @@ def _djangoize_import_probe(cmd: str, project_root: str = ".") -> str:
     return f"python -c {quote}{prefix}{body}{quote}"
 
 
+def _tests_are_discoverable(executor, language, subroot,
+                            gate_cmd) -> tuple[bool, str, str]:
+    """Can the project's OWN runner find the suite this step just wrote?
+
+    A plan-declared gate may name a single file
+    (``python -m unittest -v tests/test_game.py``). That proves the file
+    runs; it says nothing about discovery. A run shipped exactly that: the
+    gate was green and `python -m unittest -v` answered "Ran 0 tests"
+    because nothing made ``tests/`` a package.
+
+    The check re-runs the GATE with its file scoping removed, not the
+    language default: the language default for Python is pytest, which
+    collects ``tests/`` with no ``__init__.py`` at all and would have
+    called the broken project green. The question is only ever "does the
+    runner this step chose still find these tests without being pointed
+    at them".
+
+    Returns (ok, command, output). A gate that is already project-wide,
+    or that names no runner we recognise, returns ok — inventing a
+    verdict would fail steps blindly.
+    """
+    from ..agent_tools import _no_tests_collected, _TEST_RUNNER_TOKENS
+
+    if not gate_cmd:
+        return True, "", ""
+    low = gate_cmd.lower()
+    if not any(tok in low for tok in _TEST_RUNNER_TOKENS):
+        return True, "", ""
+
+    parts = gate_cmd.split()
+    kept = [p for p in parts
+            if not (("/" in p or "\\" in p
+                     or p.endswith((".py", ".js", ".ts", ".tsx", ".go")))
+                    and not p.startswith("-"))]
+    if len(kept) == len(parts):
+        return True, gate_cmd, ""      # already project-wide
+    cmd = " ".join(kept)
+    ok, out = executor.run_command(cmd, timeout=300)
+    if _no_tests_collected(cmd, getattr(executor, "last_exit_code", None),
+                           out or ""):
+        return False, cmd, out or ""
+    # A failing-but-collecting suite is a different problem, and the
+    # step's own gate already had its say on correctness.
+    return True, cmd, out or ""
+
+
 def _declared_verify_cmd(plan_step, memory: FileMemory,
                          task: str = "") -> str | None:
     """The plan-declared acceptance command for a step, or None.
@@ -5591,6 +5637,29 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             preload_full_paths=set(
                 getattr(plan_step, 'target_files', None) or ()),
         )
+        # A green gate that named ONE test file proves that file runs — not
+        # that the project's own runner can find it. Observed: the plan
+        # declared `python -m unittest -v tests/test_game.py`, the step
+        # passed, and the delivered project answered `python -m unittest -v`
+        # with "Ran 0 tests" because nothing made tests/ a package. The
+        # whole point of a TEST step is a suite the project can run.
+        if loop_result[0]:
+            from .agent_loop import truncate_middle
+            _disc_ok, _disc_cmd, _disc_out = _tests_are_discoverable(
+                executor, language, _vsub, verify_cmd)
+            if not _disc_ok:
+                log.error(
+                    "[TestStep] gate %r passed but %r collects no tests — "
+                    "the suite is not discoverable by the project's own "
+                    "runner", verify_cmd, _disc_cmd)
+                return False, (
+                    f"The step's gate ({verify_cmd}) passed, but the "
+                    f"project's own test runner finds nothing:\n\n"
+                    f"$ {_disc_cmd}\n{truncate_middle(_disc_out, 800)}\n\n"
+                    "Tests that only run when named by path are not a "
+                    "suite. Make them discoverable (for unittest, that "
+                    "usually means an __init__.py in the tests package).")
+
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge
         # from what actually ran green.
