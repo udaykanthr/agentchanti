@@ -4,6 +4,111 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.2 — 2026-08-07
+
+Five fixes from continued A/B benchmarking of `agent_loop` on/off over the
+Pac-Man task with adversarial delta-time invariants. The theme is the
+harness: in every case the model did work the pipeline then discarded,
+hid, or graded against the wrong thing. Each fix carries a regression test.
+
+Benchmarked after these changes, one run per mode, both passing their own
+suite and an independent wall-invariance check: loop 5:01 / $0.4778 / 49%
+prompt-cache hit; classic 7:55 / $0.5872 / 3%. This is the first classic
+run on this task to pass ground truth.
+
+### Fixed
+
+- **A failing command is routed by its error, not its shape.** A step whose
+  gate was a bare console script (`ruff check messy.py`, not on the child
+  process's PATH) was told "the failure is in the code — edit the source",
+  though the source was already correct. Routing now matches the failure
+  signature itself (not recognized / command not found / No module named /
+  executable file not found / cannot find the path), so any command failing
+  that way gets environment advice, including invoking an installed-but-
+  unPATHed tool as `python -m <tool>`. Assertions and tracebacks keep the
+  original wording verbatim. The run this came from reported failure on a
+  task ground truth showed had PASSED, after 22 turns and 61.9k tokens.
+- **The repeat-command nudge survives across attempts.** The streak reset
+  every attempt, so a command re-run once per attempt across loop →
+  escalation → recovery never tripped it. It is now seeded from the attempt
+  journal; an edit within the attempt still clears it.
+- **A step cannot shadow a dependency whose install just failed.** After a
+  `pip install pygame` failure, one run wrote a local `pygame/` package
+  whose own docstring said it performs no real rendering — shadowing the
+  real library, so every later step and test would have passed against a
+  no-op renderer. Blocked only when an install of that exact distribution
+  failed in the same step, and only for a new top-level module or package.
+- **A rejected chunk edit is no longer re-parsed as whole files.** Pattern 5
+  attributed indented method bodies to modules on a single symbol match,
+  writing three method bodies over three real files. A complete file passes
+  the new check trivially.
+- **A test suite the project's own runner cannot find is not done.** A run
+  shipped a false green: six steps verified early, the pipeline reported
+  success, and the delivered project answered `python -m unittest -v` with
+  "Ran 0 tests" — nothing had made `tests/` a package. A path-scoped gate
+  proves the file runs and says nothing about discovery, so the TEST step
+  now re-runs its own gate with the file scoping stripped and fails when
+  that collects nothing.
+- **A CONFIG_BUG fix may only touch config files.** Observed rewriting five
+  source modules under a triage meaning "the test environment is
+  misconfigured", taking a suite from 1 failure in 61 tests to 4 failures
+  and 3 errors in 64. A repeat CONFIG_BUG verdict that changed nothing now
+  routes to the source path.
+- **Compound commands are never token-rewritten.** `pip install -U pygame
+  && pip freeze > requirements.txt` was reassembled into `pip install -U
+  requirements.txt && freeze`, became a step's gate, and killed a run at
+  step 1 of 9 with an otherwise correct plan.
+- **The plan's own test runner is honoured.** A task whose acceptance was
+  `python -m unittest -v` had pytest installed and used anyway. Relatedly,
+  `unittest discover -v tests/test_x.py` read the path as a start directory
+  and ran zero tests, recording a game with 61 of 63 tests passing as 0/2.
+- **Windows: `| head -N` is dropped rather than failing the command.** head
+  does not exist there, so the pipeline died before the command ran. pip
+  self-upgrades now route through `python -m pip`.
+
+### Performance
+
+- **A loop step ends as soon as its gate goes green.** Steps averaged 7.6
+  turns against a max of 8, so they essentially never finished early, and
+  the whole conversation is resent every turn (~27k prompt tokens on late
+  turns against ~2k at the start). The gate is now checked as soon as an
+  edit lands — one subprocess, no tokens. On the same 7-step plan: 305,306
+  tokens rather than 821,235 (-63%), 282s rather than 517s, avg 4.4 turns
+  rather than 7.6, with the artifact still passing its suite and the
+  independent dt-invariance check.
+- **The Anthropic chat path asks for a prompt cache.** `agent_loop` keeps
+  its system prompt byte-identical *for* prompt caches, but the request
+  never set `cache_control`, so a run billed 1,224,846 tokens sent and 0
+  cached. Three breakpoints take the hit rate to 65% and cut full-price
+  input per loop turn from 18,688 to 7,492. The billed prompt is now
+  reported as input + cache_read + cache_write, since `input_tokens` alone
+  makes a working cache look like a shrinking prompt.
+- **A weak `verify:` is repaired in place instead of regenerating the plan.**
+  A re-plan cost 8,214 sent / 3,219 received to fix one line and churned the
+  step decomposition; the repair costs ~500 tokens. Shell-level assertions
+  count as teeth; `assert True` does not.
+- **An empty response that billed output tokens is treated as a reasoning
+  burn even when `finish_reason` is "stop".** Only cap-hits were detected,
+  so a burn wearing a clean stop fell through to the anti-`<think>`
+  preamble, which cannot help server-side reasoning and mutates the prompt,
+  losing prompt-cache reuse. Gemini's thinking cap is now persisted in
+  `~/.agentchanti/effort_floors.json` alongside the OpenAI floor,
+  namespaced so a numeric budget and an effort string cannot be confused.
+- **A failing command re-run unchanged is nudged, then `run_command` is
+  withheld.** Commands compare with `cd` prefixes and output pipes
+  normalised away, since the retry usually arrives redressed rather than
+  repeated. One step spent turns 4–7 re-running one gate from four
+  directories (~38k tokens) while the defect went untouched.
+- **A chunk edit whose line range no longer matches splices the named
+  symbol** instead of discarding the fix and spending an attempt on nothing.
+
+### Benchmarks
+
+- `verify_dt_invariance` no longer refuses a game it can drive: a 3-arg
+  `is_rect_wall_free` outranked `is_walkable` purely by spelling "wall" and
+  carried the opposite polarity. The probe now reads arity and polarity
+  before it trusts a name.
+
 ## 0.6.1 — 2026-08-05
 
 Correctness and context-hygiene fixes found by an A/B benchmark of
