@@ -242,6 +242,26 @@ _WITHHOLD_READONLY_AT = 3
 _REPEAT_CMD_NUDGE_AT = 1
 _WITHHOLD_RUN_COMMAND_AT = 2
 
+# Commands whose failure is an environment or argument problem, never a
+# defect in the project's source. The repeat nudge below used to tell every
+# repeat "the failure is in the code, not in how the command is invoked —
+# edit the source that produced it". For `pip install pygame==2.6.0`
+# failing because that version has no wheel for this Python, that is simply
+# false: no project source existed yet. The model obeyed anyway, and the
+# only source it could invent to satisfy the instruction was a local
+# `pygame/` stub package that shadowed the real library.
+#
+# CODE/TEST wording is unchanged — only a repeat of one of these commands
+# takes the environment branch.
+_ENV_CMD_RE = re.compile(
+    r"\b(?:pip3?|uv|npm|pnpm|yarn|apt|apt-get|brew|choco|winget|"
+    r"conda|poetry|gem|cargo|go)\s+(?:install|add|get|i)\b"
+    r"|\bpython\s+-m\s+(?:pip|venv)\b"
+    r"|\bnpx\s+"
+    r"|\b(?:python|py)\s+-m\s+venv\b",
+    re.IGNORECASE,
+)
+
 # Wrappers that change how a command's output is delivered but not what it
 # does. A model that has been told to stop re-running something tends to
 # re-run it *dressed differently* instead, so an exact-string comparison
@@ -903,17 +923,37 @@ def run_agent_loop(
             else:
                 repeat_cmd_streak = 0
             if repeat_cmd_streak == _REPEAT_CMD_NUDGE_AT:
+                _is_env_cmd = bool(_ENV_CMD_RE.search(_repeated_cmd or ""))
                 _logger.info("[AgentLoop] step %d: re-ran a failing command "
-                             "unchanged — injecting fix-the-cause nudge",
-                             step_idx + 1)
-                messages.append(Message(role="user", content=(
-                    f"You already ran `{_repeated_cmd[:160]}` earlier in "
-                    "this step and it failed the same way. Re-running it, or "
-                    "running it from a different directory, cannot change "
-                    "the result — the failure is in the code, not in how the "
-                    "command is invoked. Read the error above and edit the "
-                    f"source that produced it. {max_turns - turn} turn(s) "
-                    "remain.")))
+                             "unchanged — injecting fix-the-cause nudge%s",
+                             step_idx + 1,
+                             " (environment variant)" if _is_env_cmd else "")
+                if _is_env_cmd:
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way. Re-running it "
+                        "cannot change the result. This is an environment or "
+                        "argument problem, not a defect in the project's "
+                        "source — read the error above and change the "
+                        "command itself: drop or change a pinned version "
+                        "that has no build for this platform or Python, "
+                        "target a different package name, or use whatever "
+                        "the error actually asks for. Do NOT write a local "
+                        "module or package that stands in for the "
+                        "dependency: it would shadow the real one, and the "
+                        "step would look finished while the functionality "
+                        "stayed missing. If the dependency genuinely cannot "
+                        "be installed here, say so plainly instead. "
+                        f"{max_turns - turn} turn(s) remain.")))
+                else:
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way. Re-running it, or "
+                        "running it from a different directory, cannot change "
+                        "the result — the failure is in the code, not in how the "
+                        "command is invoked. Read the error above and edit the "
+                        f"source that produced it. {max_turns - turn} turn(s) "
+                        "remain.")))
             elif repeat_cmd_streak == _WITHHOLD_RUN_COMMAND_AT:
                 _logger.info("[AgentLoop] step %d: still re-running a failing "
                              "command — withholding run_command",
