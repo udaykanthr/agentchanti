@@ -300,6 +300,45 @@ class Executor:
         files[filename] = content
 
     @staticmethod
+    def _is_standalone_module(content: str, lang: str = "") -> bool:
+        """True when *content* could plausibly BE a whole file.
+
+        Pattern 5 attributes an unlabelled block to a file and writes it as
+        that file's entire content. That is right for a model which emits a
+        complete module without naming it, and catastrophically wrong for a
+        method-level chunk: a class body written as a module is
+        ``unexpected indent (line 1)``.
+
+        Observed on a chunk-edit whose splice was rejected — the same
+        response was then re-parsed as full files, and Pattern 5 assigned
+        three indented method bodies to three real modules, each on a
+        single symbol match. All three were reverted by the syntax guard,
+        so the diagnosis round produced nothing at all.
+
+        A genuinely complete file passes both checks trivially, so this
+        does not narrow what Pattern 5 accepts today — it only rejects
+        fragments, which were never writable as files in the first place.
+        """
+        stripped = content.strip()
+        if not stripped:
+            return False
+        # A file's first real line starts at column 0 in every language
+        # this runs on. A fragment lifted from inside a class or function
+        # does not.
+        for raw in content.splitlines():
+            if not raw.strip():
+                continue
+            if raw[:1] in (" ", "\t"):
+                return False
+            break
+        if lang == "python":
+            try:
+                ast.parse(content)
+            except SyntaxError:
+                return False
+        return True
+
+    @staticmethod
     def parse_blocks_for_single_target(text: str, target: str) -> Dict[str, str]:
         """Attribute an unlabelled code block to the step's only target.
 
@@ -536,6 +575,14 @@ class Executor:
                      best_score = file_scores[best_file]
                      
                      if best_score > 0:
+                         if not Executor._is_standalone_module(
+                                 block, normalized_lang):
+                             log.warning(
+                                 f"[Executor] Pattern 5 declined {best_file}: "
+                                 f"block is a fragment, not a whole file "
+                                 f"(writing it would replace the module with "
+                                 f"a partial definition)")
+                             continue
                          log.info(f"[Executor] Pattern 5 assigned block to {best_file} with score {best_score}")
                          Executor._try_add_file(files, best_file, block.rstrip("\n"))
                          

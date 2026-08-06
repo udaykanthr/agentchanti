@@ -91,6 +91,78 @@ _NO_TESTS_HINT = (
 )
 
 
+# Distributions named by an install command that FAILED. A model whose
+# `pip install pygame` fails has two honest options — fix the install or
+# report the blocker — and one dishonest one: write a local `pygame/`
+# package so the import succeeds. Observed: three write_file turns
+# producing `pygame/__init__.py`, `display.py` and `draw.py` whose own
+# docstring says the functions "perform no real rendering". That shadows
+# the real library on sys.path, so every later step and test would have
+# passed against a no-op renderer — a green run with no game in it.
+#
+# The trigger is deliberately narrow: the guard needs an install of that
+# exact distribution to have failed IN THIS STEP. A run whose installs
+# succeed can never reach it.
+_INSTALL_RE = re.compile(
+    r"\b(?:pip|pip3|uv)\s+(?:install|add)\b(?P<args>.*)", re.IGNORECASE)
+# A chained command holds several independent invocations; matching `.*`
+# across a separator swallows the next one's argv as if it were package
+# names (`... && python -m pip install X` yielded `python` and `install`).
+_CMD_SEPARATOR_RE = re.compile(r"&&|\|\||[;|]")
+# Strip a version/extras specifier: `pygame==2.6.0`, `pygame[all]`,
+# `pygame>=2,<3` all name the distribution `pygame`.
+_DIST_SPLIT_RE = re.compile(r"[\[<>=!~;].*$")
+
+
+def _normalise_dist(name: str) -> str:
+    """PEP 503 style normalisation — `Foo_Bar` and `foo-bar` are one name."""
+    return re.sub(r"[-_.]+", "-", name.strip().strip("'\"")).lower()
+
+
+def parse_failed_install_targets(command: str) -> set[str]:
+    """Distribution names an install *command* would have installed.
+
+    Returns an empty set for anything that is not an install command, so
+    the caller can record unconditionally on failure.
+    """
+    targets: set[str] = set()
+    for segment in _CMD_SEPARATOR_RE.split(command or ""):
+        m = _INSTALL_RE.search(segment)
+        if not m:
+            continue
+        for tok in m.group("args").split():
+            if tok.startswith("-"):
+                continue  # flag, or the value of one we do not care about
+            # Requirement files and URLs name no single distribution.
+            if "/" in tok or "\\" in tok or tok.endswith(".txt"):
+                continue
+            dist = _normalise_dist(_DIST_SPLIT_RE.sub("", tok))
+            if dist and re.fullmatch(r"[a-z0-9][a-z0-9-]*", dist):
+                targets.add(dist)
+    return targets
+
+
+def shadowed_dist(rel_path: str, failed: set[str]) -> Optional[str]:
+    """The failed distribution *rel_path* would shadow, if any.
+
+    Only a NEW TOP-LEVEL module or package can shadow an import, so this
+    looks at the first path component and nothing deeper: `pygame/draw.py`
+    and `pygame.py` shadow, `src/pygame/draw.py` does not.
+    """
+    if not failed:
+        return None
+    parts = re.split(r"[\\/]+", rel_path.strip("\\/"))
+    if not parts or not parts[0]:
+        return None
+    head = parts[0]
+    if len(parts) == 1:
+        if not head.endswith(".py"):
+            return None
+        head = head[:-3]
+    candidate = _normalise_dist(head)
+    return candidate if candidate in failed else None
+
+
 def _truncate(text: str, limit: int, what: str = "output") -> str:
     if len(text) <= limit:
         return text
@@ -127,6 +199,10 @@ class AgentTools:
         self._searcher = searcher
         self._memory = memory
         self._command_timeout = command_timeout
+        # Distributions whose install failed during this step. Scoped to
+        # the instance, and build_step_tools() builds one per step, so the
+        # window closes when the step ends.
+        self._failed_installs: set[str] = set()
 
     # ── Definitions ──
 
@@ -319,6 +395,25 @@ class AgentTools:
 
     def _tool_write_file(self, path: str, content: str) -> str:
         full = self._resolve(path)
+        rel = os.path.relpath(full, self.project_root)
+        dist = shadowed_dist(rel, self._failed_installs)
+        if dist is not None:
+            log.warning(f"[AgentTools] refused shadow write '{rel}' "
+                        f"(install of '{dist}' failed in this step)")
+            return (
+                f"ERROR: refusing to write '{path}'. Installing '{dist}' "
+                f"failed earlier in this step, and a top-level '{dist}' "
+                f"module here would shadow the real package on sys.path — "
+                f"imports would resolve to this file instead of the "
+                f"library. A local stub makes the import succeed while the "
+                f"functionality stays missing, so every later test would "
+                f"pass against code that does nothing.\n"
+                f"Fix the installation instead (check the version actually "
+                f"has a wheel for this Python, or install without pinning "
+                f"a version), or report that the dependency cannot be "
+                f"installed. If you genuinely need a project module with "
+                f"this name, put it under a package directory rather than "
+                f"at the project root.")
         os.makedirs(os.path.dirname(full) or self.project_root, exist_ok=True)
         with open(full, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
@@ -395,6 +490,9 @@ class AgentTools:
             self._executor = Executor()
         success, output = self._executor.run_command(
             command, timeout=self._command_timeout, cwd=self.project_root)
+        if not success:
+            # Arm the shadow guard for whatever this install was after.
+            self._failed_installs |= parse_failed_install_targets(command)
         status = "exit: success" if success else "exit: FAILED"
         body = _truncate(output or "(no output)", _MAX_CMD_OUTPUT_CHARS)
         # "exit: FAILED" reads identically whether an assertion failed or

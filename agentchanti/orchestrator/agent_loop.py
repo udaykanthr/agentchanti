@@ -242,6 +242,49 @@ _WITHHOLD_READONLY_AT = 3
 _REPEAT_CMD_NUDGE_AT = 1
 _WITHHOLD_RUN_COMMAND_AT = 2
 
+# Commands whose failure is an environment or argument problem, never a
+# defect in the project's source. The repeat nudge below used to tell every
+# repeat "the failure is in the code, not in how the command is invoked —
+# edit the source that produced it". For `pip install pygame==2.6.0`
+# failing because that version has no wheel for this Python, that is simply
+# false: no project source existed yet. The model obeyed anyway, and the
+# only source it could invent to satisfy the instruction was a local
+# `pygame/` stub package that shadowed the real library.
+#
+# CODE/TEST wording is unchanged — only a repeat of one of these commands
+# takes the environment branch.
+_ENV_CMD_RE = re.compile(
+    r"\b(?:pip3?|uv|npm|pnpm|yarn|apt|apt-get|brew|choco|winget|"
+    r"conda|poetry|gem|cargo|go)\s+(?:install|add|get|i)\b"
+    r"|\bpython\s+-m\s+(?:pip|venv)\b"
+    r"|\bnpx\s+"
+    r"|\b(?:python|py)\s+-m\s+venv\b",
+    re.IGNORECASE,
+)
+
+# The command shape above only catches installs. The more general signal
+# is the ERROR: a command that cannot be found, or an import that cannot
+# be resolved, is an environment problem whatever the command was.
+#
+# Observed on the cmd-recovery benchmark: the model fixed messy.py
+# correctly (`python -m ruff check messy.py` -> "All checks passed!") but
+# the step's gate was the bare console script `ruff`, which is not on the
+# child process's PATH. The gate failed on working code, the loop spent
+# 22 turns across 3 attempts and 61.9k tokens hunting PATH, and the
+# pipeline reported failure on a finished task. `ruff check messy.py` is
+# not an install command, so the shape test alone routed it to "edit the
+# source" -- advice that was wrong twice over, since the source was
+# already correct.
+_ENV_ERROR_RE = re.compile(
+    r"is not recognized as an internal or external command"
+    r"|command not found"
+    r"|No module named"
+    r"|executable file not found"
+    r"|The system cannot find the (?:path|file) specified"
+    r"|is not recognized as the name of a cmdlet",
+    re.IGNORECASE,
+)
+
 # Wrappers that change how a command's output is delivered but not what it
 # does. A model that has been told to stop re-running something tends to
 # re-run it *dressed differently* instead, so an exact-string comparison
@@ -695,7 +738,19 @@ def run_agent_loop(
     # Commands that have failed and whose cause nobody has touched since.
     # An edit clears it: re-running after a change is verification, not a
     # rut, and must not be penalised.
-    failed_since_edit: set[str] = set()
+    #
+    # Seeded from earlier attempts at THIS step. The streak used to reset
+    # with every attempt, so a command re-run once per attempt across the
+    # loop -> escalation -> recovery ladder never tripped the nudge at all
+    # — observed on cmd-recovery, where `ruff check messy.py` failed
+    # identically in all three attempts and the intervention never fired.
+    # An edit inside this attempt still clears the seed, so a genuine
+    # fix-then-verify sequence is not penalised.
+    failed_since_edit: set[str] = {
+        _n for _a in get_attempts(step_idx)
+        for _c, _c_ok in _a.get("commands", [])
+        if not _c_ok and (_n := normalize_command(_c))
+    }
     healed: set[str] = set()
 
     # Last run_command the model executed that exited 0 — evidence for
@@ -819,6 +874,7 @@ def run_agent_loop(
             _tool_msgs = tools.execute_all(response.tool_calls)
             messages.extend(_tool_msgs)
             _repeated_cmd: str | None = None
+            _repeated_out: str = ""
             # A green gate the model ran itself, as the last thing it did
             # this turn. Without this the early gate below re-ran the very
             # command the model had just run seconds earlier — observed as
@@ -835,6 +891,7 @@ def run_agent_loop(
                             _norm = normalize_command(_cmd)
                             if _norm and _norm in failed_since_edit:
                                 _repeated_cmd = _cmd
+                                _repeated_out = _content
                             failed_since_edit.add(_norm)
                         commands_run.append((_cmd, _ok))
                     if _ok:
@@ -903,17 +960,40 @@ def run_agent_loop(
             else:
                 repeat_cmd_streak = 0
             if repeat_cmd_streak == _REPEAT_CMD_NUDGE_AT:
+                _is_env_cmd = bool(_ENV_CMD_RE.search(_repeated_cmd or "")
+                                   or _ENV_ERROR_RE.search(_repeated_out))
                 _logger.info("[AgentLoop] step %d: re-ran a failing command "
-                             "unchanged — injecting fix-the-cause nudge",
-                             step_idx + 1)
-                messages.append(Message(role="user", content=(
-                    f"You already ran `{_repeated_cmd[:160]}` earlier in "
-                    "this step and it failed the same way. Re-running it, or "
-                    "running it from a different directory, cannot change "
-                    "the result — the failure is in the code, not in how the "
-                    "command is invoked. Read the error above and edit the "
-                    f"source that produced it. {max_turns - turn} turn(s) "
-                    "remain.")))
+                             "unchanged — injecting fix-the-cause nudge%s",
+                             step_idx + 1,
+                             " (environment variant)" if _is_env_cmd else "")
+                if _is_env_cmd:
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way. Re-running it "
+                        "cannot change the result. This is an environment or "
+                        "argument problem, not a defect in the project's "
+                        "source — read the error above and change the "
+                        "command itself: drop or change a pinned version "
+                        "that has no build for this platform or Python, "
+                        "target a different package name, or — if the tool "
+                        "is installed but not on PATH — invoke it through "
+                        "the interpreter instead (`python -m <tool> ...`) "
+                        "rather than by its bare name. Do NOT write a local "
+                        "module or package that stands in for the "
+                        "dependency: it would shadow the real one, and the "
+                        "step would look finished while the functionality "
+                        "stayed missing. If the dependency genuinely cannot "
+                        "be installed here, say so plainly instead. "
+                        f"{max_turns - turn} turn(s) remain.")))
+                else:
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way. Re-running it, or "
+                        "running it from a different directory, cannot change "
+                        "the result — the failure is in the code, not in how the "
+                        "command is invoked. Read the error above and edit the "
+                        f"source that produced it. {max_turns - turn} turn(s) "
+                        "remain.")))
             elif repeat_cmd_streak == _WITHHOLD_RUN_COMMAND_AT:
                 _logger.info("[AgentLoop] step %d: still re-running a failing "
                              "command — withholding run_command",
