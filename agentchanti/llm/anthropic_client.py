@@ -207,6 +207,59 @@ class AnthropicClient(LLMClient):
                     out.append({"role": m.role, "content": m.content or ""})
         return "\n\n".join(system_parts), out
 
+    # Prompt caching is a PREFIX match: everything up to a breakpoint is
+    # cached together, and any byte change before it invalidates the rest.
+    # Reads bill at ~0.1x, writes at ~1.25x, so this only pays where the
+    # prefix recurs — which is exactly the agent loop's shape. Both halves
+    # of that shape are already stable by design: the loop's system prompt
+    # is deliberately byte-identical across steps (see agent_loop's module
+    # docstring, which says so and names prompt caches as the reason), and
+    # within a step every turn re-sends the whole conversation so far.
+    #
+    # Nothing was ever marked, so none of it cached. Measured on a Pygame
+    # run: 1,224,846 tokens sent, 0 cached — 70 chat calls averaging 17k
+    # and peaking at 44.8k, every one of them billed at full price.
+    _CACHE_CONTROL = {"type": "ephemeral"}
+
+    @staticmethod
+    def _mark_cacheable(message: dict) -> None:
+        """Put a cache breakpoint on *message*'s last content block."""
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content:
+                return
+            content = [{"type": "text", "text": content}]
+            message["content"] = content
+        if isinstance(content, list) and content:
+            content[-1]["cache_control"] = dict(
+                AnthropicClient._CACHE_CONTROL)
+
+    def _apply_cache_breakpoints(self, payload: dict) -> None:
+        """Mark the stable prefix of *payload* (max 4 breakpoints allowed).
+
+        Three are used, in render order (tools -> system -> messages):
+
+        * the system block, which carries the tools before it;
+        * the opening user message, which holds the step's task and its
+          pre-loaded files and does not change for the life of the step;
+        * the newest message, so the next turn reads everything up to here.
+
+        The middle one is not redundant. A breakpoint searches back at most
+        20 content blocks for a prior entry, and a tool-calling turn adds
+        two blocks a time, so a long step can outrun the window; the anchor
+        on the opening message keeps the expensive part of the prefix
+        reachable even then.
+        """
+        if isinstance(payload.get("system"), list) and payload["system"]:
+            payload["system"][-1]["cache_control"] = dict(self._CACHE_CONTROL)
+
+        api_messages = payload.get("messages") or []
+        if not api_messages:
+            return
+        self._mark_cacheable(api_messages[0])
+        if len(api_messages) > 1:
+            self._mark_cacheable(api_messages[-1])
+
     def _chat(self, messages: List[Message],
               tools: Optional[List[ToolDef]] = None) -> ChatResponse:
         est_tokens = int(sum(len((m.content or "").split()) for m in messages) * 1.3)
@@ -221,27 +274,47 @@ class AnthropicClient(LLMClient):
             "messages": api_messages,
         }
         if system:
-            payload["system"] = system
+            # Block form so a cache breakpoint can be attached; a plain
+            # string cannot carry one.
+            payload["system"] = [{"type": "text", "text": system}]
         if tools:
             payload["tools"] = [
                 {"name": t.name, "description": t.description,
                  "input_schema": t.parameters}
                 for t in tools
             ]
+        self._apply_cache_breakpoints(payload)
 
         url = f"{self.base_url}/messages"
         response = requests.post(url, headers=self._headers(), json=payload,
                                  timeout=(10, 300))
+        if response.status_code >= 400:
+            # `raise_for_status` reports the status and drops the body, and
+            # the body is where the API says what is actually wrong — an
+            # exhausted credit balance and a malformed request are both a
+            # bare 400 without it, which is a materially different thing to
+            # go and fix.
+            log.error("[Anthropic] HTTP %s: %s",
+                      response.status_code, response.text[:600])
         response.raise_for_status()
         data = response.json()
 
         usage = data.get("usage", {})
         prompt_tokens = usage.get("input_tokens", est_tokens)
         completion_tokens = usage.get("output_tokens", 0)
+        # `input_tokens` counts only the UNCACHED remainder, so the billed
+        # prompt is the sum of the three. Reporting input_tokens alone would
+        # make a working cache look like a shrinking prompt.
+        cache_read = usage.get("cache_read_input_tokens") or 0
+        cache_write = usage.get("cache_creation_input_tokens") or 0
+        if not isinstance(prompt_tokens, int):
+            prompt_tokens = est_tokens
+        total_prompt = prompt_tokens + cache_read + cache_write
         token_tracker.record(
-            prompt_tokens if isinstance(prompt_tokens, int) else est_tokens,
+            total_prompt,
             completion_tokens if isinstance(completion_tokens, int) else 0,
             model_name=self.model,
+            cached_tokens=cache_read,
         )
 
         text_parts: list[str] = []
@@ -256,8 +329,9 @@ class AnthropicClient(LLMClient):
                     id=block.get("id", ""),
                 ))
 
-        log.debug(f"[Anthropic] Chat usage: prompt={prompt_tokens} "
-                  f"completion={completion_tokens} tool_calls={len(tool_calls)}")
+        log.debug(f"[Anthropic] Chat usage: prompt={total_prompt} "
+                  f"completion={completion_tokens} tool_calls={len(tool_calls)} "
+                  f"cache_read={cache_read} cache_write={cache_write}")
         return ChatResponse(text="".join(text_parts), tool_calls=tool_calls,
                             stop_reason=data.get("stop_reason", "") or "")
 

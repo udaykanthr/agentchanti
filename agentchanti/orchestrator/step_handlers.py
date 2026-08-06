@@ -300,6 +300,31 @@ def _get_runner_install_cmd(runner: str, cwd: str | None = None) -> str | None:
     return f"pip install {runner}"
 
 
+# `python -m unittest ...` anywhere in a plan-declared acceptance command.
+_UNITTEST_GATE_RE = re.compile(
+    r'\bpython3?(?:\.exe)?\s+-m\s+unittest\b', re.IGNORECASE)
+
+
+def _plan_declared_test_runner(plan_step, language: str | None) -> str | None:
+    """The test runner the plan's own gate uses, when it overrides the default.
+
+    Returns ``None`` when the plan says nothing useful, so the caller keeps
+    the language default.
+
+    Only unittest is honoured, and deliberately so: it ships with CPython,
+    so adopting it can never leave the step waiting on an install, and
+    pytest-flavoured tests do not satisfy a `python -m unittest` gate
+    (bare test functions and fixtures are invisible to it) while
+    unittest-flavoured tests satisfy both.
+    """
+    if plan_step is None or (language or "python") != "python":
+        return None
+    gate = getattr(plan_step, "verify_cmd", "") or ""
+    if _UNITTEST_GATE_RE.search(gate):
+        return "python -m unittest discover -v"
+    return None
+
+
 def _read_js_project_env(cwd: str | None = None) -> dict:
     """Read package.json and project config to detect JS/TS environment.
 
@@ -1732,6 +1757,58 @@ def _get_pip_cmd(cwd: str | None = None) -> str:
     return "pip"
 
 
+# Shell metacharacters that mean a line is more than one command. Their
+# presence makes token-level rewriting unsafe: the words after them belong
+# to a different command, or are redirections, not package names.
+_SHELL_OPERATOR_RE = re.compile(r'(&&|\|\||[|;<>])')
+
+
+# A chain segment that upgrades pip, whether or not other packages ride
+# along (`--upgrade pip`, `-U pip setuptools wheel`). The `pip`/`pip.exe`
+# form is the one that breaks; `python -m pip` is already the fix.
+_PIP_SELF_UPGRADE_RE = re.compile(
+    r'^(?P<interp>[\w./\\]*pip3?(?:\.exe)?)\s+install\s+'
+    r'(?P<rest>(?=(?:[^&|]*\s)?(?:-U|--upgrade)(?:\s|$))'
+    r'(?=[^&|]*(?:\s|^)pip(?:\s|$))[^&|]*)$',
+    re.IGNORECASE,
+)
+
+
+def _fix_pip_self_upgrade(cmd: str) -> str | None:
+    """Route pip-self-upgrade segments through ``python -m pip``.
+
+    Returns the corrected command, or ``None`` when there was nothing to
+    correct.
+
+    On Windows ``pip install --upgrade pip`` cannot replace the running
+    ``pip.exe`` shim: pip refuses with "To modify pip, please run the
+    following command: ...python.exe -m pip install --upgrade pip" and
+    exits 1. Chained with ``&&`` that aborts every later segment — observed
+    on a Pygame run where `python -m venv venv && ... && pip install
+    --upgrade pip setuptools wheel && pip install pygame` left pygame
+    uninstalled, and the recovery loop then spent 8 turns rediscovering the
+    remedy pip had already printed verbatim.
+
+    Rewriting rather than dropping is deliberate: `--upgrade pip setuptools
+    wheel` also upgrades build tooling a later step may need, so removing
+    the segment would lose real work. `python` after a `call ...activate`
+    is the venv's interpreter, so the rewrite installs in the same place.
+    """
+    segments = [s.strip() for s in cmd.split('&&')]
+    fixed: list[str] = []
+    changed = False
+    for seg in segments:
+        m = _PIP_SELF_UPGRADE_RE.match(seg)
+        if m:
+            fixed.append(f"python -m pip install {m.group('rest').strip()}")
+            changed = True
+        else:
+            fixed.append(seg)
+    if not changed:
+        return None
+    return ' && '.join(fixed)
+
+
 def _make_cmd_idempotent(
     cmd: str,
     executor: Executor,
@@ -1746,6 +1823,17 @@ def _make_cmd_idempotent(
     """
     stripped = cmd.strip()
     root = cwd or "."
+
+    # ── pip self-upgrade inside a chain ──
+    # `pip install --upgrade pip` cannot replace the running pip.exe on
+    # Windows; route it through `python -m pip`, which is the remedy pip
+    # itself prints. See _fix_pip_self_upgrade for the observed failure.
+    _fixed_upgrade = _fix_pip_self_upgrade(stripped)
+    if _fixed_upgrade is not None:
+        log.info("[Cmd] Routing pip self-upgrade through `python -m pip` "
+                 "(pip.exe cannot replace itself on Windows)")
+        stripped = _fixed_upgrade
+        cmd = _fixed_upgrade
 
     # ── venv activation — always a no-op in a subprocess ──
     if re.match(
@@ -1788,6 +1876,24 @@ def _make_cmd_idempotent(
         return None, "mkdir skipped — parent directories are created automatically on file write"
 
     # ── pip install <packages> ──
+    # Only a STANDALONE install can be trimmed. The token scan below reads
+    # everything after `install` as a flag or a package name, which is true
+    # only when nothing else is on the line: given
+    #
+    #   pip install -U pygame && pip freeze > requirements.txt
+    #
+    # it classified `&&`, `pip`, `freeze` and `>` as packages and
+    # `requirements.txt` as a flag, then reassembled the survivors into
+    #
+    #   pip install -U requirements.txt && freeze
+    #
+    # — a command that cannot succeed, and which became step 1's gate. The
+    # agent loop then spent its whole budget trying to satisfy it (it even
+    # read pip's own source to work out why `requirements.txt` was not a
+    # package) while the real goal, installing pygame, had already been met.
+    # The run died there, and the plan's command had been correct all along.
+    if _SHELL_OPERATOR_RE.search(stripped):
+        return cmd, ""
     m = re.match(
         r'^(pip3?|python3?\s+-m\s+pip)\s+install\s+(.*)',
         stripped, re.IGNORECASE,
@@ -3386,18 +3492,35 @@ def _build_scoped_test_cmd(
         # Go test uses package paths, not file paths — skip scoping
         return base_cmd
 
-    # Django's manage.py test requires dotted module names, not file paths.
-    # Convert e.g. "tests/test_items_api.py" → "tests.test_items_api"
-    if "manage.py test" in base_lower:
-        dotted: list[str] = []
-        for p in scoped_paths:
-            # strip leading ./
+    def _dotted(paths: list[str]) -> list[str]:
+        out: list[str] = []
+        for p in paths:
             while p.startswith("./") or p.startswith(".\\"):
                 p = p[2:]
             if p.endswith(".py"):
                 p = p[:-3]
-            dotted.append(p.replace("/", ".").replace("\\", "."))
-        return f"{base_cmd} {' '.join(dotted)}"
+            out.append(p.replace("/", ".").replace("\\", "."))
+        return out
+
+    # Django's manage.py test requires dotted module names, not file paths.
+    # Convert e.g. "tests/test_items_api.py" → "tests.test_items_api"
+    if "manage.py test" in base_lower:
+        return f"{base_cmd} {' '.join(_dotted(scoped_paths))}"
+
+    # `python -m unittest` has the same requirement, and `discover` makes it
+    # worse: its positional argument is the START DIRECTORY, so appending a
+    # file path produces `unittest discover -v tests/test_x.py`, which fails
+    # with "Start directory is not importable" — the tests never run at all.
+    # Observed on a Pac-Man run where every TEST step reported 0/2 files
+    # passed for this reason and nothing was wrong with the tests.
+    #
+    # Scoping to specific modules means discovery is not wanted here: drop
+    # `discover` and its flags and name the modules directly.
+    if "unittest" in base_lower:
+        verbose = " -v" if re.search(r"(?:^|\s)-v\b", base_cmd) else ""
+        interp = base_cmd.split("-m", 1)[0].strip() or "python"
+        return (f"{interp} -m unittest{verbose} "
+                f"{' '.join(_dotted(scoped_paths))}")
 
     # For all other runners, append file paths
     path_args = " ".join(scoped_paths)
@@ -3832,6 +3955,52 @@ def _djangoize_import_probe(cmd: str, project_root: str = ".") -> str:
     prefix = (f"import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', "
               f"'{settings}'); import django; django.setup(); ")
     return f"python -c {quote}{prefix}{body}{quote}"
+
+
+def _tests_are_discoverable(executor, language, subroot,
+                            gate_cmd) -> tuple[bool, str, str]:
+    """Can the project's OWN runner find the suite this step just wrote?
+
+    A plan-declared gate may name a single file
+    (``python -m unittest -v tests/test_game.py``). That proves the file
+    runs; it says nothing about discovery. A run shipped exactly that: the
+    gate was green and `python -m unittest -v` answered "Ran 0 tests"
+    because nothing made ``tests/`` a package.
+
+    The check re-runs the GATE with its file scoping removed, not the
+    language default: the language default for Python is pytest, which
+    collects ``tests/`` with no ``__init__.py`` at all and would have
+    called the broken project green. The question is only ever "does the
+    runner this step chose still find these tests without being pointed
+    at them".
+
+    Returns (ok, command, output). A gate that is already project-wide,
+    or that names no runner we recognise, returns ok — inventing a
+    verdict would fail steps blindly.
+    """
+    from ..agent_tools import _no_tests_collected, _TEST_RUNNER_TOKENS
+
+    if not gate_cmd:
+        return True, "", ""
+    low = gate_cmd.lower()
+    if not any(tok in low for tok in _TEST_RUNNER_TOKENS):
+        return True, "", ""
+
+    parts = gate_cmd.split()
+    kept = [p for p in parts
+            if not (("/" in p or "\\" in p
+                     or p.endswith((".py", ".js", ".ts", ".tsx", ".go")))
+                    and not p.startswith("-"))]
+    if len(kept) == len(parts):
+        return True, gate_cmd, ""      # already project-wide
+    cmd = " ".join(kept)
+    ok, out = executor.run_command(cmd, timeout=300)
+    if _no_tests_collected(cmd, getattr(executor, "last_exit_code", None),
+                           out or ""):
+        return False, cmd, out or ""
+    # A failing-but-collecting suite is a different problem, and the
+    # step's own gate already had its say on correctness.
+    return True, cmd, out or ""
 
 
 def _declared_verify_cmd(plan_step, memory: FileMemory,
@@ -5416,6 +5585,28 @@ def _extract_error_signature(output: str) -> str | None:
     return None
 
 
+def effective_bug_origin(bug_origin: str, config_fix_was_empty: bool) -> str:
+    """Route a repeat CONFIG_BUG to the source path once config is ruled out.
+
+    A CONFIG_BUG fix that produced no in-scope change has said something
+    useful: the model does not think the problem is in the config either —
+    asked to fix the test environment, it answered with source files, which
+    the scope guard then dropped. Believing the verdict a second time makes
+    the step loop (triage CONFIG_BUG -> everything dropped -> attempt spent
+    -> triage CONFIG_BUG again): safe, because nothing is written, but it
+    consumes the retry budget without ever touching the defect. Observed
+    three times consecutively on a step whose real failure was a single
+    missing method, ``Ghost.get_tile_position``.
+
+    Only the repeat is redirected; the first CONFIG_BUG verdict is honoured
+    normally, because genuinely missing config does exist and fixing it is
+    what this path is for.
+    """
+    if bug_origin == "CONFIG_BUG" and config_fix_was_empty:
+        return "SOURCE_BUG"
+    return bug_origin
+
+
 def _triage_test_failure(error_detail: str, source_summary: str,
                          test_summary: str, llm_client,
                          display: CLIDisplay, step_idx: int,
@@ -5591,6 +5782,29 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             preload_full_paths=set(
                 getattr(plan_step, 'target_files', None) or ()),
         )
+        # A green gate that named ONE test file proves that file runs — not
+        # that the project's own runner can find it. Observed: the plan
+        # declared `python -m unittest -v tests/test_game.py`, the step
+        # passed, and the delivered project answered `python -m unittest -v`
+        # with "Ran 0 tests" because nothing made tests/ a package. The
+        # whole point of a TEST step is a suite the project can run.
+        if loop_result[0]:
+            from .agent_loop import truncate_middle
+            _disc_ok, _disc_cmd, _disc_out = _tests_are_discoverable(
+                executor, language, _vsub, verify_cmd)
+            if not _disc_ok:
+                log.error(
+                    "[TestStep] gate %r passed but %r collects no tests — "
+                    "the suite is not discoverable by the project's own "
+                    "runner", verify_cmd, _disc_cmd)
+                return False, (
+                    f"The step's gate ({verify_cmd}) passed, but the "
+                    f"project's own test runner finds nothing:\n\n"
+                    f"$ {_disc_cmd}\n{truncate_middle(_disc_out, 800)}\n\n"
+                    "Tests that only run when named by path are not a "
+                    "suite. Make them discoverable (for unittest, that "
+                    "usually means an __init__.py in the tests package).")
+
         # Record the gate exactly as the loop enforced it (see
         # _record_passed_gate) so the monotonic recheck can never diverge
         # from what actually ran green.
@@ -5694,6 +5908,21 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
     fw = get_test_framework(language, test_runner=test_runner) if language else get_test_framework("python")
     test_cmd = fw["command"]
 
+    # ── Plan-declared runner ──
+    # The language default is a guess; the plan's own acceptance command is
+    # evidence. A task whose acceptance is `python -m unittest -v`, planned
+    # with a `verify: python -m unittest ...` gate, was still handed the
+    # Python default of pytest — so the run installed pytest it did not
+    # need, took its baseline through a runner the project never uses, and
+    # wrote pytest-flavoured tests against a unittest acceptance gate.
+    # unittest is stdlib, so switching to it costs nothing and can never
+    # fail to be present.
+    _planned_runner = _plan_declared_test_runner(plan_step, language)
+    if _planned_runner and _planned_runner != test_cmd:
+        log.info(f"Step {step_idx+1}: Plan's verify runs {_planned_runner!r} "
+                 f"— using it instead of the language default {test_cmd!r}")
+        test_cmd = _planned_runner
+
     # Django project detection: manage.py test is the canonical runner for Django.
     # It handles test DB setup/teardown and settings without requiring pytest.
     if (language == "python" or not language) and os.path.isfile(
@@ -5795,7 +6024,15 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
     #   B. Scoped context (target test file → parse imports → setup files)
     #   C. Semantic search fallback
     all_files = memory.all_files()
-    plan_ctx = getattr(memory, '_plan_context_files', None)
+    # Plan context moved to a thread-local store when parallel wave steps
+    # started racing on the shared FileMemory instance; this reader kept
+    # the old attribute name and so was always None — branch A below has
+    # been dead ever since. Cost of the silent fallback: a TEST step that
+    # declares `target: test_pacman.py` and four imports was still handed
+    # a 12k-token semantic-search blob of every file in the project, and
+    # logged "No target test files detected" while the plan named one.
+    from .memory import get_plan_context_files as _get_test_plan_ctx
+    plan_ctx = _get_test_plan_ctx()
 
     if plan_ctx and plan_step is not None:
         # ── Plan-aware context: use plan-declared imports + targets ──
@@ -6021,7 +6258,8 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
         test_response = tester.process(
             step_text, context=gen_context, language=language,
             env_info=js_env, test_root=_test_root,
-            pre_analysis_results=pre_analysis_results)
+            pre_analysis_results=pre_analysis_results,
+            test_command=test_cmd)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before
@@ -6276,6 +6514,9 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             # error line (import failure, assertion, etc.) — if it
             # recurs across two non-consecutive attempts, we're stuck.
             _seen_error_sigs: list[str] = []
+            # True once a CONFIG_BUG attempt produced no in-scope change,
+            # which routes a repeat CONFIG_BUG verdict to the source path.
+            _config_fix_was_empty = False
             # Snapshot before attempting fixes so we can restore if a
             # bad fix corrupts the source files across attempts.
             _test_fix_snap = memory.snapshot()
@@ -6326,6 +6567,14 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                     f"{test_path}:\n{current_content[:3000]}\n",
                     coder.llm_client, display, step_idx,
                     language=language)
+                _routed = effective_bug_origin(bug_origin,
+                                               _config_fix_was_empty)
+                if _routed != bug_origin:
+                    log.info(
+                        "Step %d: config fix changed nothing last attempt "
+                        "— treating this failure as a %s instead",
+                        step_idx + 1, _routed)
+                    bug_origin = _routed
                 is_source_bug = (bug_origin == "SOURCE_BUG")
                 is_config_bug = (bug_origin == "CONFIG_BUG")
 
@@ -6416,6 +6665,35 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                     if fix_files:
                         if subproject:
                             fix_files = _prefix_subproject_paths(fix_files, subproject, memory)
+                        # A CONFIG_BUG is by definition "the test framework or
+                        # environment is misconfigured", so its fix belongs in
+                        # config files. Nothing stopped the model returning
+                        # source modules instead, and nothing stopped this from
+                        # writing them: observed five times in one step, each
+                        # "CONFIG_BUG fix applied" rewriting map.py, player.py,
+                        # ghost.py, game.py and main.py at once. The suite went
+                        # from 1 failure in 61 tests to 4 failures and 3 errors
+                        # in 64 — a misfiled triage rewrote a nearly-passing
+                        # game. Keep the fix inside its own scope; if that
+                        # leaves nothing, the triage was wrong and the next
+                        # attempt re-triages rather than doing damage.
+                        _allowed = {c.lower() for c in _cfg_candidates}
+                        _kept = {p: c for p, c in fix_files.items()
+                                 if os.path.basename(p).lower() in _allowed}
+                        _dropped = [p for p in fix_files if p not in _kept]
+                        if _dropped:
+                            log.warning(
+                                "Step %d: CONFIG_BUG fix tried to rewrite "
+                                "non-config file(s) %s — dropped; a config "
+                                "fix may only touch %s",
+                                step_idx + 1, _dropped,
+                                sorted(_allowed)[:6])
+                        fix_files = _kept
+                    # Remember whether this attempt actually changed any
+                    # config, so a repeat CONFIG_BUG verdict can be routed
+                    # to the source path instead of looping.
+                    _config_fix_was_empty = not fix_files
+                    if fix_files:
                         executor.write_files(fix_files)
                         memory.update(fix_files)
                         log.info("Step %d: CONFIG_BUG fix applied: %s",
@@ -6477,13 +6755,24 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
                 # Falls back to full-file if ChunkEditor can't parse/apply.
                 _chunk_step_desc = fix_prompt + "\n\n" + error_detail
                 if is_source_bug:
-                    # Try chunk fix on each source file individually
+                    # Try chunk fix on each source file individually, each
+                    # seeing the others' signatures so it can tell whether
+                    # the fix is even its to make.
                     _chunk_fix_results: dict[str, str] = {}
                     for _sfp, _sfc in single_imports.items():
                         _res = _chunk_fix_file(
                             _sfp, _sfc, _chunk_step_desc,
                             coder.llm_client, language, memory,
-                            display, step_idx)
+                            display, step_idx,
+                            sibling_sources=single_imports)
+                        if _res is CHUNK_FIX_WANTS_FULL_FILE:
+                            # The model wants to work at file level. Every
+                            # remaining per-file call would be answered the
+                            # same way, and the fallback below already sends
+                            # all the sources together — stop paying for
+                            # them and go there now.
+                            _chunk_fix_results.clear()
+                            break
                         if _res:
                             _chunk_fix_results.update(_res)
                     fix_files = _chunk_fix_results or None
@@ -6711,6 +7000,12 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
 # Diff-aware editing (Phase 5)
 # ---------------------------------------------------------------------------
 
+# Returned by _chunk_fix_file when the model answered in full-file format
+# — distinct from None ("nothing to change here"), because it means every
+# further per-file chunk call would be answered the same way.
+CHUNK_FIX_WANTS_FULL_FILE: dict[str, str] = {}
+
+
 def _chunk_fix_file(
     file_path: str,
     content: str,
@@ -6720,11 +7015,21 @@ def _chunk_fix_file(
     memory: "FileMemory",
     display: "CLIDisplay",
     step_idx: int,
+    sibling_sources: dict[str, str] | None = None,
 ) -> dict[str, str] | None:
     """Try to fix a single file using chunk-level editing.
 
     Sends only the chunks relevant to the error/fix description to the LLM,
     then splices the result back — avoiding unintended changes to unrelated code.
+
+    *sibling_sources* are the other source files under test. They are
+    included as signatures only — not editable here, but visible. Without
+    them the call is blind: shown player.py alone and asked to fix
+    "Ghost 2 spawn at (17, 13) is not walkable", a model spent its whole
+    response explaining that it could not, because the spawn table lives
+    in a file it was not shown. Every source file got its own such call,
+    so a single failing assertion cost one blind call per file before the
+    full-file fallback did the real work.
 
     Returns ``{file_path: new_content}`` on success, or ``None`` to signal
     the caller should fall back to full-file editing.
@@ -6754,8 +7059,23 @@ def _chunk_fix_file(
         f"{_task_briefing}\n\n"
     ) if _task_briefing else ""
 
+    slim_context = ""
+    if sibling_sources:
+        from .memory import _extract_file_skeleton
+        _skeletons = []
+        for _sp, _sc in sibling_sources.items():
+            if _sp == file_path:
+                continue
+            _skeletons.append(_extract_file_skeleton(_sc, _sp) or f"- {_sp}")
+        if _skeletons:
+            slim_context = (
+                "Other source files under test (signatures only — you "
+                "CANNOT edit them in this response; if the fix belongs in "
+                "one of them, say so briefly and change nothing):\n"
+                + "\n".join(_skeletons) + "\n")
+
     prompt = briefing_prefix + _build_chunk_prompt(
-        step_description, formatted, "", language=language)
+        step_description, formatted, slim_context, language=language)
 
     display.step_info(
         step_idx,
@@ -6768,7 +7088,18 @@ def _chunk_fix_file(
 
     edits = chunk_editor.parse_chunk_response(llm_response)
     if edits is None:
-        log.info("[ChunkFix] LLM used full-file format for %s, falling back", file_path)
+        # parse_chunk_response collapses two different answers into None:
+        # "here is the whole file" and "I parsed no edits at all" (which
+        # includes prose refusals). Only the former means the model wants
+        # to work at file level; asking the marker directly keeps the log
+        # honest and stops a file with genuinely nothing to change from
+        # cancelling the sweep over its siblings.
+        from ..editing.chunk_editor import _FULL_FILE_MARKER
+        if _FULL_FILE_MARKER.search(llm_response):
+            log.info("[ChunkFix] LLM used full-file format for %s, "
+                     "falling back", file_path)
+            return CHUNK_FIX_WANTS_FULL_FILE
+        log.info("[ChunkFix] No chunk edits parsed for %s", file_path)
         return None
     if not edits:
         return None

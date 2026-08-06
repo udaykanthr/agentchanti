@@ -191,25 +191,37 @@ class LLMClient(ABC):
         for attempt in range(1, self.max_retries + 1):
             try:
                 self._last_stop_reason = ""
+                # Cleared per attempt: _billed_but_silent reads this, and a
+                # provider that reports no usage must not inherit the
+                # previous call's count and look like a burn.
+                self._last_completion_tokens = 0
                 if use_stream:
                     result = self._generate_stream(active_prompt)
                 else:
                     result = self._generate(active_prompt)
 
+                # Kept before stripping: an empty result means two very
+                # different things depending on whether any text arrived.
+                # Stripped-to-empty is a <think>-tag model (the preamble
+                # helps); never-arrived is server-side reasoning (only an
+                # effort downgrade helps).
+                arrived_empty = not result or not result.strip()
                 result = _strip_reasoning(result) if result else result
                 hit_cap = self._generate_hit_token_limit()
 
                 if not result or not result.strip():
                     if attempt < self.max_retries:
-                        if hit_cap:
+                        if hit_cap or (arrived_empty
+                                       and self._billed_but_silent()):
                             # The whole output budget was spent with nothing
                             # visible — a reasoning model burned every token
                             # thinking (observed: minimax planner, 16384
                             # tokens, empty text). A verbatim retry is a coin
                             # flip; let the provider dial reasoning down.
                             log.warning(
-                                f"[LLM] Empty response at the output-token "
-                                f"limit on attempt {attempt}/{self.max_retries}"
+                                f"[LLM] Empty response after {self._last_completion_tokens} "
+                                f"billed output token(s) on attempt "
+                                f"{attempt}/{self.max_retries}"
                                 f" — reasoning burn; requesting reduced effort")
                             self._prepare_token_limit_retry()
                         else:
@@ -393,6 +405,21 @@ class LLMClient(ABC):
             return False
         return (visible / self.max_output_tokens
                 ) < self._HIDDEN_BURN_MAX_VISIBLE_SHARE
+
+    def _billed_but_silent(self) -> bool:
+        """True when the provider billed output tokens but no visible text
+        survived — a reasoning burn that did *not* hit the output cap.
+
+        The cap-hit case is already handled; this is the same burn wearing
+        a ``stop`` finish_reason. Observed on gpt-5.6-terra at
+        ``reasoning_effort: high``: 521 completion tokens billed, empty
+        text, three identical retries, then the step dies. Retrying
+        verbatim reproduces it, and the generic anti-``<think>`` preamble
+        the empty path falls back to cannot help — the reasoning is
+        server-side and never appears in the stream. Dialling effort down
+        is the only lever that changes the outcome.
+        """
+        return self._last_completion_tokens > 0
 
     def _generate_hit_token_limit(self) -> bool:
         """Text-path counterpart of :meth:`_hit_token_limit`, reading the

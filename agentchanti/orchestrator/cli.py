@@ -1129,7 +1129,7 @@ def _main_impl():
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
                 fix_import_dependencies, check_gate_quality,
-                check_gate_consistency,
+                check_gate_consistency, repair_verify_commands,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
@@ -1170,6 +1170,28 @@ def _main_impl():
                     # that can only ever pass.
                     _gate_gaps = (check_gate_quality(plan_steps_parsed)
                                   + check_gate_consistency(plan_steps_parsed))
+
+                    # Repair the offending lines before considering a
+                    # re-plan. A re-plan regenerates the whole decomposition
+                    # to fix one command — expensive, and it churns targets
+                    # and dependencies that were never in question.
+                    if _gate_gaps:
+                        _repaired = repair_verify_commands(
+                            plan_steps_parsed, _gate_gaps,
+                            getattr(planner, "llm_client", None), args.task)
+                        if _repaired:
+                            log.info(
+                                "[Plan] Repaired %d acceptance gate(s) "
+                                "in place (no re-plan): %s",
+                                len(_repaired), ", ".join(_repaired))
+                            # Re-judge rather than subtract: a replacement
+                            # can be substantive yet still assume the wrong
+                            # working directory, and that check reads the
+                            # whole plan, not one command.
+                            _gate_gaps = (
+                                check_gate_quality(plan_steps_parsed)
+                                + check_gate_consistency(plan_steps_parsed))
+
                     if _gate_gaps and plan_attempt < MAX_PLAN_RETRIES:
                         log.warning(
                             "[Plan] %d step(s) have a verify: that cannot "

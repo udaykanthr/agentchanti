@@ -292,7 +292,12 @@ class TestAnthropicChat(unittest.TestCase):
         ], tools=_SAMPLE_TOOLS)
 
         payload = mock_post.call_args[1]["json"]
-        self.assertEqual(payload["system"], "Rules.")
+        # Block form, not a bare string: a string cannot carry the
+        # cache_control breakpoint that caches the tools and system prompt
+        # together. The text itself is unchanged.
+        self.assertEqual(payload["system"][0]["text"], "Rules.")
+        self.assertEqual(payload["system"][-1]["cache_control"],
+                         {"type": "ephemeral"})
         # No system message left in the messages array
         self.assertTrue(all(m["role"] != "system" for m in payload["messages"]))
         self.assertEqual(payload["tools"][0]["name"], "read_file")
