@@ -47,18 +47,26 @@ checked against an independent wall-invariance drive.
   the space put back made SDL look for a display driver named `"dummy "`,
   failed the gate, and cost a diagnosis round that "fixed" it by adding an
   environment-scrubbing function to the *generated* project's `main.py` —
-  harness damage shipped in the delivered artifact. The sanitiser now
-  returns the command untouched when it drops no segment, and any chain it
-  does reassemble has the gap closed between a `set`/`export` assignment
-  and a following `&&`. Non-assignment segments keep their spacing.
-- **A manifest the agent loop just wrote is tracked in FileMemory.**
-  `AgentTools._record` runs *after* the write has landed, so FileMemory's
-  protected-basename guard could never prevent the clobber it exists for —
-  it only made memory disagree with the filesystem while logging a WARNING
-  about a skip that had not happened. In 4 of 6 benchmark runs the loop
-  created `requirements.txt`, its gate read `pygame` back off disk and
-  passed, and the content stayed invisible to dependency checks, context
-  injection and the checkpoint for the rest of the run.
+  harness damage shipped in the delivered artifact. The repair now runs
+  unconditionally on the resolved gate — the planner writes the spaced form
+  about as often as this module reintroduced one, and a first, narrower fix
+  that only repaired chains the sanitiser had reassembled left the
+  planner-authored case broken (caught by the next benchmark run: the same
+  gate failed three times in a row while the generated `main.py` was
+  correct all along). Non-assignment segments keep their spacing, so
+  `cd app && npm test` is unaffected.
+- **A manifest a step just created is tracked in FileMemory.** The
+  protected-basename guard exists to stop a hallucinated replacement
+  clobbering a real manifest, but it tests `os.path.isfile()` — true the
+  moment the file is written — so a manifest the run had just created
+  looked pre-existing and was dropped. The content then stayed invisible to
+  dependency checks, context injection and the checkpoint for the rest of
+  the run, while the log claimed a skip that protected nothing. Fixed on
+  both paths: the agent loop's `AgentTools._record` runs *after* its write
+  has landed, so it now records unconditionally; the classic path
+  distinguishes create-from-overwrite using the pre-write existence set it
+  already computed. A genuinely pre-existing manifest is still protected on
+  disk and in memory. Seen in 5 of 8 benchmark runs.
 - **pytest is not installed for a runner that never runs.**
   `_ensure_pytest_available` ran before the plan-declared suite gate, and
   that gate passed on every run of a unittest-based project, so each run
