@@ -258,6 +258,79 @@ class Executor:
         # Bare capital-initial line with no code punctuation at all.
         return s[0].isupper() and not s.startswith(('I', 'If', 'In'))
 
+    # A file whose own content legitimately contains ``` fences. Only these
+    # get the outermost-fence rule below; for a source file a second fence in
+    # the same region is far more likely to be a follow-up example than
+    # nesting, so those keep the first-closer behaviour.
+    _FENCE_BEARING_EXTS = frozenset({
+        '.md', '.markdown', '.mdx', '.rst', '.adoc', '.txt',
+    })
+    _FENCE_BEARING_STEMS = frozenset({
+        'readme', 'changelog', 'contributing', 'license', 'authors', 'notice',
+    })
+
+    _FILE_MARKER_RE = re.compile(r"####\s*\[FILE\]:\s*(.*)")
+    _FENCE_OPEN_RE = re.compile(r"^([`~]{3,})[ \t]*([A-Za-z0-9_.+#-]*)[ \t]*$")
+
+    @staticmethod
+    def _is_fence_bearing(filename: str) -> bool:
+        """True when *filename* is a format whose content contains fences."""
+        stem, ext = os.path.splitext(os.path.basename(filename))
+        if ext.lower() in Executor._FENCE_BEARING_EXTS:
+            return True
+        return not ext and stem.lower() in Executor._FENCE_BEARING_STEMS
+
+    @staticmethod
+    def _extract_fenced_content(region: str, filename: str) -> "str | None":
+        """Content of the fenced block in *region*, honouring nested fences.
+
+        The old one-shot regex used a non-greedy body (``(.*?)\\n```py``),
+        which ends at the FIRST fence line inside the block. That is right
+        for source files and catastrophic for Markdown, whose own content is
+        full of fences: an 808-token README came back as 15 lines, cut off
+        mid-sentence at "install the required dependency:" — every command
+        the step's verify gate looked for lived inside a fence. Worse, the
+        truncation is deterministic, so all three diagnosis attempts
+        regenerated the same document, got the same 15 lines, logged
+        "previous fix changed nothing", and the pipeline halted.
+
+        Two rules replace it:
+
+        * A closing fence must be at least as long as the opening one, so a
+          model that correctly wraps ``` content in a ```` fence is parsed
+          exactly, with no guessing at all.
+        * Where both fences are three characters the nesting is genuinely
+          ambiguous, and the file's own format breaks the tie — see
+          ``_is_fence_bearing``.
+        """
+        lines = region.splitlines()
+        fence_char, fence_len = '', 0
+        open_idx = None
+        for i, line in enumerate(lines):
+            m = Executor._FENCE_OPEN_RE.match(line)
+            if m:
+                open_idx = i
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                break
+        if open_idx is None:
+            return None
+
+        # A closing fence is fence characters alone on their line, at least
+        # as long as the opener. An inner ``` therefore cannot close a ````.
+        closers = [
+            j for j in range(open_idx + 1, len(lines))
+            if (set(lines[j].strip()) == {fence_char}
+                and len(lines[j].strip()) >= fence_len)
+        ]
+        if not closers:
+            return None
+        if fence_len > 3 or not Executor._is_fence_bearing(filename):
+            close_idx = closers[0]
+        else:
+            close_idx = closers[-1]
+        return "\n".join(lines[open_idx + 1:close_idx])
+
     @staticmethod
     def parse_code_blocks(text: str) -> Dict[str, str]:
         """
@@ -265,14 +338,19 @@ class Executor:
         Expected: #### [FILE]: path/to/file.py followed by ```lang ... ```
         """
         files = {}
-        pattern = r"####\s*\[FILE\]:\s*(.*?)\n```(?:\w+)?\n(.*?)\n```"
-        matches = re.finditer(pattern, text, re.DOTALL)
-        for match in matches:
+        markers = list(Executor._FILE_MARKER_RE.finditer(text))
+        for idx, match in enumerate(markers):
+            # Each marker owns the text up to the next marker, so a nested
+            # fence can never swallow the file that follows it.
+            end = markers[idx + 1].start() if idx + 1 < len(markers) else len(text)
+            region = text[match.end():end]
             raw_filename = match.group(1).strip()
             filename = Executor._sanitize_filename(raw_filename)
-            content = match.group(2)
             # Skip if filename still looks invalid
             if not filename:
+                continue
+            content = Executor._extract_fenced_content(region, filename)
+            if content is None:
                 continue
             if '/' not in filename and '.' not in filename:
                 if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
