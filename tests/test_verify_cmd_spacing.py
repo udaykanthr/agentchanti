@@ -78,6 +78,23 @@ class DeclaredVerifyCmdTest(unittest.TestCase):
         self.assertNotIn("dummy &&", out,
                          "a space before && re-entered the set assignment")
 
+    def test_planner_authored_spaces_are_repaired(self):
+        """The planner writes the broken form itself, roughly as often.
+
+        The first version of this fix only repaired chains the sanitiser
+        had reassembled, so a gate the planner wrote WITH spaces — nothing
+        for the sanitiser to drop — passed through untouched. Caught in a
+        live run one commit later: this exact gate failed three times in a
+        row, SDL looking for a driver named "dummy ".
+        """
+        gate = ('set SDL_VIDEODRIVER=dummy && python -c "import main; '
+                "assert main.WINDOW_TITLE == 'Pac-Man Clone'; "
+                'main.run(max_frames=1)"')
+        out = self._sanitise(gate)
+        self.assertIsNotNone(out, "gate was rejected outright")
+        self.assertIn("dummy&&", out,
+                      "planner-authored space before && was not repaired")
+
     def test_plain_gate_is_preserved(self):
         out = self._sanitise("python -m unittest -v")
         self.assertEqual(out, "python -m unittest -v")

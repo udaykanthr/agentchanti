@@ -4048,6 +4048,14 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
         cmd, step_text=getattr(plan_step, "description", "") or "",
         task=task)
 
+    # Unconditional, not just on the reassembly path below: the planner
+    # writes `set SDL_VIDEODRIVER=dummy && python -c "..."` with the space
+    # itself about as often as this module reintroduces one, and on
+    # cmd.exe that assigns "dummy " either way. Repairing only what we
+    # reassembled left the planner-authored form broken — observed failing
+    # a gate three times in one step immediately after the narrower fix.
+    cmd = _strip_space_before_amp(cmd)
+
     # A heredoc opener (`python - <<PY`) means the planner wrote a
     # multi-line script: the line parser kept only the first line, and
     # heredocs are bash-only anyway (cmd.exe runs the gate). A broken
