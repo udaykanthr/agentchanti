@@ -4,6 +4,34 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.5 — 2026-08-07
+
+Closes the gap left open by 0.6.4's FileMemory work: memory was made to
+agree with the filesystem, but nothing stopped the write reaching the
+filesystem in the first place.
+
+### Fixed
+
+- **The agent loop cannot replace a manifest it did not write.** The
+  classic writer has always refused to overwrite a dependency manifest it
+  did not create (`Executor.write_files`); the loop's `write_file` went
+  straight to disk with no such check. A model regenerating
+  `requirements.txt` or `package.json` from memory could therefore replace
+  the project's real one with a shorter version, dropping dependencies —
+  and every later step would build and test against a different dependency
+  set than the project actually has, which is the kind of failure that
+  looks like a code bug for a long time.
+
+  The test is create-versus-overwrite, not existence: creating a manifest
+  is legitimate and common (5 of 8 benchmark runs did it), and a run that
+  wrote one must be able to update it. Within a step the instance tracks
+  what it created; across steps the answer comes from FileMemory, because
+  `build_step_tools()` builds a fresh `AgentTools` per step. Only a
+  manifest that existed before the run began is refused, and the refusal
+  names `edit_file` — exact-match and single-occurrence, so it cannot
+  silently discard the rest of the file — as the way to add a dependency.
+  Ordinary source files are unaffected.
+
 ## 0.6.4 — 2026-08-07
 
 The two defects observed alongside the 0.6.3 fence bug, neither of which

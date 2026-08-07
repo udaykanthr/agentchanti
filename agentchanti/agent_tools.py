@@ -18,6 +18,16 @@ from typing import Optional
 from .cli_display import log
 from .llm.chat_types import Message, ToolCall, ToolDef
 
+
+def _protected_basenames() -> set[str]:
+    """Manifest/lock filenames guarded against whole-file replacement.
+
+    Deferred import, matching the rest of this module: Executor pulls in the
+    heavier execution stack, which the tool definitions do not need.
+    """
+    from .executor import Executor
+    return Executor._PROTECTED_FILENAMES
+
 # Directories never listed/searched — build artifacts and VCS internals.
 _IGNORED_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -203,6 +213,10 @@ class AgentTools:
         # the instance, and build_step_tools() builds one per step, so the
         # window closes when the step ends.
         self._failed_installs: set[str] = set()
+        # Protected manifests this instance created. Only covers the current
+        # step — build_step_tools() makes one instance per step — so the
+        # cross-step answer comes from FileMemory, which is run-scoped.
+        self._created_manifests: set[str] = set()
 
     # ── Definitions ──
 
@@ -431,11 +445,56 @@ class AgentTools:
                 f"installed. If you genuinely need a project module with "
                 f"this name, put it under a package directory rather than "
                 f"at the project root.")
+        guard = self._protected_overwrite_error(rel, full, path)
+        if guard is not None:
+            return guard
         os.makedirs(os.path.dirname(full) or self.project_root, exist_ok=True)
         with open(full, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
+        rel_key = os.path.relpath(full, self.project_root).replace("\\", "/")
+        if os.path.basename(rel_key) in _protected_basenames():
+            self._created_manifests.add(rel_key)
         self._record(os.path.relpath(full, self.project_root), content)
         return f"OK: wrote {len(content)} chars to {path}"
+
+    def _protected_overwrite_error(self, rel: str, full: str,
+                                   path: str) -> "str | None":
+        """Refuse a whole-file overwrite of a manifest this run did not write.
+
+        The classic writer has always had this guard; the loop's write_file
+        went straight to disk, so a model could replace a real
+        requirements.txt or package.json with a shorter regenerated one and
+        silently drop dependencies. It is a whole-file rewrite that does the
+        damage, so edit_file — exact-match, single-occurrence, grounded in
+        the current content — stays available and is the right way to add a
+        dependency.
+
+        Creating a manifest is legitimate and common (5 of 8 benchmark runs
+        did it), so the test is create-versus-overwrite, not
+        existence. FileMemory answers it across steps because
+        build_step_tools() makes a fresh AgentTools per step.
+        """
+        rel_key = rel.replace("\\", "/")
+        if os.path.basename(rel_key) not in _protected_basenames():
+            return None
+        if not os.path.isfile(full):
+            return None                      # creating it — allowed
+        if rel_key in self._created_manifests:
+            return None                      # this step wrote it
+        if self._memory is not None and self._memory.get(rel_key) is not None:
+            return None                      # an earlier step in this run did
+        log.warning(f"[AgentTools] refused overwrite of pre-existing "
+                    f"manifest '{rel_key}'")
+        return (
+            f"ERROR: refusing to overwrite '{path}'. It already existed "
+            f"before this run, so it is the project's real manifest, and a "
+            f"regenerated replacement almost always drops dependencies that "
+            f"are still needed — every later step would then build against "
+            f"a different dependency set than the project actually has.\n"
+            f"Use edit_file to change one entry at a time: it matches the "
+            f"current content exactly, so it cannot silently discard the "
+            f"rest of the file. Read the file first if you need to see what "
+            f"is in it.")
 
     def _tool_edit_file(self, path: str, old_text: str, new_text: str) -> str:
         full = self._resolve(path)
