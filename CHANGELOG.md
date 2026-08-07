@@ -4,6 +4,38 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.4 — 2026-08-07
+
+The two defects observed alongside the 0.6.3 fence bug, neither of which
+caused that failure but both of which would hide or repeat one.
+
+### Fixed
+
+- **A halted pipeline exits non-zero.** The failure branch logged "Pipeline
+  failed", wrote the HTML report, and fell through returning `None`, so the
+  process exited 0. A benchmark run that stopped at step 11 of 12 after three
+  failed diagnosis attempts, having never written its tests, still returned
+  `EXIT=0` — indistinguishable from success to CI, a `&&` chain, or any
+  harness reading `$?`. `_main_impl` now returns 0/1 from the
+  `pipeline_success` flag it already had and `main` exits with it. Returned
+  rather than raised, so watcher and executor cleanup still run first.
+  `--version`, the `kb` subcommand and an aborted prompt return `None` and
+  stay 0; SIGINT stays 130; an unhandled exception is still re-raised.
+- **The fuzzy parser no longer truncates at, or invents files from, inner
+  fences.** `parse_code_blocks_fuzzy` searched every pattern's body with an
+  unanchored non-greedy `` (.*?)``` ``, so a block ended at the first ```
+  anywhere. Two consequences. It returned the same truncated document the
+  strict parser did on 0.6.3's README — and then, because Pattern 3 takes its
+  filename from the line above a fence, the document's own usage examples
+  kept matching: a README's install and run instructions were emitted as
+  phantom `requirements.txt` and `main.py` files to write. Separately, an
+  unanchored search ends a diff block on its own `+``` ` line, so a diff
+  touching any Markdown file was cut at the first fence it added. Fence
+  detection is now anchored to line starts and shares one span helper with
+  the strict parser; the patterns walk top-level blocks only, and Pattern 3
+  resumes past each block it takes so a document's interior can never be
+  re-read as further filenames.
+
 ## 0.6.3 — 2026-08-07
 
 One fix, found by A/B benchmarking `agent_loop` on/off over the Pac-Man task.
