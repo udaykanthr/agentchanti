@@ -350,9 +350,26 @@ class AgentTools:
         return full
 
     def _record(self, rel_path: str, content: str) -> None:
+        """Record a write that has ALREADY landed on disk.
+
+        ``allow_protected`` matters here. FileMemory refuses to track a
+        protected manifest basename (requirements.txt, package.json, …) that
+        exists on disk, to stop a hallucinated replacement clobbering a real
+        one. But this method is only ever called *after* the write
+        succeeded, so the guard cannot prevent anything — it can only make
+        memory disagree with the filesystem, while logging a WARNING that
+        claims a skip which did not happen.
+
+        Observed in 4 of 6 benchmark runs: the loop wrote requirements.txt,
+        the gate read 'pygame' back off disk and passed, and the content was
+        absent from FileMemory for the rest of the run — invisible to
+        dependency checks, context injection and the checkpoint's
+        file_memory.
+        """
         if self._memory is not None:
             try:
-                self._memory.update({rel_path: content})
+                self._memory.update({rel_path: content},
+                                    allow_protected={rel_path})
             except Exception as e:
                 log.debug(f"[AgentTools] FileMemory update failed: {e}")
 

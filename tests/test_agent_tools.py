@@ -69,7 +69,43 @@ class TestReadWrite(AgentToolsTestCase):
         tools = AgentTools(project_root=self.root, memory=memory)
         tools.execute(ToolCall(name="write_file",
                                arguments={"path": "m.py", "content": "z = 1"}))
-        memory.update.assert_called_once_with({"m.py": "z = 1"})
+        memory.update.assert_called_once_with({"m.py": "z = 1"},
+                                              allow_protected={"m.py"})
+
+    def test_protected_manifest_write_reaches_memory(self):
+        """A write that already landed on disk must be tracked.
+
+        FileMemory skips a protected basename that exists on disk, to stop a
+        hallucinated manifest clobbering a real one. But _record runs AFTER
+        the write, so the guard could not prevent anything — it only made
+        memory disagree with the filesystem while logging a WARNING about a
+        skip that had not happened. Seen in 4 of 6 benchmark runs: the loop
+        created requirements.txt, its gate read 'pygame' back off disk and
+        passed, and the content was absent from memory for the rest of the
+        run.
+        """
+        import os
+
+        from agentchanti.orchestrator.memory import FileMemory
+
+        # FileMemory's guard calls os.path.isfile() on the RELATIVE path, so
+        # it only fires when the cwd is the project root — which is exactly
+        # the condition of a real run, and why this needs the chdir to
+        # reproduce at all.
+        memory = FileMemory()
+        tools = AgentTools(project_root=self.root, memory=memory)
+        prev = os.getcwd()
+        os.chdir(self.root)
+        try:
+            tools.execute(ToolCall(name="write_file",
+                                   arguments={"path": "requirements.txt",
+                                              "content": "pygame"}))
+        finally:
+            os.chdir(prev)
+        self.assertTrue(os.path.isfile(os.path.join(self.root,
+                                                    "requirements.txt")),
+                        "precondition: the write must have reached disk")
+        self.assertEqual(memory.get("requirements.txt"), "pygame")
 
 
 class TestEditFile(AgentToolsTestCase):

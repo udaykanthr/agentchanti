@@ -107,8 +107,13 @@ def _to_tile(coord, scale, mode):
 
 def _tuple_tile(e):
     """(a, b) from a tuple accessor — ORDER UNKNOWN, see _entity_tile."""
+    # "current_tile" belongs here: two artifacts in one session stored no
+    # pixel position at all — an entity was (current_tile, destination_tile,
+    # segment_progress) — so every pixel strategy below failed and the run
+    # could only be refused. Ordering is still unverified for any tuple
+    # accessor, which is what _check_polarity exists to catch.
     for attr in ("tile", "tile_pos", "get_tile_pos", "grid_pos",
-                 "tile_position"):
+                 "tile_position", "current_tile"):
         v = getattr(e, attr, None)
         if v is None:
             continue
@@ -163,17 +168,22 @@ def _solve_tile_size(Game, kw):
         # The player must MOVE, or every sample sits on an exact integer
         # where floor and round agree and carry no information. A
         # stationary sweep once "proved" floor for an artifact that rounds.
+        # Conventions seen: (dx, dy), ((dx, dy),), and NAMES ("RIGHT" /
+        # Direction.RIGHT). Guarding only TypeError let a name-based API
+        # raise ValueError("Unknown movement direction: 1") straight out of
+        # this probe to the top-level handler, which reported a working
+        # game as "VERDICT: FAIL - game raised ValueError".
         for setter in ("set_direction", "set_player_direction"):
             fn_set = getattr(g, setter, None) or getattr(p, setter, None)
-            if fn_set:
+            if not fn_set:
+                continue
+            for arg in ((1, 0), ((1, 0),), ("RIGHT",), ("right",)):
                 try:
-                    fn_set(1, 0)
-                except TypeError:
-                    try:
-                        fn_set((1, 0))
-                    except Exception:
-                        pass
+                    fn_set(*arg)
+                except Exception:
+                    continue
                 break
+            break
 
         samples = []
         for _ in range(240):
@@ -274,6 +284,23 @@ def _takes_row_first(fn):
 _NEGATED = ("free", "clear", "open", "no_wall", "not_wall", "without")
 _COMPLEMENT_WORDS = ("walkable", "is_open", "can_move", "passable")
 
+# Names whose two-argument form takes a DIRECTION (or another tile) as the
+# second argument rather than a second coordinate. Two artifacts in one
+# session were refused or misread because of this: can_move(tile, direction)
+# raised "Unknown movement direction: 1", and walkable_neighbor(tile,
+# direction) matched on "walkable" and then answered a different question
+# entirely, failing the polarity check on a game that was fine.
+# See the arity guard in _wall_query.
+_DIRECTIONAL_NAMES = ("can_move", "can_go", "can_pass", "can_turn",
+                      "neighbor", "neighbour", "adjacent", "toward",
+                      "direction", "segment")
+
+# The unambiguous spellings of "is this coordinate a wall / walkable".
+# Anything else is qualified (is_position_walkable, is_entity_..._walkable)
+# and may be asking in a different coordinate space.
+_CANONICAL_QUERIES = ("is_wall", "wall_at", "is_wall_tile", "is_walkable",
+                      "walkable", "is_open", "passable", "is_passable")
+
 
 def _positional_arity(fn):
     """Number of REQUIRED positional parameters, or None if unreadable.
@@ -291,6 +318,31 @@ def _positional_arity(fn):
                if p.default is inspect.Parameter.empty
                and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
                               inspect.Parameter.POSITIONAL_OR_KEYWORD))
+
+
+def _call_coord_fn(fn, x, y):
+    """Call *fn* with whichever coordinate convention it accepts.
+
+    Artifacts split about evenly between ``f(x, y)`` and ``f((x, y))``.
+    Assuming one raised ``TypeError: pixel_to_tile() takes 2 positional
+    arguments but 3 were given`` out of a probe, which the top-level
+    handler then reported as ``VERDICT: FAIL - game raised TypeError`` —
+    a working game recorded as broken.
+
+    Returns the (col, row) pair, or None if neither convention works, so
+    the caller can fall through to another strategy rather than die.
+    """
+    for args in ((x, y), ((x, y),)):
+        try:
+            result = fn(*args)
+        except Exception:
+            continue
+        try:
+            col, row = result
+        except (TypeError, ValueError):
+            continue
+        return int(col), int(row)
+    return None
 
 
 def _wall_query(game):
@@ -318,6 +370,13 @@ def _wall_query(game):
             arity = _positional_arity(fn)
             if arity not in (1, 2):
                 continue
+            # A two-argument can_move/walkable_neighbor is (tile,
+            # direction), not (col, row) — the second argument is a
+            # DIRECTION. Calling it as a coordinate query passes a row
+            # where a direction belongs. The one-argument form (a single
+            # tile) is still a fine walkability test.
+            if arity == 2 and any(w in low for w in _DIRECTIONAL_NAMES):
+                continue
             invert = is_complement or (is_wall_named
                                        and any(n in low for n in _NEGATED))
             cands.append((m, fn, invert, arity))
@@ -333,6 +392,14 @@ def _wall_query(game):
                 0 if arity == 2 else 1,           # two coords beat a tuple
                 0 if not invert else 1,           # direct wall test first
                 0 if ("tile" in low or low in ("is_wall", "wall_at")) else 1,
+                # Plainest name wins. is_walkable and is_position_walkable
+                # tied on every term above, so the winner came down to
+                # dir() ordering — and "position" usually means PIXELS, so
+                # the alphabetical winner was answering in the wrong
+                # coordinate space and failed polarity on a sound game.
+                0 if low in _CANONICAL_QUERIES else 1,
+                len(low),                         # deterministic tiebreak
+                low,
             )
 
         name, fn, invert, _ = sorted(cands, key=rank)[0]
@@ -389,7 +456,9 @@ def entity_in_wall(entity, game):
         return query(px, py)
     maze = getattr(game, "map", None)
     if maze is not None and hasattr(maze, "pixel_to_tile"):
-        return query(*maze.pixel_to_tile(px, py))
+        tile = _call_coord_fn(maze.pixel_to_tile, px, py)
+        if tile is not None:
+            return query(*tile)
     if _TILE:
         return query(_to_tile(px, _TILE, _TILE_MODE),
                      _to_tile(py, _TILE, _TILE_MODE))
@@ -438,11 +507,26 @@ def main() -> int:
     sys.path.insert(0, ".")
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
-    Game = _find_game()
-    kw = ({"headless": True}
-          if "headless" in inspect.signature(Game).parameters else {})
-    _TILE = _tile_size(Game, kw, sys.modules[Game.__module__])
-    _check_polarity(Game, kw)
+    # Everything up to the first _run is DERIVATION: working out this
+    # artifact's vocabulary by probing it. An exception here means a guess
+    # of ours was wrong, which says nothing about the game — but it used to
+    # escape to the top-level handler and print "VERDICT: FAIL - game
+    # raised ...". That happened twice in one benchmark session, on games
+    # an independent drive then showed to be clean. Converted to a refusal
+    # (exit 2); only the drive loop below can produce a FAIL.
+    try:
+        Game = _find_game()
+        kw = ({"headless": True}
+              if "headless" in inspect.signature(Game).parameters else {})
+        _TILE = _tile_size(Game, kw, sys.modules[Game.__module__])
+        _check_polarity(Game, kw)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            f"probing the artifact raised {type(exc).__name__}: {exc} — "
+            f"could not derive its API, which is not evidence about the "
+            f"game") from exc
 
     rng = random.Random(20260802)
     total = sum(_run(Game, kw, label, fn, frames, rng)

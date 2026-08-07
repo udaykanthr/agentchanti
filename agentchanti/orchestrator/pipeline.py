@@ -4278,11 +4278,6 @@ def run_bulk_test_execution_and_fix(
             base_cmd = "npx vitest run"
             _logger.info("[BulkTest] Overriding to vitest (import/config fallback)")
 
-    # The runner itself is a pipeline dependency, not a project one —
-    # make sure it exists in the target venv before the first run.
-    if "pytest" in base_cmd:
-        _ensure_pytest_available(executor, cwd=subproject_cwd)
-
     # Deterministic vitest environment: DOM-testing suites need jsdom, the
     # testing-library packages, and a jsdom-enabled config. Planners emit
     # this setup unreliably (or not at all) — bootstrap it here so the
@@ -4336,6 +4331,14 @@ def run_bulk_test_execution_and_fix(
             return True, ""
         _logger.info("[BulkTest] Plan-declared gate did not pass — falling "
                      "back to framework runner (%s).", base_cmd)
+
+    # The runner itself is a pipeline dependency, not a project one — make
+    # sure it exists before the framework runner needs it. Deliberately
+    # AFTER the plan-declared gate: that gate passed on every run of a
+    # unittest-based project, so installing pytest up front paid a pip
+    # install and a network round-trip per run for a runner never invoked.
+    if "pytest" in base_cmd:
+        _ensure_pytest_available(executor, cwd=subproject_cwd)
 
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
