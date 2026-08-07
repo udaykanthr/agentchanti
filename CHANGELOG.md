@@ -4,6 +4,44 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.3 — 2026-08-07
+
+One fix, found by A/B benchmarking `agent_loop` on/off over the Pac-Man task.
+The classic path halted at step 11 of 12 on a bug in the extractor, not in
+the model's output — and because the bug is deterministic, no retry could
+ever escape it.
+
+Two full iterations were run per mode, folder cleared between every run.
+Before the fix: classic halted (8:01 / $0.800), loop passed (5:29 / $0.524).
+After: classic passed 16/16 (9:05 / $0.922), loop passed 8/8 (5:23 /
+$0.484). All four artifacts were checked against an independent
+wall-invariance drive as well as their own suites. Loop read 35-42% of its
+input from the prompt cache in both runs; classic read 0% in both.
+
+### Fixed
+
+- **Generated Markdown is no longer truncated at its first inner code
+  fence.** `Executor.parse_code_blocks` matched a file's body with a
+  non-greedy group (`` (.*?)\n``` ``), which ends at the FIRST fence line
+  inside the block. Correct for source files, wrong for any file whose own
+  content contains fences: an 808-token README was written as 15 lines /
+  417 bytes, cut off mid-sentence at "install the required dependency:",
+  because every command the step's verify gate looked for lived inside a
+  fence. The gate failed correctly, but all three diagnosis attempts
+  regenerated the same document, hit the same truncation, logged "previous
+  fix changed nothing", and the pipeline halted having never written the
+  tests. Extraction now splits the response by `#### [FILE]:` marker and
+  requires a closing fence at least as long as its opener, so a model that
+  wraps ``` content in a ```` fence parses exactly. Where both fences are
+  three characters the nesting is genuinely ambiguous and the file's own
+  format breaks the tie — outermost fence for `.md`/`.rst`/README-likes,
+  first closer for source files, so a follow-up example block is still not
+  swallowed into the file above it. The same rerun that halted before now
+  produces a 158-line README with its 12 inner fences intact and passes the
+  gate on the first attempt. The `agent_loop` path was never affected:
+  `write_file` receives content as a structured tool argument and no fence
+  parsing is involved.
+
 ## 0.6.2 — 2026-08-07
 
 Five fixes from continued A/B benchmarking of `agent_loop` on/off over the
