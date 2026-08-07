@@ -7,7 +7,10 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 ## 0.6.4 — 2026-08-07
 
 The two defects observed alongside the 0.6.3 fence bug, neither of which
-caused that failure but both of which would hide or repeat one.
+caused that failure but both of which would hide or repeat one — plus four
+more found by a third A/B iteration over the Pac-Man task, where both modes
+passed (loop 4:45 / $0.43, classic 16:25 / $1.34) and every artifact was
+checked against an independent wall-invariance drive.
 
 ### Fixed
 
@@ -35,6 +38,53 @@ caused that failure but both of which would hide or repeat one.
   the strict parser; the patterns walk top-level blocks only, and Pattern 3
   resumes past each block it takes so a document's interior can never be
   re-read as further filenames.
+- **Sanitising a verify gate no longer corrupts `set VAR=value` on
+  Windows.** `_declared_verify_cmd` split a gate on `&&`, stripped every
+  segment and rejoined with `" && "` unconditionally — rewriting whitespace
+  even when it dropped nothing. On `cmd.exe` that is not cosmetic:
+  `set VAR=dummy && next` assigns `"dummy "`, trailing space included. A
+  planner wrote `set SDL_VIDEODRIVER=dummy&& ...` precisely to avoid that;
+  the space put back made SDL look for a display driver named `"dummy "`,
+  failed the gate, and cost a diagnosis round that "fixed" it by adding an
+  environment-scrubbing function to the *generated* project's `main.py` —
+  harness damage shipped in the delivered artifact. The sanitiser now
+  returns the command untouched when it drops no segment, and any chain it
+  does reassemble has the gap closed between a `set`/`export` assignment
+  and a following `&&`. Non-assignment segments keep their spacing.
+- **A manifest the agent loop just wrote is tracked in FileMemory.**
+  `AgentTools._record` runs *after* the write has landed, so FileMemory's
+  protected-basename guard could never prevent the clobber it exists for —
+  it only made memory disagree with the filesystem while logging a WARNING
+  about a skip that had not happened. In 4 of 6 benchmark runs the loop
+  created `requirements.txt`, its gate read `pygame` back off disk and
+  passed, and the content stayed invisible to dependency checks, context
+  injection and the checkpoint for the rest of the run.
+- **pytest is not installed for a runner that never runs.**
+  `_ensure_pytest_available` ran before the plan-declared suite gate, and
+  that gate passed on every run of a unittest-based project, so each run
+  paid a pip install and a network round-trip for a runner never invoked.
+  Moved to the fallback path that actually needs it.
+
+### Benchmarks
+
+- **`verify_dt_invariance.py` no longer reports a working game as broken.**
+  Two of six artifacts in one session got `VERDICT: FAIL - game raised ...`
+  from exceptions raised by the harness's *own* probes rather than by the
+  game: `set_direction(1, 0)` against a name-based API raised `ValueError`,
+  and `pixel_to_tile(px, py)` against a signature taking one sequence raised
+  `TypeError`. Derivation is now separated from the drive loop — anything
+  raised while deriving an artifact's vocabulary is a refusal (exit 2), and
+  only the drive loop can produce a FAIL; the probes try each known
+  convention instead of assuming one. Two selection bugs surfaced while
+  fixing it: a two-argument `can_move`/`walkable_neighbor` takes
+  `(tile, direction)`, not `(col, row)`, and `is_walkable` tied with
+  `is_position_walkable` on every ranking term so `dir()` ordering decided
+  the winner — "position" usually means pixels, so it answered in the wrong
+  coordinate space. Ranking now prefers the plainest canonical name and is
+  deterministic. All six artifacts verify: 6 PASS, matching six independent
+  hand-written drives (before: 3 PASS, 2 false FAIL, 1 refusal). One of
+  those original passes was luck — it had been using
+  `get_walkable_neighbors`, which returns a *list*, as a boolean wall test.
 
 ## 0.6.3 — 2026-08-07
 
