@@ -4003,6 +4003,25 @@ def _tests_are_discoverable(executor, language, subroot,
     return True, cmd, out or ""
 
 
+_SET_BEFORE_AMP_RE = re.compile(
+    r"(?i)\b((?:set|export)\s+\w+=[^&|\n]*?)[ \t]+(&&|\|\|)")
+
+
+def _strip_space_before_amp(cmd: str) -> str:
+    """Close the gap between a ``set VAR=value`` and a following ``&&``.
+
+    ``cmd.exe`` assigns everything up to the separator, so
+    ``set VAR=dummy && next`` sets VAR to ``"dummy "``. Harmless on POSIX,
+    silently wrong on Windows — an SDL driver named ``"dummy "`` does not
+    exist. Applied whenever this module reassembles a chain.
+    """
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _SET_BEFORE_AMP_RE.sub(r"\1\2", cmd)
+    return cmd
+
+
 def _declared_verify_cmd(plan_step, memory: FileMemory,
                          task: str = "") -> str | None:
     """The plan-declared acceptance command for a step, or None.
@@ -4029,6 +4048,14 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
         cmd, step_text=getattr(plan_step, "description", "") or "",
         task=task)
 
+    # Unconditional, not just on the reassembly path below: the planner
+    # writes `set SDL_VIDEODRIVER=dummy && python -c "..."` with the space
+    # itself about as often as this module reintroduces one, and on
+    # cmd.exe that assigns "dummy " either way. Repairing only what we
+    # reassembled left the planner-authored form broken — observed failing
+    # a gate three times in one step immediately after the narrower fix.
+    cmd = _strip_space_before_amp(cmd)
+
     # A heredoc opener (`python - <<PY`) means the planner wrote a
     # multi-line script: the line parser kept only the first line, and
     # heredocs are bash-only anyway (cmd.exe runs the gate). A broken
@@ -4036,14 +4063,28 @@ def _declared_verify_cmd(plan_step, memory: FileMemory,
     if "<<" in cmd:
         return None
 
+    _original = cmd
     segments = [s.strip() for s in cmd.split("&&")]
+    _before = list(segments)
     segments = [s for s in segments
                 if s and not _VENV_ACTIVATE_RE.match(s)]
     if segments and segments[0].lower().startswith("cd "):
         _dir = segments[0][3:].strip().strip('"\'')
         if _dir and not os.path.isdir(_dir):
             segments = segments[1:]
-    cmd = " && ".join(segments)
+    if not segments:
+        return None
+    # Rejoining unconditionally rewrote whitespace even when nothing was
+    # dropped, and on cmd.exe that is not cosmetic: `set VAR=dummy && ...`
+    # assigns "dummy " — trailing space included. A planner had written
+    # `set SDL_VIDEODRIVER=dummy&& ...` precisely to avoid that; the space
+    # this put back made SDL look for a driver named "dummy ", failed the
+    # gate, and cost a diagnosis round that "fixed" it by adding an
+    # environment-scrubbing function to the generated project's main.py.
+    if segments == _before:
+        cmd = _original
+    else:
+        cmd = _strip_space_before_amp(" && ".join(segments))
     if not cmd:
         return None
 

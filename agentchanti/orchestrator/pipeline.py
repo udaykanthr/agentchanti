@@ -2168,7 +2168,21 @@ def _execute_step(step_idx: int, step_text: str, *,
                 _grounded = getattr(plan_step, "_grounded_edit_targets", None)
                 _written_files = executor.write_files(
                     _inline_files, allow_protected=_grounded)
-                memory.update(_inline_files, allow_protected=_grounded)
+                # A manifest this step CREATED must reach memory. The
+                # protected-basename guard exists to stop a hallucinated
+                # replacement clobbering a real one, but it tests
+                # os.path.isfile() — which is true the moment write_files
+                # creates the file, so a brand-new requirements.txt looked
+                # pre-existing and was dropped. The content then stayed
+                # invisible to dependency checks and context injection for
+                # the rest of the run, while the log claimed a skip that
+                # protected nothing. _existing_inline_targets was captured
+                # BEFORE the write, so it distinguishes the two cases.
+                _created_now = {p for p in _inline_files
+                                if p not in _existing_inline_targets}
+                memory.update(
+                    _inline_files,
+                    allow_protected=set(_grounded or ()) | _created_now)
                 display.step_tokens(step_idx, 0, 0)
                 _logger.info(
                     "[PlanStep] Inline code: wrote %d of %d file(s) for "
@@ -4278,11 +4292,6 @@ def run_bulk_test_execution_and_fix(
             base_cmd = "npx vitest run"
             _logger.info("[BulkTest] Overriding to vitest (import/config fallback)")
 
-    # The runner itself is a pipeline dependency, not a project one —
-    # make sure it exists in the target venv before the first run.
-    if "pytest" in base_cmd:
-        _ensure_pytest_available(executor, cwd=subproject_cwd)
-
     # Deterministic vitest environment: DOM-testing suites need jsdom, the
     # testing-library packages, and a jsdom-enabled config. Planners emit
     # this setup unreliably (or not at all) — bootstrap it here so the
@@ -4336,6 +4345,14 @@ def run_bulk_test_execution_and_fix(
             return True, ""
         _logger.info("[BulkTest] Plan-declared gate did not pass — falling "
                      "back to framework runner (%s).", base_cmd)
+
+    # The runner itself is a pipeline dependency, not a project one — make
+    # sure it exists before the framework runner needs it. Deliberately
+    # AFTER the plan-declared gate: that gate passed on every run of a
+    # unittest-based project, so installing pytest up front paid a pip
+    # install and a network round-trip per run for a runner never invoked.
+    if "pytest" in base_cmd:
+        _ensure_pytest_available(executor, cwd=subproject_cwd)
 
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)

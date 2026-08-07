@@ -4,6 +4,96 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## 0.6.4 — 2026-08-07
+
+The two defects observed alongside the 0.6.3 fence bug, neither of which
+caused that failure but both of which would hide or repeat one — plus four
+more found by a third A/B iteration over the Pac-Man task, where both modes
+passed (loop 4:45 / $0.43, classic 16:25 / $1.34) and every artifact was
+checked against an independent wall-invariance drive.
+
+### Fixed
+
+- **A halted pipeline exits non-zero.** The failure branch logged "Pipeline
+  failed", wrote the HTML report, and fell through returning `None`, so the
+  process exited 0. A benchmark run that stopped at step 11 of 12 after three
+  failed diagnosis attempts, having never written its tests, still returned
+  `EXIT=0` — indistinguishable from success to CI, a `&&` chain, or any
+  harness reading `$?`. `_main_impl` now returns 0/1 from the
+  `pipeline_success` flag it already had and `main` exits with it. Returned
+  rather than raised, so watcher and executor cleanup still run first.
+  `--version`, the `kb` subcommand and an aborted prompt return `None` and
+  stay 0; SIGINT stays 130; an unhandled exception is still re-raised.
+- **The fuzzy parser no longer truncates at, or invents files from, inner
+  fences.** `parse_code_blocks_fuzzy` searched every pattern's body with an
+  unanchored non-greedy `` (.*?)``` ``, so a block ended at the first ```
+  anywhere. Two consequences. It returned the same truncated document the
+  strict parser did on 0.6.3's README — and then, because Pattern 3 takes its
+  filename from the line above a fence, the document's own usage examples
+  kept matching: a README's install and run instructions were emitted as
+  phantom `requirements.txt` and `main.py` files to write. Separately, an
+  unanchored search ends a diff block on its own `+``` ` line, so a diff
+  touching any Markdown file was cut at the first fence it added. Fence
+  detection is now anchored to line starts and shares one span helper with
+  the strict parser; the patterns walk top-level blocks only, and Pattern 3
+  resumes past each block it takes so a document's interior can never be
+  re-read as further filenames.
+- **Sanitising a verify gate no longer corrupts `set VAR=value` on
+  Windows.** `_declared_verify_cmd` split a gate on `&&`, stripped every
+  segment and rejoined with `" && "` unconditionally — rewriting whitespace
+  even when it dropped nothing. On `cmd.exe` that is not cosmetic:
+  `set VAR=dummy && next` assigns `"dummy "`, trailing space included. A
+  planner wrote `set SDL_VIDEODRIVER=dummy&& ...` precisely to avoid that;
+  the space put back made SDL look for a display driver named `"dummy "`,
+  failed the gate, and cost a diagnosis round that "fixed" it by adding an
+  environment-scrubbing function to the *generated* project's `main.py` —
+  harness damage shipped in the delivered artifact. The repair now runs
+  unconditionally on the resolved gate — the planner writes the spaced form
+  about as often as this module reintroduced one, and a first, narrower fix
+  that only repaired chains the sanitiser had reassembled left the
+  planner-authored case broken (caught by the next benchmark run: the same
+  gate failed three times in a row while the generated `main.py` was
+  correct all along). Non-assignment segments keep their spacing, so
+  `cd app && npm test` is unaffected.
+- **A manifest a step just created is tracked in FileMemory.** The
+  protected-basename guard exists to stop a hallucinated replacement
+  clobbering a real manifest, but it tests `os.path.isfile()` — true the
+  moment the file is written — so a manifest the run had just created
+  looked pre-existing and was dropped. The content then stayed invisible to
+  dependency checks, context injection and the checkpoint for the rest of
+  the run, while the log claimed a skip that protected nothing. Fixed on
+  both paths: the agent loop's `AgentTools._record` runs *after* its write
+  has landed, so it now records unconditionally; the classic path
+  distinguishes create-from-overwrite using the pre-write existence set it
+  already computed. A genuinely pre-existing manifest is still protected on
+  disk and in memory. Seen in 5 of 8 benchmark runs.
+- **pytest is not installed for a runner that never runs.**
+  `_ensure_pytest_available` ran before the plan-declared suite gate, and
+  that gate passed on every run of a unittest-based project, so each run
+  paid a pip install and a network round-trip for a runner never invoked.
+  Moved to the fallback path that actually needs it.
+
+### Benchmarks
+
+- **`verify_dt_invariance.py` no longer reports a working game as broken.**
+  Two of six artifacts in one session got `VERDICT: FAIL - game raised ...`
+  from exceptions raised by the harness's *own* probes rather than by the
+  game: `set_direction(1, 0)` against a name-based API raised `ValueError`,
+  and `pixel_to_tile(px, py)` against a signature taking one sequence raised
+  `TypeError`. Derivation is now separated from the drive loop — anything
+  raised while deriving an artifact's vocabulary is a refusal (exit 2), and
+  only the drive loop can produce a FAIL; the probes try each known
+  convention instead of assuming one. Two selection bugs surfaced while
+  fixing it: a two-argument `can_move`/`walkable_neighbor` takes
+  `(tile, direction)`, not `(col, row)`, and `is_walkable` tied with
+  `is_position_walkable` on every ranking term so `dir()` ordering decided
+  the winner — "position" usually means pixels, so it answered in the wrong
+  coordinate space. Ranking now prefers the plainest canonical name and is
+  deterministic. All six artifacts verify: 6 PASS, matching six independent
+  hand-written drives (before: 3 PASS, 2 false FAIL, 1 refusal). One of
+  those original passes was luck — it had been using
+  `get_walkable_neighbors`, which returns a *list*, as a boolean wall test.
+
 ## 0.6.3 — 2026-08-07
 
 One fix, found by A/B benchmarking `agent_loop` on/off over the Pac-Man task.

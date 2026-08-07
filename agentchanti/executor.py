@@ -269,8 +269,27 @@ class Executor:
         'readme', 'changelog', 'contributing', 'license', 'authors', 'notice',
     })
 
+    # Fence info strings that say the same thing the extension does, for the
+    # fuzzy parser's blocks where no filename is known until the block is read.
+    _FENCE_BEARING_LANGS = frozenset({
+        'markdown', 'md', 'mdx', 'rst', 'rest', 'restructuredtext',
+        'adoc', 'asciidoc', 'text', 'txt',
+    })
+
     _FILE_MARKER_RE = re.compile(r"####\s*\[FILE\]:\s*(.*)")
-    _FENCE_OPEN_RE = re.compile(r"^([`~]{3,})[ \t]*([A-Za-z0-9_.+#-]*)[ \t]*$")
+    # Anchored to the start of a line, which matters on its own: an unanchored
+    # ``` search ends a block on a diff's "+```" or on a fence quoted inside a
+    # sentence.
+    _FENCE_LINE_RE = re.compile(r"^([`~]{3,})[ \t]*([^\r\n]*?)[ \t]*\r?$",
+                                re.M)
+    # A line naming a file, immediately followed by a fence line. Anchored
+    # with re.M rather than "(?:^|\n)": the scan resumes at the character
+    # after a consumed block, so the newline that would satisfy the
+    # alternation is already behind the search position and the file
+    # following a taken block would never be seen.
+    _NAME_BEFORE_FENCE_RE = re.compile(
+        r"^[^\n]*?(?:`([^`\n]+\.\w{1,5})`|(\b\S+\.\w{1,5}))"
+        r"[ \t]*:?[ \t]*\r?\n(?=[`~]{3,})", re.M)
 
     @staticmethod
     def _is_fence_bearing(filename: str) -> bool:
@@ -279,6 +298,75 @@ class Executor:
         if ext.lower() in Executor._FENCE_BEARING_EXTS:
             return True
         return not ext and stem.lower() in Executor._FENCE_BEARING_STEMS
+
+    @staticmethod
+    def _fence_bearing(filename: "str | None" = None, info: str = "") -> bool:
+        """Fence-bearing by filename if known, else by the fence's info string."""
+        if filename and Executor._is_fence_bearing(filename):
+            return True
+        return (info or "").lower() in Executor._FENCE_BEARING_LANGS
+
+    @staticmethod
+    def _fenced_block_span(text: str, search_from: int = 0,
+                           filename: "str | None" = None,
+                           info_hint: "str | None" = None):
+        """Locate one fenced block; return ``(content, end_offset)`` or None.
+
+        ``end_offset`` is past the closing fence's line, so a caller scanning
+        left to right can resume there and never re-read a block's interior.
+        That is what stops a Markdown file's own inner fences being mistaken
+        for further files.
+        """
+        m = Executor._FENCE_LINE_RE.search(text, search_from)
+        if m is None:
+            return None
+        fence_char, fence_len = m.group(1)[0], len(m.group(1))
+        info = m.group(2).strip() if info_hint is None else info_hint
+        nl = text.find("\n", m.end())
+        if nl == -1:
+            return None
+        body_start = nl + 1
+
+        # A closing fence is fence characters alone on their line, at least as
+        # long as the opener — so an inner ``` cannot close a ```` block.
+        closers = [c for c in Executor._FENCE_LINE_RE.finditer(text, body_start)
+                   if c.group(1)[0] == fence_char
+                   and len(c.group(1)) >= fence_len
+                   and not c.group(2).strip()]
+        if not closers:
+            return None
+        chosen = (closers[-1]
+                  if fence_len == 3 and Executor._fence_bearing(filename, info)
+                  else closers[0])
+
+        body = text[body_start:chosen.start()]
+        if body.endswith("\n"):
+            body = body[:-1]
+        if body.endswith("\r"):
+            body = body[:-1]
+        end = text.find("\n", chosen.end())
+        return body, (len(text) if end == -1 else end + 1)
+
+    @staticmethod
+    def _iter_fenced_blocks(text: str):
+        """Yield ``(info, content, start, end)`` per TOP-LEVEL fenced block.
+
+        Blocks nested inside another block are never yielded: the outer block
+        consumes them. Without this a README's inner ``` snippets were each
+        read as a separate file to write — one response produced phantom
+        ``requirements.txt`` and ``main.py`` entries from its own examples.
+        """
+        pos = 0
+        while True:
+            m = Executor._FENCE_LINE_RE.search(text, pos)
+            if m is None:
+                return
+            found = Executor._fenced_block_span(text, m.start())
+            if found is None:
+                return
+            content, end = found
+            yield m.group(2).strip(), content, m.start(), end
+            pos = end
 
     @staticmethod
     def _extract_fenced_content(region: str, filename: str) -> "str | None":
@@ -303,33 +391,8 @@ class Executor:
           ambiguous, and the file's own format breaks the tie — see
           ``_is_fence_bearing``.
         """
-        lines = region.splitlines()
-        fence_char, fence_len = '', 0
-        open_idx = None
-        for i, line in enumerate(lines):
-            m = Executor._FENCE_OPEN_RE.match(line)
-            if m:
-                open_idx = i
-                fence_char = m.group(1)[0]
-                fence_len = len(m.group(1))
-                break
-        if open_idx is None:
-            return None
-
-        # A closing fence is fence characters alone on their line, at least
-        # as long as the opener. An inner ``` therefore cannot close a ````.
-        closers = [
-            j for j in range(open_idx + 1, len(lines))
-            if (set(lines[j].strip()) == {fence_char}
-                and len(lines[j].strip()) >= fence_len)
-        ]
-        if not closers:
-            return None
-        if fence_len > 3 or not Executor._is_fence_bearing(filename):
-            close_idx = closers[0]
-        else:
-            close_idx = closers[-1]
-        return "\n".join(lines[open_idx + 1:close_idx])
+        found = Executor._fenced_block_span(region, 0, filename)
+        return None if found is None else found[0]
 
     @staticmethod
     def parse_code_blocks(text: str) -> Dict[str, str]:
@@ -480,14 +543,22 @@ class Executor:
         2. Diff blocks with ``+`` prefixed ``#### [FILE]:`` lines
         3. Code blocks preceded by a line mentioning a file path
         4. Code blocks whose first line is a ``# filepath`` comment
+
+        Every pattern walks TOP-LEVEL blocks only (``_iter_fenced_blocks``).
+        The old ``(.*?)```` searches were both non-greedy and unanchored, so a
+        block ended at the first ``` anywhere — including one inside a
+        Markdown document's own body, or a diff's ``+``` `` line. Run against
+        the README that halted a pipeline, this parser returned the same
+        truncated 5 lines the strict parser did AND invented two extra files,
+        ``requirements.txt`` and ``main.py``, out of that README's own usage
+        examples.
         """
         files: Dict[str, str] = {}
 
         # ── Pattern 1: #### [FILE]: as first line inside any code block ──
         # The LLM sometimes wraps everything in ```python ... ``` but puts
         # the marker inside.  The content may be plain code or diff-style.
-        for m in re.finditer(r"```(?:\w*)\n(.*?)```", text, re.DOTALL):
-            block = m.group(1)
+        for _info, block, _bs, _be in Executor._iter_fenced_blocks(text):
             first_line = block.split("\n", 1)[0].strip()
             fmatch = re.match(r"^(?:\+\s*)?####\s*\[FILE\]:\s*(.+)", first_line)
             if not fmatch:
@@ -525,8 +596,9 @@ class Executor:
             return files
 
         # ── Pattern 2: diff blocks with +#### [FILE]: or +# filepath ──
-        for m in re.finditer(r"```diff\n(.*?)```", text, re.DOTALL):
-            block = m.group(1)
+        for _info, block, _bs, _be in Executor._iter_fenced_blocks(text):
+            if _info.lower() != "diff":
+                continue
             fname_match = (
                 re.search(r"^\+\s*####\s*\[FILE\]:\s*(.+)", block, re.MULTILINE)
                 or re.search(r"^\+\s*#\s*(\S+\.\w{1,5})\s*$", block, re.MULTILINE)
@@ -558,26 +630,39 @@ class Executor:
             return files
 
         # ── Pattern 3: text before code block mentions a file path ──
-        for m in re.finditer(
-            r"(?:^|\n)[^\n]*?(?:`([^`\n]+\.\w{1,5})`|(\b\S+\.\w{1,5}))\s*:?\s*\n"
-            r"```(?:\w+)?\n(.*?)```",
-            text, re.DOTALL,
-        ):
+        # Scanned left to right, resuming past each block that is taken. This
+        # pattern names the file from the line ABOVE the fence, so it is the
+        # one that turned a README's "python main.py" example into a phantom
+        # main.py — every line inside the document looked like another
+        # filename introducing another block. Consuming the block closes that.
+        pos = 0
+        while True:
+            m = Executor._NAME_BEFORE_FENCE_RE.search(text, pos)
+            if not m:
+                break
+            fence_at = m.end()
             raw = (m.group(1) or m.group(2) or "").strip()
             filename = Executor._sanitize_filename(raw)
-            if not filename:
+            usable = bool(filename) and (
+                '/' in filename or '.' in filename
+                or filename.lower() in {"makefile", "dockerfile", "license",
+                                        "readme", "procfile", "justfile"})
+            if not usable:
+                pos = fence_at
                 continue
-            if '/' not in filename and '.' not in filename:
-                if filename.lower() not in {"makefile", "dockerfile", "license", "readme", "procfile", "justfile"}:
-                    continue
-            Executor._try_add_file(files, filename, m.group(3).rstrip("\n"))
+            found = Executor._fenced_block_span(text, fence_at, filename)
+            if found is None:
+                pos = fence_at
+                continue
+            content, block_end = found
+            Executor._try_add_file(files, filename, content)
+            pos = block_end
 
         if files:
             return files
 
         # ── Pattern 4: first line of code block is a # filepath comment ──
-        for m in re.finditer(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL):
-            block = m.group(1)
+        for _info, block, _bs, _be in Executor._iter_fenced_blocks(text):
             first_line = block.split("\n", 1)[0].strip()
             fname_match = re.match(r"^#\s*(\S+\.\w{1,5})\s*$", first_line)
             if fname_match:
@@ -611,10 +696,8 @@ class Executor:
                      symbol_to_files[name] = set()
                  symbol_to_files[name].add(path_)
                  
-             for match in re.finditer(r"```([a-zA-Z0-9_\-\+]+)?\n(.*?)```", text, re.DOTALL):
-                 lang = match.group(1) or ""
-                 block = match.group(2)
-                 
+             for lang, block, _bs, _be in Executor._iter_fenced_blocks(text):
+
                  # Some language normalization
                  normalized_lang = lang.lower()
                  if normalized_lang in ("js", "javascript"):

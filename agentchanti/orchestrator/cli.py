@@ -234,7 +234,9 @@ def main():
     _arm_faulthandler()
     install_crash_diagnostics()
     try:
-        _main_impl()
+        # Early returns inside _main_impl (--version, kb subcommand, an
+        # aborted prompt) yield None, which stays 0.
+        exit_code = _main_impl() or 0
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         sys.exit(130)
@@ -251,6 +253,7 @@ def main():
         # non-zero and the traceback still reaches stderr.
         log.exception("Unhandled exception — pipeline crashed")
         raise
+    sys.exit(exit_code)
 
 
 def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
@@ -2073,6 +2076,14 @@ def _main_impl():
         except Exception:
             pass
     executor.cleanup()
+
+    # A halted pipeline must not look like a success to the shell. This
+    # branch logged "Pipeline failed", wrote the report, and fell through
+    # returning None — so the process exited 0 and anything reading $? (CI,
+    # a `&&` chain, a benchmark harness) recorded a run that stopped at step
+    # 11 of 12, having never written its tests, as a pass. Returned rather
+    # than raised so the cleanup above always runs first.
+    return 0 if pipeline_success else 1
 
 
 if __name__ == "__main__":
