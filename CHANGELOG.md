@@ -48,6 +48,29 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A step targeting a file the application never loads is reported.**
+  A gate can assert seven true things about a file that is not in the
+  build, and every check downstream will agree the step went fine: the
+  tests render components rather than styles, the build does not error on
+  a file it never bundles, and the smoke test only proves the build
+  succeeded.
+
+  Observed on a Vite/React project. `src/main.jsx` carried the app's only
+  stylesheet import (`./index.css`) while `src/App.jsx` imported no CSS
+  at all, so the scaffold's leftover `src/App.css` was never bundled.
+  Successive "restyle the header" runs targeted it and wrote twelve
+  `.site-header` rules including a full dark palette; the built bundle
+  contained one. Nothing in the browser changed across many runs.
+
+  Stylesheets only, and only where reachability can be established: a CSS
+  file no entry point can reach is inert by construction, which is a fact
+  about the module graph rather than a heuristic. The same claim about a
+  JS module is far weaker — dynamic import, lazy routes,
+  `import.meta.glob` — so it is deliberately not made. A file the plan
+  itself intends to wire up is not an orphan, and anything ambiguous is
+  not judged. Advisory rather than a replan trigger, because the correct
+  repair varies between retargeting and adding the import.
+
 - **A gate that cannot observe its own step's file is rejected.**
   `shallow_gate_reason` clears any command matching a test runner, on the
   reasonable ground that a suite asserts real behaviour — but a suite only

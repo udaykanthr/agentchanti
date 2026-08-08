@@ -1162,6 +1162,33 @@ def _main_impl():
                     if blind_fixes:
                         log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
 
+                    # ── Target reachability ──
+                    # A gate can assert seven true things about a file the
+                    # application never loads. Observed: `src/App.css` was
+                    # imported by nothing (main.jsx loads only index.css),
+                    # so repeated "restyle the header" runs wrote a full
+                    # dark palette into a file Vite never bundled — twelve
+                    # `.site-header` rules in the source, one in the built
+                    # CSS, and no visible change across many runs while
+                    # every check stayed green.
+                    #
+                    # Advisory for now, deliberately: the correct repair
+                    # varies (retarget the loaded stylesheet, or add the
+                    # import), so routing it into the gate-rewrite loop
+                    # would prescribe the wrong fix.
+                    try:
+                        from .reachability import unreachable_stylesheet_reason
+                        for _s in plan_steps_parsed:
+                            _why = unreachable_stylesheet_reason(
+                                _s, plan_steps_parsed, project_file_reader)
+                            if _why:
+                                log.warning(
+                                    "[Plan] step %s targets a file the app "
+                                    "does not load: %s", _s.id, _why)
+                    except Exception as _reach_exc:      # never fail a run
+                        log.debug("[Plan] reachability check skipped: %s",
+                                  _reach_exc)
+
                     # ── Acceptance-gate quality ──
                     # A CODE step whose verify: only imports the module
                     # cannot fail on wrong behaviour, which makes the whole
