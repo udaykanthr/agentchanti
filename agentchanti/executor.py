@@ -6,6 +6,11 @@ import subprocess
 from typing import Dict, List, Tuple
 from .cli_display import log
 
+# Substituted for a failing command's empty output. A silent failure says
+# nothing the caller can act on, so consumers key off this to react to
+# "undiagnosable" rather than re-reading an error that is not there.
+NO_OUTPUT_MARKER = "but produced no output"
+
 
 class Executor:
     def __init__(self):
@@ -1480,7 +1485,7 @@ class Executor:
                     )
                 output = (
                     f"Command `{cmd}` exited with code {proc.returncode} "
-                    f"but produced no output.\n"
+                    f"{NO_OUTPUT_MARKER}.\n"
                     f"Possible causes:\n"
                     f"{interactive_hint}"
                     f"- The tool/binary is not installed or not on PATH\n"

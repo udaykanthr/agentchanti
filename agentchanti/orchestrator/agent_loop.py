@@ -23,6 +23,7 @@ from collections import Counter
 from threading import Lock
 
 from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
+from ..executor import NO_OUTPUT_MARKER
 from ..llm.chat_types import Message, ToolCall
 from .gate_integrity import platform_equivalent_variants, record_gate_repair
 
@@ -1003,10 +1004,13 @@ def run_agent_loop(
             if repeat_cmd_streak == _REPEAT_CMD_NUDGE_AT:
                 _is_env_cmd = bool(_ENV_CMD_RE.search(_repeated_cmd or "")
                                    or _ENV_ERROR_RE.search(_repeated_out))
+                _is_silent_failure = NO_OUTPUT_MARKER in _repeated_out
                 _logger.info("[AgentLoop] step %d: re-ran a failing command "
                              "unchanged — injecting fix-the-cause nudge%s",
                              step_idx + 1,
-                             " (environment variant)" if _is_env_cmd else "")
+                             " (environment variant)" if _is_env_cmd
+                             else " (silent-failure variant)"
+                             if _is_silent_failure else "")
                 if _is_env_cmd:
                     messages.append(Message(role="user", content=(
                         f"You already ran `{_repeated_cmd[:160]}` earlier in "
@@ -1025,6 +1029,34 @@ def run_agent_loop(
                         "step would look finished while the functionality "
                         "stayed missing. If the dependency genuinely cannot "
                         "be installed here, say so plainly instead. "
+                        f"{max_turns - turn} turn(s) remain.")))
+                elif _is_silent_failure:
+                    # A silent failure is a different rut. "Read the error
+                    # and fix the source" is unactionable when there IS no
+                    # error text, and its certainty is sometimes simply
+                    # wrong: observed on a `node -e` gate whose regex was
+                    # mis-escaped for this platform, where the source was
+                    # already correct and every run printed nothing. The
+                    # model burned its turns guessing, then eventually
+                    # printed the conditions one by one and found them all
+                    # true — the right move, reached far too late.
+                    #
+                    # Ask for that evidence directly. Note this cannot be
+                    # used to dodge the step: the acceptance gate is run by
+                    # the harness, not by the model, so a model that talks
+                    # itself out of the work still does not finish.
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way, producing NO "
+                        "output — so it has not told you what is wrong, and "
+                        "running it again cannot. Make the failure "
+                        "observable before assuming the source is at fault: "
+                        "run a version that prints each condition it checks "
+                        "separately, so you can see which one is actually "
+                        "false. If every condition it asserts turns out to "
+                        "be true, then the check itself is malformed rather "
+                        "than the code — say so explicitly and quote the "
+                        "output that shows it. Otherwise fix the source. "
                         f"{max_turns - turn} turn(s) remain.")))
                 else:
                     messages.append(Message(role="user", content=(

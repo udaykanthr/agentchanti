@@ -48,6 +48,24 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A command that fails silently is no longer met with "fix the code".**
+  The repeated-failing-command nudge told the model *"the failure is in
+  the code, not in how the command is invoked. Read the error above."*
+  When the command produced no output there is no error to read, so the
+  advice was unactionable — and its certainty was sometimes simply wrong,
+  as in the mis-escaped gate above, where the source had been correct
+  since the first turn. In that run the model eventually printed the
+  check's conditions one at a time and found every one of them true; that
+  was the right move, reached far too late.
+
+  A silent repeated failure now asks for that evidence directly: make the
+  failure observable, run a form that prints each condition separately,
+  and if all of them hold say so and quote the output. The original
+  wording is unchanged whenever there *is* an error to read. This cannot
+  be used to dodge a step — the acceptance gate is run by the harness,
+  not by the model, so talking itself out of the work still does not
+  finish it.
+
 Two further defects found by a fourth A/B iteration over the Pac-Man task,
 where both modes passed and both artifacts held every wall invariant under
 an independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
