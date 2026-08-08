@@ -4461,9 +4461,15 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
         # _record_passed_gate) — not a re-derivation whose subproject
-        # prefix can diverge after this step's writes.
+        # prefix can diverge after this step's writes. When the loop proved
+        # the declared gate unsatisfiable on this platform and passed under
+        # an equivalent reading of it, that reading is what it enforced —
+        # recording the original would hand the ledger a command already
+        # shown to be incapable of passing, and its next recheck would
+        # report a regression on code that never changed.
+        from .gate_integrity import effective_gate
         if loop_result[0] and verify_cmd and plan_step is not None:
-            setattr(plan_step, "_verified_gate_cmd", verify_cmd)
+            setattr(plan_step, "_verified_gate_cmd", effective_gate(verify_cmd))
         return loop_result
 
     # --- Proactive pre-install: ensure all required packages are installed ---

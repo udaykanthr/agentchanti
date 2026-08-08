@@ -6,9 +6,51 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
-Two defects found by a fourth A/B iteration over the Pac-Man task, where
-both modes passed and both artifacts held every wall invariant under an
-independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
+### Fixed
+
+- **A gate that cannot pass on this platform no longer fails the step.**
+  `verify_passed` already encoded "exit 0 is not proof"; this adds the
+  mirror — exit 1 is not proof either, because a gate can be an invalid
+  instrument rather than a failing test.
+
+  Observed on a React/Vite run. The planner declared a `node -e` gate
+  whose regex was double-escaped (`[\\s\\S]` rather than `[\s\S]`). Under
+  a POSIX shell the quoting collapses one level of backslashes before
+  node sees them and the regex means "any character"; under `cmd.exe`
+  there is no such collapsing, so node compiled a character class
+  matching a literal backslash, `s` or `S`. Identical plan text was
+  therefore satisfiable on Linux and unsatisfiable on Windows. The CSS
+  edit was correct on the first turn, but the primary loop, the
+  escalation to a stronger model and the recovery loop all grade against
+  that one command — so a single broken gate defeated all three at once:
+  24 turns, ~182k tokens, and a failed run on working code. The escalated
+  model even proved the gate wrong by printing each sub-condition, and
+  had nowhere to put the finding.
+
+  On a still-red verdict the loop now re-runs the gate once under the
+  other shell dialect's reading of the *identical text*. Only a variant
+  that PASSES is believed — that proves the original was unsatisfiable,
+  since the two forms differ solely by an escaping step one shell
+  performs and the other does not. A variant that also fails proves
+  nothing and leaves the original verdict untouched, so genuinely broken
+  code still fails. The repair is recorded and reused when the monotonic
+  ledger re-checks the gate, which would otherwise re-run the form
+  already shown incapable of passing and report a regression on unchanged
+  code.
+
+  Deliberately narrow: variants come from one whitelisted pure transform,
+  are never authored by a model, and are never semantically different
+  commands. A looser rule would be a machine for manufacturing false
+  greens — mutate the gate until something passes — which is precisely
+  what this project's verification layers exist to prevent. The check is
+  language-agnostic by construction: it tests behaviour rather than
+  parsing a payload, so it covers `python -c`, `node -e`, `ruby -e` and
+  anything else equally. (A syntax check could not have caught this one:
+  the broken payload is valid JavaScript.)
+
+Two further defects found by a fourth A/B iteration over the Pac-Man task,
+where both modes passed and both artifacts held every wall invariant under
+an independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
 defect broke the run — both quietly made it more expensive.
 
 ### Fixed

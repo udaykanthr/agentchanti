@@ -24,6 +24,7 @@ from threading import Lock
 
 from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
 from ..llm.chat_types import Message, ToolCall
+from .gate_integrity import platform_equivalent_variants, record_gate_repair
 
 _logger = logging.getLogger(__name__)
 
@@ -792,8 +793,42 @@ def run_agent_loop(
     from .wave_snapshots import (describe_abnormal_exit, is_abnormal_exit,
                                  log_crash_diagnostics)
 
-    def _verify_once() -> str:
-        return tools.execute_all([_verify_call(verify_cmd)])[0].content
+    def _verify_once(cmd: str | None = None) -> str:
+        return tools.execute_all([_verify_call(cmd or verify_cmd)])[0].content
+
+    def _try_platform_variants(result: str) -> str:
+        """Re-run the gate under the other shell dialect's reading of it.
+
+        A gate is an instrument, and an instrument can be broken. When the
+        SAME command text means something different on POSIX than it does
+        under cmd.exe, a red verdict may be measuring the platform rather
+        than the code — observed on a run where the correct edit landed on
+        turn 1 and three separate recovery mechanisms then spent 24 turns
+        failing against a regex that could not match anything on Windows.
+
+        Only a variant that PASSES is believed: it proves the original was
+        unsatisfiable, because the two forms are the same text and differ
+        only in an escaping step one shell performs and the other does not.
+        A variant that also fails proves nothing and is discarded, leaving
+        the original verdict untouched.
+        """
+        nonlocal verify_cmd
+        for reason, variant in platform_equivalent_variants(verify_cmd):
+            variant_result = _verify_once(variant)
+            if not verify_passed(variant_result):
+                continue
+            record_gate_repair(verify_cmd, variant, reason)
+            _logger.warning(
+                "[AgentLoop] step %d: the gate FAILED as written but PASSES "
+                "under the %s reading of the identical command — treating "
+                "the gate, not the code, as the defect",
+                step_idx + 1, reason)
+            # Adopt the repaired form for the rest of this loop so the
+            # early gate and exit verification stop re-running a command
+            # already proven incapable of passing.
+            verify_cmd = variant
+            return variant_result
+        return result
 
     def _run_verify() -> str:
         result = _verify_once()
@@ -820,6 +855,12 @@ def run_agent_loop(
                                          verify_cmd,
                                          planned_files=preload_files)):
             result = _verify_once()
+        # Last, and only on a still-red verdict: the env self-heal above
+        # can turn a red gate green by fixing the environment, and asking
+        # "is the gate itself broken?" before that would spend a
+        # subprocess on a question already about to be answered.
+        if not verify_passed(result):
+            result = _try_platform_variants(result)
         return result
 
     def _gate_result() -> str:
