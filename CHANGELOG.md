@@ -48,6 +48,33 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A step's real imports now outrank the planner's `imports:` line.**
+  `imports:` is the planner's opinion and it is optional, yet two
+  mechanisms read only that declaration. When a step editing an existing
+  file declared `imports: none`, both failed at once:
+  `fix_import_dependencies` added no edge, so producer and consumer
+  landed in the same wave and ran *concurrently*; and
+  `build_step_context` injected no sibling, so neither could see the
+  other even if it had wanted to.
+
+  Observed: `src/App.jsx` — whose first line is `import './App.css'` —
+  and `src/App.css` were both declared `imports: none`, scheduled as
+  `[[0, 1]]`, and written in parallel. The markup used
+  `site-footer__nav-title` while the stylesheet defined
+  `site-footer__heading`: 3 of 8 classes unstyled and 6 CSS rules
+  matching nothing. Tests and the build both passed, because unmatched
+  CSS classes are still valid CSS, and the string-presence acceptance
+  gates checked each file in isolation.
+
+  Two fixes, both deterministic. `_resolve_import_to_file` now takes the
+  importing file, so a relative specifier resolves at all — `./App.css`
+  inside `src/App.jsx` means `src/App.css`, which nothing could know
+  without the importer's directory (and which the existing
+  `.replace(".", "/")` branch mangled into `//App/css`). And plan fixing
+  now derives edges from the files themselves, consulting only files that
+  already exist — for a file the run is about to create there is nothing
+  to read, and the declared imports remain the only signal.
+
 - **Hoisting a scaffold no longer leaves a second copy of the project.**
   `move dir\*` on Windows moves files but *not* subdirectories, so the
   standard hoist an agent writes after scaffolding —

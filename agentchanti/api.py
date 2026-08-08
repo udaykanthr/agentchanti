@@ -401,6 +401,7 @@ def _run_task_impl(
         parse_structured_plan, is_structured_plan, validate_plan,
         fix_nested_workspace_collision,
         fix_import_dependencies,
+        project_file_reader,
         steps_as_text_list, steps_dependencies_dict,
         from_legacy_steps, parse_heuristic_plan, PlanStep,
         reclassify_manifest_steps,
@@ -423,7 +424,7 @@ def _run_task_impl(
             ws_fixes = fix_nested_workspace_collision(plan_steps)
             if ws_fixes:
                 _logger.info("[Plan] Auto-fixed workspace collision: %s", ws_fixes)
-            dep_fixes = fix_import_dependencies(plan_steps)
+            dep_fixes = fix_import_dependencies(plan_steps, read_file=project_file_reader)
             if dep_fixes:
                 _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)
             steps = steps_as_text_list(plan_steps)
@@ -440,7 +441,7 @@ def _run_task_impl(
                 "[Plan] Heuristic parser extracted %d steps from non-standard format",
                 len(heuristic_steps),
             )
-            dep_fixes = fix_import_dependencies(heuristic_steps)
+            dep_fixes = fix_import_dependencies(heuristic_steps, read_file=project_file_reader)
             if dep_fixes:
                 _logger.info("[Plan] Auto-fixed import dependencies: %s", dep_fixes)
             plan_steps = heuristic_steps

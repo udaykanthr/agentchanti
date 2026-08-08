@@ -1131,7 +1131,7 @@ def _main_impl():
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
-                fix_import_dependencies, check_gate_quality,
+                fix_import_dependencies, project_file_reader, check_gate_quality,
                 check_gate_consistency, repair_verify_commands,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -1155,7 +1155,7 @@ def _main_impl():
                     ws_fixes = fix_nested_workspace_collision(plan_steps_parsed)
                     if ws_fixes:
                         log.info(f"[Plan] Auto-fixed workspace collision: {ws_fixes}")
-                    dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                    dep_fixes = fix_import_dependencies(plan_steps_parsed, read_file=project_file_reader)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                     blind_fixes = route_blind_edits(plan_steps_parsed)
@@ -1243,7 +1243,7 @@ def _main_impl():
                         f"[Plan] Heuristic parser extracted {len(heuristic_steps)} "
                         f"steps from non-standard format"
                     )
-                    dep_fixes = fix_import_dependencies(heuristic_steps)
+                    dep_fixes = fix_import_dependencies(heuristic_steps, read_file=project_file_reader)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                     plan_steps_parsed = heuristic_steps
@@ -1390,7 +1390,7 @@ def _main_impl():
                 if is_structured_plan(plan):
                     plan_steps_parsed = parse_structured_plan(plan)
                     if plan_steps_parsed:
-                        dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                        dep_fixes = fix_import_dependencies(plan_steps_parsed, read_file=project_file_reader)
                         if dep_fixes:
                             log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                         raw_steps = steps_as_text_list(plan_steps_parsed)

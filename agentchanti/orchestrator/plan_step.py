@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import ast
+import posixpath
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -2055,7 +2056,81 @@ def repair_verify_commands(steps: list[PlanStep],
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 
-def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
+def project_file_reader(path: str) -> Optional[str]:
+    """Read *path* relative to the project root, or None.
+
+    Plan fixing runs BEFORE the run pre-loads sources into FileMemory, so
+    memory is empty at that point and disk is the only place a step's
+    existing target file can be read from.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except (OSError, ValueError):
+        return None
+
+
+def _source_derived_import_deps(steps: list[PlanStep], graph,
+                                read_file) -> list[str]:
+    """Edges the planner never declared, read from the files themselves.
+
+    ``imports:`` is the planner's opinion, and it is optional. When a step
+    that edits an EXISTING file declares ``imports: none``, the loop above
+    has nothing to iterate and the edge is simply lost — producer and
+    consumer then land in the same wave and run concurrently.
+
+    Observed: `src/App.jsx` (whose first line is ``import './App.css'``)
+    and `src/App.css` were both declared ``imports: none``, scheduled as
+    ``[[0, 1]]``, and written in parallel. Neither could see the other, so
+    the markup used ``site-footer__nav-title`` while the stylesheet
+    defined ``site-footer__heading`` — 3 of 8 classes unstyled and 6 CSS
+    rules matching nothing. Tests and the build both passed, because
+    unmatched CSS classes are still valid CSS.
+
+    Only files that already exist are consulted: for a file this run is
+    about to create there is nothing to read, and the declared imports
+    remain the only available signal.
+    """
+    if read_file is None:
+        return []
+    from .dependency_check import extract_file_deps
+
+    fixes: list[str] = []
+    for step in steps:
+        for target in step.target_files:
+            try:
+                content = read_file(target)
+            except Exception:
+                content = None
+            if not content:
+                continue
+            try:
+                imports = extract_file_deps(target, content).imports
+            except Exception:
+                continue
+            for spec in imports:
+                if not spec.startswith("."):
+                    continue          # package import, not a plan artifact
+                base = posixpath.dirname(target.replace("\\", "/"))
+                resolved = posixpath.normpath(posixpath.join(base, spec))
+                for ext in ("", ".js", ".ts", ".tsx", ".jsx", ".css",
+                            ".scss", ".py"):
+                    producer_id = graph.producer_of(resolved + ext, None)
+                    if producer_id is None:
+                        continue
+                    if producer_id == step.id or producer_id in step.depends_on:
+                        break
+                    step.depends_on.append(producer_id)
+                    fixes.append(
+                        f"Step {step.id}: {target} imports {spec} "
+                        f"(produced by step {producer_id}) — added "
+                        f"depends:{producer_id} [from source, undeclared]"
+                    )
+                    break
+    return fixes
+
+
+def fix_import_dependencies(steps: list[PlanStep], read_file=None) -> list[str]:
     """Auto-inject missing ``depends_on`` entries based on import relationships.
 
     If step B declares ``imports: src/Foo.jsx:Foo`` and step A has
@@ -2102,6 +2177,7 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
                 f"(produced by step {producer_id}) — added depends:{producer_id}"
             )
 
+    fixes.extend(_source_derived_import_deps(steps, graph, read_file))
     fixes.extend(_infer_package_init_export_deps(steps))
 
     # Safety: verify we didn't introduce a cycle
@@ -2501,7 +2577,8 @@ def build_step_context(
                 from .dependency_check import extract_file_deps
                 deps = extract_file_deps(target, content)
                 for imp in deps.imports:
-                    imp_file = _resolve_import_to_file(imp, memory, read_from_disk)
+                    imp_file = _resolve_import_to_file(
+                        imp, memory, read_from_disk, from_file=target)
                     if imp_file and imp_file not in files:
                         imp_content = (memory.get(imp_file) if memory else None)
                         if imp_content is None and read_from_disk:
@@ -2584,8 +2661,24 @@ def _resolve_import_to_file(
     import_source: str,
     memory,
     read_from_disk=None,
+    from_file: Optional[str] = None,
 ) -> Optional[str]:
-    """Best-effort resolution of an import string to a file path in memory."""
+    """Best-effort resolution of an import string to a file path in memory.
+
+    *from_file* is the file the import was written in. It is what makes a
+    relative specifier resolvable at all: ``./App.css`` inside
+    ``src/App.jsx`` means ``src/App.css``, and nothing below can know that
+    without the importer's directory.
+
+    Observed when it was missing: a plan whose two steps wrote
+    ``src/App.jsx`` and ``src/App.css`` declared ``imports: none``, so the
+    only thing that could have linked them was this source-derived
+    fallback — and it returned None. The steps landed in the SAME wave and
+    ran concurrently, neither seeing the other, and invented different
+    class vocabularies: markup used ``site-footer__nav-title`` while the
+    stylesheet defined ``site-footer__heading``. Tests and build both
+    passed, because unmatched CSS classes are valid CSS.
+    """
     if memory is None:
         return None
     all_files = memory.all_files()
@@ -2594,6 +2687,18 @@ def _resolve_import_to_file(
     if import_source in all_files:
         return import_source
 
+    # Relative specifiers resolve against the IMPORTING file's directory.
+    # Tried before the dotted-module branch below, which would otherwise
+    # mangle "./App.css" into "//App/css" via its `.` -> `/` rewrite.
+    if from_file and import_source.startswith("."):
+        base = posixpath.dirname(from_file.replace("\\", "/"))
+        joined = posixpath.normpath(posixpath.join(base, import_source))
+        for ext in ("", ".js", ".ts", ".tsx", ".jsx", ".css", ".scss",
+                    "/index.js", "/index.ts", "/index.jsx", "/index.tsx"):
+            candidate = joined + ext
+            if candidate in all_files:
+                return candidate
+
     # Python: dots to path (e.g. "utils.helpers" -> "utils/helpers.py")
     as_path = import_source.replace(".", "/")
     for ext in (".py", ".js", ".ts", ".tsx", ".jsx", ""):
@@ -2601,9 +2706,10 @@ def _resolve_import_to_file(
         if candidate in all_files:
             return candidate
 
-    # JS relative: "./utils" -> "utils.js" or "utils/index.js"
+    # JS relative, project-root spelling: "./utils" -> "utils.js"
     clean = import_source.lstrip("./")
-    for ext in (".js", ".ts", ".tsx", ".jsx", "/index.js", "/index.ts", ""):
+    for ext in (".js", ".ts", ".tsx", ".jsx", ".css", ".scss",
+                "/index.js", "/index.ts", ""):
         candidate = clean + ext
         if candidate in all_files:
             return candidate
