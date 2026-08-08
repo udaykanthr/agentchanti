@@ -4356,6 +4356,24 @@ def run_bulk_test_execution_and_fix(
 
     # ── Step 1: Run all tests ──
     ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
+    if not ok and is_abnormal_exit(getattr(executor, "last_exit_code", None)):
+        # Same category error the plan-declared gate above guards against,
+        # one command later: the runner DIED rather than reporting
+        # failures, so there is no verdict to believe. Observed on a green
+        # 10-test pygame suite that access-violated (0xC0000005) inside an
+        # iterative BFS — no SDL, no recursion — and passed on a retry with
+        # zero code changes. Without this, the crash is read as a real
+        # failure and the agent-loop fix path spends a turn "fixing" code
+        # that was never broken.
+        from .wave_snapshots import (describe_abnormal_exit,
+                                     log_crash_diagnostics)
+        _code = getattr(executor, "last_exit_code", None)
+        _logger.warning(
+            "[BulkTest] Test runner terminated abnormally (%s) — retrying "
+            "once before believing it: %s",
+            describe_abnormal_exit(_code) or _code, base_cmd)
+        log_crash_diagnostics(_code, base_cmd)
+        ok, output = executor.run_command(base_cmd, cwd=subproject_cwd)
     if ok:
         _logger.info("[BulkTest] All tests passed on first run.")
         print("  [BulkTest] All tests passed.")

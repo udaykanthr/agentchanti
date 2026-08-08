@@ -4,6 +4,48 @@ All notable user-facing changes to `agentchanti` land here. This
 project follows [Semantic Versioning](https://semver.org): breaking
 changes bump the minor (until 1.0), bugfixes bump the patch.
 
+## Unreleased
+
+Two defects found by a fourth A/B iteration over the Pac-Man task, where
+both modes passed and both artifacts held every wall invariant under an
+independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
+defect broke the run — both quietly made it more expensive.
+
+### Fixed
+
+- **Inline scripts no longer have their output swallowed by `cmd.exe`.**
+  `Executor.run_command` runs everything through `shell=True`, so a
+  perfectly ordinary `python -c "...assert n > 0..."` had its `>` read as
+  redirection: the command's real stdout was written to a file literally
+  named `0` in the project root, and the caller received an empty string.
+  Escaped quotes make it worse — they break cmd.exe's quote tracking, so
+  even a `>` written inside quotes is treated as an operator. Observed
+  live: two agent-loop verification commands returned nothing, the model
+  could not see why its own code "failed", and the step burned all eight
+  turns and escalated to the stronger model.
+
+  A single inline-script invocation now bypasses the shell entirely. The
+  gate is deliberately narrow: the command is parsed with the real Win32
+  parser (`CommandLineToArgvW`, not an approximation that would silently
+  produce a different argv), and is diverted only when it splits into
+  exactly three arguments — interpreter, inline-script flag, script.
+  Genuine shell syntax always survives parsing as extra arguments
+  (`python -m pytest > out.txt` splits into five), so a three-element argv
+  proves there is no shell work to do. Scripts containing no shell
+  metacharacter keep the existing path. The interpreter is resolved
+  explicitly against the run's PATH, because `subprocess` does *not*
+  honour env's PATH when locating an executable on Windows — without that,
+  the fix would have quietly moved every inline script off the project
+  venv and onto the system interpreter.
+
+- **A crashed test runner is retried instead of believed.** The
+  plan-declared suite gate already treated an abnormal exit as "no verdict"
+  and retried it; the framework runner it falls back to did not. A green
+  10-test pygame suite access-violated (`0xC0000005`) inside an iterative
+  BFS — no SDL, no recursion — and the crash was read as a real failure,
+  starting a fix cascade against code that was never broken. It now gets
+  the same single retry, which passed with zero code changes.
+
 ## 0.6.5 — 2026-08-07
 
 Closes the gap left open by 0.6.4's FileMemory work: memory was made to
