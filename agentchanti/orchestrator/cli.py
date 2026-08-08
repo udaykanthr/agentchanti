@@ -1172,22 +1172,53 @@ def _main_impl():
                     # CSS, and no visible change across many runs while
                     # every check stayed green.
                     #
-                    # Advisory for now, deliberately: the correct repair
-                    # varies (retarget the loaded stylesheet, or add the
-                    # import), so routing it into the gate-rewrite loop
-                    # would prescribe the wrong fix.
+                    # This replans rather than merely warning. It was
+                    # advisory for exactly one run, on the grounds that
+                    # the right repair varies — and that run proved the
+                    # point the wrong way round: the warning fired
+                    # correctly, nothing consumed it, the step edited the
+                    # dead file anyway, every gate went green and the UI
+                    # was unchanged for the fourth time. An advisory
+                    # nobody acts on is indistinguishable from silence.
+                    _reach_gaps: list[tuple[str, str]] = []
                     try:
                         from .reachability import unreachable_stylesheet_reason
                         for _s in plan_steps_parsed:
                             _why = unreachable_stylesheet_reason(
                                 _s, plan_steps_parsed, project_file_reader)
                             if _why:
-                                log.warning(
-                                    "[Plan] step %s targets a file the app "
-                                    "does not load: %s", _s.id, _why)
+                                _reach_gaps.append((_s.id, _why))
                     except Exception as _reach_exc:      # never fail a run
                         log.debug("[Plan] reachability check skipped: %s",
                                   _reach_exc)
+
+                    if _reach_gaps and plan_attempt < MAX_PLAN_RETRIES:
+                        log.warning(
+                            "[Plan] %d step(s) target a file the app never "
+                            "loads — replanning: %s", len(_reach_gaps),
+                            ", ".join(sid for sid, _ in _reach_gaps))
+                        display.show_status(
+                            "Plan targets an unloaded stylesheet, retrying...")
+                        planner_context += (
+                            "\n\n[PLANNER CORRECTION] These steps edit a file "
+                            "the application never loads, so their work "
+                            "cannot reach the browser — the tests, the build "
+                            "and the smoke test will all still pass:\n"
+                            + "\n".join(f"  - step {sid}: {why}"
+                                        for sid, why in _reach_gaps)
+                            + "\n\nFix the TARGET, not the verify command. "
+                            "Either retarget the stylesheet the entry point "
+                            "actually imports, or add an explicit step that "
+                            "imports this one and declare that dependency. "
+                            "Re-emit the COMPLETE plan.")
+                        continue
+                    if _reach_gaps:
+                        log.warning(
+                            "[Plan] Proceeding after %d attempt(s) with %d "
+                            "step(s) targeting an unloaded file — their "
+                            "changes will not be visible: %s",
+                            MAX_PLAN_RETRIES, len(_reach_gaps),
+                            ", ".join(sid for sid, _ in _reach_gaps))
 
                     # ── Acceptance-gate quality ──
                     # A CODE step whose verify: only imports the module

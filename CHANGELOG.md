@@ -68,8 +68,17 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   JS module is far weaker — dynamic import, lazy routes,
   `import.meta.glob` — so it is deliberately not made. A file the plan
   itself intends to wire up is not an orphan, and anything ambiguous is
-  not judged. Advisory rather than a replan trigger, because the correct
-  repair varies between retargeting and adding the import.
+  not judged.
+
+  It replans rather than merely warning. It shipped advisory for exactly
+  one run, on the reasoning that the right repair varies between
+  retargeting and adding the import — and that run settled the question
+  the other way: the warning fired correctly, nothing consumed it, the
+  step edited the dead file anyway, every gate went green, and the
+  interface was unchanged for the fourth time. An advisory nobody acts on
+  is indistinguishable from silence. The correction tells the planner to
+  fix the TARGET rather than the verify command, since the gate is not
+  what is wrong.
 
 - **A gate that cannot observe its own step's file is rejected.**
   `shallow_gate_reason` clears any command matching a test runner, on the
