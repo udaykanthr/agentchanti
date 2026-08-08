@@ -1184,6 +1184,39 @@ class Executor:
         if m:
             return f'move /Y "{m.group(1)}" "{m.group(2)}"'
 
+        # move dir\* dst → ALSO relocate dir's subdirectories.
+        #
+        # Not a Unix translation but a Windows-native repair, because
+        # `move dir\*` silently moves only FILES. The standard scaffold
+        # hoist —
+        #
+        #   npm create vite@latest scaffold -- --template react
+        #   move scaffold\* . && ... && rmdir scaffold
+        #
+        # therefore leaves `src\` and `public\` behind, the `rmdir` fails
+        # with "The directory is not empty", and the run continues with
+        # TWO copies of every component. Observed twice: a leftover
+        # `vite-react-scaffold\` and a nested `home_page\home_page\`, both
+        # of which were then indexed, so semantic search served steps a
+        # stale duplicate of the file they were editing.
+        #
+        # The source directory is deliberately left in place (empty)
+        # rather than deleted: these commands are chained, and a later
+        # segment of the SAME command line routinely still refers to it
+        # (`type scaffold\.gitignore >> .gitignore && rmdir scaffold`).
+        #
+        # Parenthesised so the two halves stay ONE command. Without the
+        # group, a caller's trailing `&& rmdir scaffold` binds to the FOR
+        # BODY instead of to the rewrite as a whole, so it runs only when
+        # a subdirectory happened to exist — and silently does nothing,
+        # with exit 0, when the directory was flat.
+        m = re.match(r'^move\s+((?:/[a-zA-Z]\s+)*)([^\s"]+)[\\/]\*\s+(\S+)$',
+                     cmd, re.IGNORECASE)
+        if m:
+            flags, src, dst = m.group(1), m.group(2), m.group(3)
+            return (f'(move {flags}{src}\\* {dst} & '
+                    f'for /d %i in ({src}\\*) do @move {flags}"%i" {dst})')
+
         # chmod → no-op on Windows
         if re.match(r'^chmod\s+', cmd):
             return 'echo chmod skipped >nul'

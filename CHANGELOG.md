@@ -48,6 +48,29 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **Hoisting a scaffold no longer leaves a second copy of the project.**
+  `move dir\*` on Windows moves files but *not* subdirectories, so the
+  standard hoist an agent writes after scaffolding —
+  `npm create vite@latest scaffold -- --template react` followed by
+  `move scaffold\* . && ... && rmdir scaffold` — silently left `src\` and
+  `public\` behind. The `rmdir` then failed with "The directory is not
+  empty" (exit 1) and the run carried on with two copies of every
+  component. Seen twice in one afternoon: a leftover
+  `vite-react-scaffold\` and a nested `home_page\home_page\`.
+
+  The cost is not just clutter. Both orphan trees were indexed, so
+  semantic search served later steps a stale duplicate of the very file
+  they were editing, and the project scan reported 17 files where 11
+  existed. The rewrite now adds a subdirectory pass, and leaves the
+  (emptied) source directory in place because a later segment of the same
+  chained command routinely still refers to it.
+
+  Grouped in parentheses, which is load-bearing: ungrouped, a caller's
+  trailing `&& rmdir scaffold` binds to the `for` body rather than to the
+  rewrite as a whole, so it runs only when a subdirectory happens to
+  exist and silently does nothing — with exit 0 — when the directory is
+  flat.
+
 - **A command that fails silently is no longer met with "fix the code".**
   The repeated-failing-command nudge told the model *"the failure is in
   the code, not in how the command is invoked. Read the error above."*
