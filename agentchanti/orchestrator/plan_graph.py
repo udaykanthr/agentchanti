@@ -88,6 +88,42 @@ def module_key(spec: str) -> str:
     return stem
 
 
+_DEFAULT_PREFIXED = re.compile(r"^default\s+(\S+)$", re.IGNORECASE)
+_AS_DEFAULT = re.compile(r"^(\S+)\s+as\s+default$", re.IGNORECASE)
+
+
+def _export_satisfied(spec: str, actual: set[str]) -> bool:
+    """Does *actual* provide the declared export *spec*?
+
+    The two sides speak different vocabularies, and the mismatch was pure
+    noise: planners write ``exports: Footer, default Footer`` while the JS
+    extractor reports ``['Footer', 'default']``, so every run warned that
+    ``default Footer`` was missing from a file exporting exactly that.
+    Six-plus consecutive runs, never once correct — and a warning that is
+    always wrong is worse than none, because it trains the reader to skip
+    the line that will one day be right.
+    """
+    spec = (spec or "").strip()
+    if not spec or spec in actual:
+        return True
+
+    # "default Foo" / "Foo as default" — a default export that also has a
+    # name. Either spelling in *actual* satisfies it.
+    m = _DEFAULT_PREFIXED.match(spec) or _AS_DEFAULT.match(spec)
+    if m:
+        return "default" in actual or m.group(1) in actual
+
+    # A bare name against a file whose ONLY export is the default. That
+    # shape is `function Foo() {}; export default Foo` — the default IS
+    # Foo, but the extractor flattens it to "default" and loses the name.
+    # Deliberately narrow: when the file exports other names and simply
+    # not this one, the warning still stands.
+    if actual == {"default"}:
+        return True
+
+    return False
+
+
 @dataclass
 class PlanNode:
     """One file the plan promises to produce."""
@@ -273,7 +309,8 @@ class PlanGraph:
             if not node.exports or not node.actual_exports:
                 continue
             actual = set(node.actual_exports)
-            missing.extend(s for s in node.exports if s not in actual)
+            missing.extend(s for s in node.exports
+                           if not _export_satisfied(s, actual))
         return missing
 
     # ── diagnostics ───────────────────────────────────────────────────

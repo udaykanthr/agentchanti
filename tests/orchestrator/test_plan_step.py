@@ -1532,6 +1532,67 @@ class TestUnrunnableGate(unittest.TestCase):
                   'process.exit(1)"')
             self.assertIsNone(self._reason(js))
 
+    # ── gate relevance ──────────────────────────────────────────────
+    # A gate can be runnable, and assert plenty, and still be unable to
+    # observe the file the step was asked to write. Observed: a step
+    # briefed to add a whole footer layout was gated on
+    # `cd react-home && npm test -- --run`, deleted two words from a
+    # selector, wrote no footer styling at all, and passed on turn 2. The
+    # markup shipped with eight classes and none of them styled; suite,
+    # build and smoke test were all green because none could see it.
+
+    def _step(self, targets, cmd, step_type="CODE"):
+        s = PlanStep(id="2.2", step_type=step_type, index=0,
+                     verify_cmd=cmd)
+        s.target_files = list(targets)
+        return s
+
+    def _irrelevant(self, targets, cmd, step_type="CODE"):
+        from agentchanti.orchestrator.plan_step import irrelevant_gate_reason
+        return irrelevant_gate_reason(self._step(targets, cmd, step_type))
+
+    def test_a_suite_gate_on_a_stylesheet_step_is_flagged(self):
+        reason = self._irrelevant(["react-home/src/index.css"],
+                                  "cd react-home && npm test -- --run")
+        self.assertIsNotNone(reason)
+        self.assertIn("stylesheets", reason)
+
+    def test_a_gate_that_asserts_the_file_is_left_alone(self):
+        q = chr(39)
+        cmd = ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+               + q + 'a.css' + q + ',' + q + 'utf8' + q + ');'
+               'if(!s.includes(' + q + '.site-footer' + q + '))'
+               'process.exit(1)"')
+        self.assertIsNone(self._irrelevant(["src/index.css"], cmd))
+
+    def test_executable_targets_are_never_flagged(self):
+        for targets in (["src/App.jsx"],
+                        ["src/index.css", "src/App.jsx"],   # mixed
+                        []):                                 # undeclared
+            with self.subTest(targets=targets):
+                self.assertIsNone(
+                    self._irrelevant(targets, "npm test -- --run"))
+
+    def test_a_non_runner_command_is_not_second_guessed(self):
+        # `npm run build` does real work; judging it would be noise.
+        self.assertIsNone(self._irrelevant(["src/index.css"],
+                                           "npm run build"))
+
+    def test_relevance_is_judged_for_CODE_steps_only(self):
+        steps = [self._step(["src/index.css"], "npm test -- --run", "TEST")]
+        self.assertEqual(check_gate_quality(steps), [])
+
+    def test_the_plan_from_the_failing_run_flags_only_the_css_step(self):
+        steps = [
+            self._step(["react-home/src/components/Footer.jsx"],
+                       "cd react-home && npm test -- --run"),
+            self._step(["react-home/src/index.css"],
+                       "cd react-home && npm test -- --run"),
+        ]
+        steps[0].id, steps[1].id = "1.1", "2.2"
+        self.assertEqual([sid for sid, _ in check_gate_quality(steps)],
+                         ["2.2"])
+
     def test_unrunnable_outranks_shallow(self):
         """Reporting 'too shallow' would send the planner to fix the wrong
         thing — the gate is broken, not weak."""

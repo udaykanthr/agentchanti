@@ -48,6 +48,34 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A gate that cannot observe its own step's file is rejected.**
+  `shallow_gate_reason` clears any command matching a test runner, on the
+  reasonable ground that a suite asserts real behaviour — but a suite only
+  asserts what it can reach, and a stylesheet is not reachable. No CSS
+  edit can turn `npm test` red.
+
+  Observed: a step briefed to add a whole footer layout — brand area,
+  navigation grid, legal row, responsive breakpoints — was gated on
+  `cd react-home && npm test -- --run`. It deleted two words from a
+  selector, wrote no footer styling at all, and passed on turn 2. The
+  markup shipped with eight classes and not one of them styled, while the
+  suite, the build and the smoke test were all green, because none of
+  them could see the difference.
+
+  Deliberately narrow: flagged only when EVERY target is a stylesheet AND
+  the gate is nothing but a runner invocation. A gate that also asserts
+  something about the file is fine, and any step touching executable code
+  is left alone.
+
+- **The export-promise warning stopped crying wolf.** Planners spell a
+  default export `default Footer`; the JavaScript extractor reports
+  `['Footer', 'default']`. Comparing the two literally warned that
+  `default Footer` was missing from a file exporting precisely that — on
+  every run for a week, never once correctly. The bare-name form is also
+  reconciled against a file whose only export is the default, which is
+  the same symbol with the name flattened away. A genuinely absent export
+  is still reported.
+
 - **A malformed `node -e` gate is rejected at plan time, not paid for.**
   `unrunnable_gate_reason` already refused a `python -c` gate whose
   payload could not be parsed; JavaScript payloads went unchecked. The

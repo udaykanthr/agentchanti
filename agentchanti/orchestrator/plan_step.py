@@ -1997,6 +1997,55 @@ def _js_payload_error(payload: str) -> Optional[str]:
             f"the closing quote")
 
 
+# Files a JS/Python test suite cannot execute. Editing one of these can
+# no more fail `npm test` than leaving it untouched can.
+_INERT_TARGET_SUFFIXES = (".css", ".scss", ".sass", ".less", ".styl")
+
+
+def irrelevant_gate_reason(step: PlanStep) -> Optional[str]:
+    """Explain why *step*'s gate cannot fail on *this* step's work, or None.
+
+    ``shallow_gate_reason`` clears any command matching a test runner, on
+    the reasonable ground that a suite asserts real behaviour. But a suite
+    only asserts the behaviour it can reach, and a stylesheet is not
+    reachable: no CSS edit can turn `npm test` red.
+
+    Observed: a step whose brief was to add a full footer layout — brand
+    area, navigation grid, legal row, responsive breakpoints — was gated
+    on `cd react-home && npm test -- --run`. It deleted two words from a
+    selector, wrote no footer styling whatsoever, and passed on turn 2.
+    The markup shipped with eight classes and none of them styled, and
+    every later check (suite, build, smoke test) was equally green,
+    because none of them could see the difference.
+
+    Deliberately narrow: only when EVERY target is a stylesheet AND the
+    gate is nothing but a runner invocation. A gate that also asserts
+    something about the file is fine, and any step touching executable
+    code is left alone.
+    """
+    targets = list(getattr(step, "target_files", None) or [])
+    if not targets:
+        return None
+    if not all(t.lower().endswith(_INERT_TARGET_SUFFIXES) for t in targets):
+        return None
+
+    cmd = (getattr(step, "verify_cmd", None) or "").strip()
+    if not cmd or not _TEST_RUNNER_RE.search(cmd):
+        return None
+    # An assertion about the file itself makes the gate relevant again,
+    # whatever else the command also runs.
+    if shell_level_assertion(cmd) or _INLINE_SCRIPT_RE.search(cmd):
+        return None
+
+    return (f"the gate only runs a test suite, but this step's target(s) "
+            f"({', '.join(targets[:3])}) are stylesheets that no test can "
+            f"execute — it passes whether or not the styling was written, "
+            f"and did exactly that on a step that produced none. Assert the "
+            f"stylesheet's own content instead (that the selectors and "
+            f"declarations this step promises are present), optionally "
+            f"alongside the suite")
+
+
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
     """Find CODE steps whose ``verify:`` cannot detect a behavioural defect.
 
@@ -2019,6 +2068,10 @@ def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
         reason = unrunnable_gate_reason(step.verify_cmd)
         if reason is None and step.step_type == "CODE":
             reason = shallow_gate_reason(step.verify_cmd)
+        if reason is None and step.step_type == "CODE":
+            # Last: a gate can be runnable AND assert plenty, and still
+            # be unable to observe the file this step was asked to write.
+            reason = irrelevant_gate_reason(step)
         if reason:
             gaps.append((step.id, reason))
     return gaps
