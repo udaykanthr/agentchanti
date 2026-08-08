@@ -48,6 +48,21 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A self-locating suite gate is no longer given the sub-project cwd too.**
+  BulkTest's preflight runs the plan-declared gate before substituting the
+  framework default. It passed `cwd=<subproject>` unconditionally — so a
+  gate that already opens with its own `cd` had the prefix applied twice:
+  `cd react-home && npm test -- --run` launched from `react-home/` looked
+  for `react-home/react-home`, and cmd.exe answered "The system cannot
+  find the path specified" with exit 1.
+
+  The result was a spurious `Plan-declared gate did not pass`, demoting a
+  perfectly good gate to the framework runner — precisely the substitution
+  this preflight exists to prevent. Every other caller ran the identical
+  command from the repo root and it passed. The test mirrors the one
+  `_gate_on_declared_verify` already uses before ADDING such a prefix, so
+  the two cannot disagree about what "self-locating" means.
+
 - **A step targeting a file the application never loads is reported.**
   A gate can assert seven true things about a file that is not in the
   build, and every check downstream will agree the step went fine: the

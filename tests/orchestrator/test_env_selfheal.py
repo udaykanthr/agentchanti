@@ -191,6 +191,87 @@ class TestPlanGateAbnormalExitRetry:
         assert len(gate_runs) == 1, ex.commands
 
 
+class _CwdRecordingExecutor:
+    """Records the cwd each command was launched with."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, object]] = []
+        self.last_exit_code = 0
+
+    def run_command(self, cmd, cwd=None, timeout=None, **_kw):
+        self.calls.append((cmd, cwd))
+        if "--version" in cmd:
+            return True, "vitest"
+        return True, "ok"
+
+
+class TestDeclaredGateIsNotDoublePrefixed:
+    """A gate that opens with its own `cd` already knows where to run.
+
+    Handing it the sub-project cwd as well applies the prefix twice:
+    `cd react-home && npm test` launched from `react-home/` looks for
+    `react-home/react-home`, and cmd.exe answers "The system cannot find
+    the path specified" with exit 1. Observed as a spurious "Plan-declared
+    gate did not pass", which demoted a perfectly good gate to the
+    framework default — the exact substitution this preflight exists to
+    prevent.
+    """
+
+    def _run(self, executor, verify_cmd):
+        from agentchanti.orchestrator.pipeline import (
+            run_bulk_test_execution_and_fix,
+        )
+        from unittest.mock import MagicMock
+
+        memory = MagicMock()
+        # The manifest is what makes `react-home/` a sub-project at all —
+        # without it nothing sets a cwd and the test proves nothing.
+        files = {
+            "react-home/package.json": '{"name":"app"}',
+            "react-home/src/App.test.jsx": "it('x', () => {})",
+        }
+        memory.all_files.return_value = files
+        memory.as_dict.return_value = files
+        return run_bulk_test_execution_and_fix(
+            memory=memory, executor=executor, coder=MagicMock(),
+            display=MagicMock(), language="javascript", task="t",
+            cfg=MagicMock(), all_plan_steps=[
+                _Step(["react-home/src/App.test.jsx"], verify_cmd)],
+        )
+
+    def _gate_calls(self, ex, cmd):
+        return [cwd for c, cwd in ex.calls if c == cmd]
+
+    def test_a_self_locating_gate_runs_from_the_repo_root(self):
+        from unittest.mock import patch
+        cmd = "cd react-home && npm test -- --run"
+        ex = _CwdRecordingExecutor()
+        # Force the sub-project to be detected. Without this the fixture
+        # resolves no sub-project, both branches yield None, and the test
+        # passes against the pre-fix code too — proving nothing.
+        with patch("agentchanti.orchestrator.pipeline._detect_subproject_root",
+                   return_value="react-home"):
+            self._run(ex, cmd)
+        cwds = self._gate_calls(ex, cmd)
+        assert cwds, ex.calls
+        assert all(c is None for c in cwds), cwds
+
+    # The decision itself, unit-tested — the integration test above proves
+    # the wiring, this proves the rule in both directions.
+    def test_the_rule(self):
+        from agentchanti.orchestrator.pipeline import declared_gate_cwd
+        # Self-locating: the gate carries its own directory.
+        assert declared_gate_cwd("cd react-home && npm test", "react-home") is None
+        assert declared_gate_cwd("CD react-home && npm test", "react-home") is None
+        assert declared_gate_cwd("  cd sub && pytest", "sub") is None
+        # Not self-locating: the cwd is what makes it runnable at all.
+        assert declared_gate_cwd("npm test -- --run", "react-home") == "react-home"
+        assert declared_gate_cwd("npx vitest run", None) is None
+        # A command merely CONTAINING cd is not self-locating.
+        assert declared_gate_cwd(
+            "npm test && cd docs", "react-home") == "react-home"
+
+
 class TestFrameworkRunnerAbnormalExitRetry:
     """The same protection, one command later.
 

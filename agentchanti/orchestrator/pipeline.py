@@ -4164,6 +4164,28 @@ def _plan_declared_suite_cmd(all_plan_steps, test_files) -> str | None:
     return None
 
 
+def declared_gate_cwd(cmd: str, subproject_cwd: str | None) -> str | None:
+    """Where to launch a plan-declared gate: None means the repo root.
+
+    A gate that opens with its own ``cd`` already knows where to run, and
+    handing it the sub-project cwd as WELL applies the prefix twice.
+    Observed: `cd react-home && npm test -- --run` launched from
+    `react-home/` looked for `react-home/react-home`, cmd.exe answered
+    "The system cannot find the path specified" with exit 1, and BulkTest
+    logged a spurious "Plan-declared gate did not pass" — demoting a
+    perfectly good gate to the framework default, which is precisely the
+    substitution this preflight exists to prevent. Every other caller ran
+    the same command from the repo root and it passed.
+
+    The test mirrors `_gate_on_declared_verify`, which already refuses to
+    ADD a `cd {sub}` prefix to a command that has one, so the two cannot
+    disagree about what "self-locating" means.
+    """
+    if cmd and cmd.lstrip().lower().startswith("cd "):
+        return None
+    return subproject_cwd
+
+
 def run_bulk_test_execution_and_fix(
     *,
     memory: FileMemory,
@@ -4311,10 +4333,20 @@ def run_bulk_test_execution_and_fix(
     from .wave_snapshots import is_abnormal_exit
     _declared_suite = _plan_declared_suite_cmd(all_plan_steps, test_files)
     if _declared_suite and _declared_suite != " ".join(base_cmd.split()):
+        # A gate that opens with its own `cd` already knows where to run.
+        # Handing it the sub-project cwd as WELL applies the prefix twice:
+        # `cd react-home && npm test` launched from `react-home/` looks for
+        # `react-home/react-home`, and cmd.exe answers "The system cannot
+        # find the path specified" with exit 1. Observed as a spurious
+        # "Plan-declared gate did not pass", demoting a perfectly good gate
+        # to the framework default — the exact substitution the preflight
+        # exists to avoid. Every other caller ran this same command from
+        # the repo root and it passed.
+        _pf_cwd = declared_gate_cwd(_declared_suite, subproject_cwd)
         _logger.info("[BulkTest] Running plan-declared suite gate first: %s",
                      _declared_suite)
         _pf_ok, _pf_out = executor.run_command(
-            _declared_suite, cwd=subproject_cwd)
+            _declared_suite, cwd=_pf_cwd)
         if not _pf_ok and is_abnormal_exit(
                 getattr(executor, "last_exit_code", None)):
             # The process died rather than reporting failures — on Windows
@@ -4334,7 +4366,7 @@ def run_bulk_test_execution_and_fix(
                 describe_abnormal_exit(_code) or _code, _declared_suite)
             log_crash_diagnostics(_code, _declared_suite)
             _pf_ok, _pf_out = executor.run_command(
-                _declared_suite, cwd=subproject_cwd)
+                _declared_suite, cwd=_pf_cwd)
         if _pf_ok:
             _logger.info("[BulkTest] Suite passed via plan-declared gate — "
                          "skipping framework re-run.")
