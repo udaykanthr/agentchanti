@@ -31,6 +31,8 @@ import logging
 import ast
 import posixpath
 import re
+import shutil
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
@@ -1917,9 +1919,35 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     match = _INLINE_SCRIPT_RE.search(cmd)
     if not match:
         return None
-    payload = match.groupdict().get("py")
-    if not payload:
-        return None
+    groups = match.groupdict()
+    for key, check in (("py", _python_payload_error),
+                       ("js", _js_payload_error)):
+        payload = groups.get(key)
+        if payload:
+            return check(_unescape_shell_quotes(payload))
+    return None
+
+
+def _unescape_shell_quotes(payload: str) -> str:
+    """Undo the one escape the capture keeps but the interpreter never sees.
+
+    The payload is captured from between the command's quotes, so a
+    ``\\"`` written for the shell is still a backslash-quote here — while
+    the interpreter is handed a plain ``"``. Checking the raw capture
+    therefore fails on perfectly good gates: verified, both
+    ``python -c "... open(\\"p.json\\") ..."`` and the JS equivalent were
+    reported unrunnable before this, which sends the planner off to
+    rewrite a command that was never broken.
+
+    Only ``\\"`` is undone — every shell agrees on that one. ``\\\\`` is
+    deliberately left alone: POSIX collapses it and cmd.exe does not (see
+    :mod:`.gate_integrity`), and it cannot change a payload's syntactic
+    validity either way.
+    """
+    return payload.replace('\\"', '"')
+
+
+def _python_payload_error(payload: str) -> Optional[str]:
     try:
         ast.parse(payload)
     except SyntaxError as exc:
@@ -1931,6 +1959,42 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         return (f"the verify command's python -c payload cannot be parsed "
                 f"({exc}) — it can never pass")
     return None
+
+
+def _js_payload_error(payload: str) -> Optional[str]:
+    """Syntax-check a ``node -e`` payload, or stay silent.
+
+    Observed: a plan put ``&& npm --prefix react-home run build`` INSIDE
+    the ``node -e "..."`` string. As JavaScript that is a syntax error, so
+    the gate could not pass whatever the code did. The loop diagnosed it,
+    recovered the step via an equivalent command — and the monotonic
+    ledger then rechecked the original, called it a regression and rolled
+    a wave of correct work back. 153k tokens for a misplaced quote.
+
+    Silence is the safe answer: a missing node, a timeout or any other
+    surprise means "not judged", never "rejected". A false rejection
+    costs a full replan of a plan that was fine.
+    """
+    if shutil.which("node") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["node", "--check"], input=payload, capture_output=True,
+            text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return None
+    detail = (proc.stderr or "").strip().splitlines()
+    # Line 1 is "[stdin]:N"; the message itself is a little further down.
+    reason = next((ln.strip() for ln in detail
+                   if "Error" in ln or "error" in ln), "syntax error")
+    return (f"the verify command's node -e payload is not valid JavaScript "
+            f"({reason[:120]}) — it can never pass, whatever the code does. "
+            f"A common cause is putting a shell chain such as "
+            f"`&& npm run build` INSIDE the quoted script instead of after "
+            f"the closing quote")
 
 
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:

@@ -48,6 +48,31 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A malformed `node -e` gate is rejected at plan time, not paid for.**
+  `unrunnable_gate_reason` already refused a `python -c` gate whose
+  payload could not be parsed; JavaScript payloads went unchecked. The
+  same defect in the other language therefore cost a whole run: a plan
+  put `&& npm --prefix react-home run build` INSIDE the quoted script,
+  which is a syntax error, and the failure only surfaced after the loop,
+  an escalation and a recovery had each spent their turn budget against
+  it. Rejected at plan time it costs one replan instead.
+
+  Dispatch is a table of payload-kind → checker, so a further language is
+  a row rather than a branch. Silence is the safe answer throughout: no
+  node on PATH, a timeout, or any other surprise means "not judged",
+  never "rejected", because a false rejection replans a plan that was
+  fine.
+
+- **A valid gate using escaped quotes is no longer called unrunnable.**
+  The payload is captured from between the command's quotes, so a `\"`
+  written for the shell is still backslash-quote in the capture while the
+  interpreter receives a plain `"`. Checking the raw text reported good
+  gates as broken — verified for both
+  `python -c "... open(\"p.json\") ..."` and its JS equivalent — sending
+  the planner off to rewrite a command that was never at fault. A
+  latent false positive in the existing Python check, found while adding
+  the JavaScript one.
+
 - **A gate accepted via an equivalent form is now recorded that way.**
   The loop had two ways to satisfy a gate that no correct work could
   pass — the platform re-reading above, and the older flag-variant escape

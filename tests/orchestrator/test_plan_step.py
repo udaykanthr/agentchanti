@@ -1466,6 +1466,72 @@ class TestUnrunnableGate(unittest.TestCase):
         self.assertEqual([g[0] for g in gaps], ["4.1"])
         self.assertIn("not valid Python", gaps[0][1])
 
+    # ── node -e payloads ────────────────────────────────────────────
+    # Same rule, other language. A plan put `&& npm --prefix react-home
+    # run build` INSIDE the `node -e "..."` string: a JavaScript syntax
+    # error, so no code could satisfy it. The loop recovered the step via
+    # an equivalent command, the monotonic ledger rechecked the original,
+    # called it a regression, and rolled a wave of correct work back —
+    # 153k tokens for a misplaced quote.
+    JS_BROKEN = (
+        'node -e "const fs=require(' + chr(39) + 'fs' + chr(39) + ');'
+        'const s=fs.readFileSync(' + chr(39) + 'a.jsx' + chr(39) + ','
+        + chr(39) + 'utf8' + chr(39) + ');'
+        'if(!s.includes(' + chr(39) + 'x' + chr(39) + '))process.exit(1)'
+        ' && npm --prefix react-home run build"')
+
+    def _node_available(self):
+        import shutil
+        return shutil.which("node") is not None
+
+    def test_catches_a_shell_chain_left_inside_the_js_payload(self):
+        if not self._node_available():
+            self.skipTest("needs node to syntax-check JS")
+        reason = self._reason(self.JS_BROKEN)
+        self.assertIsNotNone(reason)
+        self.assertIn("not valid JavaScript", reason)
+        self.assertIn("can never pass", reason)
+
+    @staticmethod
+    def _js_gate(body):
+        q = chr(39)
+        return ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+                + q + 'a.css' + q + ',' + q + 'utf8' + q + ');'
+                + body + '"')
+
+    def test_valid_js_gates_are_untouched(self):
+        if not self._node_available():
+            self.skipTest("needs node to syntax-check JS")
+        q, bs = chr(39), chr(92)
+        for cmd in (
+            self._js_gate('if(!s.includes(' + q + '.site-footer' + q
+                          + '))process.exit(1)'),
+            # Valid JS, wrong semantics — a syntax check must NOT claim
+            # this one; it is caught at run time by gate_integrity.
+            self._js_gate('if(!/[' + bs * 2 + 's' + bs * 2 + 'S]*/.test(s))'
+                          'process.exit(1)'),
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._reason(cmd))
+
+    def test_escaped_quotes_do_not_fake_a_syntax_error(self):
+        """The capture keeps the shell's `\\"`; the interpreter never sees it.
+
+        Judging the raw capture reported these perfectly good gates as
+        unrunnable, sending the planner to rewrite a command that was
+        never broken.
+        """
+        q, bs = chr(39), chr(92)
+        py = ('python -c "import json; assert json.loads(open(' + bs + '"'
+              'p.json' + bs + '").read())"')
+        self.assertIsNone(self._reason(py))
+        if self._node_available():
+            js = ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+                  + q + 'a.jsx' + q + ',' + q + 'utf8' + q + ');'
+                  'if(!s.includes(' + bs + '"import x' + bs + '"))'
+                  'process.exit(1)"')
+            self.assertIsNone(self._reason(js))
+
     def test_unrunnable_outranks_shallow(self):
         """Reporting 'too shallow' would send the planner to fix the wrong
         thing — the gate is broken, not weak."""
