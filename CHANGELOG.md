@@ -48,6 +48,24 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A gate accepted via an equivalent form is now recorded that way.**
+  The loop had two ways to satisfy a gate that no correct work could
+  pass — the platform re-reading above, and the older flag-variant escape
+  hatch — but only one of them told the monotonic ledger. The other
+  passed the step and then let the ledger re-run the *original*, which
+  failed exactly as it always had, which read as a regression.
+
+  Observed: a plan wrote `&& npm --prefix react-home run build` INSIDE
+  the `node -e "..."` string, making the payload a JavaScript syntax
+  error that no code could satisfy. The loop diagnosed it, ran the
+  correct form, and recovered the step — then the ledger rechecked the
+  malformed original, reported `REGRESSION`, rolled the wave back and
+  failed the run. The work had been correct for two minutes.
+
+  The resolution now happens in `_record_passed_gate`, the single
+  chokepoint every path funnels through (loop, recovery, classic),
+  rather than at individual call sites where it could drift.
+
 - **A step's real imports now outrank the planner's `imports:` line.**
   `imports:` is the planner's opinion and it is optional, yet two
   mechanisms read only that declaration. When a step editing an existing

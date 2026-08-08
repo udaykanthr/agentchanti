@@ -4376,6 +4376,14 @@ def _record_passed_gate(success: bool, plan_step, memory: FileMemory,
         cmd = _declared_verify_cmd(plan_step, memory, task=task)
     if not cmd:
         return
+    # Same invariant, one step further: when the gate was satisfied by a
+    # proven-equivalent form (a platform re-reading, or the flag-variant
+    # the loop itself ran), THAT is the string which exited 0. Recording
+    # the original instead hands the ledger a command already shown to be
+    # unpassable, and its next recheck reports a regression on code that
+    # never changed — the rollback this function's own history warns of.
+    from .gate_integrity import effective_gate
+    cmd = effective_gate(cmd)
     from .wave_snapshots import get_gate_ledger
     get_gate_ledger().record(
         cmd, getattr(plan_step, "id", "") or "")
@@ -4461,15 +4469,13 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
         # _record_passed_gate) — not a re-derivation whose subproject
-        # prefix can diverge after this step's writes. When the loop proved
-        # the declared gate unsatisfiable on this platform and passed under
-        # an equivalent reading of it, that reading is what it enforced —
-        # recording the original would hand the ledger a command already
-        # shown to be incapable of passing, and its next recheck would
-        # report a regression on code that never changed.
-        from .gate_integrity import effective_gate
+        # prefix can diverge after this step's writes. Resolving a gate
+        # that was satisfied by an equivalent form is deliberately NOT
+        # done here — `_record_passed_gate` is the single chokepoint for
+        # every path (loop, recovery, classic), so the transform lives
+        # there rather than in each caller.
         if loop_result[0] and verify_cmd and plan_step is not None:
-            setattr(plan_step, "_verified_gate_cmd", effective_gate(verify_cmd))
+            setattr(plan_step, "_verified_gate_cmd", verify_cmd)
         return loop_result
 
     # --- Proactive pre-install: ensure all required packages are installed ---

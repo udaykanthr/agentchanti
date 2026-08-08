@@ -1118,6 +1118,16 @@ def run_agent_loop(
                              step_idx + 1, turn)
                 return _finish("verified", turn, (True, summary))
             if _variant_gate_ok():
+                # Tell the LEDGER too, or the step passes and the run
+                # still dies: the monotonic recheck re-runs the declared
+                # command, the malformed original fails exactly as it
+                # always did, and that reads as a regression. Observed —
+                # a gate with `&& npm run build` written INSIDE the
+                # `node -e "..."` string (a JS syntax error, unpassable by
+                # any code) was correctly recovered via the variant, then
+                # rechecked in its original form, declared a REGRESSION,
+                # and the whole wave was rolled back over working code.
+                record_gate_repair(verify_cmd, last_ok_cmd, "flag-variant")
                 _logger.info(
                     "[AgentLoop] step %d: gate command fails but the loop "
                     "ran a flag-variant of it successfully (%r) — "

@@ -10,6 +10,7 @@ recovery loop then burned 24 turns and ~182k tokens failing against it.
 
 import os
 import shutil
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -108,6 +109,64 @@ class TestVariants:
         if os.name == 'nt':
             pytest.skip("POSIX shells already collapsed it")
         assert platform_equivalent_variants(FOOTER_GATE) == []
+
+
+class TestLedgerSeesTheRepair:
+    """A repaired gate must reach the monotonic ledger, or the run dies anyway.
+
+    Observed: a plan wrote `&& npm --prefix react-home run build` INSIDE
+    the `node -e "..."` string, making the payload a JavaScript syntax
+    error that no correct code could ever satisfy. The loop's flag-variant
+    escape hatch recovered the step correctly — and then the ledger
+    rechecked the ORIGINAL, saw it fail exactly as it always had, called
+    it a REGRESSION, rolled the wave back and failed the run. The step
+    passed; the run still lost the work.
+    """
+
+    MALFORMED = (
+        'node -e "const s=require(\'fs\').readFileSync(\'a.jsx\',\'utf8\');'
+        'if(!s.includes(\'x\'))process.exit(1) && npm run build"')
+    WORKING = (
+        'node -e "const s=require(\'fs\').readFileSync(\'a.jsx\',\'utf8\');'
+        'if(!s.includes(\'x\'))process.exit(1)" && npm run build')
+
+    def test_record_passed_gate_stores_the_repaired_form(self):
+        from agentchanti.orchestrator.step_handlers import _record_passed_gate
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+
+        record_gate_repair(self.MALFORMED, self.WORKING, "flag-variant")
+
+        step = SimpleNamespace(id="2.1", _verified_gate_cmd=self.MALFORMED)
+        recorded = []
+        ledger = get_gate_ledger()
+        with patch.object(ledger, "record",
+                          side_effect=lambda c, i: recorded.append(c)):
+            _record_passed_gate(True, step, MagicMock(), task="t")
+
+        assert recorded == [self.WORKING], recorded
+
+    def test_an_unrepaired_gate_is_recorded_verbatim(self):
+        from agentchanti.orchestrator.step_handlers import _record_passed_gate
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+
+        step = SimpleNamespace(id="1.1", _verified_gate_cmd="npm test")
+        recorded = []
+        ledger = get_gate_ledger()
+        with patch.object(ledger, "record",
+                          side_effect=lambda c, i: recorded.append(c)):
+            _record_passed_gate(True, step, MagicMock(), task="t")
+
+        assert recorded == ["npm test"]
+
+    def test_a_failed_step_records_nothing(self):
+        from agentchanti.orchestrator.step_handlers import _record_passed_gate
+        from agentchanti.orchestrator.wave_snapshots import get_gate_ledger
+
+        step = SimpleNamespace(id="1.1", _verified_gate_cmd="npm test")
+        ledger = get_gate_ledger()
+        with patch.object(ledger, "record") as rec:
+            _record_passed_gate(False, step, MagicMock(), task="t")
+        rec.assert_not_called()
 
 
 class TestRepairRegistry:
