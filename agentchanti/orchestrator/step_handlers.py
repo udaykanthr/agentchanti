@@ -4891,8 +4891,17 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             review_ctx = _build_review_context(files, memory, step_text)
 
         prev_files = dict(files)  # Save for potential merge on retry
+        # Captured BEFORE the write: FileMemory's protected-basename guard
+        # tests os.path.isfile(), which is true the moment write_files
+        # creates the file, so a manifest this step created looked
+        # pre-existing and was dropped from memory. Same fix as the
+        # plan-step inline writer; this is the path a plain CODE step for
+        # requirements.txt actually takes.
+        _existing_before = {p for p in files if os.path.exists(p)}
         written = executor.write_files(files)
-        memory.update(files)
+        memory.update(files,
+                      allow_protected={p for p in files
+                                       if p not in _existing_before})
         display.step_info(step_idx, f"Written: {', '.join(written)}")
 
         # Auto-install any new package imports found in the generated code

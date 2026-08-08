@@ -1,6 +1,7 @@
 import ast
 import os
 import re
+import shutil
 import subprocess
 from typing import Dict, List, Tuple
 from .cli_display import log
@@ -1216,6 +1217,94 @@ class Executor:
 
         return cmd
 
+    # Interpreters whose "run this inline script" flag takes an entire
+    # program as ONE argument. Those scripts routinely contain `>`, `<`,
+    # `|` and `&` as ordinary language operators, which is what makes them
+    # unsafe to hand to cmd.exe. See _shell_free_argv.
+    _INLINE_SCRIPT_INTERPRETERS = frozenset({
+        'python', 'python3', 'py', 'node', 'deno', 'ruby', 'perl',
+    })
+    _INLINE_SCRIPT_FLAGS = frozenset({'-c', '-e', '-p', '--eval', '--print'})
+
+    # cmd.exe metacharacters. Their presence in a script is what turns a
+    # working command into a silently redirected one.
+    _CMD_METACHARS = ('>', '<', '|', '&', '^')
+
+    @staticmethod
+    def _win_split(cmd: str) -> List[str] | None:
+        """Split *cmd* into argv exactly as Windows itself would.
+
+        Uses the real Win32 parser rather than shlex: the quoting rules
+        (2n backslashes before a quote, `\\"` for a literal quote) are
+        idiosyncratic, and an approximation here would produce a DIFFERENT
+        argv than the child would otherwise have received — silently
+        changing the command instead of fixing it.
+        """
+        import ctypes
+        try:
+            argc = ctypes.c_int(0)
+            fn = ctypes.windll.shell32.CommandLineToArgvW
+            fn.restype = ctypes.POINTER(ctypes.c_wchar_p)
+            fn.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+            argv_ptr = fn(cmd, ctypes.byref(argc))
+            if not argv_ptr:
+                return None
+            try:
+                return [argv_ptr[i] for i in range(argc.value)]
+            finally:
+                ctypes.windll.kernel32.LocalFree(argv_ptr)
+        except Exception:            # not Windows, or shell32 unavailable
+            return None
+
+    @staticmethod
+    def _shell_free_argv(cmd: str) -> List[str] | None:
+        """argv for an inline-script command that must NOT touch cmd.exe.
+
+        `python -c "...assert n > 0..."` is ordinary Python, but under
+        ``shell=True`` cmd.exe reads that `>` as redirection and writes the
+        command's real stdout into a file literally named `0`, handing the
+        caller empty output instead. Observed in a benchmark run: two
+        agent-loop verification commands returned nothing, the model could
+        not see why its code "failed", and the step burned all 8 turns and
+        escalated. Escaped quotes (``\\"``) make it worse by breaking
+        cmd.exe's quote tracking, so even a `>` written inside quotes is
+        treated as an operator.
+
+        Returns None (keep the shell) unless the command is a single
+        inline-script invocation. The ``len(argv) == 3`` test is the
+        load-bearing one: genuine shell syntax always survives parsing as
+        extra argv entries — ``python -m pytest > out.txt`` splits into 5,
+        with `>` and `out.txt` as their own arguments — so a 3-element argv
+        proves there is no shell work to do and bypassing is equivalent.
+        """
+        if os.name != 'nt':
+            return None
+        argv = Executor._win_split(cmd)
+        if not argv or len(argv) != 3:
+            return None
+        exe = os.path.basename(argv[0]).lower()
+        if exe.endswith('.exe'):
+            exe = exe[:-4]
+        if exe not in Executor._INLINE_SCRIPT_INTERPRETERS:
+            return None
+        if argv[1] not in Executor._INLINE_SCRIPT_FLAGS:
+            return None
+        # Only divert commands actually at risk. A script with no
+        # metacharacter runs identically either way, and leaving it on the
+        # existing path keeps this change's blast radius to the bug.
+        if not any(c in argv[2] for c in Executor._CMD_METACHARS):
+            return None
+        return argv
+
+    @staticmethod
+    def _env_path_key(run_env: dict) -> str:
+        """The PATH key actually present in *run_env*.
+
+        Windows env vars are case-insensitive ('Path' vs 'PATH'), but a
+        plain dict is not.
+        """
+        return next((k for k in run_env if k.upper() == "PATH"), "PATH")
+
     @staticmethod
     def _venv_bin_dir(cwd: str | None = None) -> str | None:
         """Return the Scripts/bin dir of a project venv under *cwd*, if any.
@@ -1273,7 +1362,7 @@ class Executor:
             return
         # Windows env vars are case-insensitive ('Path' vs 'PATH') — reuse the
         # existing key to avoid passing duplicates to the subprocess.
-        path_key = next((k for k in run_env if k.upper() == "PATH"), "PATH")
+        path_key = Executor._env_path_key(run_env)
         current = run_env.get(path_key, "")
         if venv_bin not in current.split(os.pathsep):
             run_env[path_key] = venv_bin + os.pathsep + current if current else venv_bin
@@ -1325,11 +1414,37 @@ class Executor:
             run_env.setdefault("PIP_NO_INPUT", "1")
             run_env.setdefault("NPM_CONFIG_YES", "true")
 
+            # An inline script (`python -c "...n > 0..."`) must bypass
+            # cmd.exe, which would read its language operators as
+            # redirection and swallow the output.
+            argv = Executor._shell_free_argv(cmd)
+            if argv:
+                # subprocess does NOT honour env's PATH when resolving the
+                # executable on Windows — CreateProcess searches the PARENT
+                # process's PATH. Verified: with the project venv prepended
+                # to run_env, `Popen(['python', ...])` still launched
+                # C:\Python313\python.exe. Left implicit, this "fix" would
+                # silently move every inline script off the venv
+                # interpreter and report the project's own packages
+                # missing. Resolve it explicitly, or keep the shell.
+                resolved = shutil.which(
+                    argv[0], path=run_env.get(Executor._env_path_key(run_env)))
+                if resolved:
+                    misread = [c for c in Executor._CMD_METACHARS
+                               if c in argv[2]]
+                    log.debug(
+                        f"[Executor] Inline script — bypassing cmd.exe, "
+                        f"which would misread {' '.join(misread)} as shell "
+                        f"syntax and swallow the output")
+                    argv = [resolved] + argv[1:]
+                else:
+                    argv = None
+
             # Read as raw bytes and decode manually. On Windows, text=True
             # uses cp1252 by default, but most tools (Node.js, Jest, Go)
             # output UTF-8.  This mismatch causes empty/garbled output.
             proc = subprocess.Popen(
-                cmd, shell=True,
+                argv or cmd, shell=argv is None,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

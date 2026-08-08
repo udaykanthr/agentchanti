@@ -6,6 +6,8 @@ test run failed with ``No module named pytest`` while the BulkTest fix loop
 whose fix was one pip install.
 """
 
+import logging
+
 from agentchanti.orchestrator.pipeline import (
     _ensure_pytest_available,
     _missing_third_party_module,
@@ -187,3 +189,75 @@ class TestPlanGateAbnormalExitRetry:
         self._run(ex)
         gate_runs = [c for c in ex.commands if c == "python -m unittest -v"]
         assert len(gate_runs) == 1, ex.commands
+
+
+class TestFrameworkRunnerAbnormalExitRetry:
+    """The same protection, one command later.
+
+    The plan-declared gate was guarded but the framework runner it falls
+    back to was not, so a crash there still counted as a failure. Observed:
+    a 10-test pygame suite access-violated (0xC0000005) under
+    `python -m pytest` inside an iterative BFS — no SDL, no recursion — and
+    passed on a retry with no code changes. Believing it sends the
+    agent-loop fix path after code that was never broken.
+    """
+
+    def _run(self, executor):
+        from agentchanti.orchestrator.pipeline import (
+            run_bulk_test_execution_and_fix,
+        )
+        from unittest.mock import MagicMock
+
+        memory = MagicMock()
+        memory.all_files.return_value = {"tests/test_x.py": "def test_a(): pass"}
+        memory.as_dict.return_value = {"tests/test_x.py": "def test_a(): pass"}
+        # No plan-declared gate — go straight to the framework runner.
+        return run_bulk_test_execution_and_fix(
+            memory=memory, executor=executor, coder=MagicMock(),
+            display=MagicMock(), language="python", task="t",
+            cfg=MagicMock(), all_plan_steps=[_Step(["tests/test_x.py"])],
+        )
+
+    def _suite_runs(self, ex):
+        return [c for c in ex.commands
+                if c.startswith("python -m pytest") and "--version" not in c]
+
+    # Asserting `ok` alone proves nothing: treating the crash as a failure
+    # ALSO ends green here, because the fix loop's own re-run consumes the
+    # clean exit code. What separates the two is whether a fix cascade was
+    # started at all — that is the cost the retry exists to avoid.
+    _FIX_PATH = "Agent-loop fix attempt"
+
+    def test_crashed_runner_is_retried_and_no_fix_cascade_starts(self, caplog):
+        ex = _CrashOnceExecutor([3221225477, 0])
+        with caplog.at_level(logging.INFO):
+            ok, _err = self._run(ex)
+        assert len(self._suite_runs(ex)) == 2, ex.commands
+        assert ok
+        assert self._FIX_PATH not in caplog.text
+
+    def test_fast_fail_code_is_also_retried(self, caplog):
+        # 0xC0000409 — the other native death seen on this machine.
+        ex = _CrashOnceExecutor([3221226505, 0])
+        with caplog.at_level(logging.INFO):
+            ok, _err = self._run(ex)
+        assert len(self._suite_runs(ex)) == 2, ex.commands
+        assert ok
+        assert self._FIX_PATH not in caplog.text
+
+    def test_an_ordinary_failure_is_not_retried(self, caplog):
+        # exit 1 IS a verdict — retrying costs a suite run and changes
+        # nothing. Asserted on the retry itself rather than a run count:
+        # the fix loop legitimately re-runs the suite after each attempt,
+        # so counting runs cannot tell a retry from a post-fix re-check.
+        ex = _CrashOnceExecutor([1, 1, 1, 1, 1])
+        with caplog.at_level(logging.WARNING):
+            self._run(ex)
+        assert "terminated abnormally" not in caplog.text
+
+    def test_the_retry_is_reported(self, caplog):
+        ex = _CrashOnceExecutor([3221225477, 0])
+        with caplog.at_level(logging.WARNING):
+            self._run(ex)
+        assert "terminated abnormally" in caplog.text
+        assert "0xC0000005" in caplog.text
