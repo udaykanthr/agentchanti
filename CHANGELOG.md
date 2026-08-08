@@ -48,6 +48,30 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **Markup and stylesheet are checked for agreement on class names.**
+  Two files can each be individually correct and jointly wrong. A
+  component step writes `site-footer__content`; a stylesheet step in the
+  same wave, unable to see it, writes `.site-footer__inner`. Both gates
+  pass, the suite passes, the production build passes — an unmatched CSS
+  class is still valid CSS — and the page renders unstyled.
+
+  Four of six consecutive runs on one project drifted this way, once
+  completely (7 classes rendered, 0 styled). The decisive case had a gate
+  asserting eight structural properties of the stylesheet — background,
+  colour, max-width container, grid, hover, divider, flex utility row,
+  responsive stacking. All eight were true; all eight described selectors
+  the markup never rendered. No single-file assertion can catch this,
+  because neither file is wrong on its own — only the join is.
+
+  Runs after the build is green, since it answers what the build cannot,
+  and is held to the same check re-run as a command so a repair is
+  verified rather than believed. Only "rendered but never defined" counts
+  as a defect; orphaned rules are reported as the explanation, never as
+  the failure. Refuses rather than guesses whenever the answer is
+  unclear — a utility or component framework in the dependencies, Sass
+  nesting, CSS Modules, or a dynamic `className` — because a false
+  accusation sends a correct run into a fix loop.
+
 - **A self-locating suite gate is no longer given the sub-project cwd too.**
   BulkTest's preflight runs the plan-declared gate before substituting the
   framework default. It passed `cwd=<subproject>` unconditionally — so a
