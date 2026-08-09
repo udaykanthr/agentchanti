@@ -48,6 +48,15 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   anything else equally. (A syntax check could not have caught this one:
   the broken payload is valid JavaScript.)
 
+- **A log file is created only when there is something to log.**
+  `setup_logger()` runs at module scope, so *any* import of the package
+  opened a timestamped log — including short-lived subprocess utilities
+  that never write a line. The style-coupling gate made this visible by
+  running `python -m agentchanti...` once per check: a single run left
+  ten zero-byte files beside its real 47 KB log, cluttering exactly the
+  directory someone opens to find out what happened. The handler now
+  defers opening its file until the first record.
+
 - **Markup and stylesheet are checked for agreement on class names.**
   Two files can each be individually correct and jointly wrong. A
   component step writes `site-footer__content`; a stylesheet step in the

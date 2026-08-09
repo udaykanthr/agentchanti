@@ -147,7 +147,16 @@ def setup_logger(log_dir: str = ".agentchanti/logs") -> logging.Logger:
     logger = logging.getLogger("agentchanti")
     logger.setLevel(logging.DEBUG)
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    # delay=True: create the file on the FIRST record, not at import.
+    #
+    # `log = setup_logger()` runs at module scope, so ANY import of the
+    # package opened a timestamped log — including short-lived subprocess
+    # utilities that never log a line. Observed after the style-coupling
+    # gate started running `python -m agentchanti...` once per check: a
+    # single run left ten zero-byte files beside its real 47 KB log,
+    # which is noise in exactly the place someone goes to read what
+    # happened.
+    fh = logging.FileHandler(log_file, encoding="utf-8", delay=True)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
