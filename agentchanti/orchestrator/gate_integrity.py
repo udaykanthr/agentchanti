@@ -208,10 +208,26 @@ def reset_repairs() -> None:
 _RUNNERS = frozenset({
     "pytest", "unittest", "nose2", "tox",
     "jest", "vitest", "mocha", "jasmine", "ava",
-    "go", "cargo", "gradle", "mvn", "rspec", "phpunit",
+    "rspec", "phpunit",
 })
+# Tools whose SUBCOMMAND decides what they do: `go test` is a gate,
+# `go build` is not.
+_SUBCOMMAND_RUNNERS = frozenset({"go", "cargo", "gradle", "mvn", "dotnet"})
 _INTERPRETERS = frozenset({"python", "python3", "py", "node", "ruby", "perl"})
+# Script runners — `npm test` really is a gate, so these carry an operation.
+# pip is deliberately ABSENT: there is no `pip test`, and an installer
+# proves nothing about the code. Python's actual gates (pytest, unittest,
+# tox) are runners in their own right and are covered above, including the
+# `poetry run pytest` / `uv run pytest` forms.
 _PKG_MANAGERS = frozenset({"npm", "yarn", "pnpm", "bun"})
+# Modules that provision an environment rather than judge code, even when
+# invoked as `python -m <module>`.
+_INSTALLER_MODULES = frozenset({"pip", "ensurepip", "venv", "virtualenv"})
+# Verbs that mutate the environment rather than judge the code.
+_INSTALL_VERBS = frozenset({
+    "install", "add", "ci", "sync", "uninstall", "remove", "update",
+    "upgrade", "restore", "fetch",
+})
 _SEGMENT_RE = re.compile(r"&&|\|\||;|\|")
 
 
@@ -219,39 +235,86 @@ def _basename(token: str) -> str:
     return re.split(r"[\\/]", token.strip().strip('"\''))[-1].lower()
 
 
+def _segment_operation(tokens: List[str]) -> str | None:
+    """The instrument one shell segment drives, or None.
+
+    Position matters, and an early version of this ignored it: scanning
+    every token for a known runner name made `pip install pytest` report
+    "pytest" — the package being INSTALLED read as the instrument. Since
+    that command exits 0 whenever pytest is already present, it could have
+    been adopted as a stand-in for a test suite, which is exactly the
+    "gate quietly replaced by something weaker" this whole mechanism has to
+    refuse. An installer verifies nothing; it must have no operation at all.
+    """
+    if not tokens:
+        return None
+    head = _basename(tokens[0])
+    positional = [t for t in tokens[1:] if not t.startswith("-")]
+
+    # Installing/removing is a side effect, never a verification.
+    if positional and positional[0].lower() in _INSTALL_VERBS:
+        return None
+
+    # `npm test`, `npm run test` — the runner lives in package.json, so the
+    # script name is the identity. Without this a JS gate has no operation
+    # and could never be superseded.
+    if head in _PKG_MANAGERS:
+        if not positional:
+            return None
+        script = positional[0].lower()
+        if script == "run" and len(positional) > 1:
+            script = positional[1].lower()
+        return f"{head}:{script}"
+
+    # `go test ./...` vs `go build` are different instruments.
+    if head in _SUBCOMMAND_RUNNERS:
+        return f"{head}:{positional[0].lower()}" if positional else head
+
+    if head in _RUNNERS:
+        return head
+
+    if head in _INTERPRETERS:
+        # `python -m pytest ...` — the module IS the runner.
+        if "-m" in tokens:
+            idx = tokens.index("-m")
+            if idx + 1 < len(tokens):
+                module = _basename(tokens[idx + 1])
+                after = [t for t in tokens[idx + 2:] if not t.startswith("-")]
+                # `python -m pip install ...` / `python -m venv env`: an
+                # installer is still an installer when routed through -m.
+                if (module in _INSTALLER_MODULES
+                        or (after and after[0].lower() in _INSTALL_VERBS)):
+                    return None
+                return module if module in _RUNNERS else f"module:{module}"
+        # `python hello.py` — the script identifies the operation.
+        if positional:
+            return "script:" + _basename(positional[0])
+        return None
+
+    # `poetry run pytest`, `uv run pytest -q`, `pipenv run pytest`.
+    lowered = [t.lower() for t in tokens]
+    if "run" in lowered:
+        after = [t for t in tokens[lowered.index("run") + 1:]
+                 if not t.startswith("-")]
+        if after and _basename(after[0]) in _RUNNERS:
+            return _basename(after[0])
+    return None
+
+
 def gate_operation(cmd: str) -> set[str]:
     """The tool identities *cmd* invokes — its "core operation".
 
     `python -m pytest a.py` and `pytest b.py` are both {"pytest"}: same
     instrument, different argument. That is the level at which one command
-    can stand in for another. A command naming no runner and no script —
-    `echo ok`, `true` — yields the empty set and can therefore never be
-    accepted as a substitute, which is the point.
+    can stand in for another. A command that verifies nothing — `echo ok`,
+    `pip install pytest`, `cd build` — yields the empty set and can
+    therefore never be accepted as a substitute, which is the point.
     """
     ops: set[str] = set()
     for segment in _SEGMENT_RE.split(cmd or ""):
-        tokens = [t for t in segment.split() if t]
-        if not tokens:
-            continue
-        runner = next((t for t in tokens if _basename(t) in _RUNNERS), None)
-        if runner:
-            ops.add(_basename(runner))
-            continue
-        # `npm test` / `yarn test --silent`: the script name is the identity,
-        # since the runner behind it lives in package.json. Without this a JS
-        # gate has no operation at all and could never be superseded.
-        if _basename(tokens[0]) in _PKG_MANAGERS:
-            script = next((t for t in tokens[1:] if not t.startswith("-")), None)
-            if script:
-                if script.lower() == "run" and len(tokens) > 2:
-                    script = next((t for t in tokens[2:]
-                                   if not t.startswith("-")), script)
-                ops.add(f"{_basename(tokens[0])}:{script.lower()}")
-            continue
-        if _basename(tokens[0]) in _INTERPRETERS:
-            script = next((t for t in tokens[1:] if not t.startswith("-")), None)
-            if script:
-                ops.add("script:" + _basename(script))
+        found = _segment_operation([t for t in segment.split() if t])
+        if found:
+            ops.add(found)
     return ops
 
 

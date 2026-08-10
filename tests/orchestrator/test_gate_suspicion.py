@@ -46,6 +46,37 @@ class OperationIdentityTest(unittest.TestCase):
         self.assertEqual(gate_operation("echo ok"), set())
         self.assertFalse(same_gate_operation(GATE, "echo ok"))
 
+    def test_an_installer_is_never_an_operation(self):
+        """`pip install pytest` mentions the runner but verifies NOTHING.
+
+        An earlier version scanned every token for a known runner name, so
+        the package being installed was read as the instrument — and since
+        that command exits 0 whenever pytest is already present, it could
+        have been adopted as a stand-in for the suite.
+        """
+        for cmd in ("pip install pytest",
+                    "pip3 install pytest",
+                    "pip install -r requirements.txt",
+                    "python -m pip install --upgrade pip",
+                    "python -m venv venv",
+                    "npm install", "npm ci", "yarn add jest"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(gate_operation(cmd), set())
+                self.assertFalse(same_gate_operation(GATE, cmd))
+
+    def test_only_a_positional_runner_counts(self):
+        """A runner NAMED in passing is not a runner being invoked."""
+        self.assertEqual(gate_operation("echo pytest"), set())
+
+    def test_subcommand_runners_distinguish_their_verbs(self):
+        self.assertEqual(gate_operation("go test ./..."), {"go:test"})
+        self.assertFalse(same_gate_operation("go test ./...", "go build"))
+
+    def test_run_wrappers_resolve_to_the_runner(self):
+        for cmd in ("poetry run pytest", "uv run pytest -q", "pipenv run pytest"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(gate_operation(cmd), {"pytest"})
+
     def test_package_manager_scripts(self):
         self.assertEqual(gate_operation("npm test --silent"), {"npm:test"})
         self.assertTrue(same_gate_operation("npm test --silent", "npm run test"))
@@ -123,11 +154,25 @@ class DiagnosisLoopIntegrationTest(unittest.TestCase):
             MagicMock(verify_cmd=None), [WORKING], self.executor, 0,
             diag_attempt=3))
 
-    def test_an_unrelated_passing_command_is_not_adopted(self):
-        """`pip install x` succeeding says nothing about the suite."""
+    def test_a_passing_installer_is_not_adopted(self):
+        """`pip install pytest` exits 0 once pytest exists — and proves
+        nothing. Note the stub makes it PASS, so this fails unless the
+        operation check itself rejects it; an earlier version of this test
+        let the command fail and so passed for the wrong reason."""
+        everything_passes = MagicMock()
+        everything_passes.run_command.side_effect = \
+            lambda cmd, **kw: ((cmd != GATE), "")
         self.assertFalse(_consider_gate_superseded(
-            self.plan_step, ["pip install pytest"], self.executor, 0,
+            self.plan_step, ["pip install pytest"], everything_passes, 0,
             diag_attempt=3))
+        self.assertIsNone(repaired_gate(GATE))
+
+    def test_a_passing_echo_is_not_adopted(self):
+        everything_passes = MagicMock()
+        everything_passes.run_command.side_effect = \
+            lambda cmd, **kw: ((cmd != GATE), "")
+        self.assertFalse(_consider_gate_superseded(
+            self.plan_step, ["echo ok"], everything_passes, 0, diag_attempt=3))
         self.assertIsNone(repaired_gate(GATE))
 
     def test_an_executor_that_raises_never_breaks_the_loop(self):
