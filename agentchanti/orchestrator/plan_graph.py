@@ -90,6 +90,8 @@ def module_key(spec: str) -> str:
 
 _DEFAULT_PREFIXED = re.compile(r"^default\s+(\S+)$", re.IGNORECASE)
 _AS_DEFAULT = re.compile(r"^(\S+)\s+as\s+default$", re.IGNORECASE)
+# Identifier-shaped words inside a prose export description.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 def _export_satisfied(spec: str, actual: set[str]) -> bool:
@@ -119,6 +121,27 @@ def _export_satisfied(spec: str, actual: set[str]) -> bool:
     # Deliberately narrow: when the file exports other names and simply
     # not this one, the warning still stands.
     if actual == {"default"}:
+        return True
+
+    # The prompt asks for `exports: <Symbol1>, <Symbol2>`, but a weaker
+    # planner answers in English:
+    #
+    #     exports: main function that prints "Hello World" when executed
+    #
+    # The file DID export `main`. Comparing the whole sentence to the
+    # symbol set finds nothing, so a correct step was warned about — twice
+    # in one clean run, both wrong. Look for any identifier in the prose
+    # that the file really exports.
+    words = _IDENTIFIER_RE.findall(spec)
+    if any(w in actual for w in words):
+        return True
+
+    # Still prose, and nothing in it matched. A sentence is not a symbol
+    # reference, so there is no claim here that can be checked — and per
+    # this function's own history, a warning that cannot be right is worse
+    # than no warning. A bare name that is genuinely absent has no
+    # whitespace and still falls through to the warning below.
+    if len(words) > 1 or " " in spec:
         return True
 
     return False

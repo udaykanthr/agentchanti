@@ -6321,7 +6321,11 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             step_text, context=gen_context, language=language,
             env_info=js_env, test_root=_test_root,
             pre_analysis_results=pre_analysis_results,
-            test_command=test_cmd)
+            test_command=test_cmd,
+            # The gate was written against the plan's target, so the tester
+            # has to write that exact path rather than a conventional one.
+            target_files=list(
+                getattr(plan_step, "target_files", None) or []) or None)
 
         sent_after, recv_after = token_tracker.snapshot()
         sent_delta = sent_after - sent_before
