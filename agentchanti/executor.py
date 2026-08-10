@@ -509,6 +509,62 @@ class Executor:
                 return False
         return True
 
+    # `cat <<'EOF' > path` / `cat > path <<EOF`, closed by the delimiter on
+    # its own line. Anchored at the start of the block: a heredoc appearing
+    # later is content being discussed, not a wrapper around the whole file.
+    _HEREDOC_WRITE_RE = re.compile(
+        r'\A\s*(?:cat|tee)\b[^\n]*?<<-?\s*[\'"]?(?P<delim>[A-Za-z_]\w*)[\'"]?'
+        r'[^\n]*\n(?P<body>.*?)^[ \t]*(?P=delim)[ \t]*$',
+        re.DOTALL | re.MULTILINE)
+
+    # The opener alone. A response cut at the output-token cap loses its
+    # closing delimiter, and dropping just the recipe line still keeps the
+    # `cat <<` out of the source; whatever remains is then judged by the
+    # ordinary syntax check, which is what catches the truncation itself.
+    _HEREDOC_OPENER_RE = re.compile(
+        r'\A\s*(?:cat|tee)\b[^\n]*?<<-?\s*[\'"]?[A-Za-z_]\w*[\'"]?[^\n]*\n')
+
+    # Shell targets may legitimately CONTAIN a heredoc, so never unwrap them.
+    _SHELL_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".fish")
+
+    @staticmethod
+    def _unwrap_shell_file_write(block: str, target: str) -> str:
+        """Return the heredoc body when *block* is a shell recipe writing a file.
+
+        A model asked for code sometimes answers with the *command* that
+        creates it::
+
+            cat <<'EOF' > hello_world.py
+            print("Hello World")
+            EOF
+
+        Attributed to the step's only target, those wrapper lines are written
+        into the .py file verbatim. The syntax check above cannot catch it,
+        because `cat <<'EOF' > hello_world.py` is VALID Python — a left-shift
+        followed by a comparison — so it parses cleanly and only fails at
+        import with `NameError: name 'cat' is not defined`. Observed on a
+        local model: three diagnosis attempts and a halted run over a
+        one-line hello world that was correct inside the heredoc all along.
+
+        Unwrapping keeps the body the model actually meant. Shell targets are
+        left alone: a .sh file may legitimately contain a heredoc.
+        """
+        if not block or target.lower().endswith(Executor._SHELL_SUFFIXES):
+            return block
+        match = Executor._HEREDOC_WRITE_RE.search(block)
+        if match:
+            body = match.group("body")
+        else:
+            opener = Executor._HEREDOC_OPENER_RE.match(block)
+            if not opener:
+                return block
+            body = block[opener.end():]
+        if not body.strip():
+            return block          # empty heredoc — nothing better to offer
+        log.info("[Executor] Unwrapped a shell heredoc that wrapped '%s' — "
+                 "writing the file body, not the `cat <<` recipe", target)
+        return body
+
     @staticmethod
     def parse_blocks_for_single_target(text: str, target: str) -> Dict[str, str]:
         """Attribute an unlabelled code block to the step's only target.
@@ -542,12 +598,21 @@ class Executor:
             tail = re.split(r"```(?:[a-zA-Z0-9_+\-]*)\n", text)[-1]
             if tail.strip():
                 blocks.append(tail)
-        blocks = [b for b in blocks if b.strip()]
-        if not blocks:
+        # Before sizing them up: a block may be a shell recipe wrapping the
+        # real file body, and the wrapper is not part of the file.
+        unwrapped = [(Executor._unwrap_shell_file_write(b, target), b)
+                     for b in blocks]
+        candidates = [(body, body != original)
+                      for body, original in unwrapped if body.strip()]
+        if not candidates:
             return {}
-        best = max(blocks, key=len)
-        # A couple of lines is a fragment being discussed, not a file.
-        if len(best.strip().splitlines()) < 3:
+        best, was_unwrapped = max(candidates, key=lambda c: len(c[0]))
+        # A couple of lines is a fragment being discussed, not a file — but
+        # only when we are guessing. A heredoc named the file explicitly, so
+        # its body is a file however short it is; applying the fragment rule
+        # there would reject the very content the unwrap recovered (a
+        # two-line hello world, in the run that prompted this).
+        if not was_unwrapped and len(best.strip().splitlines()) < 3:
             return {}
         # Never write source that cannot parse. A truncated block is the
         # common case here, and half a module is worse than none: it

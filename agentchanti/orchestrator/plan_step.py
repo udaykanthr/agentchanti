@@ -1911,11 +1911,20 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     it. Three attempts across two models spent 24 turns and ~20 command
     runs on it before the run was abandoned.
 
+    Structural defects are judged first, because they need no payload at
+    all: an interpreter pointed at another executable, and a placeholder
+    left in the command. Both are unsatisfiable for the same reason as a
+    broken payload — no output of the step can change the verdict.
+
     Only the inline `python -c` payload is judged; a real newline inside
     it is perfectly legal and must not be flagged.
     """
     if not cmd:
         return None
+    for structural in (_interpreter_target_error, _placeholder_error):
+        reason = structural(cmd)
+        if reason:
+            return reason
     match = _INLINE_SCRIPT_RE.search(cmd)
     if not match:
         return None
@@ -1945,6 +1954,64 @@ def _unescape_shell_quotes(payload: str) -> str:
     validity either way.
     """
     return payload.replace('\\"', '"')
+
+
+# An interpreter handed another executable as the script to run. Observed on
+# a hello-world run whose planner wrote:
+#
+#     python venv\Scripts\python.exe hello_world.py | find /i "Hello World"
+#
+# Python then tries to PARSE python.exe as source and dies with
+# "SyntaxError: Non-UTF-8 code starting with '\x90'". No edit to the target
+# file can ever satisfy that, and three diagnosis attempts were spent on a
+# program that already worked — `python hello_world.py` exited 0 midway
+# through the same run. The flag alternation lets `python -X utf8 foo.exe`
+# through to the script slot; `python -m pytest` lands on `pytest`, which is
+# not an executable path and is correctly ignored.
+_INTERPRETER_RUNS_BINARY_RE = re.compile(
+    r'\b(?:python[23]?|node|ruby|perl)(?:\.exe)?\s+'
+    r'(?:-[A-Za-z]\w*\s+)*'
+    r'(?P<script>[^\s"\';|&]*'
+    r'(?:\.exe\b|[\\/](?:python[23]?|node|ruby|perl)(?:\.exe)?\b)'
+    r'[^\s"\';|&]*)',
+    re.IGNORECASE)
+
+# `<filename>`, `<path to file>` — a placeholder the planner was told never
+# to emit, run verbatim. Observed: `python <filename>` executed as-is.
+_PLACEHOLDER_RE = re.compile(r'<[A-Za-z_][\w\-]*(?:\s+[\w\-]+)*>')
+
+_QUOTED_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+
+def _strip_quoted(cmd: str) -> str:
+    """Blank out quoted spans so payload contents cannot trip outer checks.
+
+    `node -e "if (a<b) ..."` and an HTML assertion inside a python -c string
+    both contain angle brackets that are not placeholders. The payloads are
+    judged separately by the -c/-e checks; here they are noise.
+    """
+    return _QUOTED_RE.sub(" ", cmd)
+
+
+def _interpreter_target_error(cmd: str) -> Optional[str]:
+    match = _INTERPRETER_RUNS_BINARY_RE.search(_strip_quoted(cmd))
+    if not match:
+        return None
+    script = match.group("script")
+    return (f"the verify command runs an interpreter on another executable "
+            f"({script}) — the interpreter parses that binary as source and "
+            f"fails with a decoding/syntax error, so the gate can never pass "
+            f"whatever the code does. Invoke the script directly, e.g. "
+            f"`python your_script.py`, using the pipeline's own Python")
+
+
+def _placeholder_error(cmd: str) -> Optional[str]:
+    match = _PLACEHOLDER_RE.search(_strip_quoted(cmd))
+    if not match:
+        return None
+    return (f"the verify command still contains the placeholder "
+            f"`{match.group(0)}` — it is run verbatim, so the gate can never "
+            f"pass. Write the real path or command")
 
 
 def _python_payload_error(payload: str) -> Optional[str]:
