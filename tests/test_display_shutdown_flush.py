@@ -81,6 +81,27 @@ class DetachedProxiesAreDrainedTest(unittest.TestCase):
         self.assertEqual(sink.getvalue(), settled,
                          "finalizer still emitted — buffer was not drained")
 
+    def test_a_buffered_ansi_reset_is_not_printed_literally(self):
+        """flush() hands the raw escape to console.print; the user then sees a
+        stray "[0m" after a finished run. Completing the line instead routes
+        through FileProxy.write()'s AnsiDecoder, which applies it as styling."""
+        display = CLIDisplay("t")
+        proxy, sink = _proxy_with_buffered_text("\x1b[0m")
+        display._live_proxies = [proxy]
+
+        display._drain_live_proxies()
+
+        self.assertEqual(_buffer_of(proxy), "", "proxy still dirty")
+        self.assertNotIn("[0m", sink.getvalue(),
+                         "raw escape leaked to the terminal")
+
+    def test_real_text_still_survives_the_quiet_drain(self):
+        display = CLIDisplay("t")
+        proxy, sink = _proxy_with_buffered_text("Embedding symbols: 0batch")
+        display._live_proxies = [proxy]
+        display._drain_live_proxies()
+        self.assertIn("Embedding symbols", sink.getvalue())
+
     def test_current_streams_are_drained_too(self):
         display = CLIDisplay("t")
         proxy, sink = _proxy_with_buffered_text("partial")

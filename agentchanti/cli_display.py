@@ -486,10 +486,19 @@ class CLIDisplay:
         reading stderr — where real failures appear. And the buffered text is
         genuine output that the throwing finalizer never delivers.
         """
-        seen = list(self._live_proxies) + [sys.stdout, sys.stderr]
-        for stream in seen:
+        for stream in list(self._live_proxies) + [sys.stdout, sys.stderr]:
             try:
-                stream.flush()
+                buffered = (getattr(stream, "_FileProxy__buffer", None)
+                            if self._is_rich_proxy(stream) else None)
+                if buffered:
+                    # Completing the line goes through FileProxy.write(),
+                    # which runs the text through rich's AnsiDecoder. flush()
+                    # does not: it hands the raw string to console.print, so a
+                    # buffered colour reset arrives as a literal "[0m" on the
+                    # user's terminal instead of being applied as styling.
+                    stream.write("\n")
+                else:
+                    stream.flush()
             except Exception:
                 pass
 
