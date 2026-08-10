@@ -1375,6 +1375,14 @@ def _execute_step(step_idx: int, step_text: str, *,
                     current_file=None,
                     max_tokens=getattr(cfg, "KB_MAX_CONTEXT_TOKENS", 4000) if cfg else 4000,
                     language=getattr(project_context, "language", None) if project_context else None,
+                    # Without this the builder's own "Skip for CMD steps —
+                    # install commands don't need them" guard is dead code on
+                    # the one path that runs for EVERY step: the parameter
+                    # defaults to None, and `None != "CMD"` is True, so the
+                    # check concludes the opposite of what it was written for.
+                    # Observed: a `python -m venv` step was handed 1,392
+                    # tokens of Python test-generation instructions.
+                    step_type=getattr(plan_step, "step_type", None),
                 )
                 if kb_ctx.kb_available or kb_ctx.behavioral_instructions or kb_ctx.global_patterns:
                     kb_text = kb_context_builder.format_context_for_prompt(kb_ctx)
