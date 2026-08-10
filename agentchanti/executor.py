@@ -11,6 +11,30 @@ from .cli_display import log
 # "undiagnosable" rather than re-reading an error that is not there.
 NO_OUTPUT_MARKER = "but produced no output"
 
+# Appended when a command DIED — twice — instead of reporting a verdict.
+# "Failed" and "crashed" are different facts: the first is evidence about
+# the code, the second is evidence about nothing. Consumers that would
+# otherwise record a regression key off this to stay undecided.
+CRASHED_MARKER = "[process terminated abnormally — no verdict]"
+
+
+def _crash_helpers():
+    """Lazily fetch the abnormal-exit helpers from ``wave_snapshots``.
+
+    That module is stdlib-only, but *reaching* it executes
+    ``orchestrator/__init__``, which imports this one — so a module-level
+    import is circular. Deferring to call time (the same thing ``pipeline``
+    does at its own crash guards) breaks the cycle. If the import fails for
+    any reason the predicate degrades to "never abnormal", which preserves
+    today's behaviour rather than silently swallowing real failures.
+    """
+    try:
+        from .orchestrator.wave_snapshots import (  # noqa: PLC0415
+            describe_abnormal_exit, is_abnormal_exit, log_crash_diagnostics)
+        return is_abnormal_exit, describe_abnormal_exit, log_crash_diagnostics
+    except Exception:                                  # pragma: no cover
+        return (lambda _code: False), (lambda _code: ""), (lambda *_a: None)
+
 
 class Executor:
     def __init__(self):
@@ -1408,13 +1432,79 @@ class Executor:
 
     def run_command(self, cmd: str, env: dict | None = None,
                     timeout: int = 120, background: bool = False,
-                    cwd: str | None = None) -> Tuple[bool, str]:
+                    cwd: str | None = None,
+                    retry_on_crash: bool = True) -> Tuple[bool, str]:
+        """Run a shell command, retrying once if the process CRASHED.
+
+        A process that dies never reported a verdict, so believing its exit
+        status is a category error — on Windows a pygame/SDL suite
+        fast-fails (0xC0000409) or access-violates (0xC0000005) in a
+        substantial fraction of invocations, printing ordinary-looking test
+        output first. Read as a result, that green suite becomes "the tests
+        regressed" and a correct file gets rolled back.
+
+        The pipeline already knew this and hand-rolled the same
+        detect-log-retry block at four call sites (``GateLedger.recheck``,
+        the BulkTest plan gate, the BulkTest runner, ``AgentLoop._run_verify``
+        — whose comment records it as having been *missing* there until
+        someone hit it). Copy-paste coverage leaves every site the author
+        did not think of unprotected, and an audit found 31 further
+        test/gate invocations without the guard, including re-runs of the
+        very ``base_cmd`` that is guarded elsewhere in the same function.
+        Centralising it here makes the protection the default that new call
+        sites inherit instead of a rule they must remember.
+
+        Only an *abnormal* exit retries: a signal death or an NTSTATUS
+        failure code. An ordinary non-zero status is a real verdict and is
+        returned untouched, so genuine failures are never masked. Pass
+        ``retry_on_crash=False`` for a command whose side effects must not
+        be repeated. Background commands are never retried — they have not
+        finished, so there is no exit status to judge.
+
+        Returns (success, output); see :meth:`_run_command_once` for the
+        command-rewriting behaviour.
+        """
+        ok, out = self._run_command_once(
+            cmd, env=env, timeout=timeout, background=background, cwd=cwd)
+        if ok or background or not retry_on_crash:
+            return ok, out
+
+        is_abnormal, describe, log_diagnostics = _crash_helpers()
+        code = self.last_exit_code
+        if not is_abnormal(code):
+            return ok, out                       # a real verdict — believe it
+
+        log.warning(
+            f"[Executor] Command terminated abnormally "
+            f"({describe(code) or code}) — retrying once before believing "
+            f"it: {cmd}")
+        log_diagnostics(code, cmd)
+        ok, out = self._run_command_once(
+            cmd, env=env, timeout=timeout, background=background, cwd=cwd)
+        if ok:
+            return ok, out
+
+        if is_abnormal(self.last_exit_code):
+            # Crashed twice. Still a failure to the caller — suppressing it
+            # would invent a pass — but tagged, so a consumer that can act
+            # on "inconclusive" (a gate ledger deciding whether to record a
+            # regression) is able to tell it apart from a real red suite.
+            log.warning(
+                f"[Executor] Command crashed again "
+                f"({describe(self.last_exit_code) or self.last_exit_code}) "
+                f"— reporting as inconclusive: {cmd}")
+            out = f"{out}\n{CRASHED_MARKER}".strip()
+        return ok, out
+
+    def _run_command_once(self, cmd: str, env: dict | None = None,
+                          timeout: int = 120, background: bool = False,
+                          cwd: str | None = None) -> Tuple[bool, str]:
         """
         Runs an arbitrary shell command. Returns (success, output).
         On Windows, auto-wraps PowerShell cmdlets so they don't fail
         in the default cmd.exe shell.
 
-        If *background* is True, the process is started and tracked. The 
+        If *background* is True, the process is started and tracked. The
         method waits briefly (3s) to see if it crashes; if not, it returns success.
 
         If *cwd* is set, the command runs in that directory instead of the
