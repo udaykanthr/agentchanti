@@ -2891,6 +2891,61 @@ def _execute_step(step_idx: int, step_text: str, *,
         return step_idx, False, f"Unhandled exception: {type(exc).__name__}: {exc}"
 
 
+# A gate is only ever suspected after this many diagnosis rounds have failed
+# against it. One failure is an ordinary red test; a gate that survives two
+# rounds of correct-looking fixes is the thing worth doubting.
+_GATE_SUSPICION_AFTER = 2
+
+
+def _consider_gate_superseded(plan_step, passed_cmds, executor, step_idx,
+                              diag_attempt) -> bool:
+    """Record a proven stand-in when the step's own gate is the defect.
+
+    Twice on hello-world runs the plan's gate named something that did not
+    exist (`pytest test_hello.py` against a tester that wrote
+    `tests/test_hello_world.py`). Diagnosis said so every round and proposed
+    the working command; the pipeline RAN it, saw exit 0 — and then re-ran
+    the gate and failed the step. The evidence needed to save the run was
+    produced and discarded three times.
+
+    Nothing is believed on the strength of that earlier observation:
+    :func:`prove_gate_superseded` re-runs both commands now, and accepts the
+    substitution only while the gate still fails and the candidate still
+    passes. It must also drive the same instrument, so `echo ok` — which
+    names no runner at all — can never stand in for a suite.
+
+    Returns True when a repair was recorded; the ledger and the next gate
+    execution pick it up through ``effective_gate``.
+    """
+    if diag_attempt < _GATE_SUSPICION_AFTER or not passed_cmds:
+        return False
+    gate = getattr(plan_step, "verify_cmd", None)
+    if not gate:
+        return False
+
+    from .gate_integrity import (effective_gate, prove_gate_superseded,
+                                 record_gate_repair)
+    gate = effective_gate(gate)
+
+    def _run(cmd: str):
+        return executor.run_command(cmd)
+
+    for candidate in passed_cmds:
+        try:
+            if prove_gate_superseded(gate, candidate, _run):
+                record_gate_repair(
+                    gate, candidate,
+                    f"diagnosis-equivalent after {diag_attempt} failed rounds")
+                log.warning(
+                    "Task %d: the step's gate is the defect — it still fails "
+                    "while `%s` passes on the same files. Using the proven "
+                    "command from here on.", step_idx + 1, candidate)
+                return True
+        except Exception as exc:            # never let this break the loop
+            log.debug("[GateSuspicion] candidate check failed: %s", exc)
+    return False
+
+
 def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                         steps: list[str],
                         llm_client, executor, coder, reviewer, tester,
@@ -3107,7 +3162,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
 
             _task_goal = getattr(project_context, 'goal_summary', '') if project_context else ''
             _step_targets = plan_step.target_files if plan_step else None
-            fix_applied, cmds_succeeded, has_fix_commands, _fix_cmds_run = _apply_fix(
+            (fix_applied, cmds_succeeded, has_fix_commands, _fix_cmds_run,
+             _fix_cmds_passed) = _apply_fix(
                 diagnosis, executor, memory, display, step_idx,
                 step_type=step_type,
                 original_error_cmd=_orig_cmd,
@@ -3392,6 +3448,9 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             else:
                 log.warning(f"Task {step_idx+1}: Still failing after "
                             f"diagnosis attempt {diag_attempt}")
+                _consider_gate_superseded(
+                    plan_step, _fix_cmds_passed, executor, step_idx,
+                    diag_attempt)
 
         except Exception as exc:
             log.error(f"Task {step_idx+1}: Exception during diagnosis "

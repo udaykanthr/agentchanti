@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from typing import List, Tuple
 
@@ -175,3 +176,107 @@ def reset_repairs() -> None:
     """Drop every recorded repair (tests, and between runs in-process)."""
     with _repairs_lock:
         _repairs.clear()
+
+
+# ---------------------------------------------------------------------------
+# A gate superseded by the command diagnosis proved equivalent
+# ---------------------------------------------------------------------------
+#
+# The module above catches a gate broken by SHELL ESCAPING. This catches the
+# other way a gate is the defect: it names something that does not exist.
+#
+# Observed twice on hello-world runs, both on working code:
+#
+#   gate: python -m pytest test_hello.py -q   -> exit 4, no such file
+#   ran : python -m pytest tests/test_hello_world.py -> exit 0, 2 passed
+#
+# The tester had written a conventionally-named file, so the plan's gate
+# pointed at a path nobody created. Diagnosis identified this correctly every
+# round and proposed the working command; the pipeline RAN that command, saw
+# it pass, then re-ran the gate and failed the step. Three rounds, then halt.
+#
+# `_handle_cmd_step` already has this idea for CMD steps: when a fix command
+# is "the same core operation" as the failed one, the step is resolved rather
+# than re-running something known to fail. It is restricted to CMD steps and
+# compares against the failed command, so a broken CODE/TEST *gate* never
+# benefits.
+#
+# The decision is deliberately behavioural, matching this module's existing
+# stance that "what IS decidable is behaviour": re-run both, and only accept
+# the substitution when the gate still fails AND the candidate still passes.
+
+_RUNNERS = frozenset({
+    "pytest", "unittest", "nose2", "tox",
+    "jest", "vitest", "mocha", "jasmine", "ava",
+    "go", "cargo", "gradle", "mvn", "rspec", "phpunit",
+})
+_INTERPRETERS = frozenset({"python", "python3", "py", "node", "ruby", "perl"})
+_PKG_MANAGERS = frozenset({"npm", "yarn", "pnpm", "bun"})
+_SEGMENT_RE = re.compile(r"&&|\|\||;|\|")
+
+
+def _basename(token: str) -> str:
+    return re.split(r"[\\/]", token.strip().strip('"\''))[-1].lower()
+
+
+def gate_operation(cmd: str) -> set[str]:
+    """The tool identities *cmd* invokes — its "core operation".
+
+    `python -m pytest a.py` and `pytest b.py` are both {"pytest"}: same
+    instrument, different argument. That is the level at which one command
+    can stand in for another. A command naming no runner and no script —
+    `echo ok`, `true` — yields the empty set and can therefore never be
+    accepted as a substitute, which is the point.
+    """
+    ops: set[str] = set()
+    for segment in _SEGMENT_RE.split(cmd or ""):
+        tokens = [t for t in segment.split() if t]
+        if not tokens:
+            continue
+        runner = next((t for t in tokens if _basename(t) in _RUNNERS), None)
+        if runner:
+            ops.add(_basename(runner))
+            continue
+        # `npm test` / `yarn test --silent`: the script name is the identity,
+        # since the runner behind it lives in package.json. Without this a JS
+        # gate has no operation at all and could never be superseded.
+        if _basename(tokens[0]) in _PKG_MANAGERS:
+            script = next((t for t in tokens[1:] if not t.startswith("-")), None)
+            if script:
+                if script.lower() == "run" and len(tokens) > 2:
+                    script = next((t for t in tokens[2:]
+                                   if not t.startswith("-")), script)
+                ops.add(f"{_basename(tokens[0])}:{script.lower()}")
+            continue
+        if _basename(tokens[0]) in _INTERPRETERS:
+            script = next((t for t in tokens[1:] if not t.startswith("-")), None)
+            if script:
+                ops.add("script:" + _basename(script))
+    return ops
+
+
+def same_gate_operation(a: str, b: str) -> bool:
+    """Do *a* and *b* drive the same instrument?"""
+    return bool(gate_operation(a) & gate_operation(b))
+
+
+def prove_gate_superseded(gate: str, candidate: str, run) -> bool:
+    """Is *candidate* a working stand-in for a *gate* that cannot pass?
+
+    *run* is called as ``run(cmd) -> (ok, output)``.
+
+    Both are re-run at decision time rather than trusting the earlier
+    observations: the files have changed since, and a stale "it passed once"
+    is exactly the kind of evidence that lets a weak gate through. Accepting
+    a substitute is only safe while the original genuinely fails, so a gate
+    that has started passing is left completely alone.
+    """
+    if not gate or not candidate or gate.strip() == candidate.strip():
+        return False
+    if not same_gate_operation(gate, candidate):
+        return False
+    gate_ok, _ = run(gate)
+    if gate_ok:
+        return False        # the gate works — there is nothing to supersede
+    candidate_ok, _ = run(candidate)
+    return bool(candidate_ok)
