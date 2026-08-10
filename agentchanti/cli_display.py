@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import re
@@ -380,6 +381,11 @@ class CLIDisplay:
         self._spinner_stop = threading.Event()
         self._spinner_thread: threading.Thread | None = None
 
+        # Every rich stream proxy this display has ever installed. Draining
+        # only the current sys.stdout/sys.stderr is not enough — see
+        # _drain_live_proxies.
+        self._live_proxies: list = []
+
         if _RICH_AVAILABLE:
             _make_output_encoding_lenient()
             self._console = Console()
@@ -392,6 +398,14 @@ class CLIDisplay:
                 vertical_overflow="visible",
             )
             self._live.start()
+            self._track_live_proxies()
+            # Last line of defence. A proxy can be written to again *after*
+            # the display is finished (a tqdm bar holds the stream it
+            # captured at construction, not whatever sys.stderr is now), so
+            # a drain at finish() can be re-dirtied. atexit runs while the
+            # import system is still alive, which is precisely what the
+            # shutdown flush needs and no longer has.
+            atexit.register(self._drain_live_proxies)
         else:
             self._live = None
             self._console = None
@@ -428,12 +442,67 @@ class CLIDisplay:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_rich_proxy(stream) -> bool:
+        return type(stream).__module__.split(".")[0] == "rich"
+
+    def _track_live_proxies(self):
+        """Record the proxies ``Live.start()`` just installed.
+
+        Each start() wraps whatever the streams are *now*, so a
+        pause()/resume() cycle mints a fresh pair and detaches the old one.
+        Only the objects we captured here can be drained later by identity.
+        """
+        for stream in (sys.stdout, sys.stderr):
+            if self._is_rich_proxy(stream) and not any(
+                    s is stream for s in self._live_proxies):
+                self._live_proxies.append(stream)
+
+    def _drain_live_proxies(self):
+        """Empty every rich stream proxy while the interpreter is healthy.
+
+        In a terminal, ``Live.start()`` replaces sys.stdout/sys.stderr with
+        ``rich.file_proxy.FileProxy``, which buffers any write that does not
+        end in a newline — a progress bar's ``\\r`` updates, for instance.
+        FileProxy extends ``io.TextIOBase``, so ``io.IOBase.__del__`` closes
+        and therefore FLUSHES it during interpreter shutdown, where
+        ``console.print`` reaches ``rich_cast``'s function-level
+        ``from rich.console import RenderableType``. With sys.meta_path torn
+        down that import raises::
+
+            Exception ignored in: <rich.file_proxy.FileProxy object ...>
+            ImportError: sys.meta_path is None, Python is likely shutting down
+
+        Draining the *current* streams is not sufficient, which is how the
+        first attempt at this fix failed against a real run. A detached proxy
+        keeps receiving writes from anything that captured it earlier — tqdm
+        stores the stream handed to it at construction, so the KB embedder's
+        "Embedding symbols" bar keeps writing partial lines to a proxy that
+        stopped being sys.stderr several pause/resume cycles ago. Every proxy
+        we ever installed has to be drained, not just the live pair.
+
+        Two reasons this is worth fixing: the traceback is noise after a
+        SUCCESSFUL run, and noise on stderr is how people learn to stop
+        reading stderr — where real failures appear. And the buffered text is
+        genuine output that the throwing finalizer never delivers.
+        """
+        seen = list(self._live_proxies) + [sys.stdout, sys.stderr]
+        for stream in seen:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    # Back-compat alias for the earlier, narrower name.
+    _flush_live_proxies = _drain_live_proxies
+
     def pause(self):
         """Pause rendering for interactive prompts."""
         self._stop_spinner()
         with self._lock:
             self.paused = True
         if self._live:
+            self._drain_live_proxies()
             try:
                 self._live.stop()
             except Exception:
@@ -448,6 +517,9 @@ class CLIDisplay:
                 self._live.start()
             except Exception:
                 pass
+            # start() minted a fresh proxy pair; the previous pair is now
+            # detached but may still be written to by whoever captured it.
+            self._track_live_proxies()
         self.render()
 
     def render(self):
@@ -1084,6 +1156,11 @@ class CLIDisplay:
         """Show a final summary screen after pipeline completes."""
         self._stop_spinner()
         if self._live:
+            # Before the proxies are dropped — see _flush_live_proxies. This
+            # is the path the shutdown traceback was actually observed on:
+            # the run prints its report and "Committed!", exits, and the
+            # abandoned proxy raises from its finalizer.
+            self._drain_live_proxies()
             try:
                 self._live.stop()
             except Exception:
