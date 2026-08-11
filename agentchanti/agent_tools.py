@@ -332,12 +332,39 @@ class AgentTools:
 
     # ── Execution ──
 
-    def execute(self, call: ToolCall) -> str:
-        """Execute one tool call; always returns a string result."""
+    def execute(self, call: ToolCall,
+                allowed: "frozenset[str] | set[str] | None" = None) -> str:
+        """Execute one tool call; always returns a string result.
+
+        *allowed* is the set of tool names offered for this turn. A call to
+        anything outside it is refused rather than run.
+
+        Narrowing the offered tool list is not enough on its own: the loop
+        withholds the read-only tools when a model spends turn after turn
+        inspecting, but the model is free to ignore the list and ask anyway.
+        Observed on gpt-oss:120b-cloud — the offer dropped to three acting
+        tools and the next FOUR turns were still `read_file`, so a step
+        burned its whole budget on seven reads and zero writes before
+        escalating to a much more expensive model. The intervention had
+        silently done nothing.
+
+        The refusal comes back as an ordinary tool result, so the model
+        reads "this is disabled" and can act on it, which is the same
+        contract every other error here uses.
+        """
         handler = getattr(self, f"_tool_{call.name}", None)
+        # Unknown outranks withheld: a name this class has never had is a
+        # different mistake from one deliberately taken away this turn, and
+        # "disabled" would send the model looking for a way to re-enable it.
         if handler is None:
             names = ", ".join(t.name for t in self.definitions())
             return f"ERROR: unknown tool '{call.name}'. Available: {names}"
+        if allowed is not None and call.name not in allowed:
+            log.info("[AgentTools] refused withheld tool '%s' "
+                     "(offered: %s)", call.name, ", ".join(sorted(allowed)))
+            return (f"ERROR: '{call.name}' is disabled for this turn. "
+                    f"Available: {', '.join(sorted(allowed))}. "
+                    f"Use one of those to change something now.")
         try:
             return handler(**call.arguments)
         except TypeError as e:
@@ -346,10 +373,17 @@ class AgentTools:
             log.warning(f"[AgentTools] {call.name} failed: {e}")
             return f"ERROR: {call.name} failed: {e}"
 
-    def execute_all(self, calls: list[ToolCall]) -> list[Message]:
-        """Execute tool calls and wrap results as ``role="tool"`` messages."""
+    def execute_all(self, calls: list[ToolCall],
+                    allowed: "frozenset[str] | set[str] | None" = None
+                    ) -> list[Message]:
+        """Execute tool calls and wrap results as ``role="tool"`` messages.
+
+        *allowed* restricts which tools may run this turn; see :meth:`execute`.
+        Left as None every known tool runs, which is the behaviour for every
+        turn that withholds nothing.
+        """
         return [
-            Message(role="tool", content=self.execute(c),
+            Message(role="tool", content=self.execute(c, allowed=allowed),
                     tool_call_id=c.id, tool_name=c.name)
             for c in calls
         ]
