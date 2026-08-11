@@ -913,7 +913,21 @@ def run_agent_loop(
                 display.step_info(step_idx,
                                   f"Agent loop {turn}/{max_turns}: {names}")
             messages.append(response.to_message())
-            _tool_msgs = tools.execute_all(response.tool_calls)
+            # Enforce the narrowed offer. Withholding a tool from the list
+            # is only a request; a model that ignores it kept getting the
+            # tool executed anyway, so the intervention did nothing at all.
+            # Passing the offer through makes the refusal real.
+            #
+            # The final turn is deliberately NOT enforced. Tools are absent
+            # from that offer to prod a text summary, but a model that edits
+            # anyway may just have fixed the step — the gate runs after this
+            # block, so that late write can still turn the step green.
+            # Refusing it would throw away a working fix to enforce a
+            # formatting preference.
+            _allowed = ({d.name for d in tools_for_turn}
+                        if tools_for_turn is not None else None)
+            _tool_msgs = tools.execute_all(response.tool_calls,
+                                           allowed=_allowed)
             messages.extend(_tool_msgs)
             _repeated_cmd: str | None = None
             _repeated_out: str = ""
