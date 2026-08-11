@@ -37,6 +37,19 @@ class ProseExportsTest(unittest.TestCase):
             'test that runs hello_world.py and checks for "Hello World"',
             {"test_hello_world"}))
 
+    def test_no_exports_spelled_any_way_is_not_a_missing_symbol(self):
+        """A later run warned twice on `exports: (none)` — the planner
+        answering "nothing" instead of omitting the line, and the check
+        hunting for a symbol literally called "(none)"."""
+        for spec in ("(none)", "none", "None", "(None)", "n/a", "N/A",
+                     "-", "--", "()", "nothing", "no exports", "*"):
+            with self.subTest(spec=spec):
+                self.assertTrue(_export_satisfied(spec, {"main", "run"}))
+
+    def test_a_real_symbol_named_none_still_matches_exactly(self):
+        """The no-declaration check sits after the exact match for this."""
+        self.assertTrue(_export_satisfied("none", {"none", "other"}))
+
     def test_a_bare_name_that_is_genuinely_absent_still_warns(self):
         """The check must keep its teeth for the case it was built for."""
         self.assertFalse(_export_satisfied("startServer", {"app"}))

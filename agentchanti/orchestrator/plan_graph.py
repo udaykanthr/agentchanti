@@ -93,6 +93,28 @@ _AS_DEFAULT = re.compile(r"^(\S+)\s+as\s+default$", re.IGNORECASE)
 # Identifier-shaped words inside a prose export description.
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 
+# Ways a planner spells "this step exports nothing". The prompt says to omit
+# the line entirely, but models answer the question instead of skipping it.
+_NO_DECLARATION = frozenset({
+    "none", "n/a", "na", "nil", "null", "nothing", "noexports", "tbd",
+})
+
+
+def _declares_nothing(spec: str) -> bool:
+    """Is *spec* a way of saying "no exports" rather than a symbol name?
+
+    Observed as `exports: (none)` — both export warnings in an otherwise
+    clean run were that, hunting for a symbol literally called "(none)".
+    Punctuation and case are stripped so `(none)`, `None` and `-` all land
+    together; an empty result (a bare dash, `()`, `*`) counts too, since
+    there is no name in it to look for.
+
+    Checked only AFTER the exact-match test, so a file that really does
+    export something called `none` still matches it first.
+    """
+    cleaned = re.sub(r"[^\w/]+", "", spec or "").lower()
+    return not cleaned or cleaned in _NO_DECLARATION
+
 
 def _export_satisfied(spec: str, actual: set[str]) -> bool:
     """Does *actual* provide the declared export *spec*?
@@ -107,6 +129,11 @@ def _export_satisfied(spec: str, actual: set[str]) -> bool:
     """
     spec = (spec or "").strip()
     if not spec or spec in actual:
+        return True
+
+    # "no exports", spelled any of the ways a planner spells it. Deliberately
+    # after the exact match above, so a genuine symbol named `none` wins.
+    if _declares_nothing(spec):
         return True
 
     # "default Foo" / "Foo as default" — a default export that also has a
