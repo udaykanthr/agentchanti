@@ -912,7 +912,7 @@ def _progress_probe(g):
     # object keeps reporting a maze the game no longer plays on: progress
     # froze after the first death and read as +1 where the real figure was
     # 36. Under-reporting here is not cosmetic — zero is a FAIL.
-    holder_attrs = [None, "map", "maze", "board", "level", "grid"]
+    holder_attrs = [None, "map", "maze", "board", "level", "grid", "player"]
 
     def read(holder_attr, name):
         holder = g if holder_attr is None else getattr(g, holder_attr, None)
@@ -940,8 +940,10 @@ def _progress_probe(g):
     for holder_attr in holder_attrs:
         for name in ("pellets_remaining", "remaining_pellet_count",
                      "pellet_count", "pellets_left", "remaining_pellets",
+                     "remaining_collectibles", "collectibles_remaining",
+                     "dots_remaining",
                      "pellets", "collectibles", "collectible_tiles",
-                     "pellet_tiles"):
+                     "collectible_positions", "pellet_tiles"):
             if read(holder_attr, name) is not None:
                 return (label_of(holder_attr, name),
                         lambda h=holder_attr, n=name: read(h, n), -1)

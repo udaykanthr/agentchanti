@@ -190,6 +190,29 @@ class PlanNode:
         return os.path.basename(self.key)
 
 
+# Directories that hold INSTALLED code rather than planned output. A path
+# under one of these names a dependency the project consumes, never a
+# module the plan is building, so it must not make an import look
+# unresolvable. Kept deliberately short: a leading `env/` is a plausible
+# real source directory, so only the unambiguous virtualenv names and the
+# package roots themselves are listed.
+_DEPENDENCY_DIRS = frozenset({
+    "site-packages", "dist-packages", "node_modules", "vendor",
+    "__pypackages__", "bower_components",
+})
+_ENV_ROOTS = frozenset({"venv", ".venv", "virtualenv", ".virtualenv"})
+
+
+def _is_dependency_path(key: str) -> bool:
+    """True when *key* lives inside an installed-dependency tree."""
+    parts = [p for p in key.replace("\\", "/").split("/") if p]
+    if not parts:
+        return False
+    if any(part in _DEPENDENCY_DIRS for part in parts):
+        return True
+    return parts[0].lower() in _ENV_ROOTS
+
+
 class PlanGraph:
     """Resolution index over a plan's declared targets and exports."""
 
@@ -297,10 +320,19 @@ class PlanGraph:
         A plan targeting ``pacman_clone/src/config.py`` while its verify
         says ``from src.config import ...`` yields ``pacman_clone`` — the
         gate is unsatisfiable from the repo root, which is where it runs.
+
+        Installed dependencies are not planned targets. A CMD step that
+        declares ``produces: venv\\Lib\\site-packages\\pygame`` is naming
+        where pip put a third-party package, but the key still ends with
+        ``/pygame``, so every gate that imports pygame matched here and
+        was reported unsatisfiable. Observed twice: it discarded an
+        already-repaired gate and forced a full re-plan, once on the very
+        first run of a benchmark session and again on the most expensive
+        run of that session (253,706 tokens).
         """
         suffix = "/" + key
         for node_key in self._by_key:
-            if node_key.endswith(suffix):
+            if node_key.endswith(suffix) and not _is_dependency_path(node_key):
                 return node_key[: -len(suffix)]
         return None
 
