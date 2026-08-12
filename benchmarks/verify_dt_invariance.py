@@ -634,8 +634,14 @@ def _direction_values(Game):
     return encoders
 
 
+# Every name here was the ONLY input entry point on some artifact. The list
+# is append-only for a reason: `set_player_direction` was missing, so a
+# perfectly playable game reported "no input method visibly moved the
+# player" and lost its whole liveness result to a refusal.
 _SENDER_NAMES = ("queue_direction", "request_direction", "set_direction",
-                 "set_next_direction", "handle_input", "turn")
+                 "set_player_direction", "set_desired_direction",
+                 "set_next_direction", "change_direction", "move",
+                 "handle_input", "turn")
 
 
 def _senders(g):
