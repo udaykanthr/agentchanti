@@ -23,7 +23,9 @@ from collections import Counter
 from threading import Lock
 
 from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
+from ..executor import NO_OUTPUT_MARKER
 from ..llm.chat_types import Message, ToolCall
+from .gate_integrity import platform_equivalent_variants, record_gate_repair
 
 _logger = logging.getLogger(__name__)
 
@@ -490,6 +492,29 @@ def _py_signature_outline(source: str) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+def _missing_required(tools: AgentTools,
+                      required: set[str] | None) -> list[str]:
+    """Declared target files that are still absent from disk.
+
+    A pure file-existence check — no LLM call, no judgement. Paths that
+    escape the project root are ignored rather than raising: a malformed
+    `target:` line must not be able to hold a step open forever.
+    """
+    if not required:
+        return []
+    missing = []
+    for path in sorted(required):
+        if not path or not path.strip():
+            continue
+        try:
+            full = tools._resolve(path.strip())
+        except ValueError:
+            continue
+        if not os.path.exists(full):
+            missing.append(path.strip())
+    return missing
+
+
 def _preload_target_files(tools: AgentTools,
                           paths: list[str] | None,
                           full_paths: set[str] | None = None) -> str:
@@ -701,6 +726,7 @@ def run_agent_loop(
     context: str = "",
     preload_files: list[str] | None = None,
     preload_full_paths: set[str] | None = None,
+    required_files: set[str] | None = None,
     _recovery: bool = False,
     attempt_label: str = "first attempt",
 ) -> tuple[bool, str]:
@@ -714,6 +740,11 @@ def run_agent_loop(
       → ``(False, ...)`` — a step that changed nothing cannot have
       succeeded.
     - ``max_turns`` exhausted → ``(False, ...)``.
+
+    *required_files* are the step's plan-declared targets. While any of
+    them is missing the loop declines to exit EARLY on a green gate —
+    only that exit, so the guard can spend turns the step already had but
+    can never turn a passing step into a failing one.
 
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
@@ -792,8 +823,42 @@ def run_agent_loop(
     from .wave_snapshots import (describe_abnormal_exit, is_abnormal_exit,
                                  log_crash_diagnostics)
 
-    def _verify_once() -> str:
-        return tools.execute_all([_verify_call(verify_cmd)])[0].content
+    def _verify_once(cmd: str | None = None) -> str:
+        return tools.execute_all([_verify_call(cmd or verify_cmd)])[0].content
+
+    def _try_platform_variants(result: str) -> str:
+        """Re-run the gate under the other shell dialect's reading of it.
+
+        A gate is an instrument, and an instrument can be broken. When the
+        SAME command text means something different on POSIX than it does
+        under cmd.exe, a red verdict may be measuring the platform rather
+        than the code — observed on a run where the correct edit landed on
+        turn 1 and three separate recovery mechanisms then spent 24 turns
+        failing against a regex that could not match anything on Windows.
+
+        Only a variant that PASSES is believed: it proves the original was
+        unsatisfiable, because the two forms are the same text and differ
+        only in an escaping step one shell performs and the other does not.
+        A variant that also fails proves nothing and is discarded, leaving
+        the original verdict untouched.
+        """
+        nonlocal verify_cmd
+        for reason, variant in platform_equivalent_variants(verify_cmd):
+            variant_result = _verify_once(variant)
+            if not verify_passed(variant_result):
+                continue
+            record_gate_repair(verify_cmd, variant, reason)
+            _logger.warning(
+                "[AgentLoop] step %d: the gate FAILED as written but PASSES "
+                "under the %s reading of the identical command — treating "
+                "the gate, not the code, as the defect",
+                step_idx + 1, reason)
+            # Adopt the repaired form for the rest of this loop so the
+            # early gate and exit verification stop re-running a command
+            # already proven incapable of passing.
+            verify_cmd = variant
+            return variant_result
+        return result
 
     def _run_verify() -> str:
         result = _verify_once()
@@ -820,6 +885,12 @@ def run_agent_loop(
                                          verify_cmd,
                                          planned_files=preload_files)):
             result = _verify_once()
+        # Last, and only on a still-red verdict: the env self-heal above
+        # can turn a red gate green by fixing the environment, and asking
+        # "is the gate itself broken?" before that would spend a
+        # subprocess on a question already about to be answered.
+        if not verify_passed(result):
+            result = _try_platform_variants(result)
         return result
 
     def _gate_result() -> str:
@@ -871,7 +942,21 @@ def run_agent_loop(
                 display.step_info(step_idx,
                                   f"Agent loop {turn}/{max_turns}: {names}")
             messages.append(response.to_message())
-            _tool_msgs = tools.execute_all(response.tool_calls)
+            # Enforce the narrowed offer. Withholding a tool from the list
+            # is only a request; a model that ignores it kept getting the
+            # tool executed anyway, so the intervention did nothing at all.
+            # Passing the offer through makes the refusal real.
+            #
+            # The final turn is deliberately NOT enforced. Tools are absent
+            # from that offer to prod a text summary, but a model that edits
+            # anyway may just have fixed the step — the gate runs after this
+            # block, so that late write can still turn the step green.
+            # Refusing it would throw away a working fix to enforce a
+            # formatting preference.
+            _allowed = ({d.name for d in tools_for_turn}
+                        if tools_for_turn is not None else None)
+            _tool_msgs = tools.execute_all(response.tool_calls,
+                                           allowed=_allowed)
             messages.extend(_tool_msgs)
             _repeated_cmd: str | None = None
             _repeated_out: str = ""
@@ -962,10 +1047,13 @@ def run_agent_loop(
             if repeat_cmd_streak == _REPEAT_CMD_NUDGE_AT:
                 _is_env_cmd = bool(_ENV_CMD_RE.search(_repeated_cmd or "")
                                    or _ENV_ERROR_RE.search(_repeated_out))
+                _is_silent_failure = NO_OUTPUT_MARKER in _repeated_out
                 _logger.info("[AgentLoop] step %d: re-ran a failing command "
                              "unchanged — injecting fix-the-cause nudge%s",
                              step_idx + 1,
-                             " (environment variant)" if _is_env_cmd else "")
+                             " (environment variant)" if _is_env_cmd
+                             else " (silent-failure variant)"
+                             if _is_silent_failure else "")
                 if _is_env_cmd:
                     messages.append(Message(role="user", content=(
                         f"You already ran `{_repeated_cmd[:160]}` earlier in "
@@ -984,6 +1072,34 @@ def run_agent_loop(
                         "step would look finished while the functionality "
                         "stayed missing. If the dependency genuinely cannot "
                         "be installed here, say so plainly instead. "
+                        f"{max_turns - turn} turn(s) remain.")))
+                elif _is_silent_failure:
+                    # A silent failure is a different rut. "Read the error
+                    # and fix the source" is unactionable when there IS no
+                    # error text, and its certainty is sometimes simply
+                    # wrong: observed on a `node -e` gate whose regex was
+                    # mis-escaped for this platform, where the source was
+                    # already correct and every run printed nothing. The
+                    # model burned its turns guessing, then eventually
+                    # printed the conditions one by one and found them all
+                    # true — the right move, reached far too late.
+                    #
+                    # Ask for that evidence directly. Note this cannot be
+                    # used to dodge the step: the acceptance gate is run by
+                    # the harness, not by the model, so a model that talks
+                    # itself out of the work still does not finish.
+                    messages.append(Message(role="user", content=(
+                        f"You already ran `{_repeated_cmd[:160]}` earlier in "
+                        "this step and it failed the same way, producing NO "
+                        "output — so it has not told you what is wrong, and "
+                        "running it again cannot. Make the failure "
+                        "observable before assuming the source is at fault: "
+                        "run a version that prints each condition it checks "
+                        "separately, so you can see which one is actually "
+                        "false. If every condition it asserts turns out to "
+                        "be true, then the check itself is malformed rather "
+                        "than the code — say so explicitly and quote the "
+                        "output that shows it. Otherwise fix the source. "
                         f"{max_turns - turn} turn(s) remain.")))
                 else:
                     messages.append(Message(role="user", content=(
@@ -1017,6 +1133,34 @@ def run_agent_loop(
                     and (_dirty_since_gate or _self_gate is not None)):
                 _early = _gate_result()
                 if verify_passed(_early):
+                    _missing = _missing_required(tools, required_files)
+                    if _missing:
+                        # The gate can go green before the step is done. A
+                        # plan declaring `target: tests/__init__.py,
+                        # tests/test_map.py, tests/test_movement_invariants.py`
+                        # had the first two written; `python -m unittest -v`
+                        # passed on those alone, the loop exited at turn 3 of
+                        # 8, and the run was reported complete with the
+                        # adversarial test file — the whole point of the task
+                        # — never created. Declining to stop early is safe:
+                        # it can only spend turns the step already had, never
+                        # turn a passing step into a failure.
+                        _logger.info(
+                            "[AgentLoop] step %d: gate %r passes on turn "
+                            "%d/%d but %d declared target(s) do not exist "
+                            "yet (%s) — not exiting early",
+                            step_idx + 1, verify_cmd, turn, max_turns,
+                            len(_missing), ", ".join(_missing))
+                        messages.append(Message(role="user", content=(
+                            f"`{verify_cmd}` passes, but the step declares "
+                            "target file(s) that do not exist yet: "
+                            + ", ".join(_missing)
+                            + ". A green gate is not the same as a finished "
+                            "step — the gate cannot see a file you have not "
+                            "written. Create them now with the content the "
+                            "step describes. "
+                            f"{max_turns - turn} turn(s) remain.")))
+                        continue
                     _logger.info(
                         "[AgentLoop] step %d verified early on turn %d/%d "
                         "— gate %r passes, ending the loop instead of "
@@ -1045,6 +1189,16 @@ def run_agent_loop(
                              step_idx + 1, turn)
                 return _finish("verified", turn, (True, summary))
             if _variant_gate_ok():
+                # Tell the LEDGER too, or the step passes and the run
+                # still dies: the monotonic recheck re-runs the declared
+                # command, the malformed original fails exactly as it
+                # always did, and that reads as a regression. Observed —
+                # a gate with `&& npm run build` written INSIDE the
+                # `node -e "..."` string (a JS syntax error, unpassable by
+                # any code) was correctly recovered via the variant, then
+                # rechecked in its original form, declared a REGRESSION,
+                # and the whole wave was rolled back over working code.
+                record_gate_repair(verify_cmd, last_ok_cmd, "flag-variant")
                 _logger.info(
                     "[AgentLoop] step %d: gate command fails but the loop "
                     "ran a flag-variant of it successfully (%r) — "

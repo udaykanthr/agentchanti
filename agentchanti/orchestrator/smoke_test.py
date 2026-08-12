@@ -657,7 +657,9 @@ def _run_js_build_verification(memory, executor, coder, display,
     ok, out = executor.run_command(build_cmd, timeout=300, cwd=cwd)
     if ok:
         _logger.info("[SmokeTest] JS build passed")
-        return True, ""
+        return _verify_style_coupling(
+            memory, executor, coder, display, task, language, cfg,
+            project_dir)
 
     _logger.warning("[SmokeTest] JS build FAILED:\n%s", (out or "")[-1500:])
 
@@ -684,6 +686,75 @@ def _run_js_build_verification(memory, executor, coder, display,
         return False, f"Production build failing after recovery: {info[:500]}"
 
     return False, f"Production build failed: {(out or '')[-1000:]}"
+
+
+def _verify_style_coupling(memory, executor, coder, display, task,
+                           language, cfg, project_dir: str
+                           ) -> tuple[bool, str]:
+    """Do the classes the markup renders exist in the stylesheet?
+
+    Runs only after the build is green, because it answers a question the
+    build cannot: an unmatched CSS class is valid CSS, so a page whose
+    every element is unstyled compiles perfectly. Observed on four of six
+    consecutive runs of one project — once with 7 classes rendered and 0
+    styled, while a gate asserting eight structural properties of the
+    stylesheet passed on all eight, every one of them describing a
+    selector the markup never rendered.
+
+    The check refuses far more often than it fires (see
+    :mod:`.style_coupling`); a false accusation here would send a correct
+    run into a fix loop.
+    """
+    from .style_coupling import find_style_drift
+
+    try:
+        drift = find_style_drift(project_dir)
+    except Exception as exc:                       # never fail a run
+        _logger.debug("[SmokeTest] style-coupling check skipped: %s", exc)
+        return True, ""
+    if drift is None or not drift.broken:
+        if drift is not None:
+            _logger.info("[SmokeTest] Style coupling OK — every rendered "
+                         "class is defined")
+        return True, ""
+
+    _logger.warning("[SmokeTest] Style coupling BROKEN:\n%s", drift.describe())
+    print(f"  [SmokeTest] {len(drift.unstyled)} rendered class(es) have no "
+          f"stylesheet rule — those elements render unstyled.")
+
+    from .agent_loop import (
+        agent_loop_enabled, build_step_tools, run_recovery_loop,
+    )
+    llm_client = getattr(coder, "llm_client", None)
+    if not agent_loop_enabled(cfg, llm_client):
+        # Reported rather than silently accepted: the run is finished, so
+        # this is the last chance to say the page will look wrong.
+        return True, ""
+
+    # The same check, as a command, so the fix is held to the real thing
+    # rather than the model's opinion of it.
+    gate = (f"python -m agentchanti.orchestrator.style_coupling "
+            f"{project_dir or '.'}")
+    tools = build_step_tools(executor, memory, project_root=".")
+    recovered, info = run_recovery_loop(
+        llm_client, tools,
+        step_text=("Make the stylesheet and the markup agree on class "
+                   "names. Rename the CSS selectors to match what the "
+                   "components already render — do NOT rename the "
+                   "className values in the markup unless the component "
+                   "is clearly the wrong one."),
+        task=task,
+        error_info=drift.describe(),
+        display=_status_only(display, "Style coupling"),
+        step_idx=0, language=language,
+        max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+        verify_cmd=gate,
+        escalation_client=getattr(coder, "escalation_client", None))
+    if recovered:
+        _logger.info("[SmokeTest] Style coupling repaired: %s", info)
+        return True, ""
+    _logger.warning("[SmokeTest] Style coupling still broken: %s", info)
+    return True, ""      # advisory outcome — never fails an otherwise green run
 
 
 def run_smoke_verification(

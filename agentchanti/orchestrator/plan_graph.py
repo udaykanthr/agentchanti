@@ -88,6 +88,92 @@ def module_key(spec: str) -> str:
     return stem
 
 
+_DEFAULT_PREFIXED = re.compile(r"^default\s+(\S+)$", re.IGNORECASE)
+_AS_DEFAULT = re.compile(r"^(\S+)\s+as\s+default$", re.IGNORECASE)
+# Identifier-shaped words inside a prose export description.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+
+# Ways a planner spells "this step exports nothing". The prompt says to omit
+# the line entirely, but models answer the question instead of skipping it.
+_NO_DECLARATION = frozenset({
+    "none", "n/a", "na", "nil", "null", "nothing", "noexports", "tbd",
+})
+
+
+def _declares_nothing(spec: str) -> bool:
+    """Is *spec* a way of saying "no exports" rather than a symbol name?
+
+    Observed as `exports: (none)` — both export warnings in an otherwise
+    clean run were that, hunting for a symbol literally called "(none)".
+    Punctuation and case are stripped so `(none)`, `None` and `-` all land
+    together; an empty result (a bare dash, `()`, `*`) counts too, since
+    there is no name in it to look for.
+
+    Checked only AFTER the exact-match test, so a file that really does
+    export something called `none` still matches it first.
+    """
+    cleaned = re.sub(r"[^\w/]+", "", spec or "").lower()
+    return not cleaned or cleaned in _NO_DECLARATION
+
+
+def _export_satisfied(spec: str, actual: set[str]) -> bool:
+    """Does *actual* provide the declared export *spec*?
+
+    The two sides speak different vocabularies, and the mismatch was pure
+    noise: planners write ``exports: Footer, default Footer`` while the JS
+    extractor reports ``['Footer', 'default']``, so every run warned that
+    ``default Footer`` was missing from a file exporting exactly that.
+    Six-plus consecutive runs, never once correct — and a warning that is
+    always wrong is worse than none, because it trains the reader to skip
+    the line that will one day be right.
+    """
+    spec = (spec or "").strip()
+    if not spec or spec in actual:
+        return True
+
+    # "no exports", spelled any of the ways a planner spells it. Deliberately
+    # after the exact match above, so a genuine symbol named `none` wins.
+    if _declares_nothing(spec):
+        return True
+
+    # "default Foo" / "Foo as default" — a default export that also has a
+    # name. Either spelling in *actual* satisfies it.
+    m = _DEFAULT_PREFIXED.match(spec) or _AS_DEFAULT.match(spec)
+    if m:
+        return "default" in actual or m.group(1) in actual
+
+    # A bare name against a file whose ONLY export is the default. That
+    # shape is `function Foo() {}; export default Foo` — the default IS
+    # Foo, but the extractor flattens it to "default" and loses the name.
+    # Deliberately narrow: when the file exports other names and simply
+    # not this one, the warning still stands.
+    if actual == {"default"}:
+        return True
+
+    # The prompt asks for `exports: <Symbol1>, <Symbol2>`, but a weaker
+    # planner answers in English:
+    #
+    #     exports: main function that prints "Hello World" when executed
+    #
+    # The file DID export `main`. Comparing the whole sentence to the
+    # symbol set finds nothing, so a correct step was warned about — twice
+    # in one clean run, both wrong. Look for any identifier in the prose
+    # that the file really exports.
+    words = _IDENTIFIER_RE.findall(spec)
+    if any(w in actual for w in words):
+        return True
+
+    # Still prose, and nothing in it matched. A sentence is not a symbol
+    # reference, so there is no claim here that can be checked — and per
+    # this function's own history, a warning that cannot be right is worse
+    # than no warning. A bare name that is genuinely absent has no
+    # whitespace and still falls through to the warning below.
+    if len(words) > 1 or " " in spec:
+        return True
+
+    return False
+
+
 @dataclass
 class PlanNode:
     """One file the plan promises to produce."""
@@ -102,6 +188,29 @@ class PlanNode:
     @property
     def basename(self) -> str:
         return os.path.basename(self.key)
+
+
+# Directories that hold INSTALLED code rather than planned output. A path
+# under one of these names a dependency the project consumes, never a
+# module the plan is building, so it must not make an import look
+# unresolvable. Kept deliberately short: a leading `env/` is a plausible
+# real source directory, so only the unambiguous virtualenv names and the
+# package roots themselves are listed.
+_DEPENDENCY_DIRS = frozenset({
+    "site-packages", "dist-packages", "node_modules", "vendor",
+    "__pypackages__", "bower_components",
+})
+_ENV_ROOTS = frozenset({"venv", ".venv", "virtualenv", ".virtualenv"})
+
+
+def _is_dependency_path(key: str) -> bool:
+    """True when *key* lives inside an installed-dependency tree."""
+    parts = [p for p in key.replace("\\", "/").split("/") if p]
+    if not parts:
+        return False
+    if any(part in _DEPENDENCY_DIRS for part in parts):
+        return True
+    return parts[0].lower() in _ENV_ROOTS
 
 
 class PlanGraph:
@@ -211,10 +320,19 @@ class PlanGraph:
         A plan targeting ``pacman_clone/src/config.py`` while its verify
         says ``from src.config import ...`` yields ``pacman_clone`` — the
         gate is unsatisfiable from the repo root, which is where it runs.
+
+        Installed dependencies are not planned targets. A CMD step that
+        declares ``produces: venv\\Lib\\site-packages\\pygame`` is naming
+        where pip put a third-party package, but the key still ends with
+        ``/pygame``, so every gate that imports pygame matched here and
+        was reported unsatisfiable. Observed twice: it discarded an
+        already-repaired gate and forced a full re-plan, once on the very
+        first run of a benchmark session and again on the most expensive
+        run of that session (253,706 tokens).
         """
         suffix = "/" + key
         for node_key in self._by_key:
-            if node_key.endswith(suffix):
+            if node_key.endswith(suffix) and not _is_dependency_path(node_key):
                 return node_key[: -len(suffix)]
         return None
 
@@ -273,7 +391,8 @@ class PlanGraph:
             if not node.exports or not node.actual_exports:
                 continue
             actual = set(node.actual_exports)
-            missing.extend(s for s in node.exports if s not in actual)
+            missing.extend(s for s in node.exports
+                           if not _export_satisfied(s, actual))
         return missing
 
     # ── diagnostics ───────────────────────────────────────────────────

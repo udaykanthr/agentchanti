@@ -126,6 +126,15 @@ class TestVenvInterpreterIsPreserved:
         bin_dir.mkdir(parents=True)
         shim = bin_dir / "python.exe"
         shim.write_bytes(open(sys.executable, 'rb').read())
+        # A copied exe with no pyvenv.cfg beside it fails to start with
+        # "failed to locate pyvenv.cfg" whenever the SUITE itself is run
+        # from a venv — the copy then has no base installation to resolve
+        # against. Write a real one so the fixture works under both.
+        (bin_dir.parent / "pyvenv.cfg").write_text(
+            f"home = {os.path.dirname(sys._base_executable or sys.executable)}\n"
+            f"include-system-site-packages = false\n"
+            f"version = {'.'.join(map(str, sys.version_info[:3]))}\n",
+            encoding="utf-8")
 
         ex = Executor()
         ok, out = ex.run_command(

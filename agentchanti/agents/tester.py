@@ -13,7 +13,8 @@ class TesterAgent(Agent):
                 env_info: dict | None = None,
                 test_root: str | None = None,
                 pre_analysis_results: str | None = None,
-                test_command: str | None = None) -> str:
+                test_command: str | None = None,
+                target_files: list[str] | None = None) -> str:
         # Infer language from context file paths when not explicitly provided
         if language is None:
             file_paths = self._extract_file_paths(context)
@@ -103,13 +104,38 @@ Language: {lang_name}
             example_name = f"Example{test_suffix}{test_ext}"
         else:
             example_name = f"{fw.get('prefix', 'test_')}example{test_ext}"
-        prompt += f"""
+        # The plan's declared target outranks the framework convention.
+        # Without it this prompt showed an INVENTED example path built from
+        # `{test_dir}/{prefix}example`, so a plan asking for `test_hello.py`
+        # got `tests/test_hello_world.py` — a perfectly conventional name,
+        # and one the step's own gate (`pytest test_hello.py`) could never
+        # find. That step failed three diagnosis rounds and halted the run
+        # while `pytest tests/test_hello_world.py` passed each time.
+        _declared = [t for t in (target_files or []) if str(t).strip()]
+        if _declared:
+            _paths = "\n".join(f"#### [FILE]: {str(t).replace(chr(92), '/')}"
+                               for t in _declared)
+            _format_block = f"""
+OUTPUT FORMAT — write EXACTLY these file(s), using these EXACT paths:
+
+{_paths}
+```{lang_tag}
+// test code here
+```
+
+Those paths are what the step's acceptance command checks. Do NOT rename
+them, do NOT move them into another directory, and do NOT invent a
+different filename — a test that passes under a different path still
+fails the step."""
+        else:
+            _format_block = f"""
 OUTPUT FORMAT — for EACH test file, use EXACTLY this marker:
 
 #### [FILE]: {test_dir}/{example_name}
 ```{lang_tag}
 // test code here
-```
+```"""
+        prompt += f"""{_format_block}
 
 STRICT RULES:
 - The path after [FILE]: must be ONLY the file path, nothing else.

@@ -235,6 +235,45 @@ class TestRunAgentLoop(AgentLoopTestCase):
         with open(os.path.join(self.root, "a.txt"), "w") as f:
             f.write("data")
 
+    # -- repeated failing command: silent vs. diagnosable --------------
+    # "Read the error and fix the source" is unactionable when there IS
+    # no error text, and its certainty is sometimes simply wrong: a gate
+    # mis-escaped for the platform failed silently on correct code, and
+    # the model spent its whole budget looking for a defect in a file
+    # that never had one.
+
+    _SILENT_OUT = ("Command `node -e \"x\"` exited with code 1 "
+                   "but produced no output.\nPossible causes:\n"
+                   "- The command crashed before it could produce output")
+
+    def _repeat_cmd_run(self, output):
+        self.executor.run_command.return_value = (False, output)
+        cmd = _tool_response(ToolCall(name="run_command",
+                                      arguments={"command": 'node -e "x"'},
+                                      id="r"))
+        llm = self._llm(cmd, cmd, _final("done"))
+        run_agent_loop(llm, self.tools, "step", "task", max_turns=5)
+        return "\n".join(m.content for call in llm.chat.call_args_list
+                         for m in call[0][0] if m.role == "user")
+
+    def test_silent_repeated_failure_asks_for_evidence(self):
+        prompts = self._repeat_cmd_run(self._SILENT_OUT)
+        self.assertIn("producing NO output", prompts)
+        self.assertIn("prints each condition it checks", prompts)
+        # It may conclude the CHECK is wrong — but only with evidence.
+        self.assertIn("quote the output that shows it", prompts)
+        # And it must not be told the opposite in the same breath.
+        self.assertNotIn("the failure is in the code", prompts)
+
+    def test_diagnosable_repeated_failure_keeps_the_original_nudge(self):
+        # There IS an error to read here, so pointing at the source is
+        # right — the softer wording must not leak into this case.
+        prompts = self._repeat_cmd_run(
+            "Traceback (most recent call last):\n"
+            "  File \"app.py\", line 2\nNameError: name 'x' is not defined")
+        self.assertIn("the failure is in the code", prompts)
+        self.assertNotIn("producing NO output", prompts)
+
     def test_preload_injects_existing_target_file_into_opening_message(self):
         with open(os.path.join(self.root, "app.py"), "w") as f:
             f.write("def existing():\n    return 42\n")

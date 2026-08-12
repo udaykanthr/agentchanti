@@ -1131,7 +1131,7 @@ def _main_impl():
             from .plan_step import (
                 parse_structured_plan, is_structured_plan, validate_plan,
                 fix_nested_workspace_collision,
-                fix_import_dependencies, check_gate_quality,
+                fix_import_dependencies, project_file_reader, check_gate_quality,
                 check_gate_consistency, repair_verify_commands,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
@@ -1155,12 +1155,70 @@ def _main_impl():
                     ws_fixes = fix_nested_workspace_collision(plan_steps_parsed)
                     if ws_fixes:
                         log.info(f"[Plan] Auto-fixed workspace collision: {ws_fixes}")
-                    dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                    dep_fixes = fix_import_dependencies(plan_steps_parsed, read_file=project_file_reader)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                     blind_fixes = route_blind_edits(plan_steps_parsed)
                     if blind_fixes:
                         log.info(f"[Plan] Blind-edit routing: {blind_fixes}")
+
+                    # ── Target reachability ──
+                    # A gate can assert seven true things about a file the
+                    # application never loads. Observed: `src/App.css` was
+                    # imported by nothing (main.jsx loads only index.css),
+                    # so repeated "restyle the header" runs wrote a full
+                    # dark palette into a file Vite never bundled — twelve
+                    # `.site-header` rules in the source, one in the built
+                    # CSS, and no visible change across many runs while
+                    # every check stayed green.
+                    #
+                    # This replans rather than merely warning. It was
+                    # advisory for exactly one run, on the grounds that
+                    # the right repair varies — and that run proved the
+                    # point the wrong way round: the warning fired
+                    # correctly, nothing consumed it, the step edited the
+                    # dead file anyway, every gate went green and the UI
+                    # was unchanged for the fourth time. An advisory
+                    # nobody acts on is indistinguishable from silence.
+                    _reach_gaps: list[tuple[str, str]] = []
+                    try:
+                        from .reachability import unreachable_stylesheet_reason
+                        for _s in plan_steps_parsed:
+                            _why = unreachable_stylesheet_reason(
+                                _s, plan_steps_parsed, project_file_reader)
+                            if _why:
+                                _reach_gaps.append((_s.id, _why))
+                    except Exception as _reach_exc:      # never fail a run
+                        log.debug("[Plan] reachability check skipped: %s",
+                                  _reach_exc)
+
+                    if _reach_gaps and plan_attempt < MAX_PLAN_RETRIES:
+                        log.warning(
+                            "[Plan] %d step(s) target a file the app never "
+                            "loads — replanning: %s", len(_reach_gaps),
+                            ", ".join(sid for sid, _ in _reach_gaps))
+                        display.show_status(
+                            "Plan targets an unloaded stylesheet, retrying...")
+                        planner_context += (
+                            "\n\n[PLANNER CORRECTION] These steps edit a file "
+                            "the application never loads, so their work "
+                            "cannot reach the browser — the tests, the build "
+                            "and the smoke test will all still pass:\n"
+                            + "\n".join(f"  - step {sid}: {why}"
+                                        for sid, why in _reach_gaps)
+                            + "\n\nFix the TARGET, not the verify command. "
+                            "Either retarget the stylesheet the entry point "
+                            "actually imports, or add an explicit step that "
+                            "imports this one and declare that dependency. "
+                            "Re-emit the COMPLETE plan.")
+                        continue
+                    if _reach_gaps:
+                        log.warning(
+                            "[Plan] Proceeding after %d attempt(s) with %d "
+                            "step(s) targeting an unloaded file — their "
+                            "changes will not be visible: %s",
+                            MAX_PLAN_RETRIES, len(_reach_gaps),
+                            ", ".join(sid for sid, _ in _reach_gaps))
 
                     # ── Acceptance-gate quality ──
                     # A CODE step whose verify: only imports the module
@@ -1243,7 +1301,7 @@ def _main_impl():
                         f"[Plan] Heuristic parser extracted {len(heuristic_steps)} "
                         f"steps from non-standard format"
                     )
-                    dep_fixes = fix_import_dependencies(heuristic_steps)
+                    dep_fixes = fix_import_dependencies(heuristic_steps, read_file=project_file_reader)
                     if dep_fixes:
                         log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                     plan_steps_parsed = heuristic_steps
@@ -1390,7 +1448,7 @@ def _main_impl():
                 if is_structured_plan(plan):
                     plan_steps_parsed = parse_structured_plan(plan)
                     if plan_steps_parsed:
-                        dep_fixes = fix_import_dependencies(plan_steps_parsed)
+                        dep_fixes = fix_import_dependencies(plan_steps_parsed, read_file=project_file_reader)
                         if dep_fixes:
                             log.info(f"[Plan] Auto-fixed import dependencies: {dep_fixes}")
                         raw_steps = steps_as_text_list(plan_steps_parsed)

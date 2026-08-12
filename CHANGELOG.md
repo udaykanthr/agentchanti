@@ -6,9 +6,270 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
-Two defects found by a fourth A/B iteration over the Pac-Man task, where
-both modes passed and both artifacts held every wall invariant under an
-independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
+### Fixed
+
+- **A gate that cannot pass on this platform no longer fails the step.**
+  `verify_passed` already encoded "exit 0 is not proof"; this adds the
+  mirror — exit 1 is not proof either, because a gate can be an invalid
+  instrument rather than a failing test.
+
+  Observed on a React/Vite run. The planner declared a `node -e` gate
+  whose regex was double-escaped (`[\\s\\S]` rather than `[\s\S]`). Under
+  a POSIX shell the quoting collapses one level of backslashes before
+  node sees them and the regex means "any character"; under `cmd.exe`
+  there is no such collapsing, so node compiled a character class
+  matching a literal backslash, `s` or `S`. Identical plan text was
+  therefore satisfiable on Linux and unsatisfiable on Windows. The CSS
+  edit was correct on the first turn, but the primary loop, the
+  escalation to a stronger model and the recovery loop all grade against
+  that one command — so a single broken gate defeated all three at once:
+  24 turns, ~182k tokens, and a failed run on working code. The escalated
+  model even proved the gate wrong by printing each sub-condition, and
+  had nowhere to put the finding.
+
+  On a still-red verdict the loop now re-runs the gate once under the
+  other shell dialect's reading of the *identical text*. Only a variant
+  that PASSES is believed — that proves the original was unsatisfiable,
+  since the two forms differ solely by an escaping step one shell
+  performs and the other does not. A variant that also fails proves
+  nothing and leaves the original verdict untouched, so genuinely broken
+  code still fails. The repair is recorded and reused when the monotonic
+  ledger re-checks the gate, which would otherwise re-run the form
+  already shown incapable of passing and report a regression on unchanged
+  code.
+
+  Deliberately narrow: variants come from one whitelisted pure transform,
+  are never authored by a model, and are never semantically different
+  commands. A looser rule would be a machine for manufacturing false
+  greens — mutate the gate until something passes — which is precisely
+  what this project's verification layers exist to prevent. The check is
+  language-agnostic by construction: it tests behaviour rather than
+  parsing a payload, so it covers `python -c`, `node -e`, `ruby -e` and
+  anything else equally. (A syntax check could not have caught this one:
+  the broken payload is valid JavaScript.)
+
+- **A log file is created only when there is something to log.**
+  `setup_logger()` runs at module scope, so *any* import of the package
+  opened a timestamped log — including short-lived subprocess utilities
+  that never write a line. The style-coupling gate made this visible by
+  running `python -m agentchanti...` once per check: a single run left
+  ten zero-byte files beside its real 47 KB log, cluttering exactly the
+  directory someone opens to find out what happened. The handler now
+  defers opening its file until the first record.
+
+- **Markup and stylesheet are checked for agreement on class names.**
+  Two files can each be individually correct and jointly wrong. A
+  component step writes `site-footer__content`; a stylesheet step in the
+  same wave, unable to see it, writes `.site-footer__inner`. Both gates
+  pass, the suite passes, the production build passes — an unmatched CSS
+  class is still valid CSS — and the page renders unstyled.
+
+  Four of six consecutive runs on one project drifted this way, once
+  completely (7 classes rendered, 0 styled). The decisive case had a gate
+  asserting eight structural properties of the stylesheet — background,
+  colour, max-width container, grid, hover, divider, flex utility row,
+  responsive stacking. All eight were true; all eight described selectors
+  the markup never rendered. No single-file assertion can catch this,
+  because neither file is wrong on its own — only the join is.
+
+  Runs after the build is green, since it answers what the build cannot,
+  and is held to the same check re-run as a command so a repair is
+  verified rather than believed. Only "rendered but never defined" counts
+  as a defect; orphaned rules are reported as the explanation, never as
+  the failure. Refuses rather than guesses whenever the answer is
+  unclear — a utility or component framework in the dependencies, Sass
+  nesting, CSS Modules, or a dynamic `className` — because a false
+  accusation sends a correct run into a fix loop.
+
+- **A self-locating suite gate is no longer given the sub-project cwd too.**
+  BulkTest's preflight runs the plan-declared gate before substituting the
+  framework default. It passed `cwd=<subproject>` unconditionally — so a
+  gate that already opens with its own `cd` had the prefix applied twice:
+  `cd react-home && npm test -- --run` launched from `react-home/` looked
+  for `react-home/react-home`, and cmd.exe answered "The system cannot
+  find the path specified" with exit 1.
+
+  The result was a spurious `Plan-declared gate did not pass`, demoting a
+  perfectly good gate to the framework runner — precisely the substitution
+  this preflight exists to prevent. Every other caller ran the identical
+  command from the repo root and it passed. The test mirrors the one
+  `_gate_on_declared_verify` already uses before ADDING such a prefix, so
+  the two cannot disagree about what "self-locating" means.
+
+- **A step targeting a file the application never loads is reported.**
+  A gate can assert seven true things about a file that is not in the
+  build, and every check downstream will agree the step went fine: the
+  tests render components rather than styles, the build does not error on
+  a file it never bundles, and the smoke test only proves the build
+  succeeded.
+
+  Observed on a Vite/React project. `src/main.jsx` carried the app's only
+  stylesheet import (`./index.css`) while `src/App.jsx` imported no CSS
+  at all, so the scaffold's leftover `src/App.css` was never bundled.
+  Successive "restyle the header" runs targeted it and wrote twelve
+  `.site-header` rules including a full dark palette; the built bundle
+  contained one. Nothing in the browser changed across many runs.
+
+  Stylesheets only, and only where reachability can be established: a CSS
+  file no entry point can reach is inert by construction, which is a fact
+  about the module graph rather than a heuristic. The same claim about a
+  JS module is far weaker — dynamic import, lazy routes,
+  `import.meta.glob` — so it is deliberately not made. A file the plan
+  itself intends to wire up is not an orphan, and anything ambiguous is
+  not judged.
+
+  It replans rather than merely warning. It shipped advisory for exactly
+  one run, on the reasoning that the right repair varies between
+  retargeting and adding the import — and that run settled the question
+  the other way: the warning fired correctly, nothing consumed it, the
+  step edited the dead file anyway, every gate went green, and the
+  interface was unchanged for the fourth time. An advisory nobody acts on
+  is indistinguishable from silence. The correction tells the planner to
+  fix the TARGET rather than the verify command, since the gate is not
+  what is wrong.
+
+- **A gate that cannot observe its own step's file is rejected.**
+  `shallow_gate_reason` clears any command matching a test runner, on the
+  reasonable ground that a suite asserts real behaviour — but a suite only
+  asserts what it can reach, and a stylesheet is not reachable. No CSS
+  edit can turn `npm test` red.
+
+  Observed: a step briefed to add a whole footer layout — brand area,
+  navigation grid, legal row, responsive breakpoints — was gated on
+  `cd react-home && npm test -- --run`. It deleted two words from a
+  selector, wrote no footer styling at all, and passed on turn 2. The
+  markup shipped with eight classes and not one of them styled, while the
+  suite, the build and the smoke test were all green, because none of
+  them could see the difference.
+
+  Deliberately narrow: flagged only when EVERY target is a stylesheet AND
+  the gate is nothing but a runner invocation. A gate that also asserts
+  something about the file is fine, and any step touching executable code
+  is left alone.
+
+- **The export-promise warning stopped crying wolf.** Planners spell a
+  default export `default Footer`; the JavaScript extractor reports
+  `['Footer', 'default']`. Comparing the two literally warned that
+  `default Footer` was missing from a file exporting precisely that — on
+  every run for a week, never once correctly. The bare-name form is also
+  reconciled against a file whose only export is the default, which is
+  the same symbol with the name flattened away. A genuinely absent export
+  is still reported.
+
+- **A malformed `node -e` gate is rejected at plan time, not paid for.**
+  `unrunnable_gate_reason` already refused a `python -c` gate whose
+  payload could not be parsed; JavaScript payloads went unchecked. The
+  same defect in the other language therefore cost a whole run: a plan
+  put `&& npm --prefix react-home run build` INSIDE the quoted script,
+  which is a syntax error, and the failure only surfaced after the loop,
+  an escalation and a recovery had each spent their turn budget against
+  it. Rejected at plan time it costs one replan instead.
+
+  Dispatch is a table of payload-kind → checker, so a further language is
+  a row rather than a branch. Silence is the safe answer throughout: no
+  node on PATH, a timeout, or any other surprise means "not judged",
+  never "rejected", because a false rejection replans a plan that was
+  fine.
+
+- **A valid gate using escaped quotes is no longer called unrunnable.**
+  The payload is captured from between the command's quotes, so a `\"`
+  written for the shell is still backslash-quote in the capture while the
+  interpreter receives a plain `"`. Checking the raw text reported good
+  gates as broken — verified for both
+  `python -c "... open(\"p.json\") ..."` and its JS equivalent — sending
+  the planner off to rewrite a command that was never at fault. A
+  latent false positive in the existing Python check, found while adding
+  the JavaScript one.
+
+- **A gate accepted via an equivalent form is now recorded that way.**
+  The loop had two ways to satisfy a gate that no correct work could
+  pass — the platform re-reading above, and the older flag-variant escape
+  hatch — but only one of them told the monotonic ledger. The other
+  passed the step and then let the ledger re-run the *original*, which
+  failed exactly as it always had, which read as a regression.
+
+  Observed: a plan wrote `&& npm --prefix react-home run build` INSIDE
+  the `node -e "..."` string, making the payload a JavaScript syntax
+  error that no code could satisfy. The loop diagnosed it, ran the
+  correct form, and recovered the step — then the ledger rechecked the
+  malformed original, reported `REGRESSION`, rolled the wave back and
+  failed the run. The work had been correct for two minutes.
+
+  The resolution now happens in `_record_passed_gate`, the single
+  chokepoint every path funnels through (loop, recovery, classic),
+  rather than at individual call sites where it could drift.
+
+- **A step's real imports now outrank the planner's `imports:` line.**
+  `imports:` is the planner's opinion and it is optional, yet two
+  mechanisms read only that declaration. When a step editing an existing
+  file declared `imports: none`, both failed at once:
+  `fix_import_dependencies` added no edge, so producer and consumer
+  landed in the same wave and ran *concurrently*; and
+  `build_step_context` injected no sibling, so neither could see the
+  other even if it had wanted to.
+
+  Observed: `src/App.jsx` — whose first line is `import './App.css'` —
+  and `src/App.css` were both declared `imports: none`, scheduled as
+  `[[0, 1]]`, and written in parallel. The markup used
+  `site-footer__nav-title` while the stylesheet defined
+  `site-footer__heading`: 3 of 8 classes unstyled and 6 CSS rules
+  matching nothing. Tests and the build both passed, because unmatched
+  CSS classes are still valid CSS, and the string-presence acceptance
+  gates checked each file in isolation.
+
+  Two fixes, both deterministic. `_resolve_import_to_file` now takes the
+  importing file, so a relative specifier resolves at all — `./App.css`
+  inside `src/App.jsx` means `src/App.css`, which nothing could know
+  without the importer's directory (and which the existing
+  `.replace(".", "/")` branch mangled into `//App/css`). And plan fixing
+  now derives edges from the files themselves, consulting only files that
+  already exist — for a file the run is about to create there is nothing
+  to read, and the declared imports remain the only signal.
+
+- **Hoisting a scaffold no longer leaves a second copy of the project.**
+  `move dir\*` on Windows moves files but *not* subdirectories, so the
+  standard hoist an agent writes after scaffolding —
+  `npm create vite@latest scaffold -- --template react` followed by
+  `move scaffold\* . && ... && rmdir scaffold` — silently left `src\` and
+  `public\` behind. The `rmdir` then failed with "The directory is not
+  empty" (exit 1) and the run carried on with two copies of every
+  component. Seen twice in one afternoon: a leftover
+  `vite-react-scaffold\` and a nested `home_page\home_page\`.
+
+  The cost is not just clutter. Both orphan trees were indexed, so
+  semantic search served later steps a stale duplicate of the very file
+  they were editing, and the project scan reported 17 files where 11
+  existed. The rewrite now adds a subdirectory pass, and leaves the
+  (emptied) source directory in place because a later segment of the same
+  chained command routinely still refers to it.
+
+  Grouped in parentheses, which is load-bearing: ungrouped, a caller's
+  trailing `&& rmdir scaffold` binds to the `for` body rather than to the
+  rewrite as a whole, so it runs only when a subdirectory happens to
+  exist and silently does nothing — with exit 0 — when the directory is
+  flat.
+
+- **A command that fails silently is no longer met with "fix the code".**
+  The repeated-failing-command nudge told the model *"the failure is in
+  the code, not in how the command is invoked. Read the error above."*
+  When the command produced no output there is no error to read, so the
+  advice was unactionable — and its certainty was sometimes simply wrong,
+  as in the mis-escaped gate above, where the source had been correct
+  since the first turn. In that run the model eventually printed the
+  check's conditions one at a time and found every one of them true; that
+  was the right move, reached far too late.
+
+  A silent repeated failure now asks for that evidence directly: make the
+  failure observable, run a form that prints each condition separately,
+  and if all of them hold say so and quote the output. The original
+  wording is unchanged whenever there *is* an error to read. This cannot
+  be used to dodge a step — the acceptance gate is run by the harness,
+  not by the model, so talking itself out of the work still does not
+  finish it.
+
+Two further defects found by a fourth A/B iteration over the Pac-Man task,
+where both modes passed and both artifacts held every wall invariant under
+an independent drive (fixed 1/60, jittery, hostile, and dt=1.0). Neither
 defect broke the run — both quietly made it more expensive.
 
 ### Fixed

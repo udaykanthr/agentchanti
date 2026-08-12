@@ -6,6 +6,35 @@ import subprocess
 from typing import Dict, List, Tuple
 from .cli_display import log
 
+# Substituted for a failing command's empty output. A silent failure says
+# nothing the caller can act on, so consumers key off this to react to
+# "undiagnosable" rather than re-reading an error that is not there.
+NO_OUTPUT_MARKER = "but produced no output"
+
+# Appended when a command DIED — twice — instead of reporting a verdict.
+# "Failed" and "crashed" are different facts: the first is evidence about
+# the code, the second is evidence about nothing. Consumers that would
+# otherwise record a regression key off this to stay undecided.
+CRASHED_MARKER = "[process terminated abnormally — no verdict]"
+
+
+def _crash_helpers():
+    """Lazily fetch the abnormal-exit helpers from ``wave_snapshots``.
+
+    That module is stdlib-only, but *reaching* it executes
+    ``orchestrator/__init__``, which imports this one — so a module-level
+    import is circular. Deferring to call time (the same thing ``pipeline``
+    does at its own crash guards) breaks the cycle. If the import fails for
+    any reason the predicate degrades to "never abnormal", which preserves
+    today's behaviour rather than silently swallowing real failures.
+    """
+    try:
+        from .orchestrator.wave_snapshots import (  # noqa: PLC0415
+            describe_abnormal_exit, is_abnormal_exit, log_crash_diagnostics)
+        return is_abnormal_exit, describe_abnormal_exit, log_crash_diagnostics
+    except Exception:                                  # pragma: no cover
+        return (lambda _code: False), (lambda _code: ""), (lambda *_a: None)
+
 
 class Executor:
     def __init__(self):
@@ -480,6 +509,62 @@ class Executor:
                 return False
         return True
 
+    # `cat <<'EOF' > path` / `cat > path <<EOF`, closed by the delimiter on
+    # its own line. Anchored at the start of the block: a heredoc appearing
+    # later is content being discussed, not a wrapper around the whole file.
+    _HEREDOC_WRITE_RE = re.compile(
+        r'\A\s*(?:cat|tee)\b[^\n]*?<<-?\s*[\'"]?(?P<delim>[A-Za-z_]\w*)[\'"]?'
+        r'[^\n]*\n(?P<body>.*?)^[ \t]*(?P=delim)[ \t]*$',
+        re.DOTALL | re.MULTILINE)
+
+    # The opener alone. A response cut at the output-token cap loses its
+    # closing delimiter, and dropping just the recipe line still keeps the
+    # `cat <<` out of the source; whatever remains is then judged by the
+    # ordinary syntax check, which is what catches the truncation itself.
+    _HEREDOC_OPENER_RE = re.compile(
+        r'\A\s*(?:cat|tee)\b[^\n]*?<<-?\s*[\'"]?[A-Za-z_]\w*[\'"]?[^\n]*\n')
+
+    # Shell targets may legitimately CONTAIN a heredoc, so never unwrap them.
+    _SHELL_SUFFIXES = (".sh", ".bash", ".zsh", ".ksh", ".fish")
+
+    @staticmethod
+    def _unwrap_shell_file_write(block: str, target: str) -> str:
+        """Return the heredoc body when *block* is a shell recipe writing a file.
+
+        A model asked for code sometimes answers with the *command* that
+        creates it::
+
+            cat <<'EOF' > hello_world.py
+            print("Hello World")
+            EOF
+
+        Attributed to the step's only target, those wrapper lines are written
+        into the .py file verbatim. The syntax check above cannot catch it,
+        because `cat <<'EOF' > hello_world.py` is VALID Python — a left-shift
+        followed by a comparison — so it parses cleanly and only fails at
+        import with `NameError: name 'cat' is not defined`. Observed on a
+        local model: three diagnosis attempts and a halted run over a
+        one-line hello world that was correct inside the heredoc all along.
+
+        Unwrapping keeps the body the model actually meant. Shell targets are
+        left alone: a .sh file may legitimately contain a heredoc.
+        """
+        if not block or target.lower().endswith(Executor._SHELL_SUFFIXES):
+            return block
+        match = Executor._HEREDOC_WRITE_RE.search(block)
+        if match:
+            body = match.group("body")
+        else:
+            opener = Executor._HEREDOC_OPENER_RE.match(block)
+            if not opener:
+                return block
+            body = block[opener.end():]
+        if not body.strip():
+            return block          # empty heredoc — nothing better to offer
+        log.info("[Executor] Unwrapped a shell heredoc that wrapped '%s' — "
+                 "writing the file body, not the `cat <<` recipe", target)
+        return body
+
     @staticmethod
     def parse_blocks_for_single_target(text: str, target: str) -> Dict[str, str]:
         """Attribute an unlabelled code block to the step's only target.
@@ -513,12 +598,21 @@ class Executor:
             tail = re.split(r"```(?:[a-zA-Z0-9_+\-]*)\n", text)[-1]
             if tail.strip():
                 blocks.append(tail)
-        blocks = [b for b in blocks if b.strip()]
-        if not blocks:
+        # Before sizing them up: a block may be a shell recipe wrapping the
+        # real file body, and the wrapper is not part of the file.
+        unwrapped = [(Executor._unwrap_shell_file_write(b, target), b)
+                     for b in blocks]
+        candidates = [(body, body != original)
+                      for body, original in unwrapped if body.strip()]
+        if not candidates:
             return {}
-        best = max(blocks, key=len)
-        # A couple of lines is a fragment being discussed, not a file.
-        if len(best.strip().splitlines()) < 3:
+        best, was_unwrapped = max(candidates, key=lambda c: len(c[0]))
+        # A couple of lines is a fragment being discussed, not a file — but
+        # only when we are guessing. A heredoc named the file explicitly, so
+        # its body is a file however short it is; applying the fragment rule
+        # there would reject the very content the unwrap recovered (a
+        # two-line hello world, in the run that prompted this).
+        if not was_unwrapped and len(best.strip().splitlines()) < 3:
             return {}
         # Never write source that cannot parse. A truncated block is the
         # common case here, and half a module is worse than none: it
@@ -1179,6 +1273,39 @@ class Executor:
         if m:
             return f'move /Y "{m.group(1)}" "{m.group(2)}"'
 
+        # move dir\* dst → ALSO relocate dir's subdirectories.
+        #
+        # Not a Unix translation but a Windows-native repair, because
+        # `move dir\*` silently moves only FILES. The standard scaffold
+        # hoist —
+        #
+        #   npm create vite@latest scaffold -- --template react
+        #   move scaffold\* . && ... && rmdir scaffold
+        #
+        # therefore leaves `src\` and `public\` behind, the `rmdir` fails
+        # with "The directory is not empty", and the run continues with
+        # TWO copies of every component. Observed twice: a leftover
+        # `vite-react-scaffold\` and a nested `home_page\home_page\`, both
+        # of which were then indexed, so semantic search served steps a
+        # stale duplicate of the file they were editing.
+        #
+        # The source directory is deliberately left in place (empty)
+        # rather than deleted: these commands are chained, and a later
+        # segment of the SAME command line routinely still refers to it
+        # (`type scaffold\.gitignore >> .gitignore && rmdir scaffold`).
+        #
+        # Parenthesised so the two halves stay ONE command. Without the
+        # group, a caller's trailing `&& rmdir scaffold` binds to the FOR
+        # BODY instead of to the rewrite as a whole, so it runs only when
+        # a subdirectory happened to exist — and silently does nothing,
+        # with exit 0, when the directory was flat.
+        m = re.match(r'^move\s+((?:/[a-zA-Z]\s+)*)([^\s"]+)[\\/]\*\s+(\S+)$',
+                     cmd, re.IGNORECASE)
+        if m:
+            flags, src, dst = m.group(1), m.group(2), m.group(3)
+            return (f'(move {flags}{src}\\* {dst} & '
+                    f'for /d %i in ({src}\\*) do @move {flags}"%i" {dst})')
+
         # chmod → no-op on Windows
         if re.match(r'^chmod\s+', cmd):
             return 'echo chmod skipped >nul'
@@ -1370,13 +1497,79 @@ class Executor:
 
     def run_command(self, cmd: str, env: dict | None = None,
                     timeout: int = 120, background: bool = False,
-                    cwd: str | None = None) -> Tuple[bool, str]:
+                    cwd: str | None = None,
+                    retry_on_crash: bool = True) -> Tuple[bool, str]:
+        """Run a shell command, retrying once if the process CRASHED.
+
+        A process that dies never reported a verdict, so believing its exit
+        status is a category error — on Windows a pygame/SDL suite
+        fast-fails (0xC0000409) or access-violates (0xC0000005) in a
+        substantial fraction of invocations, printing ordinary-looking test
+        output first. Read as a result, that green suite becomes "the tests
+        regressed" and a correct file gets rolled back.
+
+        The pipeline already knew this and hand-rolled the same
+        detect-log-retry block at four call sites (``GateLedger.recheck``,
+        the BulkTest plan gate, the BulkTest runner, ``AgentLoop._run_verify``
+        — whose comment records it as having been *missing* there until
+        someone hit it). Copy-paste coverage leaves every site the author
+        did not think of unprotected, and an audit found 31 further
+        test/gate invocations without the guard, including re-runs of the
+        very ``base_cmd`` that is guarded elsewhere in the same function.
+        Centralising it here makes the protection the default that new call
+        sites inherit instead of a rule they must remember.
+
+        Only an *abnormal* exit retries: a signal death or an NTSTATUS
+        failure code. An ordinary non-zero status is a real verdict and is
+        returned untouched, so genuine failures are never masked. Pass
+        ``retry_on_crash=False`` for a command whose side effects must not
+        be repeated. Background commands are never retried — they have not
+        finished, so there is no exit status to judge.
+
+        Returns (success, output); see :meth:`_run_command_once` for the
+        command-rewriting behaviour.
+        """
+        ok, out = self._run_command_once(
+            cmd, env=env, timeout=timeout, background=background, cwd=cwd)
+        if ok or background or not retry_on_crash:
+            return ok, out
+
+        is_abnormal, describe, log_diagnostics = _crash_helpers()
+        code = self.last_exit_code
+        if not is_abnormal(code):
+            return ok, out                       # a real verdict — believe it
+
+        log.warning(
+            f"[Executor] Command terminated abnormally "
+            f"({describe(code) or code}) — retrying once before believing "
+            f"it: {cmd}")
+        log_diagnostics(code, cmd)
+        ok, out = self._run_command_once(
+            cmd, env=env, timeout=timeout, background=background, cwd=cwd)
+        if ok:
+            return ok, out
+
+        if is_abnormal(self.last_exit_code):
+            # Crashed twice. Still a failure to the caller — suppressing it
+            # would invent a pass — but tagged, so a consumer that can act
+            # on "inconclusive" (a gate ledger deciding whether to record a
+            # regression) is able to tell it apart from a real red suite.
+            log.warning(
+                f"[Executor] Command crashed again "
+                f"({describe(self.last_exit_code) or self.last_exit_code}) "
+                f"— reporting as inconclusive: {cmd}")
+            out = f"{out}\n{CRASHED_MARKER}".strip()
+        return ok, out
+
+    def _run_command_once(self, cmd: str, env: dict | None = None,
+                          timeout: int = 120, background: bool = False,
+                          cwd: str | None = None) -> Tuple[bool, str]:
         """
         Runs an arbitrary shell command. Returns (success, output).
         On Windows, auto-wraps PowerShell cmdlets so they don't fail
         in the default cmd.exe shell.
 
-        If *background* is True, the process is started and tracked. The 
+        If *background* is True, the process is started and tracked. The
         method waits briefly (3s) to see if it crashes; if not, it returns success.
 
         If *cwd* is set, the command runs in that directory instead of the
@@ -1480,7 +1673,7 @@ class Executor:
                     )
                 output = (
                     f"Command `{cmd}` exited with code {proc.returncode} "
-                    f"but produced no output.\n"
+                    f"{NO_OUTPUT_MARKER}.\n"
                     f"Possible causes:\n"
                     f"{interactive_hint}"
                     f"- The tool/binary is not installed or not on PATH\n"

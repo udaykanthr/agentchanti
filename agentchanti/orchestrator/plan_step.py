@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import logging
 import ast
+import posixpath
 import re
+import shutil
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
@@ -1801,6 +1804,84 @@ def shallow_gate_reason(cmd: str) -> Optional[str]:
             "as long as the module loads")
 
 
+def _same_expr(a, b) -> bool:
+    """True when two AST nodes are the same expression, structurally."""
+    import ast as _ast
+    try:
+        return _ast.dump(a) == _ast.dump(b)
+    except Exception:
+        return False
+
+
+def _always_true(node) -> bool:
+    """True when *node* is a test that NO runtime value can falsify.
+
+    `assert True` was already rejected as punctuation, but the same
+    intent survives in forms the constant check cannot see. Observed on a
+    Pac-Man run whose plan gated its whole Game class on
+
+        assert isinstance(g.player, type(g.player))
+        assert isinstance(g.map,    type(g.map))
+
+    — true for every object that has ever existed. Both gates went green
+    against a game where nothing moved in 600 frames, and the pipeline
+    reported success. `verified-early` sharpens the cost: the loop exits
+    the moment the gate passes, so a gate that cannot fail ends the step
+    on turn one.
+
+    Recognised: truthy constants, `isinstance(x, type(x))`,
+    `isinstance(x, object)`, and a comparison of an expression with
+    itself. `and` is tautological only when every operand is; `or` when
+    any is.
+
+    Deliberately narrow. A false positive here costs a re-plan, so only
+    forms that are true by construction are claimed — `x == x` is
+    included even though NaN falsifies it, because a gate asserting it
+    is not checking behaviour either way.
+    """
+    import ast as _ast
+
+    if isinstance(node, _ast.Constant):
+        return bool(node.value)
+
+    if isinstance(node, _ast.BoolOp):
+        if isinstance(node.op, _ast.And):
+            return all(_always_true(v) for v in node.values)
+        return any(_always_true(v) for v in node.values)
+
+    if isinstance(node, _ast.Call):
+        fn = node.func
+        if (isinstance(fn, _ast.Name) and fn.id == "isinstance"
+                and len(node.args) == 2):
+            obj, cls = node.args
+            # isinstance(x, type(x))
+            if (isinstance(cls, _ast.Call)
+                    and isinstance(cls.func, _ast.Name)
+                    and cls.func.id == "type"
+                    and len(cls.args) == 1
+                    and _same_expr(cls.args[0], obj)):
+                return True
+            # isinstance(x, object)
+            if isinstance(cls, _ast.Name) and cls.id == "object":
+                return True
+        return False
+
+    if isinstance(node, _ast.Compare) and len(node.ops) == 1:
+        if (isinstance(node.ops[0], (_ast.Eq, _ast.Is, _ast.LtE, _ast.GtE))
+                and _same_expr(node.left, node.comparators[0])):
+            return True
+
+    return False
+
+
+def _describe(node) -> str:
+    import ast as _ast
+    try:
+        return _ast.unparse(node)
+    except Exception:                       # pragma: no cover - <3.9 only
+        return "the assertion"
+
+
 def _shallow_python_reason(payload: str) -> Optional[str]:
     """Classify a ``python -c`` payload. None when it can fail on a value."""
     import ast as _ast
@@ -1821,20 +1902,27 @@ def _shallow_python_reason(payload: str) -> Optional[str]:
         return ("only imports the module — it proves the file parses, not "
                 "that it behaves correctly")
 
+    # Assertions that cannot fail, kept for the message. `assert True` is
+    # not an assertion, it is punctuation — and so is every other form in
+    # `_always_true`. Only an assert that some runtime value could falsify
+    # counts as a gate.
+    tautologies: list[str] = []
+
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Assert):
-            # `assert True` is not an assertion, it is punctuation. The
-            # gate-quality pressure produces these: told its smoke gate
-            # "never asserts", a planner appended `assert True` and the
-            # check went quiet — a gate that CANNOT fail, arrived at by
-            # the machinery meant to prevent exactly that. Only an assert
-            # over a runtime value counts.
-            if isinstance(node.test, _ast.Constant):
+            if _always_true(node.test):
+                tautologies.append(_describe(node.test))
                 continue
             return None
         # `sys.exit(1)` / `raise` on a bad value are assertions in spirit.
         if isinstance(node, _ast.Raise):
             return None
+
+    if tautologies:
+        shown = "; ".join(f"`{t}`" for t in tautologies[:2])
+        return (f"asserts only things that are true for every possible "
+                f"value ({shown}) — the gate passes no matter what the "
+                f"code does. Assert a concrete expected value instead")
 
     return ("imports and prints but never asserts — it passes whatever the "
             "values are, so it cannot detect wrong behaviour")
@@ -1908,17 +1996,110 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     it. Three attempts across two models spent 24 turns and ~20 command
     runs on it before the run was abandoned.
 
+    Structural defects are judged first, because they need no payload at
+    all: an interpreter pointed at another executable, and a placeholder
+    left in the command. Both are unsatisfiable for the same reason as a
+    broken payload — no output of the step can change the verdict.
+
     Only the inline `python -c` payload is judged; a real newline inside
     it is perfectly legal and must not be flagged.
     """
     if not cmd:
         return None
+    for structural in (_interpreter_target_error, _placeholder_error):
+        reason = structural(cmd)
+        if reason:
+            return reason
     match = _INLINE_SCRIPT_RE.search(cmd)
     if not match:
         return None
-    payload = match.groupdict().get("py")
-    if not payload:
+    groups = match.groupdict()
+    for key, check in (("py", _python_payload_error),
+                       ("js", _js_payload_error)):
+        payload = groups.get(key)
+        if payload:
+            return check(_unescape_shell_quotes(payload))
+    return None
+
+
+def _unescape_shell_quotes(payload: str) -> str:
+    """Undo the one escape the capture keeps but the interpreter never sees.
+
+    The payload is captured from between the command's quotes, so a
+    ``\\"`` written for the shell is still a backslash-quote here — while
+    the interpreter is handed a plain ``"``. Checking the raw capture
+    therefore fails on perfectly good gates: verified, both
+    ``python -c "... open(\\"p.json\\") ..."`` and the JS equivalent were
+    reported unrunnable before this, which sends the planner off to
+    rewrite a command that was never broken.
+
+    Only ``\\"`` is undone — every shell agrees on that one. ``\\\\`` is
+    deliberately left alone: POSIX collapses it and cmd.exe does not (see
+    :mod:`.gate_integrity`), and it cannot change a payload's syntactic
+    validity either way.
+    """
+    return payload.replace('\\"', '"')
+
+
+# An interpreter handed another executable as the script to run. Observed on
+# a hello-world run whose planner wrote:
+#
+#     python venv\Scripts\python.exe hello_world.py | find /i "Hello World"
+#
+# Python then tries to PARSE python.exe as source and dies with
+# "SyntaxError: Non-UTF-8 code starting with '\x90'". No edit to the target
+# file can ever satisfy that, and three diagnosis attempts were spent on a
+# program that already worked — `python hello_world.py` exited 0 midway
+# through the same run. The flag alternation lets `python -X utf8 foo.exe`
+# through to the script slot; `python -m pytest` lands on `pytest`, which is
+# not an executable path and is correctly ignored.
+_INTERPRETER_RUNS_BINARY_RE = re.compile(
+    r'\b(?:python[23]?|node|ruby|perl)(?:\.exe)?\s+'
+    r'(?:-[A-Za-z]\w*\s+)*'
+    r'(?P<script>[^\s"\';|&]*'
+    r'(?:\.exe\b|[\\/](?:python[23]?|node|ruby|perl)(?:\.exe)?\b)'
+    r'[^\s"\';|&]*)',
+    re.IGNORECASE)
+
+# `<filename>`, `<path to file>` — a placeholder the planner was told never
+# to emit, run verbatim. Observed: `python <filename>` executed as-is.
+_PLACEHOLDER_RE = re.compile(r'<[A-Za-z_][\w\-]*(?:\s+[\w\-]+)*>')
+
+_QUOTED_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+
+def _strip_quoted(cmd: str) -> str:
+    """Blank out quoted spans so payload contents cannot trip outer checks.
+
+    `node -e "if (a<b) ..."` and an HTML assertion inside a python -c string
+    both contain angle brackets that are not placeholders. The payloads are
+    judged separately by the -c/-e checks; here they are noise.
+    """
+    return _QUOTED_RE.sub(" ", cmd)
+
+
+def _interpreter_target_error(cmd: str) -> Optional[str]:
+    match = _INTERPRETER_RUNS_BINARY_RE.search(_strip_quoted(cmd))
+    if not match:
         return None
+    script = match.group("script")
+    return (f"the verify command runs an interpreter on another executable "
+            f"({script}) — the interpreter parses that binary as source and "
+            f"fails with a decoding/syntax error, so the gate can never pass "
+            f"whatever the code does. Invoke the script directly, e.g. "
+            f"`python your_script.py`, using the pipeline's own Python")
+
+
+def _placeholder_error(cmd: str) -> Optional[str]:
+    match = _PLACEHOLDER_RE.search(_strip_quoted(cmd))
+    if not match:
+        return None
+    return (f"the verify command still contains the placeholder "
+            f"`{match.group(0)}` — it is run verbatim, so the gate can never "
+            f"pass. Write the real path or command")
+
+
+def _python_payload_error(payload: str) -> Optional[str]:
     try:
         ast.parse(payload)
     except SyntaxError as exc:
@@ -1930,6 +2111,91 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         return (f"the verify command's python -c payload cannot be parsed "
                 f"({exc}) — it can never pass")
     return None
+
+
+def _js_payload_error(payload: str) -> Optional[str]:
+    """Syntax-check a ``node -e`` payload, or stay silent.
+
+    Observed: a plan put ``&& npm --prefix react-home run build`` INSIDE
+    the ``node -e "..."`` string. As JavaScript that is a syntax error, so
+    the gate could not pass whatever the code did. The loop diagnosed it,
+    recovered the step via an equivalent command — and the monotonic
+    ledger then rechecked the original, called it a regression and rolled
+    a wave of correct work back. 153k tokens for a misplaced quote.
+
+    Silence is the safe answer: a missing node, a timeout or any other
+    surprise means "not judged", never "rejected". A false rejection
+    costs a full replan of a plan that was fine.
+    """
+    if shutil.which("node") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["node", "--check"], input=payload, capture_output=True,
+            text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return None
+    detail = (proc.stderr or "").strip().splitlines()
+    # Line 1 is "[stdin]:N"; the message itself is a little further down.
+    reason = next((ln.strip() for ln in detail
+                   if "Error" in ln or "error" in ln), "syntax error")
+    return (f"the verify command's node -e payload is not valid JavaScript "
+            f"({reason[:120]}) — it can never pass, whatever the code does. "
+            f"A common cause is putting a shell chain such as "
+            f"`&& npm run build` INSIDE the quoted script instead of after "
+            f"the closing quote")
+
+
+# Files a JS/Python test suite cannot execute. Editing one of these can
+# no more fail `npm test` than leaving it untouched can.
+_INERT_TARGET_SUFFIXES = (".css", ".scss", ".sass", ".less", ".styl")
+
+
+def irrelevant_gate_reason(step: PlanStep) -> Optional[str]:
+    """Explain why *step*'s gate cannot fail on *this* step's work, or None.
+
+    ``shallow_gate_reason`` clears any command matching a test runner, on
+    the reasonable ground that a suite asserts real behaviour. But a suite
+    only asserts the behaviour it can reach, and a stylesheet is not
+    reachable: no CSS edit can turn `npm test` red.
+
+    Observed: a step whose brief was to add a full footer layout — brand
+    area, navigation grid, legal row, responsive breakpoints — was gated
+    on `cd react-home && npm test -- --run`. It deleted two words from a
+    selector, wrote no footer styling whatsoever, and passed on turn 2.
+    The markup shipped with eight classes and none of them styled, and
+    every later check (suite, build, smoke test) was equally green,
+    because none of them could see the difference.
+
+    Deliberately narrow: only when EVERY target is a stylesheet AND the
+    gate is nothing but a runner invocation. A gate that also asserts
+    something about the file is fine, and any step touching executable
+    code is left alone.
+    """
+    targets = list(getattr(step, "target_files", None) or [])
+    if not targets:
+        return None
+    if not all(t.lower().endswith(_INERT_TARGET_SUFFIXES) for t in targets):
+        return None
+
+    cmd = (getattr(step, "verify_cmd", None) or "").strip()
+    if not cmd or not _TEST_RUNNER_RE.search(cmd):
+        return None
+    # An assertion about the file itself makes the gate relevant again,
+    # whatever else the command also runs.
+    if shell_level_assertion(cmd) or _INLINE_SCRIPT_RE.search(cmd):
+        return None
+
+    return (f"the gate only runs a test suite, but this step's target(s) "
+            f"({', '.join(targets[:3])}) are stylesheets that no test can "
+            f"execute — it passes whether or not the styling was written, "
+            f"and did exactly that on a step that produced none. Assert the "
+            f"stylesheet's own content instead (that the selectors and "
+            f"declarations this step promises are present), optionally "
+            f"alongside the suite")
 
 
 def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
@@ -1954,6 +2220,10 @@ def check_gate_quality(steps: list[PlanStep]) -> list[tuple[str, str]]:
         reason = unrunnable_gate_reason(step.verify_cmd)
         if reason is None and step.step_type == "CODE":
             reason = shallow_gate_reason(step.verify_cmd)
+        if reason is None and step.step_type == "CODE":
+            # Last: a gate can be runnable AND assert plenty, and still
+            # be unable to observe the file this step was asked to write.
+            reason = irrelevant_gate_reason(step)
         if reason:
             gaps.append((step.id, reason))
     return gaps
@@ -2055,7 +2325,81 @@ def repair_verify_commands(steps: list[PlanStep],
 # Auto-fix: inject missing import-based dependencies
 # ---------------------------------------------------------------------------
 
-def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
+def project_file_reader(path: str) -> Optional[str]:
+    """Read *path* relative to the project root, or None.
+
+    Plan fixing runs BEFORE the run pre-loads sources into FileMemory, so
+    memory is empty at that point and disk is the only place a step's
+    existing target file can be read from.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except (OSError, ValueError):
+        return None
+
+
+def _source_derived_import_deps(steps: list[PlanStep], graph,
+                                read_file) -> list[str]:
+    """Edges the planner never declared, read from the files themselves.
+
+    ``imports:`` is the planner's opinion, and it is optional. When a step
+    that edits an EXISTING file declares ``imports: none``, the loop above
+    has nothing to iterate and the edge is simply lost — producer and
+    consumer then land in the same wave and run concurrently.
+
+    Observed: `src/App.jsx` (whose first line is ``import './App.css'``)
+    and `src/App.css` were both declared ``imports: none``, scheduled as
+    ``[[0, 1]]``, and written in parallel. Neither could see the other, so
+    the markup used ``site-footer__nav-title`` while the stylesheet
+    defined ``site-footer__heading`` — 3 of 8 classes unstyled and 6 CSS
+    rules matching nothing. Tests and the build both passed, because
+    unmatched CSS classes are still valid CSS.
+
+    Only files that already exist are consulted: for a file this run is
+    about to create there is nothing to read, and the declared imports
+    remain the only available signal.
+    """
+    if read_file is None:
+        return []
+    from .dependency_check import extract_file_deps
+
+    fixes: list[str] = []
+    for step in steps:
+        for target in step.target_files:
+            try:
+                content = read_file(target)
+            except Exception:
+                content = None
+            if not content:
+                continue
+            try:
+                imports = extract_file_deps(target, content).imports
+            except Exception:
+                continue
+            for spec in imports:
+                if not spec.startswith("."):
+                    continue          # package import, not a plan artifact
+                base = posixpath.dirname(target.replace("\\", "/"))
+                resolved = posixpath.normpath(posixpath.join(base, spec))
+                for ext in ("", ".js", ".ts", ".tsx", ".jsx", ".css",
+                            ".scss", ".py"):
+                    producer_id = graph.producer_of(resolved + ext, None)
+                    if producer_id is None:
+                        continue
+                    if producer_id == step.id or producer_id in step.depends_on:
+                        break
+                    step.depends_on.append(producer_id)
+                    fixes.append(
+                        f"Step {step.id}: {target} imports {spec} "
+                        f"(produced by step {producer_id}) — added "
+                        f"depends:{producer_id} [from source, undeclared]"
+                    )
+                    break
+    return fixes
+
+
+def fix_import_dependencies(steps: list[PlanStep], read_file=None) -> list[str]:
     """Auto-inject missing ``depends_on`` entries based on import relationships.
 
     If step B declares ``imports: src/Foo.jsx:Foo`` and step A has
@@ -2102,6 +2446,7 @@ def fix_import_dependencies(steps: list[PlanStep]) -> list[str]:
                 f"(produced by step {producer_id}) — added depends:{producer_id}"
             )
 
+    fixes.extend(_source_derived_import_deps(steps, graph, read_file))
     fixes.extend(_infer_package_init_export_deps(steps))
 
     # Safety: verify we didn't introduce a cycle
@@ -2501,7 +2846,8 @@ def build_step_context(
                 from .dependency_check import extract_file_deps
                 deps = extract_file_deps(target, content)
                 for imp in deps.imports:
-                    imp_file = _resolve_import_to_file(imp, memory, read_from_disk)
+                    imp_file = _resolve_import_to_file(
+                        imp, memory, read_from_disk, from_file=target)
                     if imp_file and imp_file not in files:
                         imp_content = (memory.get(imp_file) if memory else None)
                         if imp_content is None and read_from_disk:
@@ -2584,8 +2930,24 @@ def _resolve_import_to_file(
     import_source: str,
     memory,
     read_from_disk=None,
+    from_file: Optional[str] = None,
 ) -> Optional[str]:
-    """Best-effort resolution of an import string to a file path in memory."""
+    """Best-effort resolution of an import string to a file path in memory.
+
+    *from_file* is the file the import was written in. It is what makes a
+    relative specifier resolvable at all: ``./App.css`` inside
+    ``src/App.jsx`` means ``src/App.css``, and nothing below can know that
+    without the importer's directory.
+
+    Observed when it was missing: a plan whose two steps wrote
+    ``src/App.jsx`` and ``src/App.css`` declared ``imports: none``, so the
+    only thing that could have linked them was this source-derived
+    fallback — and it returned None. The steps landed in the SAME wave and
+    ran concurrently, neither seeing the other, and invented different
+    class vocabularies: markup used ``site-footer__nav-title`` while the
+    stylesheet defined ``site-footer__heading``. Tests and build both
+    passed, because unmatched CSS classes are valid CSS.
+    """
     if memory is None:
         return None
     all_files = memory.all_files()
@@ -2594,6 +2956,18 @@ def _resolve_import_to_file(
     if import_source in all_files:
         return import_source
 
+    # Relative specifiers resolve against the IMPORTING file's directory.
+    # Tried before the dotted-module branch below, which would otherwise
+    # mangle "./App.css" into "//App/css" via its `.` -> `/` rewrite.
+    if from_file and import_source.startswith("."):
+        base = posixpath.dirname(from_file.replace("\\", "/"))
+        joined = posixpath.normpath(posixpath.join(base, import_source))
+        for ext in ("", ".js", ".ts", ".tsx", ".jsx", ".css", ".scss",
+                    "/index.js", "/index.ts", "/index.jsx", "/index.tsx"):
+            candidate = joined + ext
+            if candidate in all_files:
+                return candidate
+
     # Python: dots to path (e.g. "utils.helpers" -> "utils/helpers.py")
     as_path = import_source.replace(".", "/")
     for ext in (".py", ".js", ".ts", ".tsx", ".jsx", ""):
@@ -2601,9 +2975,10 @@ def _resolve_import_to_file(
         if candidate in all_files:
             return candidate
 
-    # JS relative: "./utils" -> "utils.js" or "utils/index.js"
+    # JS relative, project-root spelling: "./utils" -> "utils.js"
     clean = import_source.lstrip("./")
-    for ext in (".js", ".ts", ".tsx", ".jsx", "/index.js", "/index.ts", ""):
+    for ext in (".js", ".ts", ".tsx", ".jsx", ".css", ".scss",
+                "/index.js", "/index.ts", ""):
         candidate = clean + ext
         if candidate in all_files:
             return candidate

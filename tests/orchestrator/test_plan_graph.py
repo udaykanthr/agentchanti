@@ -130,6 +130,51 @@ class TestLifecycle(unittest.TestCase):
     def test_reconcile_ignores_steps_that_have_not_been_built(self):
         self.assertEqual(self.graph.reconcile("2.1"), [])
 
+
+class TestDefaultExportVocabulary(unittest.TestCase):
+    """`exports: default Footer` vs extracted `['Footer', 'default']`.
+
+    Planners spell a default export as `default Foo`; the JS extractor
+    reports the flag `default` alongside the name. Comparing the two
+    literally warned that `default Footer` was missing from a file that
+    exported precisely that — on six-plus consecutive runs, never once
+    correctly. A warning that is always wrong is worse than none: it
+    trains the reader to skip the line that will one day be right.
+    """
+
+    def _satisfied(self, spec, actual):
+        from agentchanti.orchestrator.plan_graph import _export_satisfied
+        return _export_satisfied(spec, set(actual))
+
+    def test_the_warnings_seen_in_real_runs_are_silenced(self):
+        for spec, actual in (
+            ("default Footer", ["Footer", "default"]),
+            ("default App", ["App", "default"]),
+            ("default HomePage", ["HomePage", "default"]),
+            ("App as default", ["default"]),
+        ):
+            with self.subTest(spec=spec):
+                self.assertTrue(self._satisfied(spec, actual))
+
+    def test_a_bare_name_matches_a_file_that_only_default_exports_it(self):
+        # `function App() {}; export default App` — the extractor keeps
+        # the flag and loses the name.
+        self.assertTrue(self._satisfied("App", ["default"]))
+
+    def test_plain_named_exports_still_match(self):
+        self.assertTrue(self._satisfied("Footer", ["Footer", "default"]))
+
+    def test_a_genuinely_missing_export_is_still_reported(self):
+        """The teeth must survive: this is the case the check exists for."""
+        self.assertFalse(self._satisfied("TILE_SIZE", ["Map"]))
+        self.assertFalse(self._satisfied("Missing", ["Footer", "default"]))
+
+    def test_a_named_export_absent_from_a_multi_export_file_still_warns(self):
+        # `default` is present, but so are other names — so the file is
+        # not the "only a default export" shape, and a missing name is
+        # a real finding rather than a vocabulary artefact.
+        self.assertFalse(self._satisfied("Sidebar", ["Footer", "default"]))
+
     def test_module_level_constants_count_as_exports(self):
         """The extractor used to see only class/def, so a step declaring
         TILE_SIZE, START, WIN … was reported as defining none of them —

@@ -1466,6 +1466,133 @@ class TestUnrunnableGate(unittest.TestCase):
         self.assertEqual([g[0] for g in gaps], ["4.1"])
         self.assertIn("not valid Python", gaps[0][1])
 
+    # ── node -e payloads ────────────────────────────────────────────
+    # Same rule, other language. A plan put `&& npm --prefix react-home
+    # run build` INSIDE the `node -e "..."` string: a JavaScript syntax
+    # error, so no code could satisfy it. The loop recovered the step via
+    # an equivalent command, the monotonic ledger rechecked the original,
+    # called it a regression, and rolled a wave of correct work back —
+    # 153k tokens for a misplaced quote.
+    JS_BROKEN = (
+        'node -e "const fs=require(' + chr(39) + 'fs' + chr(39) + ');'
+        'const s=fs.readFileSync(' + chr(39) + 'a.jsx' + chr(39) + ','
+        + chr(39) + 'utf8' + chr(39) + ');'
+        'if(!s.includes(' + chr(39) + 'x' + chr(39) + '))process.exit(1)'
+        ' && npm --prefix react-home run build"')
+
+    def _node_available(self):
+        import shutil
+        return shutil.which("node") is not None
+
+    def test_catches_a_shell_chain_left_inside_the_js_payload(self):
+        if not self._node_available():
+            self.skipTest("needs node to syntax-check JS")
+        reason = self._reason(self.JS_BROKEN)
+        self.assertIsNotNone(reason)
+        self.assertIn("not valid JavaScript", reason)
+        self.assertIn("can never pass", reason)
+
+    @staticmethod
+    def _js_gate(body):
+        q = chr(39)
+        return ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+                + q + 'a.css' + q + ',' + q + 'utf8' + q + ');'
+                + body + '"')
+
+    def test_valid_js_gates_are_untouched(self):
+        if not self._node_available():
+            self.skipTest("needs node to syntax-check JS")
+        q, bs = chr(39), chr(92)
+        for cmd in (
+            self._js_gate('if(!s.includes(' + q + '.site-footer' + q
+                          + '))process.exit(1)'),
+            # Valid JS, wrong semantics — a syntax check must NOT claim
+            # this one; it is caught at run time by gate_integrity.
+            self._js_gate('if(!/[' + bs * 2 + 's' + bs * 2 + 'S]*/.test(s))'
+                          'process.exit(1)'),
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._reason(cmd))
+
+    def test_escaped_quotes_do_not_fake_a_syntax_error(self):
+        """The capture keeps the shell's `\\"`; the interpreter never sees it.
+
+        Judging the raw capture reported these perfectly good gates as
+        unrunnable, sending the planner to rewrite a command that was
+        never broken.
+        """
+        q, bs = chr(39), chr(92)
+        py = ('python -c "import json; assert json.loads(open(' + bs + '"'
+              'p.json' + bs + '").read())"')
+        self.assertIsNone(self._reason(py))
+        if self._node_available():
+            js = ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+                  + q + 'a.jsx' + q + ',' + q + 'utf8' + q + ');'
+                  'if(!s.includes(' + bs + '"import x' + bs + '"))'
+                  'process.exit(1)"')
+            self.assertIsNone(self._reason(js))
+
+    # ── gate relevance ──────────────────────────────────────────────
+    # A gate can be runnable, and assert plenty, and still be unable to
+    # observe the file the step was asked to write. Observed: a step
+    # briefed to add a whole footer layout was gated on
+    # `cd react-home && npm test -- --run`, deleted two words from a
+    # selector, wrote no footer styling at all, and passed on turn 2. The
+    # markup shipped with eight classes and none of them styled; suite,
+    # build and smoke test were all green because none could see it.
+
+    def _step(self, targets, cmd, step_type="CODE"):
+        s = PlanStep(id="2.2", step_type=step_type, index=0,
+                     verify_cmd=cmd)
+        s.target_files = list(targets)
+        return s
+
+    def _irrelevant(self, targets, cmd, step_type="CODE"):
+        from agentchanti.orchestrator.plan_step import irrelevant_gate_reason
+        return irrelevant_gate_reason(self._step(targets, cmd, step_type))
+
+    def test_a_suite_gate_on_a_stylesheet_step_is_flagged(self):
+        reason = self._irrelevant(["react-home/src/index.css"],
+                                  "cd react-home && npm test -- --run")
+        self.assertIsNotNone(reason)
+        self.assertIn("stylesheets", reason)
+
+    def test_a_gate_that_asserts_the_file_is_left_alone(self):
+        q = chr(39)
+        cmd = ('node -e "const s=require(' + q + 'fs' + q + ').readFileSync('
+               + q + 'a.css' + q + ',' + q + 'utf8' + q + ');'
+               'if(!s.includes(' + q + '.site-footer' + q + '))'
+               'process.exit(1)"')
+        self.assertIsNone(self._irrelevant(["src/index.css"], cmd))
+
+    def test_executable_targets_are_never_flagged(self):
+        for targets in (["src/App.jsx"],
+                        ["src/index.css", "src/App.jsx"],   # mixed
+                        []):                                 # undeclared
+            with self.subTest(targets=targets):
+                self.assertIsNone(
+                    self._irrelevant(targets, "npm test -- --run"))
+
+    def test_a_non_runner_command_is_not_second_guessed(self):
+        # `npm run build` does real work; judging it would be noise.
+        self.assertIsNone(self._irrelevant(["src/index.css"],
+                                           "npm run build"))
+
+    def test_relevance_is_judged_for_CODE_steps_only(self):
+        steps = [self._step(["src/index.css"], "npm test -- --run", "TEST")]
+        self.assertEqual(check_gate_quality(steps), [])
+
+    def test_the_plan_from_the_failing_run_flags_only_the_css_step(self):
+        steps = [
+            self._step(["react-home/src/components/Footer.jsx"],
+                       "cd react-home && npm test -- --run"),
+            self._step(["react-home/src/index.css"],
+                       "cd react-home && npm test -- --run"),
+        ]
+        steps[0].id, steps[1].id = "1.1", "2.2"
+        self.assertEqual([sid for sid, _ in check_gate_quality(steps)],
+                         ["2.2"])
+
     def test_unrunnable_outranks_shallow(self):
         """Reporting 'too shallow' would send the planner to fix the wrong
         thing — the gate is broken, not weak."""
