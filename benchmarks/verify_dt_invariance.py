@@ -119,6 +119,16 @@ def _find_game():
     raise SystemExit("no Game class found")
 
 
+# Tokens an artifact may accept as "begin play" when it exposes no starter
+# method at all. Tried through update(), and kept only if `state` moves.
+_START_TOKENS = ("space", "start", "enter", "return", {"start": True},
+                 {"space": True})
+
+
+def _state_of(g):
+    return str(getattr(g, "state", ""))
+
+
 def _new_game(Game, kw):
     g = Game(**kw)
     # A game left on its start screen ignores input and often does not
@@ -129,7 +139,27 @@ def _new_game(Game, kw):
                     "new_game"):
         if hasattr(g, starter):
             getattr(g, starter)()
-            break
+            return g
+
+    # No starter method exists on some artifacts: the START -> PLAYING
+    # transition is requested through the update input instead, e.g.
+    # `update(0.0, "space")`. Leaving such a game on its start screen is
+    # not a cosmetic miss — its entities never move, so the dt profiles
+    # score zero wall-frames while proving nothing at all. Measured on one
+    # artifact: 900 frames, not one entity displaced, reported clean.
+    #
+    # Nothing is assumed: a token is accepted only if `state` actually
+    # changes, which is the artifact reporting the transition itself.
+    before = _state_of(g)
+    if "start" not in before.lower():
+        return g
+    for token in _START_TOKENS:
+        try:
+            _advance(g)(0.0, token)
+        except Exception:
+            continue
+        if _state_of(g) != before:
+            return g
     return g
 
 
@@ -523,17 +553,41 @@ def _check_polarity(Game, kw):
     print("  polarity verified: no entity is in a wall at spawn")
 
 
+def _entity_marks(g):
+    """Movement marks for every entity, via the SAME resolver the player
+    uses. An earlier version had its own narrower accessor list and could
+    not read a `position` property, so it reported "NOTHING MOVED" for an
+    artifact that demonstrably moves — turning a real result into a
+    fabricated warning about itself."""
+    return tuple(_entity_mark(e)
+                 for e in [g.player] + list(g.ghosts))
+
+
 def _run(Game, kw, label, dt_fn, frames, rng):
+    """Return (wall-frames, did-anything-move).
+
+    The second value exists because "no entity entered a wall" is a
+    NEGATIVE invariant, and a game where nothing happens satisfies it
+    perfectly. Measured on an artifact that starts through its update
+    input and so never left its start screen here: 900 frames, not one
+    entity displaced, zero wall-frames — reported clean while proving
+    nothing. That is the same trap the liveness checks were added to
+    catch, in the file that added them.
+    """
     g = _new_game(Game, kw)
-    advance = g.step if hasattr(g, "step") else g.update
-    bad = 0
+    advance = _advance(g)
+    before = _entity_marks(g)
+    bad, moved = 0, False
     for _ in range(frames):
         advance(dt_fn(rng))
+        if not moved and _entity_marks(g) != before:
+            moved = True
         for e in [g.player] + list(g.ghosts):
             if entity_in_wall(e, g):
                 bad += 1
-    print(f"{label:<32} wall-frames = {bad}")
-    return bad
+    print(f"{label:<32} wall-frames = {bad}"
+          f"{'' if moved else '   (NOTHING MOVED)'}")
+    return bad, moved
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +699,15 @@ _SENDER_NAMES = ("queue_direction", "request_direction", "set_direction",
 
 
 def _senders(g):
-    """(label, send) pairs to try, on the game and then on the player."""
+    """(label, send) pairs to try, on the game and then on the player.
+
+    `send` is normally a bound method. The one exception is the sentinel
+    ``_UPDATE_INPUT``, meaning "this artifact has no direction method —
+    hand the value to update() each frame instead"; `_drive` and
+    `_check_progress` know how to honour it. It is tried LAST, so a real
+    method always wins, and it only appears when update actually accepts
+    a second positional argument.
+    """
     out = []
     for holder_name, holder in (("game", g), ("player", getattr(g, "player", None))):
         if holder is None:
@@ -654,11 +716,47 @@ def _senders(g):
             fn = getattr(holder, name, None)
             if callable(fn):
                 out.append((f"{holder_name}.{name}", fn))
+    step = g.step if hasattr(g, "step") else getattr(g, "update", None)
+    if step is not None and _update_takes_input(step):
+        out.append((_UPDATE_INPUT, _UPDATE_INPUT))
     return out
 
 
+_UPDATE_INPUT = "update(dt, input)"
+
+
+def _update_takes_input(fn):
+    """True when the step function accepts a second positional argument.
+
+    Read from the signature rather than guessed; anything unreadable
+    (builtins, *args) falls back to the single-argument form that every
+    other artifact uses.
+    """
+    try:
+        params = [p for p in inspect.signature(fn).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    except (TypeError, ValueError):
+        return False
+    return len(params) >= 2
+
+
 def _advance(g):
-    return g.step if hasattr(g, "step") else g.update
+    """Return ``advance(dt, value=None)`` for this artifact.
+
+    Some games have no direction method at all — input arrives as the
+    second argument of update, e.g. `update(dt, "right")`, and the same
+    channel carries the start request. Callers that have no input to send
+    pass nothing and get the old single-argument behaviour.
+    """
+    fn = g.step if hasattr(g, "step") else g.update
+    takes_input = _update_takes_input(fn)
+
+    def advance(dt, value=None):
+        if value is not None and takes_input:
+            return fn(dt, value)
+        return fn(dt)
+
+    return advance
 
 
 def _player_mark(g):
@@ -670,7 +768,11 @@ def _player_mark(g):
     that moved fine reads as "did not move", differently on each run
     because ghost RNG is unseeded.
     """
-    p = getattr(g, "player", None)
+    return _entity_mark(getattr(g, "player", None))
+
+
+def _entity_mark(p):
+    """Finest available position signal for one entity, or None."""
     if p is None:
         return None
 
@@ -719,10 +821,14 @@ def _drive(g, send, value, frames=60, dt=0.02):
     before = _player_mark(g)
     if before is None:
         return False
-    send(value)
+    carried = None
+    if send == _UPDATE_INPUT:
+        carried = value          # delivered every frame, via update
+    else:
+        send(value)
     advance = _advance(g)
     for _ in range(frames):
-        advance(dt)
+        advance(dt, carried)
         if _player_mark(g) != before:
             return True
     return False
@@ -861,13 +967,18 @@ def _check_progress(Game, kw, send_label, encode, rng):
         advance = _advance(g)
         names = list(_DIR_VECTORS)
         gained, last = 0, read()
+        carried = None
         for frame in range(3000):
             if frame % 20 == 0:
-                try:
-                    send(encode(rng.choice(names)))
-                except Exception:
-                    pass
-            advance(0.02)
+                value = encode(rng.choice(names))
+                if send == _UPDATE_INPUT:
+                    carried = value
+                else:
+                    try:
+                        send(value)
+                    except Exception:
+                        pass
+            advance(0.02, carried)
             now = read()
             if now is None:
                 break
@@ -933,10 +1044,17 @@ def main() -> int:
         _check_polarity(Game, kw)
         # Guarded: a profile that never returns is the artifact spinning,
         # and exits FAIL from inside _guard rather than hanging here.
-        total = _guard(
+        results = _guard(
             "the dt profiles", _WATCHDOG_SECONDS * len(PROFILES),
-            lambda: sum(_run(Game, kw, label, fn, frames, rng)
-                        for label, fn, frames in PROFILES))
+            lambda: [_run(Game, kw, label, fn, frames, rng)
+                     for label, fn, frames in PROFILES])
+        total = sum(bad for bad, _ in results)
+        if not any(moved for _, moved in results):
+            # Zero wall-frames out of a game that never moved is not
+            # evidence of wall safety, so it must not be recorded as any.
+            raise SystemExit(
+                "no entity moved in any dt profile, so zero wall-frames "
+                "proves nothing about wall safety")
     except SystemExit as exc:
         wall_note = str(exc.code)
         print(f"{'wall checks':<32} cannot verify ({wall_note})")
