@@ -1,13 +1,35 @@
-"""Independent dt-invariance check for a generated tile-maze game.
+"""Independent playability check for a generated tile-maze game.
 
-Ground truth that does not trust the pipeline's own claim: drive the
-generated game at several timestep profiles and assert that no entity
-ever occupies a wall tile. A game that only holds together at a fixed
-1/60 dt fails here, which is the bug this exists to catch.
+Ground truth that does not trust the pipeline's own claim. Three things
+are asserted, and each caught a real artifact that its own generated
+tests passed and the pipeline reported as a success:
+
+1. WALL SAFETY - drive the game at several timestep profiles and assert
+   no entity ever occupies a wall tile. A game that only holds together
+   at a fixed 1/60 dt fails here.
+2. EVERY DIRECTION RETURNS - send each of the four directions under a
+   wall-clock cap. One artifact computed the distance to the next tile
+   centre as the CURRENT centre when moving left or up, so its movement
+   loop never consumed its travel budget and spun forever: pressing Left
+   or Up froze the game. It passed all five wall profiles above with
+   zero wall-frames, so before this check the verdict was PASS.
+3. THE PLAYER MAKES PROGRESS - drive it around and require the pellet
+   count to fall (or the score to rise). Another artifact collected a
+   pellet only where the player came to a STOP, because its "at tile
+   centre" test was true only when stationary; a moving Pac-Man ate
+   nothing and the maze could never be cleared.
+
+2 and 3 are LIVENESS checks, and they are why this file is no longer
+only about dt: every invariant it used to assert was negative ("nothing
+bad happened"), which a game where nothing happens at all satisfies
+perfectly.
 
     cd <generated-project> && python verify_dt_invariance.py
 
-Exit code 0 = PASS, 1 = FAIL, 2 = could not verify.
+Exit code 0 = PASS, 1 = FAIL, 2 = could not verify. A run where some
+checks pass and others cannot be derived exits 2, not 0 — a partial pass
+is not a pass, and a caller must never record an unverified game as
+verified.
 
 WHY SO MUCH OF THIS FILE IS REFUSALS
 ------------------------------------
@@ -39,6 +61,15 @@ import inspect
 import os
 import random
 import sys
+import threading
+
+# Wall-clock cap for any single driven phase. Generous: the slowest honest
+# artifact measured ran 2,600 frames in 1.3s, so anything near this bound
+# is not slow, it is stuck.
+_WATCHDOG_SECONDS = 60
+
+_DIR_VECTORS = {"LEFT": (-1, 0), "RIGHT": (1, 0),
+                "UP": (0, -1), "DOWN": (0, 1)}
 
 # Profiles: the spec asks for ~0.008-0.05, the rest are stress.
 PROFILES = (
@@ -88,12 +119,54 @@ def _find_game():
     raise SystemExit("no Game class found")
 
 
+# Append-only, like _SENDER_NAMES and for the same reason: each of these
+# was the only way some artifact leaves its start screen, and a missing
+# name costs the whole run. `start_new_game` was absent, so a working game
+# — score 0 -> 20, ghosts roaming — reported five inert dt profiles and
+# refused on both halves.
+_STARTER_NAMES = ("start_game", "start_playing", "start_new_game",
+                  "new_game", "start", "begin_game", "begin", "new_round")
+
+# Tokens an artifact may accept as "begin play" when it exposes no starter
+# method at all. Tried through update(), and kept only if `state` moves.
+_START_TOKENS = ("space", "start", "enter", "return", {"start": True},
+                 {"space": True})
+
+
+def _state_of(g):
+    return str(getattr(g, "state", ""))
+
+
 def _new_game(Game, kw):
     g = Game(**kw)
-    for starter in ("start_game", "start"):
+    # A game left on its start screen ignores input and often does not
+    # advance entities at all, so every check downstream reads as "nothing
+    # moves". One artifact named this `start_playing`, which was missing
+    # here, and its whole liveness result was a false "cannot verify".
+    for starter in _STARTER_NAMES:
         if hasattr(g, starter):
             getattr(g, starter)()
-            break
+            return g
+
+    # No starter method exists on some artifacts: the START -> PLAYING
+    # transition is requested through the update input instead, e.g.
+    # `update(0.0, "space")`. Leaving such a game on its start screen is
+    # not a cosmetic miss — its entities never move, so the dt profiles
+    # score zero wall-frames while proving nothing at all. Measured on one
+    # artifact: 900 frames, not one entity displaced, reported clean.
+    #
+    # Nothing is assumed: a token is accepted only if `state` actually
+    # changes, which is the artifact reporting the transition itself.
+    before = _state_of(g)
+    if "start" not in before.lower():
+        return g
+    for token in _START_TOKENS:
+        try:
+            _advance(g)(0.0, token)
+        except Exception:
+            continue
+        if _state_of(g) != before:
+            return g
     return g
 
 
@@ -487,17 +560,457 @@ def _check_polarity(Game, kw):
     print("  polarity verified: no entity is in a wall at spawn")
 
 
+def _entity_marks(g):
+    """Movement marks for every entity, via the SAME resolver the player
+    uses. An earlier version had its own narrower accessor list and could
+    not read a `position` property, so it reported "NOTHING MOVED" for an
+    artifact that demonstrably moves — turning a real result into a
+    fabricated warning about itself."""
+    return tuple(_entity_mark(e)
+                 for e in [g.player] + list(g.ghosts))
+
+
 def _run(Game, kw, label, dt_fn, frames, rng):
+    """Return (wall-frames, did-anything-move).
+
+    The second value exists because "no entity entered a wall" is a
+    NEGATIVE invariant, and a game where nothing happens satisfies it
+    perfectly. Measured on an artifact that starts through its update
+    input and so never left its start screen here: 900 frames, not one
+    entity displaced, zero wall-frames — reported clean while proving
+    nothing. That is the same trap the liveness checks were added to
+    catch, in the file that added them.
+    """
     g = _new_game(Game, kw)
-    advance = g.step if hasattr(g, "step") else g.update
-    bad = 0
+    advance = _advance(g)
+    before = _entity_marks(g)
+    bad, moved = 0, False
     for _ in range(frames):
         advance(dt_fn(rng))
+        if not moved and _entity_marks(g) != before:
+            moved = True
         for e in [g.player] + list(g.ghosts):
             if entity_in_wall(e, g):
                 bad += 1
-    print(f"{label:<32} wall-frames = {bad}")
-    return bad
+    print(f"{label:<32} wall-frames = {bad}"
+          f"{'' if moved else '   (NOTHING MOVED)'}")
+    return bad, moved
+
+
+# ---------------------------------------------------------------------------
+# Non-termination
+# ---------------------------------------------------------------------------
+
+def _guard(what, seconds, fn, *args):
+    """Run *fn* under a wall-clock cap. A hang is a FAIL, not a refusal.
+
+    Non-termination is the one defect this file could not see: every check
+    above assumes the artifact eventually returns. Observed 2026-08-12 —
+    a generated ``Player.update`` computed the distance to the next tile
+    centre as the CURRENT centre when moving left or up, so the distance
+    was 0, the "snap" branch consumed none of the travel budget, and
+    ``while remaining > eps`` spun forever. Pressing Left or Up froze the
+    game. There was no exception and no failing test: 8 generated tests
+    passed and the pipeline reported success, because nothing drove the
+    player left through ``Game.update`` from a tile centre.
+
+    This is deliberately a FAIL and not a refusal. Everywhere else in this
+    file an unknown is "I cannot verify"; a game that never returns is not
+    unknown, it is broken, and a caller must not record it as unverified.
+
+    A spinning thread cannot be killed in Python, so the worker is a
+    daemon and the process leaves via ``os._exit`` rather than waiting on
+    it at interpreter shutdown.
+    """
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = fn(*args)
+        except BaseException as exc:              # noqa: BLE001
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        print(f"\nVERDICT: FAIL - {what} did not return within {seconds}s "
+              f"(non-termination)")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+# ---------------------------------------------------------------------------
+# Liveness: does anything actually happen?
+# ---------------------------------------------------------------------------
+
+def _local_modules(Game):
+    """Modules belonging to the artifact, nearest first.
+
+    Direction vocabularies live wherever the artifact put them —
+    ``Direction`` in entities.py, ``DIRECTIONS`` in player.py, plain
+    tuples in game.py have all been seen for the same prompt.
+    """
+    here = os.path.abspath(".")
+    mods = [sys.modules[Game.__module__]]
+    for mod in list(sys.modules.values()):
+        path = getattr(mod, "__file__", None)
+        if not path or mod in mods:
+            continue
+        try:
+            if os.path.abspath(path).startswith(here):
+                mods.append(mod)
+        except Exception:
+            continue
+    return mods
+
+
+def _direction_values(Game):
+    """Candidate encodings of "go left", newest artifact first.
+
+    Every one of these was the ONLY accepted form in some run: a bare
+    vector, a ``Direction`` enum member, a ``DIRECTIONS["LEFT"]`` lookup,
+    a lowercase string. Passing the wrong one is silent — one artifact's
+    ``queue_direction`` ignored anything not in ``DIRECTIONS.values()``,
+    so a string input simply did nothing and the player sat still. That
+    reads exactly like a broken game, which is why nothing here is
+    assumed: an encoding counts only once the player is seen to move.
+    """
+    encoders = [("vector", lambda n: _DIR_VECTORS[n])]
+    for mod in _local_modules(Game):
+        enum = getattr(mod, "Direction", None)
+        if enum is not None and all(hasattr(enum, n) for n in _DIR_VECTORS):
+            encoders.append((f"{mod.__name__}.Direction",
+                             lambda n, e=enum: getattr(e, n)))
+        table = getattr(mod, "DIRECTIONS", None)
+        if isinstance(table, dict) and all(n in table for n in _DIR_VECTORS):
+            encoders.append((f"{mod.__name__}.DIRECTIONS",
+                             lambda n, t=table: t[n]))
+    encoders.append(("name", lambda n: n))
+    encoders.append(("lowercase name", lambda n: n.lower()))
+    return encoders
+
+
+# Every name here was the ONLY input entry point on some artifact. The list
+# is append-only for a reason: `set_player_direction` was missing, so a
+# perfectly playable game reported "no input method visibly moved the
+# player" and lost its whole liveness result to a refusal.
+_SENDER_NAMES = ("queue_direction", "request_direction", "set_direction",
+                 "set_player_direction", "set_desired_direction",
+                 "set_next_direction", "buffer_direction",
+                 "change_direction", "move", "handle_input", "handle_key",
+                 "turn")
+
+
+def _senders(g):
+    """(label, send) pairs to try, on the game and then on the player.
+
+    `send` is normally a bound method. The one exception is the sentinel
+    ``_UPDATE_INPUT``, meaning "this artifact has no direction method —
+    hand the value to update() each frame instead"; `_drive` and
+    `_check_progress` know how to honour it. It is tried LAST, so a real
+    method always wins, and it only appears when update actually accepts
+    a second positional argument.
+    """
+    out = []
+    for holder_name, holder in (("game", g), ("player", getattr(g, "player", None))):
+        if holder is None:
+            continue
+        for name in _SENDER_NAMES:
+            fn = getattr(holder, name, None)
+            if callable(fn):
+                out.append((f"{holder_name}.{name}", fn))
+    step = g.step if hasattr(g, "step") else getattr(g, "update", None)
+    if step is not None and _update_takes_input(step):
+        out.append((_UPDATE_INPUT, _UPDATE_INPUT))
+    return out
+
+
+_UPDATE_INPUT = "update(dt, input)"
+
+
+def _update_takes_input(fn):
+    """True when the step function accepts a second positional argument.
+
+    Read from the signature rather than guessed; anything unreadable
+    (builtins, *args) falls back to the single-argument form that every
+    other artifact uses.
+    """
+    try:
+        params = [p for p in inspect.signature(fn).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    except (TypeError, ValueError):
+        return False
+    return len(params) >= 2
+
+
+def _advance(g):
+    """Return ``advance(dt, value=None)`` for this artifact.
+
+    Some games have no direction method at all — input arrives as the
+    second argument of update, e.g. `update(dt, "right")`, and the same
+    channel carries the start request. Callers that have no input to send
+    pass nothing and get the old single-argument behaviour.
+    """
+    fn = g.step if hasattr(g, "step") else g.update
+    takes_input = _update_takes_input(fn)
+
+    def advance(dt, value=None):
+        if value is not None and takes_input:
+            return fn(dt, value)
+        return fn(dt)
+
+    return advance
+
+
+def _player_mark(g):
+    """Something that must change when the player moves.
+
+    Sub-tile progress is folded in where the artifact exposes it. A
+    tile-granular mark needs a WHOLE tile of travel to register, and a
+    player that dies first respawns on its start tile — so a direction
+    that moved fine reads as "did not move", differently on each run
+    because ghost RNG is unseeded.
+    """
+    return _entity_mark(getattr(g, "player", None))
+
+
+def _entity_mark(p):
+    """Finest available position signal for one entity, or None."""
+    if p is None:
+        return None
+
+    def _position_tuple(entity):
+        pos = getattr(entity, "position", None)
+        if pos is None:
+            return None
+        try:
+            values = tuple(pos)
+        except Exception:
+            return None
+        return values if len(values) == 2 else None
+
+    # FINEST FIRST. Preferring the tile hid a real defect: an artifact whose
+    # player advanced 2.4px on its first frame and then never moved again
+    # never changed tile, so every direction read as "did not move", no
+    # input API resolved, and both liveness checks were skipped as a
+    # refusal — reported as "cannot verify" when the truthful answer is
+    # that Pac-Man cannot move. With a pixel mark the API resolves, the
+    # progress sweep runs, and the run fails as it should.
+    mark = None
+    for probe in (_entity_pixels, _position_tuple, _entity_tile, _tuple_tile):
+        found = probe(p)
+        if found is not None:
+            mark = tuple(found)
+            break
+    if mark is None:
+        return None
+    for fine in ("progress", "segment_progress", "edge_progress", "offset"):
+        value = getattr(p, fine, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return mark + (round(float(value), 4),)
+    return mark
+
+
+def _drive(g, send, value, frames=60, dt=0.02):
+    """Send one direction and step; did the player move at ANY point?
+
+    Sampled every frame, not compared start-to-end: a ghost catching the
+    player respawns it on its start tile, so an end-state comparison
+    reports "never moved" for a direction that moved fine and then died.
+    Observed on a working artifact whose DOWN neighbour is walkable —
+    and if that had happened on all four directions the verdict would
+    have been a false "no direction moves the player".
+    """
+    before = _player_mark(g)
+    if before is None:
+        return False
+    carried = None
+    if send == _UPDATE_INPUT:
+        carried = value          # delivered every frame, via update
+    else:
+        send(value)
+    advance = _advance(g)
+    for _ in range(frames):
+        advance(dt, carried)
+        if _player_mark(g) != before:
+            return True
+    return False
+
+
+def _resolve_input_api(Game, kw):
+    """Find a (label, send-factory, encoder) that visibly moves the player.
+
+    Verified against the artifact's own behaviour rather than assumed —
+    the rule this whole file runs on. Returns None when nothing works,
+    which is a refusal for the liveness checks only; the wall checks above
+    do not need input and keep their verdict.
+    """
+    for enc_label, encode in _direction_values(Game):
+        probe = _new_game(Game, kw)
+        for send_label, _ in _senders(probe):
+            for name in _DIR_VECTORS:
+                g = _new_game(Game, kw)
+                send = dict(_senders(g)).get(send_label)
+                if send is None:
+                    continue
+                try:
+                    moved = _guard(
+                        f"input probe {send_label}({enc_label} {name})",
+                        _WATCHDOG_SECONDS, _drive, g, send, encode(name))
+                except Exception:
+                    break            # this sender rejects this encoding
+                if moved:
+                    return f"{send_label} <- {enc_label}", send_label, encode
+    return None
+
+
+def _check_directions(Game, kw, send_label, encode):
+    """Every direction must RETURN. That is the assertion here.
+
+    The freeze that motivated this affected LEFT and UP only, because
+    their next-centre arithmetic was wrong while RIGHT and DOWN were
+    fine, so the sweep has to cover all four; a single-direction probe
+    would have passed it. A hang inside `_guard` exits FAIL by design.
+
+    Which directions MOVED is reported but deliberately not a verdict.
+    Some are walls at spawn, and even an open one can read as "did not
+    move" when a ghost kills the player first — that flipped between
+    identical runs of the same artifact. Liveness is carried instead by
+    the progress check below, which sweeps 3,000 frames and accumulates
+    across lives, and would fail anyway if the player could not move.
+    """
+    moved = []
+    for name in _DIR_VECTORS:
+        g = _new_game(Game, kw)
+        send = dict(_senders(g)).get(send_label)
+        if _guard(f"driving {name}", _WATCHDOG_SECONDS,
+                  _drive, g, send, encode(name), 120):
+            moved.append(name)
+    print(f"{'all four directions return':<32} yes "
+          f"(moved: {', '.join(moved) if moved else 'none observed'})")
+    return True
+
+
+def _progress_probe(g):
+    """A counter that must change while the player eats.
+
+    Pellets go down or the score goes up; either proves collection is
+    wired to movement. Observed 2026-08-12: an artifact collected a pellet
+    only where the player came to a STOP, because its "at tile centre"
+    test was ``logical_tile == destination_tile`` — true only when
+    stationary. A moving Pac-Man ate nothing and the maze could never be
+    cleared. Seven generated tests passed; one of them proved a single
+    pellet scores, from a standing start.
+    """
+    # Resolved from the live game on EVERY read, never captured. Restarting
+    # rebuilds the map on some artifacts, so a reader holding the original
+    # object keeps reporting a maze the game no longer plays on: progress
+    # froze after the first death and read as +1 where the real figure was
+    # 36. Under-reporting here is not cosmetic — zero is a FAIL.
+    holder_attrs = [None, "map", "maze", "board", "level", "grid", "player"]
+
+    def read(holder_attr, name):
+        holder = g if holder_attr is None else getattr(g, holder_attr, None)
+        if holder is None:
+            return None
+        value = getattr(holder, name, None)
+        if value is None:
+            return None
+        try:
+            value = value() if callable(value) else value
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return len(value)
+        except Exception:
+            return None
+
+    def label_of(holder_attr, name):
+        return f"{holder_attr or 'game'}.{name}"
+
+    for holder_attr in holder_attrs:
+        for name in ("pellets_remaining", "remaining_pellet_count",
+                     "pellet_count", "pellets_left", "remaining_pellets",
+                     "remaining_collectibles", "collectibles_remaining",
+                     "dots_remaining",
+                     "pellets", "collectibles", "collectible_tiles",
+                     "collectible_positions", "pellet_tiles"):
+            if read(holder_attr, name) is not None:
+                return (label_of(holder_attr, name),
+                        lambda h=holder_attr, n=name: read(h, n), -1)
+    for holder_attr in holder_attrs:
+        if read(holder_attr, "score") is not None:
+            return (label_of(holder_attr, "score"),
+                    lambda h=holder_attr: read(h, "score"), +1)
+    return None
+
+
+def _check_progress(Game, kw, send_label, encode, rng):
+    """Drive the player around and require the collection counter to move."""
+    g = _new_game(Game, kw)
+    probe = _progress_probe(g)
+    if probe is None:
+        print(f"{'collection progress':<32} cannot verify "
+              f"(no pellet count or score found)")
+        return None
+    label, read, sign = probe
+    send = dict(_senders(g)).get(send_label)
+
+    def sweep():
+        """Total progress ACROSS lives, not endpoint minus start.
+
+        Reviving restores the pellets, so comparing the first and last
+        readings measures only the final life — and a working game whose
+        last life happens to eat nothing before dying would be reported
+        as collecting nothing at all. Movement in the wrong direction is
+        a reset: re-baseline on it rather than counting it.
+        """
+        advance = _advance(g)
+        names = list(_DIR_VECTORS)
+        gained, last = 0, read()
+        carried = None
+        for frame in range(3000):
+            if frame % 20 == 0:
+                value = encode(rng.choice(names))
+                if send == _UPDATE_INPUT:
+                    carried = value
+                else:
+                    try:
+                        send(value)
+                    except Exception:
+                        pass
+            advance(0.02, carried)
+            now = read()
+            if now is None:
+                break
+            step = (now - last) * sign
+            if step > 0:
+                gained += step
+            last = now
+            # A death that ends the run would cap progress at whatever the
+            # first life managed; revive so the sweep keeps eating.
+            state = str(getattr(g, "state", "")).lower()
+            if "over" in state:
+                for revive in ("restart", "reset", "start_game",
+                               "start_playing", "start"):
+                    if hasattr(g, revive):
+                        getattr(g, revive)()
+                        last = read()
+                        break
+        return gained
+
+    gained = _guard("the collection sweep", _WATCHDOG_SECONDS, sweep)
+    print(f"{'collection progress':<32} {label} +{gained} across the sweep")
+    return gained > 0
 
 
 def main() -> int:
@@ -518,8 +1031,6 @@ def main() -> int:
         Game = _find_game()
         kw = ({"headless": True}
               if "headless" in inspect.signature(Game).parameters else {})
-        _TILE = _tile_size(Game, kw, sys.modules[Game.__module__])
-        _check_polarity(Game, kw)
     except SystemExit:
         raise
     except Exception as exc:
@@ -529,13 +1040,82 @@ def main() -> int:
             f"game") from exc
 
     rng = random.Random(20260802)
-    total = sum(_run(Game, kw, label, fn, frames, rng)
-                for label, fn, frames in PROFILES)
+
+    # The wall checks need the artifact's coordinate space; the liveness
+    # checks below do not — they only need something observable to change.
+    # So a coordinate refusal must no longer abort the program, or the
+    # liveness checks are dead code on every artifact whose positions we
+    # cannot map. Two of three artifacts in one session exposed only a
+    # `position` tuple of unproven order, refused here, and would have
+    # carried a freeze past this file untested.
+    total, wall_note = None, None
+    try:
+        _TILE = _tile_size(Game, kw, sys.modules[Game.__module__])
+        _check_polarity(Game, kw)
+        # Guarded: a profile that never returns is the artifact spinning,
+        # and exits FAIL from inside _guard rather than hanging here.
+        results = _guard(
+            "the dt profiles", _WATCHDOG_SECONDS * len(PROFILES),
+            lambda: [_run(Game, kw, label, fn, frames, rng)
+                     for label, fn, frames in PROFILES])
+        if not any(moved for _, moved in results):
+            # Zero wall-frames out of a game that never moved is not
+            # evidence of wall safety, so it must not be recorded as any.
+            raise SystemExit(
+                "no entity moved in any dt profile, so zero wall-frames "
+                "proves nothing about wall safety")
+        # Assigned only once the result MEANS something. Setting it before
+        # the check left total=0 through the refusal, so the summary went
+        # on to claim "no entity entered a wall" about a game that never
+        # moved — the precise false claim this guard exists to stop.
+        total = sum(bad for bad, _ in results)
+    except SystemExit as exc:
+        total, wall_note = None, str(exc.code)
+        print(f"{'wall checks':<32} cannot verify ({wall_note})")
+    except Exception as exc:                       # noqa: BLE001
+        total = None
+        wall_note = f"probing raised {type(exc).__name__}: {exc}"
+        print(f"{'wall checks':<32} cannot verify ({wall_note})")
+
+    # Liveness. Deriving the input vocabulary can fail on an artifact that
+    # exposes none we recognise; that is a refusal for THESE checks alone,
+    # so the wall verdict above still stands.
+    api = _resolve_input_api(Game, kw)
+    if api is None:
+        print(f"{'liveness':<32} cannot verify "
+              f"(no input method visibly moved the player)")
+        moved_any, progressed = None, None
+    else:
+        api_label, send_label, encode = api
+        print(f"{'input api':<32} {api_label}")
+        moved_any = _check_directions(Game, kw, send_label, encode)
+        progressed = _check_progress(Game, kw, send_label, encode, rng)
+
     print()
+    failures = []
     if total:
-        print(f"VERDICT: FAIL - {total} wall-frames")
+        failures.append(f"{total} wall-frames")
+    if progressed is False:
+        failures.append("nothing is ever collected while driving")
+    if failures:
+        print("VERDICT: FAIL - " + "; ".join(failures))
         return 1
-    print("VERDICT: PASS - no entity entered a wall")
+
+    # A partial pass is not a pass. Whatever ran is reported as clean, but
+    # the exit code stays 2 so a caller never records an unverified game as
+    # verified — the same reason a refusal has never shared FAIL's code.
+    proved = [name for name, ok in (("no entity entered a wall", total == 0),
+                                    ("every direction returns", moved_any),
+                                    ("the player makes progress", progressed))
+              if ok]
+    unproven = [name for name, ok in (("wall safety", total is not None),
+                                      ("direction liveness", moved_any is not None),
+                                      ("collection progress", progressed is not None))
+                if not ok]
+    if unproven:
+        print("CLEAN SO FAR: " + ("; ".join(proved) if proved else "nothing"))
+        raise SystemExit("could not verify " + ", ".join(unproven))
+    print("VERDICT: PASS - " + ", ".join(proved))
     return 0
 
 

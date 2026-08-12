@@ -4465,6 +4465,8 @@ def _handle_code_step_impl(step_text: str, coder: CoderAgent, reviewer: Reviewer
             preload_files=_loop_preload_paths(plan_step),
             preload_full_paths=set(
                 getattr(plan_step, 'target_files', None) or ()),
+            required_files=set(
+                getattr(plan_step, 'target_files', None) or ()),
         )
         # Record the gate exactly as the loop enforced it, so the monotonic
         # ledger rechecks the command that actually passed (see
@@ -5842,6 +5844,8 @@ def _handle_test_step_impl(step_text: str, tester: TesterAgent, coder: CoderAgen
             context=loop_context,
             preload_files=_loop_preload_paths(plan_step),
             preload_full_paths=set(
+                getattr(plan_step, 'target_files', None) or ()),
+            required_files=set(
                 getattr(plan_step, 'target_files', None) or ()),
         )
         # A green gate that named ONE test file proves that file runs — not

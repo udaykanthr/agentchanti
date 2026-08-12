@@ -492,6 +492,29 @@ def _py_signature_outline(source: str) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+def _missing_required(tools: AgentTools,
+                      required: set[str] | None) -> list[str]:
+    """Declared target files that are still absent from disk.
+
+    A pure file-existence check — no LLM call, no judgement. Paths that
+    escape the project root are ignored rather than raising: a malformed
+    `target:` line must not be able to hold a step open forever.
+    """
+    if not required:
+        return []
+    missing = []
+    for path in sorted(required):
+        if not path or not path.strip():
+            continue
+        try:
+            full = tools._resolve(path.strip())
+        except ValueError:
+            continue
+        if not os.path.exists(full):
+            missing.append(path.strip())
+    return missing
+
+
 def _preload_target_files(tools: AgentTools,
                           paths: list[str] | None,
                           full_paths: set[str] | None = None) -> str:
@@ -703,6 +726,7 @@ def run_agent_loop(
     context: str = "",
     preload_files: list[str] | None = None,
     preload_full_paths: set[str] | None = None,
+    required_files: set[str] | None = None,
     _recovery: bool = False,
     attempt_label: str = "first attempt",
 ) -> tuple[bool, str]:
@@ -716,6 +740,11 @@ def run_agent_loop(
       → ``(False, ...)`` — a step that changed nothing cannot have
       succeeded.
     - ``max_turns`` exhausted → ``(False, ...)``.
+
+    *required_files* are the step's plan-declared targets. While any of
+    them is missing the loop declines to exit EARLY on a green gate —
+    only that exit, so the guard can spend turns the step already had but
+    can never turn a passing step into a failing one.
 
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
@@ -913,7 +942,21 @@ def run_agent_loop(
                 display.step_info(step_idx,
                                   f"Agent loop {turn}/{max_turns}: {names}")
             messages.append(response.to_message())
-            _tool_msgs = tools.execute_all(response.tool_calls)
+            # Enforce the narrowed offer. Withholding a tool from the list
+            # is only a request; a model that ignores it kept getting the
+            # tool executed anyway, so the intervention did nothing at all.
+            # Passing the offer through makes the refusal real.
+            #
+            # The final turn is deliberately NOT enforced. Tools are absent
+            # from that offer to prod a text summary, but a model that edits
+            # anyway may just have fixed the step — the gate runs after this
+            # block, so that late write can still turn the step green.
+            # Refusing it would throw away a working fix to enforce a
+            # formatting preference.
+            _allowed = ({d.name for d in tools_for_turn}
+                        if tools_for_turn is not None else None)
+            _tool_msgs = tools.execute_all(response.tool_calls,
+                                           allowed=_allowed)
             messages.extend(_tool_msgs)
             _repeated_cmd: str | None = None
             _repeated_out: str = ""
@@ -1090,6 +1133,34 @@ def run_agent_loop(
                     and (_dirty_since_gate or _self_gate is not None)):
                 _early = _gate_result()
                 if verify_passed(_early):
+                    _missing = _missing_required(tools, required_files)
+                    if _missing:
+                        # The gate can go green before the step is done. A
+                        # plan declaring `target: tests/__init__.py,
+                        # tests/test_map.py, tests/test_movement_invariants.py`
+                        # had the first two written; `python -m unittest -v`
+                        # passed on those alone, the loop exited at turn 3 of
+                        # 8, and the run was reported complete with the
+                        # adversarial test file — the whole point of the task
+                        # — never created. Declining to stop early is safe:
+                        # it can only spend turns the step already had, never
+                        # turn a passing step into a failure.
+                        _logger.info(
+                            "[AgentLoop] step %d: gate %r passes on turn "
+                            "%d/%d but %d declared target(s) do not exist "
+                            "yet (%s) — not exiting early",
+                            step_idx + 1, verify_cmd, turn, max_turns,
+                            len(_missing), ", ".join(_missing))
+                        messages.append(Message(role="user", content=(
+                            f"`{verify_cmd}` passes, but the step declares "
+                            "target file(s) that do not exist yet: "
+                            + ", ".join(_missing)
+                            + ". A green gate is not the same as a finished "
+                            "step — the gate cannot see a file you have not "
+                            "written. Create them now with the content the "
+                            "step describes. "
+                            f"{max_turns - turn} turn(s) remain.")))
+                        continue
                     _logger.info(
                         "[AgentLoop] step %d verified early on turn %d/%d "
                         "— gate %r passes, ending the loop instead of "

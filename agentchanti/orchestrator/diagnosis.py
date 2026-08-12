@@ -799,14 +799,22 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                original_error_cmd: str | None = None,
                step_text: str = '',
                task: str = '',
-               step_target_files: list[str] | None = None) -> tuple[bool, bool, bool]:
+               step_target_files: list[str] | None = None) -> tuple:
     """Apply fixes from a diagnosis response.
 
-    Returns ``(applied, cmds_succeeded, has_fix_commands)`` where *applied* is True if any
-    fix action was taken, *cmds_succeeded* is True if all fix commands
-    ran successfully (relevant for CMD steps where the fix command itself
-    is the corrected step), and *has_fix_commands* is True if at least one parameter
-    was executed as a shell command.
+    Returns ``(applied, cmds_succeeded, has_fix_commands, executed_cmds,
+    passed_cmds)`` where *applied* is True if any fix action was taken,
+    *cmds_succeeded* is True if all fix commands ran successfully (relevant
+    for CMD steps where the fix command itself is the corrected step), and
+    *has_fix_commands* is True if at least one parameter was executed as a
+    shell command.
+
+    *passed_cmds* is the subset of *executed_cmds* that exited 0. The
+    aggregate flag cannot answer "which one worked?", and that is precisely
+    the question when a step's gate is the thing that is broken: diagnosis
+    proposes a working command, the pipeline runs it and sees it pass, and
+    the answer used to be discarded. See
+    :func:`gate_integrity.prove_gate_superseded`.
 
     Parameters
     ----------
@@ -819,6 +827,7 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
     cmds_succeeded = True
     has_fix_commands = False
     executed_cmds: list[str] = []
+    passed_cmds: list[str] = []
 
     # Reset the rejection record for this attempt — it is set below only
     # when a guard rejects the fix, and consumed by the next attempt's
@@ -1456,6 +1465,8 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
             })
         if not success:
             cmds_succeeded = False
+        else:
+            passed_cmds.append(cmd)
         applied = True
         has_fix_commands = True
         executed_cmds.append(cmd)
@@ -1470,4 +1481,5 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                      f"stopping fix command loop (alternatives not needed).")
             break
 
-    return applied, cmds_succeeded, has_fix_commands, executed_cmds
+    return (applied, cmds_succeeded, has_fix_commands, executed_cmds,
+            passed_cmds)

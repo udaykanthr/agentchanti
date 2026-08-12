@@ -109,6 +109,12 @@ def _is_harness_error(out: str | None) -> bool:
 # fatal signal as a negative return code.
 _NTSTATUS_FAILURE_BASE = 0xC0000000
 
+# Most a single gate is sampled before the ledger gives up on getting two
+# agreeing verdicts. Three covers the worst honest sequence — a crash that
+# costs a sample, then the failure and its confirmation — while keeping a
+# genuinely red gate to one extra run per re-check.
+_MAX_GATE_SAMPLES = 3
+
 
 def is_abnormal_exit(code: int | None) -> bool:
     """True when the process DIED rather than reporting a verdict.
@@ -160,39 +166,59 @@ class GateLedger:
         with self._lock:
             self._gates.clear()
 
-    def recheck(self, executor, timeout: int = 300) -> list[tuple[str, str, str]]:
-        """Re-run every recorded gate; return the ones that now fail.
+    def _sample_gate(self, executor, cmd: str,
+                     timeout: int) -> tuple[str, str, int | None]:
+        """Run *cmd* once and classify what came back.
 
-        Each regression is ``(cmd, step_label, output_tail)``. An empty
-        list means monotonic progress holds.
+        ``"pass"``    — the gate is green.
+        ``"crash"``   — the process died, so it reported no verdict at all.
+        ``"harness"`` — the command could not launch (env/cwd), likewise
+                        no verdict about the code.
+        ``"fail"``    — the code under test genuinely failed the check.
         """
-        regressions: list[tuple[str, str, str]] = []
-        for cmd, label in self.gates().items():
-            ok, out = executor.run_command(cmd, timeout=timeout)
-            if ok:
-                continue
-            exit_code = getattr(executor, "last_exit_code", None)
-            if is_abnormal_exit(exit_code):
-                # The process died instead of reporting a verdict, so
-                # there is nothing to conclude from it. Retry once: the
-                # native fast-fail this guards against is intermittent,
-                # and a second green run is real evidence.
-                _logger.warning(
-                    "[GateLedger] gate process terminated abnormally "
-                    "(%s) — retrying once before believing it (%s): %s",
-                    describe_abnormal_exit(exit_code) or exit_code,
-                    label or "?", cmd)
-                log_crash_diagnostics(exit_code, cmd)
-                ok, out = executor.run_command(cmd, timeout=timeout)
-                if ok:
-                    continue
-                if is_abnormal_exit(getattr(executor, "last_exit_code", None)):
+        ok, out = executor.run_command(cmd, timeout=timeout)
+        exit_code = getattr(executor, "last_exit_code", None)
+        if ok:
+            return "pass", out, exit_code
+        if is_abnormal_exit(exit_code):
+            return "crash", out, exit_code
+        if _is_harness_error(out):
+            return "harness", out, exit_code
+        return "fail", out, exit_code
+
+    def _confirmed_failure(self, executor, cmd: str, label: str,
+                           timeout: int) -> str | None:
+        """Output of a failure seen **twice**, or ``None`` if unconfirmed.
+
+        Rolling back is enormously more expensive than re-running: it
+        discards a whole wave of real work, and it fails the run. So no
+        single sample may decide it. A failure must reproduce before it is
+        believed, and any sample that PASSES dismisses the earlier one.
+
+        Observed 2026-08-12: the same `python -m unittest -v`, one second
+        apart, on bytes that had not changed — exit 0, then exit 1. The
+        ledger called the second sample a REGRESSION and rolled the run
+        back; by hand afterwards the suite passed 12/12, and that
+        project's pygame teardown was measured segfaulting 6 times in 30.
+        The abnormal-exit guard below could not save it, because the
+        deciding sample came back as an ordinary exit 1.
+        """
+        crashes = 0
+        seen_failure: str | None = None
+
+        for _attempt in range(_MAX_GATE_SAMPLES):
+            verdict, out, exit_code = self._sample_gate(
+                executor, cmd, timeout)
+
+            if verdict == "pass":
+                if seen_failure is not None or crashes:
                     _logger.warning(
-                        "[GateLedger] gate crashed again — treating as "
-                        "inconclusive rather than a regression (%s): %s",
-                        label or "?", cmd)
-                    continue
-            if _is_harness_error(out):
+                        "[GateLedger] gate PASSES on re-run — the earlier "
+                        "result did not reproduce, so it is flaky rather "
+                        "than a regression (%s): %s", label or "?", cmd)
+                return None
+
+            if verdict == "harness":
                 # The command can no longer launch (missing interpreter /
                 # wrong cwd) — inconclusive, not a code regression. Rolling
                 # back over this would discard good code (observed: a
@@ -202,11 +228,57 @@ class GateLedger:
                     "[GateLedger] gate no longer launches — harness/env "
                     "error, treating as inconclusive rather than a "
                     "regression (%s): %s", label or "?", cmd)
+                return None
+
+            if verdict == "crash":
+                # A dead process is not a verdict. Retry: the native
+                # fast-fail this guards against is intermittent. Two
+                # crashes mean the gate cannot be read at all here — more
+                # attempts would only cost time.
+                crashes += 1
+                if crashes >= 2:
+                    _logger.warning(
+                        "[GateLedger] gate crashed again — treating as "
+                        "inconclusive rather than a regression (%s): %s",
+                        label or "?", cmd)
+                    return None
+                _logger.warning(
+                    "[GateLedger] gate process terminated abnormally "
+                    "(%s) — retrying once before believing it (%s): %s",
+                    describe_abnormal_exit(exit_code) or exit_code,
+                    label or "?", cmd)
+                log_crash_diagnostics(exit_code, cmd)
                 continue
-            _logger.warning(
-                "[GateLedger] REGRESSION — previously-passing gate "
-                "now fails (%s): %s", label or "?", cmd)
-            regressions.append((cmd, label, (out or "")[-1500:]))
+
+            if seen_failure is not None:
+                _logger.warning(
+                    "[GateLedger] REGRESSION — previously-passing gate "
+                    "fails twice in a row (%s): %s", label or "?", cmd)
+                return out
+            seen_failure = out
+            _logger.info(
+                "[GateLedger] gate failed (%s): %s — re-running once to "
+                "confirm before treating it as a regression",
+                label or "?", cmd)
+
+        _logger.warning(
+            "[GateLedger] gate never failed twice in %d sample(s) — "
+            "inconclusive rather than a regression (%s): %s",
+            _MAX_GATE_SAMPLES, label or "?", cmd)
+        return None
+
+    def recheck(self, executor, timeout: int = 300) -> list[tuple[str, str, str]]:
+        """Re-run every recorded gate; return the ones that now fail.
+
+        Each regression is ``(cmd, step_label, output_tail)``, and each has
+        been confirmed by a second failing run. An empty list means
+        monotonic progress holds.
+        """
+        regressions: list[tuple[str, str, str]] = []
+        for cmd, label in self.gates().items():
+            out = self._confirmed_failure(executor, cmd, label, timeout)
+            if out is not None:
+                regressions.append((cmd, label, (out or "")[-1500:]))
         return regressions
 
 

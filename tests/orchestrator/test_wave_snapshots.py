@@ -96,22 +96,86 @@ class TestGateLedger(unittest.TestCase):
         executor.run_command.side_effect = _run
         self.assertEqual(ledger.recheck(executor), [])
 
-    def test_a_real_failure_after_a_crash_still_regresses(self):
-        """The retry must not swallow a genuine failure."""
-        ledger = GateLedger()
-        ledger.record("python -m unittest -v", "4.1")
+    def _scripted(self, outcomes, codes):
+        """An executor that replays *outcomes*/*codes* one run at a time."""
         executor = MagicMock()
-        outcomes = [(False, "died"), (False, "FAILED (errors=1)")]
-        codes = [3221226505, 1]
 
         def _run(cmd, timeout=300):
             executor.last_exit_code = codes.pop(0)
             return outcomes.pop(0)
 
         executor.run_command.side_effect = _run
+        return executor
+
+    def test_a_real_failure_after_a_crash_still_regresses(self):
+        """The retry must not swallow a genuine failure.
+
+        The crash costs a sample without yielding a verdict, so the
+        failure still has to reproduce before it counts.
+        """
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = self._scripted(
+            [(False, "died"), (False, "FAILED (errors=1)"),
+             (False, "FAILED (errors=1)")],
+            [3221226505, 1, 1])
         regressions = ledger.recheck(executor)
         self.assertEqual(len(regressions), 1)
         self.assertIn("FAILED", regressions[0][2])
+
+    def test_a_failure_that_does_not_reproduce_is_not_a_regression(self):
+        """The 2026-08-12 incident: the same `python -m unittest -v`, one
+        second apart on unchanged bytes, exited 0 then 1. That single red
+        sample rolled back the wave and failed a run whose suite passed
+        12/12 by hand afterwards (pygame teardown segfaults ~20% here).
+
+        An ordinary exit 1 is not an abnormal exit, so the crash guard
+        could not catch it — only requiring the failure to reproduce can.
+        """
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "7.1")
+        executor = self._scripted(
+            [(False, "FAILED (errors=1)"), (True, "OK")], [1, 0])
+        self.assertEqual(ledger.recheck(executor), [])
+        self.assertEqual(executor.run_command.call_count, 2)
+
+    def test_a_failure_confirmed_by_a_second_run_still_regresses(self):
+        """The guard must keep its teeth: two agreeing failures roll back."""
+        ledger = GateLedger()
+        ledger.record("pytest -q", "3.1")
+        executor = self._scripted(
+            [(False, "1 failed"), (False, "1 failed")], [1, 1])
+        regressions = ledger.recheck(executor)
+        self.assertEqual(len(regressions), 1)
+        self.assertEqual(executor.run_command.call_count, 2)
+
+    def test_a_crash_then_failure_then_pass_is_not_a_regression(self):
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = self._scripted(
+            [(False, "died"), (False, "FAILED"), (True, "OK")],
+            [3221226505, 1, 0])
+        self.assertEqual(ledger.recheck(executor), [])
+
+    def test_sampling_is_bounded(self):
+        """A gate that never repeats itself must not loop forever."""
+        ledger = GateLedger()
+        ledger.record("python -m unittest -v", "4.1")
+        executor = self._scripted(
+            [(False, "died"), (False, "FAILED"), (False, "died"),
+             (False, "FAILED")],
+            [3221226505, 1, 3221226505, 1])
+        self.assertEqual(ledger.recheck(executor), [])
+        self.assertLessEqual(executor.run_command.call_count, 3)
+
+    def test_a_green_gate_is_still_sampled_once(self):
+        """The confirming re-run costs nothing when nothing is failing."""
+        ledger = GateLedger()
+        ledger.record("pytest -q", "1.1")
+        executor = MagicMock()
+        executor.run_command.return_value = (True, "OK")
+        self.assertEqual(ledger.recheck(executor), [])
+        self.assertEqual(executor.run_command.call_count, 1)
 
     def test_recheck_real_failure_still_regresses(self):
         """A genuine code failure (assertion / non-zero test exit) is still
@@ -207,8 +271,10 @@ class TestEnforceMonotonicGates(unittest.TestCase):
         from agentchanti.orchestrator.cli import _enforce_monotonic_gates
         get_gate_ledger().record("python -m unittest discover -v", "4.1")
         executor = MagicMock()
-        # Red before the repair, green after it.
+        # Consistently red before the repair — a stale stub fails every
+        # run, so both confirming samples fail — and green after it.
         executor.run_command.side_effect = [
+            (False, "FAILED (errors=1)"),
             (False, "FAILED (errors=1)"),
             (True, "OK"),
         ]
