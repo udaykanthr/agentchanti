@@ -656,31 +656,58 @@ def _advance(g):
 
 
 def _player_mark(g):
-    """Something that must change when the player moves."""
+    """Something that must change when the player moves.
+
+    Sub-tile progress is folded in where the artifact exposes it. A
+    tile-granular mark needs a WHOLE tile of travel to register, and a
+    player that dies first respawns on its start tile — so a direction
+    that moved fine reads as "did not move", differently on each run
+    because ghost RNG is unseeded.
+    """
     p = getattr(g, "player", None)
     if p is None:
         return None
+    mark = None
     for probe in (_entity_pixels, _entity_tile, _tuple_tile):
-        mark = probe(p)
-        if mark is not None:
-            return tuple(mark)
-    pos = getattr(p, "position", None)
-    if pos is not None:
+        found = probe(p)
+        if found is not None:
+            mark = tuple(found)
+            break
+    if mark is None:
+        pos = getattr(p, "position", None)
+        if pos is None:
+            return None
         try:
-            return tuple(pos)
+            mark = tuple(pos)
         except Exception:
             return None
-    return None
+    for fine in ("progress", "segment_progress", "edge_progress", "offset"):
+        value = getattr(p, fine, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return mark + (round(float(value), 4),)
+    return mark
 
 
 def _drive(g, send, value, frames=60, dt=0.02):
-    """Send one direction and step; return whether the player moved."""
+    """Send one direction and step; did the player move at ANY point?
+
+    Sampled every frame, not compared start-to-end: a ghost catching the
+    player respawns it on its start tile, so an end-state comparison
+    reports "never moved" for a direction that moved fine and then died.
+    Observed on a working artifact whose DOWN neighbour is walkable —
+    and if that had happened on all four directions the verdict would
+    have been a false "no direction moves the player".
+    """
     before = _player_mark(g)
+    if before is None:
+        return False
     send(value)
     advance = _advance(g)
     for _ in range(frames):
         advance(dt)
-    return before is not None and _player_mark(g) != before
+        if _player_mark(g) != before:
+            return True
+    return False
 
 
 def _resolve_input_api(Game, kw):
@@ -711,24 +738,30 @@ def _resolve_input_api(Game, kw):
 
 
 def _check_directions(Game, kw, send_label, encode):
-    """Every direction must return, and at least one must move the player.
+    """Every direction must RETURN. That is the assertion here.
 
-    The per-direction sweep is the point: the freeze that motivated this
-    affected LEFT and UP only, because their next-centre arithmetic was
-    wrong while RIGHT and DOWN were fine. A single-direction probe would
-    have passed it.
+    The freeze that motivated this affected LEFT and UP only, because
+    their next-centre arithmetic was wrong while RIGHT and DOWN were
+    fine, so the sweep has to cover all four; a single-direction probe
+    would have passed it. A hang inside `_guard` exits FAIL by design.
+
+    Which directions MOVED is reported but deliberately not a verdict.
+    Some are walls at spawn, and even an open one can read as "did not
+    move" when a ghost kills the player first — that flipped between
+    identical runs of the same artifact. Liveness is carried instead by
+    the progress check below, which sweeps 3,000 frames and accumulates
+    across lives, and would fail anyway if the player could not move.
     """
     moved = []
     for name in _DIR_VECTORS:
         g = _new_game(Game, kw)
         send = dict(_senders(g)).get(send_label)
-        # A hang inside here exits the process with FAIL, by design.
         if _guard(f"driving {name}", _WATCHDOG_SECONDS,
-                  _drive, g, send, encode(name)):
+                  _drive, g, send, encode(name), 120):
             moved.append(name)
-    print(f"{'directions that move the player':<32} "
-          f"{', '.join(moved) if moved else 'NONE'}")
-    return bool(moved)
+    print(f"{'all four directions return':<32} yes "
+          f"(moved: {', '.join(moved) if moved else 'none observed'})")
+    return True
 
 
 def _progress_probe(g):
@@ -898,8 +931,8 @@ def main() -> int:
     # so the wall verdict above still stands.
     api = _resolve_input_api(Game, kw)
     if api is None:
-        print(f"{'directions that move the player':<32} cannot verify "
-              f"(no input method moved the player)")
+        print(f"{'liveness':<32} cannot verify "
+              f"(no input method visibly moved the player)")
         moved_any, progressed = None, None
     else:
         api_label, send_label, encode = api
@@ -911,8 +944,6 @@ def main() -> int:
     failures = []
     if total:
         failures.append(f"{total} wall-frames")
-    if moved_any is False:
-        failures.append("no direction moves the player")
     if progressed is False:
         failures.append("nothing is ever collected while driving")
     if failures:
