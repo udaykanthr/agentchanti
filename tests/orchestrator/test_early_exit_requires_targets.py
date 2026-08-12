@@ -68,9 +68,29 @@ class MissingRequiredTest(unittest.TestCase):
 
     def test_a_path_escaping_the_root_is_ignored_not_raised(self):
         """A malformed `target:` must not be able to hold a step open."""
+        # `os.sep + name` is absolute on POSIX and on Windows, where join()
+        # keeps the drive but replaces the path. `../` escapes on both.
         self.assertEqual(
-            _missing_required(self.tools, {"../outside.py", "C:/etc/x.py"}),
+            _missing_required(self.tools,
+                              {"../outside.py", os.sep + "elsewhere.py"}),
             [])
+
+    def test_a_windows_drive_path_is_not_portable_shorthand(self):
+        """`C:/etc/x.py` does not mean "outside the root" everywhere.
+
+        On POSIX it is an ordinary RELATIVE path naming a directory called
+        `C:`, so it resolves inside the project root and is correctly
+        reported missing. An earlier version of the test above asserted
+        the Windows reading and failed all three Linux CI jobs while
+        passing all three Windows ones — on a branch named for platform
+        escaping.
+        """
+        result = _missing_required(self.tools, {"C:/etc/x.py"})
+        if os.name == "nt":
+            self.assertEqual(result, [], "absolute, so outside the root")
+        else:
+            self.assertEqual(result, ["C:/etc/x.py"],
+                             "relative, so a genuinely missing target")
 
     def test_results_are_sorted_for_a_stable_message(self):
         self.assertEqual(
