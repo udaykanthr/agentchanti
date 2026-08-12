@@ -673,20 +673,32 @@ def _player_mark(g):
     p = getattr(g, "player", None)
     if p is None:
         return None
+
+    def _position_tuple(entity):
+        pos = getattr(entity, "position", None)
+        if pos is None:
+            return None
+        try:
+            values = tuple(pos)
+        except Exception:
+            return None
+        return values if len(values) == 2 else None
+
+    # FINEST FIRST. Preferring the tile hid a real defect: an artifact whose
+    # player advanced 2.4px on its first frame and then never moved again
+    # never changed tile, so every direction read as "did not move", no
+    # input API resolved, and both liveness checks were skipped as a
+    # refusal — reported as "cannot verify" when the truthful answer is
+    # that Pac-Man cannot move. With a pixel mark the API resolves, the
+    # progress sweep runs, and the run fails as it should.
     mark = None
-    for probe in (_entity_pixels, _entity_tile, _tuple_tile):
+    for probe in (_entity_pixels, _position_tuple, _entity_tile, _tuple_tile):
         found = probe(p)
         if found is not None:
             mark = tuple(found)
             break
     if mark is None:
-        pos = getattr(p, "position", None)
-        if pos is None:
-            return None
-        try:
-            mark = tuple(pos)
-        except Exception:
-            return None
+        return None
     for fine in ("progress", "segment_progress", "edge_progress", "offset"):
         value = getattr(p, fine, None)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
