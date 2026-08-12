@@ -1804,6 +1804,84 @@ def shallow_gate_reason(cmd: str) -> Optional[str]:
             "as long as the module loads")
 
 
+def _same_expr(a, b) -> bool:
+    """True when two AST nodes are the same expression, structurally."""
+    import ast as _ast
+    try:
+        return _ast.dump(a) == _ast.dump(b)
+    except Exception:
+        return False
+
+
+def _always_true(node) -> bool:
+    """True when *node* is a test that NO runtime value can falsify.
+
+    `assert True` was already rejected as punctuation, but the same
+    intent survives in forms the constant check cannot see. Observed on a
+    Pac-Man run whose plan gated its whole Game class on
+
+        assert isinstance(g.player, type(g.player))
+        assert isinstance(g.map,    type(g.map))
+
+    — true for every object that has ever existed. Both gates went green
+    against a game where nothing moved in 600 frames, and the pipeline
+    reported success. `verified-early` sharpens the cost: the loop exits
+    the moment the gate passes, so a gate that cannot fail ends the step
+    on turn one.
+
+    Recognised: truthy constants, `isinstance(x, type(x))`,
+    `isinstance(x, object)`, and a comparison of an expression with
+    itself. `and` is tautological only when every operand is; `or` when
+    any is.
+
+    Deliberately narrow. A false positive here costs a re-plan, so only
+    forms that are true by construction are claimed — `x == x` is
+    included even though NaN falsifies it, because a gate asserting it
+    is not checking behaviour either way.
+    """
+    import ast as _ast
+
+    if isinstance(node, _ast.Constant):
+        return bool(node.value)
+
+    if isinstance(node, _ast.BoolOp):
+        if isinstance(node.op, _ast.And):
+            return all(_always_true(v) for v in node.values)
+        return any(_always_true(v) for v in node.values)
+
+    if isinstance(node, _ast.Call):
+        fn = node.func
+        if (isinstance(fn, _ast.Name) and fn.id == "isinstance"
+                and len(node.args) == 2):
+            obj, cls = node.args
+            # isinstance(x, type(x))
+            if (isinstance(cls, _ast.Call)
+                    and isinstance(cls.func, _ast.Name)
+                    and cls.func.id == "type"
+                    and len(cls.args) == 1
+                    and _same_expr(cls.args[0], obj)):
+                return True
+            # isinstance(x, object)
+            if isinstance(cls, _ast.Name) and cls.id == "object":
+                return True
+        return False
+
+    if isinstance(node, _ast.Compare) and len(node.ops) == 1:
+        if (isinstance(node.ops[0], (_ast.Eq, _ast.Is, _ast.LtE, _ast.GtE))
+                and _same_expr(node.left, node.comparators[0])):
+            return True
+
+    return False
+
+
+def _describe(node) -> str:
+    import ast as _ast
+    try:
+        return _ast.unparse(node)
+    except Exception:                       # pragma: no cover - <3.9 only
+        return "the assertion"
+
+
 def _shallow_python_reason(payload: str) -> Optional[str]:
     """Classify a ``python -c`` payload. None when it can fail on a value."""
     import ast as _ast
@@ -1824,20 +1902,27 @@ def _shallow_python_reason(payload: str) -> Optional[str]:
         return ("only imports the module — it proves the file parses, not "
                 "that it behaves correctly")
 
+    # Assertions that cannot fail, kept for the message. `assert True` is
+    # not an assertion, it is punctuation — and so is every other form in
+    # `_always_true`. Only an assert that some runtime value could falsify
+    # counts as a gate.
+    tautologies: list[str] = []
+
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Assert):
-            # `assert True` is not an assertion, it is punctuation. The
-            # gate-quality pressure produces these: told its smoke gate
-            # "never asserts", a planner appended `assert True` and the
-            # check went quiet — a gate that CANNOT fail, arrived at by
-            # the machinery meant to prevent exactly that. Only an assert
-            # over a runtime value counts.
-            if isinstance(node.test, _ast.Constant):
+            if _always_true(node.test):
+                tautologies.append(_describe(node.test))
                 continue
             return None
         # `sys.exit(1)` / `raise` on a bad value are assertions in spirit.
         if isinstance(node, _ast.Raise):
             return None
+
+    if tautologies:
+        shown = "; ".join(f"`{t}`" for t in tautologies[:2])
+        return (f"asserts only things that are true for every possible "
+                f"value ({shown}) — the gate passes no matter what the "
+                f"code does. Assert a concrete expected value instead")
 
     return ("imports and prints but never asserts — it passes whatever the "
             "values are, so it cannot detect wrong behaviour")
