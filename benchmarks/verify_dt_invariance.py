@@ -119,6 +119,14 @@ def _find_game():
     raise SystemExit("no Game class found")
 
 
+# Append-only, like _SENDER_NAMES and for the same reason: each of these
+# was the only way some artifact leaves its start screen, and a missing
+# name costs the whole run. `start_new_game` was absent, so a working game
+# — score 0 -> 20, ghosts roaming — reported five inert dt profiles and
+# refused on both halves.
+_STARTER_NAMES = ("start_game", "start_playing", "start_new_game",
+                  "new_game", "start", "begin_game", "begin", "new_round")
+
 # Tokens an artifact may accept as "begin play" when it exposes no starter
 # method at all. Tried through update(), and kept only if `state` moves.
 _START_TOKENS = ("space", "start", "enter", "return", {"start": True},
@@ -135,8 +143,7 @@ def _new_game(Game, kw):
     # advance entities at all, so every check downstream reads as "nothing
     # moves". One artifact named this `start_playing`, which was missing
     # here, and its whole liveness result was a false "cannot verify".
-    for starter in ("start_game", "start_playing", "start", "begin",
-                    "new_game"):
+    for starter in _STARTER_NAMES:
         if hasattr(g, starter):
             getattr(g, starter)()
             return g
@@ -694,8 +701,9 @@ def _direction_values(Game):
 # player" and lost its whole liveness result to a refusal.
 _SENDER_NAMES = ("queue_direction", "request_direction", "set_direction",
                  "set_player_direction", "set_desired_direction",
-                 "set_next_direction", "change_direction", "move",
-                 "handle_input", "turn")
+                 "set_next_direction", "buffer_direction",
+                 "change_direction", "move", "handle_input", "handle_key",
+                 "turn")
 
 
 def _senders(g):
@@ -1048,17 +1056,22 @@ def main() -> int:
             "the dt profiles", _WATCHDOG_SECONDS * len(PROFILES),
             lambda: [_run(Game, kw, label, fn, frames, rng)
                      for label, fn, frames in PROFILES])
-        total = sum(bad for bad, _ in results)
         if not any(moved for _, moved in results):
             # Zero wall-frames out of a game that never moved is not
             # evidence of wall safety, so it must not be recorded as any.
             raise SystemExit(
                 "no entity moved in any dt profile, so zero wall-frames "
                 "proves nothing about wall safety")
+        # Assigned only once the result MEANS something. Setting it before
+        # the check left total=0 through the refusal, so the summary went
+        # on to claim "no entity entered a wall" about a game that never
+        # moved — the precise false claim this guard exists to stop.
+        total = sum(bad for bad, _ in results)
     except SystemExit as exc:
-        wall_note = str(exc.code)
+        total, wall_note = None, str(exc.code)
         print(f"{'wall checks':<32} cannot verify ({wall_note})")
     except Exception as exc:                       # noqa: BLE001
+        total = None
         wall_note = f"probing raised {type(exc).__name__}: {exc}"
         print(f"{'wall checks':<32} cannot verify ({wall_note})")
 
