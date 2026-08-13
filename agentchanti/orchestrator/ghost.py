@@ -1466,26 +1466,80 @@ def _parse_state_guard(test) -> Optional[tuple[str, set[str]]]:
 
 
 def guarded_advance_methods(text: str) -> dict[str, tuple[str, set[str]]]:
-    """``method -> (state_attr, live_values)`` for every guarded advancer."""
+    """``"Class.method" -> (state_attr, live_values)`` for guarded advancers.
+
+    Keyed by class, not by bare method name, because the name alone does
+    not identify the code a call reaches. `Game.update` is state-guarded
+    while `Player.update` and `Ghost.update` — same name, same project —
+    are not, and a test driving the player and ghost directly skips no
+    frames at all. Matching on `update` reported it as if it did.
+    """
     out: dict[str, tuple[str, set[str]]] = {}
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return out
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if not isinstance(node, ast.ClassDef):
             continue
-        guard = _state_guard(node)
-        if guard is None:
-            continue
-        attr, live = guard
-        if node.name in out:                  # same name, differing guards
-            prev_attr, prev_live = out[node.name]
-            if prev_attr == attr:
-                out[node.name] = (attr, prev_live | live)
-            continue
-        out[node.name] = (attr, live)
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            guard = _state_guard(item)
+            if guard is None:
+                continue
+            out[f"{node.name}.{item.name}"] = guard
     return out
+
+
+def _class_bindings(tree) -> dict[str, str]:
+    """``receiver -> class`` for every ``x = Class(...)`` in a module.
+
+    Covers the two spellings tests actually use: a local ``game =
+    Game(seed)`` and a fixture ``self.game = Game()`` set up in `setUp`.
+    A receiver bound to two different classes is dropped — an unresolved
+    receiver must not be guessed at.
+    """
+    out: dict[str, str] = {}
+    conflicted: set[str] = set()
+
+    def _key(target) -> Optional[str]:
+        if isinstance(target, ast.Name):
+            return target.id
+        if (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)):
+            return f"{target.value.id}.{target.attr}"
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(
+                node.value, ast.Call):
+            continue
+        func = node.value.func
+        cls = (func.id if isinstance(func, ast.Name)
+               else func.attr if isinstance(func, ast.Attribute) else None)
+        if cls is None or not cls[:1].isupper():
+            continue
+        for target in node.targets:
+            key = _key(target)
+            if key is None:
+                continue
+            if out.get(key, cls) != cls:
+                conflicted.add(key)
+            out[key] = cls
+    for key in conflicted:
+        out.pop(key, None)
+    return out
+
+
+def _receiver_key(func: ast.Attribute) -> Optional[str]:
+    """The binding key for the object a method call is made on."""
+    recv = func.value
+    if isinstance(recv, ast.Name):
+        return recv.id
+    if isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name):
+        return f"{recv.value.id}.{recv.attr}"
+    return None
 
 
 def _loop_iterations(node: ast.For) -> int:
@@ -1594,8 +1648,8 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
         text = _read(root, path)
         if text is None:
             continue
-        for name, guard in guarded_advance_methods(text).items():
-            advancers.setdefault(name, guard)
+        for qualified, guard in guarded_advance_methods(text).items():
+            advancers.setdefault(qualified, guard)
     if not advancers:
         return []
 
@@ -1610,6 +1664,7 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
             tree = ast.parse(text)
         except (SyntaxError, ValueError, RecursionError, MemoryError):
             continue
+        bindings = _class_bindings(tree)
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -1619,12 +1674,17 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
                 iterations = _loop_iterations(loop)
                 if iterations < _MIN_LONG_RUN:
                     continue
-                called = {
-                    n.func.attr for n in ast.walk(loop)
-                    if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr in advancers
-                }
+                # Resolve each call's receiver to the class it was built
+                # from; an unresolved receiver is simply not evidence.
+                called = set()
+                for n in ast.walk(loop):
+                    if not isinstance(n, ast.Call) or not isinstance(
+                            n.func, ast.Attribute):
+                        continue
+                    key = _receiver_key(n.func)
+                    cls = bindings.get(key) if key else None
+                    if cls and f"{cls}.{n.func.attr}" in advancers:
+                        called.add(f"{cls}.{n.func.attr}")
                 if not called:
                     continue
                 if any(isinstance(n, ast.Break) for n in ast.walk(loop)):
@@ -1633,6 +1693,8 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
                 attr, live = advancers[method]
                 before, after = _siblings(fn, loop)
                 if _pins_state_live(list(loop.body) + after, attr, live):
+                    continue
+                if _reacts_to_state(loop, attr):
                     continue
                 if _extends_lifetime(before):
                     continue
@@ -1666,6 +1728,31 @@ def _siblings(fn, loop: ast.For) -> tuple[list, list]:
 # A timer set to this or beyond is nobody's real gameplay value; it is a
 # test deliberately holding the simulation open.
 _KEEPALIVE_MIN = 1000
+
+
+def _reacts_to_state(loop: ast.For, attr: str) -> bool:
+    """Does the loop body branch on the state at all?
+
+    The third honest pattern, after pinning and breaking: notice the run
+    ended and start another one. A real suite wrote
+
+        if game.state is GameState.GAME_OVER:
+            game.restart()
+
+    and commented that it restarts "so this test continues to exercise the
+    actual PLAYING update loop" — 2000 of 2000 frames live across six
+    restarts. It pins nothing and never breaks, so the first version of
+    this check reported all three of its loops. A test that reads the
+    state inside its own loop has thought about termination, and that is
+    the whole question being asked here.
+    """
+    for node in ast.walk(loop):
+        if not isinstance(node, (ast.If, ast.While)):
+            continue
+        if any(isinstance(n, ast.Attribute) and n.attr == attr
+               for n in ast.walk(node.test)):
+            return True
+    return False
 
 
 def _extends_lifetime(stmts) -> bool:

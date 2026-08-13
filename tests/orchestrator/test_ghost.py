@@ -1128,3 +1128,88 @@ def test_degenerate_long_run_surfaces_as_a_disagreement(tmp_path):
             if g.kind == "degenerate-long-run"]
     assert len(gaps) == 1
     assert "test_sim.py" in gaps[0].detail
+
+
+def test_restart_on_termination_is_silent(tmp_path):
+    """Noticing the run ended and starting another is honest.
+
+    A real suite wrote exactly this and was live for 2000 of 2000 frames
+    across six restarts; the first version of this check reported all
+    three of its loops.
+    """
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n"
+                           "            if game.state is GAME_OVER:\n"
+                           "                game.restart()\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_same_method_name_on_an_unguarded_class_is_not_accused(tmp_path):
+    """`Player.update` is not `Game.update`, whatever the name says.
+
+    A real suite drove the player and ghost directly for 800 frames.
+    Neither class early-returns, so no frame can be silently skipped, but
+    matching on the bare name `update` reported it anyway.
+    """
+    root = str(tmp_path)
+    _write(root, "game.py", _GAME + '''
+
+class Player:
+    def __init__(self):
+        self.tile = (0, 0)
+
+    def update(self, dt):
+        self.tile = (dt, dt)
+''')
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, Player, PLAYING, GAME_OVER\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_long(self):\n"
+           "        player = Player()\n"
+           "        for _ in range(800):\n"
+           "            player.update(0.016)\n"
+           "            self.assertTrue(player.tile)\n")
+    assert degenerate_long_runs(root, ["game.py", "test_sim.py"]) == []
+
+
+def test_guarded_class_is_still_caught_alongside_an_unguarded_twin(tmp_path):
+    """Adding an unguarded `Player.update` must not silence `Game.update`."""
+    root = str(tmp_path)
+    _write(root, "game.py", _GAME + '''
+
+class Player:
+    def update(self, dt):
+        self.tile = dt
+''')
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, Player, PLAYING, GAME_OVER\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_long(self):\n"
+           "        game = Game()\n"
+           "        for _ in range(2000):\n"
+           "            game.update(0.016)\n"
+           "            self.assertTrue(game.ok)\n")
+    found = degenerate_long_runs(root, ["game.py", "test_sim.py"])
+    assert len(found) == 1
+    assert "Game.update()" in found[0][1]
+
+
+def test_fixture_receiver_from_setup_is_resolved(tmp_path):
+    """`self.game = Game()` in setUp binds the receiver just as well."""
+    root = str(tmp_path)
+    _write(root, "game.py", _GAME)
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, PLAYING, GAME_OVER\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.game = Game()\n\n"
+           "    def test_long(self):\n"
+           "        for _ in range(2000):\n"
+           "            self.game.update(0.016)\n"
+           "            self.assertTrue(self.game.ok)\n")
+    assert len(degenerate_long_runs(root, ["game.py", "test_sim.py"])) == 1
