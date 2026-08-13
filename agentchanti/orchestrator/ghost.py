@@ -887,6 +887,37 @@ def _python_class_members(text: str) -> set[str]:
     return names
 
 
+def _export_evidence(module_level: Iterable[str],
+                     members: Iterable[str] = (),
+                     limit: int = 12) -> str:
+    """The 'file exports …' evidence for a violated export claim.
+
+    Plain ``sorted(actual)[:8]`` over the merged set was actively
+    misleading. ``_python_class_members`` contributes both ``member`` and
+    ``Class.member`` spellings, and an alphabetical head could be spent
+    entirely on those: for the ``entities.py`` that really declared
+    ``Player``, ``GridMover``, ``add_direction`` and 11 other module-level
+    names, the evidence showed eight entries, three of them
+    ``Ghost.__init__``-style, and none of the names a reader would look
+    for. A correct finding read like a false positive.
+
+    So the file's own module-level names come first — a plan's ``exports:``
+    almost always names one — class members fill only the room left over,
+    and the elided count is always stated, because a silent truncation is
+    what made the old line read as a complete list.
+    """
+    module_level = sorted(set(module_level))
+    members = sorted(set(members) - set(module_level))
+    shown = module_level[:limit]
+    if len(shown) < limit:
+        shown += members[:limit - len(shown)]
+    omitted = (len(module_level) + len(members)) - len(shown)
+    listing = ", ".join(shown) if shown else "nothing"
+    if omitted > 0:
+        listing += f" (+{omitted} more)"
+    return listing
+
+
 def _check_exports(text: str, symbol: str, path: str,
                    language: str | None) -> tuple[str, str]:
     """Is *symbol* actually exported by the file's real contents?
@@ -898,17 +929,22 @@ def _check_exports(text: str, symbol: str, path: str,
     try:
         from ..language_backend import get_backend
         backend = get_backend(_language_for(path, language))
-        actual = set(backend.extract_exports(text) or [])
+        exported = set(backend.extract_exports(text) or [])
     except Exception:
         return UNKNOWN, "no export extractor for this file"
+    members: set[str] = set()
     if path.lower().endswith(".py"):
-        actual |= _python_class_members(text)
+        members = _python_class_members(text)
+    # The verdict is decided on the union, exactly as before; only the
+    # evidence distinguishes the two sources, so the reader sees the
+    # file's own top-level names before one class's method list.
+    actual = exported | members
     if not actual:
         return UNKNOWN, "extractor found no exports at all — inconclusive"
     if _export_satisfied(symbol, actual):
         return HOLDS, ""
     return VIOLATED, (f"declared export not found; file exports "
-                      f"{sorted(actual)[:8]}")
+                      f"{_export_evidence(exported, members)}")
 
 
 _EXT_LANG = {

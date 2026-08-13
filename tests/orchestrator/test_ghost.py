@@ -297,6 +297,48 @@ def test_genuinely_absent_export_still_violated_with_classes(tmp_path):
         "file:entities.py#exports:OPPOSITE_DIRECTION"].verdict == VIOLATED
 
 
+def test_violated_export_evidence_names_module_level_symbols(tmp_path):
+    """The evidence must show the file's own names, not one class's methods.
+
+    Observed on a real Pac-Man run: `entities.py` declared 14 module-level
+    names, and the finding's evidence was an alphabetical head of the
+    merged set — eight entries, three of them `Ghost.__init__`-style, with
+    `Player` and `GridMover` cut. The verdict was correct and the evidence
+    made it look like a false positive.
+    """
+    root = str(tmp_path)
+    ghost = GhostPlan.build(
+        [_step("3.1", target_files=["entities.py"],
+               exports=["position_to_tile"])], root)
+    body = ["UP = (0, -1)", "DOWN = (0, 1)", "Player = 1", "GridMover = 2",
+            "", "", "class Ghost:"]
+    body += [f"    def _m{i}(self):\n        pass\n" for i in range(20)]
+    _write(root, "entities.py", "\n".join(body))
+
+    ghost.resolve(["3.1"], language="python")
+    exp = ghost.expectations["file:entities.py#exports:position_to_tile"]
+    assert exp.verdict == VIOLATED
+    # Every module-level name is present, ahead of any class member.
+    for name in ("UP", "DOWN", "Player", "GridMover"):
+        assert name in exp.evidence
+    assert exp.evidence.index("Player") < exp.evidence.index("Ghost._m")
+    # A truncated list must say so, or it reads as the complete set.
+    assert "more)" in exp.evidence
+
+
+def test_short_export_list_is_not_marked_truncated(tmp_path):
+    """No elision count when nothing was elided."""
+    root = str(tmp_path)
+    ghost = GhostPlan.build(
+        [_step("4.2", target_files=["main.py"], exports=["main"])], root)
+    _write(root, "main.py", "def run():\n    return 0\n")
+
+    ghost.resolve(["4.2"], language="python")
+    evidence = ghost.expectations["file:main.py#exports:main"].evidence
+    assert "run" in evidence
+    assert "more)" not in evidence
+
+
 def test_unwired_import_edge_is_violated(tmp_path):
     root = str(tmp_path)
     steps = [
