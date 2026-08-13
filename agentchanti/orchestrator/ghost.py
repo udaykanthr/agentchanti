@@ -1407,14 +1407,16 @@ def _state_guard(fn) -> Optional[tuple[str, set[str]]]:
             if not (isinstance(s, ast.Expr)
                     and isinstance(s.value, ast.Constant)
                     and isinstance(s.value.value, str))]
-    node = None
     for stmt in body:
         # The prologue is guards only; the first real work ends it.
-        if not isinstance(stmt, ast.If) or stmt.orelse or len(stmt.body) != 1:
+        if not isinstance(stmt, ast.If) or stmt.orelse or not stmt.body:
             break
-        leave = stmt.body[0]
+        leave = stmt.body[-1]
         if isinstance(leave, ast.Raise):
             continue                     # validation guard, keep looking
+        # The body may do a little work before leaving — one real guard
+        # ran `self.assert_invariants()` first, which is exactly why its
+        # frozen frames kept passing — but it must still leave.
         if not isinstance(leave, ast.Return) or leave.value is not None:
             break
         guard = _parse_state_guard(stmt.test)
@@ -1424,7 +1426,19 @@ def _state_guard(fn) -> Optional[tuple[str, set[str]]]:
 
 
 def _parse_state_guard(test) -> Optional[tuple[str, set[str]]]:
-    """The ``(attr, live)`` a bare-return guard condition expresses."""
+    """The ``(attr, live)`` a bare-return guard condition expresses.
+
+    An ``or`` is enough on its own: ``if self.state != PLAYING or dt ==
+    0.0: return`` leaves early whenever the state leaves PLAYING, whatever
+    the other disjunct says. An ``and`` is not, since the guard may then
+    decline to fire on a dead state, so it is left unread.
+    """
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        for value in test.values:
+            guard = _parse_state_guard(value)
+            if guard is not None:
+                return guard
+        return None
     negated = False
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         test, negated = test.operand, True
@@ -1694,7 +1708,7 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
                 before, after = _siblings(fn, loop)
                 if _pins_state_live(list(loop.body) + after, attr, live):
                     continue
-                if _reacts_to_state(loop, attr):
+                if _handles_termination(loop, attr, live):
                     continue
                 if _extends_lifetime(before):
                     continue
@@ -1730,8 +1744,8 @@ def _siblings(fn, loop: ast.For) -> tuple[list, list]:
 _KEEPALIVE_MIN = 1000
 
 
-def _reacts_to_state(loop: ast.For, attr: str) -> bool:
-    """Does the loop body branch on the state at all?
+def _handles_termination(loop: ast.For, attr: str, live: set[str]) -> bool:
+    """Does the loop body branch on the run having *ended*?
 
     The third honest pattern, after pinning and breaking: notice the run
     ended and start another one. A real suite wrote
@@ -1741,16 +1755,40 @@ def _reacts_to_state(loop: ast.For, attr: str) -> bool:
 
     and commented that it restarts "so this test continues to exercise the
     actual PLAYING update loop" — 2000 of 2000 frames live across six
-    restarts. It pins nothing and never breaks, so the first version of
-    this check reported all three of its loops. A test that reads the
-    state inside its own loop has thought about termination, and that is
-    the whole question being asked here.
+    restarts.
+
+    Branching on the *live* state is a different thing and is not
+    accepted: ``if game.state == PLAYING and frame % 11 == 0: send_input()``
+    only gates input, and the loop it appeared in degenerated anyway. The
+    condition has to be one that a dead run satisfies.
     """
+    def _tests_terminal(test) -> bool:
+        if isinstance(test, ast.BoolOp):
+            return any(_tests_terminal(v) for v in test.values)
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return False              # `not <live>` is read below, not here
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            return False
+        if not any(isinstance(n, ast.Attribute) and n.attr == attr
+                   for n in ast.walk(test.left)):
+            return False
+        op, right = test.ops[0], test.comparators[0]
+        names = {right.id} if isinstance(right, ast.Name) else (
+            {right.attr} if isinstance(right, ast.Attribute) else set())
+        if isinstance(right, (ast.Tuple, ast.List, ast.Set)):
+            names = {e.id if isinstance(e, ast.Name) else
+                     e.attr if isinstance(e, ast.Attribute) else ""
+                     for e in right.elts}
+        if not names or "" in names:
+            return False
+        if isinstance(op, (ast.Eq, ast.Is, ast.In)):
+            return not (names & live)       # compares against a dead state
+        if isinstance(op, (ast.NotEq, ast.IsNot, ast.NotIn)):
+            return bool(names & live)       # "not still live"
+        return False
+
     for node in ast.walk(loop):
-        if not isinstance(node, (ast.If, ast.While)):
-            continue
-        if any(isinstance(n, ast.Attribute) and n.attr == attr
-               for n in ast.walk(node.test)):
+        if isinstance(node, (ast.If, ast.While)) and _tests_terminal(node.test):
             return True
     return False
 

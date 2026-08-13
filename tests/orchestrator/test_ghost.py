@@ -1213,3 +1213,56 @@ def test_fixture_receiver_from_setup_is_resolved(tmp_path):
            "            self.game.update(0.016)\n"
            "            self.assertTrue(self.game.ok)\n")
     assert len(degenerate_long_runs(root, ["game.py", "test_sim.py"])) == 1
+
+
+def test_guard_with_work_before_the_return_is_found(tmp_path):
+    """A guard may do a little work before it leaves.
+
+    Observed: `if self.state != PLAYING or dt == 0.0: self.assert_invariants();
+    return` — and re-asserting the invariants is exactly why the frozen
+    frames kept passing. Requiring a single-statement body missed it, and
+    the suite it belonged to ran 171 of 2001 frames.
+    """
+    root = str(tmp_path)
+    game = ('PLAYING = "playing"\n\n\nclass Game:\n'
+            '    def __init__(self):\n        self.state = PLAYING\n\n'
+            '    def assert_invariants(self):\n        pass\n\n'
+            '    def update(self, dt):\n'
+            '        if self.state != PLAYING or dt == 0.0:\n'
+            '            self.assert_invariants()\n            return\n'
+            '        self.tick = dt\n')
+    paths = _project(root, "        for _ in range(2001):\n"
+                           "            game.update(0.008)\n"
+                           "            self.assertTrue(game.ok)\n", game=game)
+    assert len(degenerate_long_runs(root, paths)) == 1
+
+
+def test_and_guard_is_not_read_as_a_state_guard(tmp_path):
+    """`or` fires whenever the state dies; `and` may decline to."""
+    root = str(tmp_path)
+    game = ('PLAYING = "playing"\n\n\nclass Game:\n'
+            '    def __init__(self):\n        self.state = PLAYING\n\n'
+            '    def update(self, dt):\n'
+            '        if self.state != PLAYING and dt == 0.0:\n'
+            '            return\n'
+            '        self.tick = dt\n')
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n", game=game)
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_gating_input_on_the_live_state_is_not_handling_termination(tmp_path):
+    """Reading the state to decide whether to send input changes nothing.
+
+    A real suite wrote `if game.state == PLAYING and frame % 11 == 0:
+    request_direction(...)` and still ran 44 of its 650 frames.
+    """
+    root = str(tmp_path)
+    paths = _project(
+        root, "        for frame in range(650):\n"
+              "            if game.state == PLAYING and frame % 11 == 0:\n"
+              "                game.request_direction(1)\n"
+              "            game.update(0.016)\n"
+              "            self.assertTrue(game.ok)\n")
+    assert len(degenerate_long_runs(root, paths)) == 1
