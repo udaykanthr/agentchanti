@@ -77,6 +77,9 @@ _DEFAULTS = {
     "agent_loop": True,
     "agent_loop_max_turns": 8,
     "wave_snapshots": True,
+    "ghost_shadow": True,
+    "ghost_heal": True,
+    "ghost_heal_source_edits": True,
     "plan_mode": "content",
     "dependency_check_enabled": True,
     "analyser_enabled": False,
@@ -436,6 +439,28 @@ class Config:
         # Only activates in a workdir that is NOT already a git repo.
         self.WAVE_SNAPSHOTS = _get_bool(
             "WAVE_SNAPSHOTS", "wave_snapshots", _DEFAULTS["wave_snapshots"])
+
+        # Read-only reconciliation of the plan's declared effects against
+        # the real tree (orchestrator/ghost.py). Costs no LLM call and
+        # changes no verdict — it only reports where the evidence and the
+        # pipeline's own claim disagree.
+        self.GHOST_SHADOW = _get_bool(
+            "GHOST_SHADOW", "ghost_shadow", _DEFAULTS["ghost_shadow"])
+
+        # Deterministic repair of the gaps the shadow finds
+        # (orchestrator/ghost_heal.py): installing a declared dependency
+        # into the interpreter that runs the app, creating an absent
+        # package marker, adding a declared-but-missing import. Never
+        # writes content the plan did not supply — a healer that invents
+        # a CSS rule or a function body to satisfy its own check turns a
+        # detectable defect into an undetectable one.
+        self.GHOST_HEAL = _get_bool(
+            "GHOST_HEAL", "ghost_heal", _DEFAULTS["ghost_heal"])
+        # Narrows healing to environment actions only (installs), leaving
+        # every project file untouched.
+        self.GHOST_HEAL_SOURCE_EDITS = _get_bool(
+            "GHOST_HEAL_SOURCE_EDITS", "ghost_heal_source_edits",
+            _DEFAULTS["ghost_heal_source_edits"])
 
         # Planning mode: "content" (planner emits full file bodies,
         # classic) or "intent" (planner emits goals + verify: gates; the

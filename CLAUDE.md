@@ -74,6 +74,24 @@ A/B harness comparing `agent_loop` on vs off over the task set in `benchmarks/ta
 
 `benchmarks/verify_dt_invariance.py <project-dir>` is an independent ground-truth check for generated tile-maze games: it drives the game at several timestep profiles and asserts no entity ever occupies a wall tile, catching games that only hold together at a fixed 1/60 dt. Exit codes are **0 PASS, 1 FAIL, 2 could-not-verify** — the third is deliberate, because generated projects share no vocabulary and a refusal must never be recorded as a failure.
 
+### Ghost Shadow (orchestrator/ghost.py)
+
+Read-only reconciliation of the plan's *declared postconditions* against the real tree — no LLM calls, no commands run, no verdict changed. `GhostPlan.build()` is called in `cli.py` once the plan is final (after blind-edit routing / dependency fixes / verify repair) and before the first step runs, so its file hashes are a true pre-run baseline. Steps' `target:`/`exports:`/`imports:`/`verify:` become interned `Expectation` nodes (`EXISTS`, `TOUCHED`, `PARSES`, `EXPORTS`, `IMPORT_EDGE`, `PKG_PRESENT`, `GATE_PASSED`) shared across the steps that declare them; verdicts are four-valued (`HOLDS`/`VIOLATED`/`UNKNOWN`/`INAPPLICABLE`) and fold over an append-only observation journal. Resolved per wave next to `_reconcile_plan_graph`, reported once at the end of the run under `[Ghost]`.
+
+`PLAN_ANCHORS` is the step-drift check, and the reason the ghost can repair as well as report. Where the planner supplied a file's body (`PlanStep.inline_code`, i.e. content mode), the structural names that body declares — CSS selectors, Python defs/classes/constants, JS exports — must still be present in the written file. A smaller model plans correctly and then deviates while executing an individual step, and nothing else notices: the file exists, parses, and often satisfies a gate that never names the missing piece.
+
+### Ghost Heal (orchestrator/ghost_heal.py)
+
+Deterministic repair of what the shadow finds — no LLM call. Runs per wave (so later steps benefit) and once at the end, under `[GhostHeal]`. Governed by one rule: **never invent content; freely restore content the plan already specified.** Those are different things — writing an empty `.site-header {}` to satisfy a check makes a real defect undetectable, but writing the `.site-header` rule *the planner put in `inline_code`* invents nothing and enforces a decision already made.
+
+Healers: `PKG_PRESENT` → install into the interpreter `Executor._venv_bin_dir()` resolves (never bare `python`, which is the original bug); `EXISTS` → restore from the plan's body, or create an empty `__init__.py` (empty *is* its correct content); `IMPORT_EDGE` → add the import, only when both files are Python in the same directory, exactly one consumer is a real module, and every declared symbol demonstrably exists in the source; `PLAN_ANCHORS`/`EXPORTS` → restore the plan's body when the written file is a strict regression.
+
+Refusals are as important as repairs. Restoration is declined when the written file declares anything the plan's body does not — the step may have added real work, so the conflict is reported instead of clobbered. `PARSES`, `TOUCHED` and `GATE_PASSED` have no healer at all: no source specifies what they should contain. Every heal is verified by re-resolving its expectation, and source edits are snapshotted and reverted if the gap does not close. Flags: `ghost_heal` (default true), `ghost_heal_source_edits` (narrows to environment actions only).
+
+`PKG_PRESENT` is the one check that looks past the repo at the environment: for any manifest the plan targets (`requirements.txt`, `package.json`) every declared runtime dependency must be present in the environment the app will actually run in — the venv `Executor._venv_bin_dir()` resolves, or `node_modules`. Purely a filesystem comparison, no subprocess. It exists because a plan step wrote `python -m venv venv && python -m pip install pygame`, which creates a venv but never activates it, so pygame installed into the pipeline's interpreter instead; every gate passed (the game modules were headless and imported no pygame) and only `main.py` needed it, crashing at launch under the project venv. No venv / no `node_modules` resolves `UNKNOWN` — a project on the ambient interpreter must never be accused.
+
+Surfaces five disagreement classes the rest of the pipeline is blind to: `violated-*` (a step claimed done while a declared postcondition is false), `planned-untouched` (target's bytes never changed), `unplanned-write` (a file no step declared), `no-checkable-claim` (a step whose expectations are all tautologies — the plan-level analogue of `gate_integrity`), and `failed-but-clean` (run marked failed while everything declared holds). Disable with `ghost_shadow: false`.
+
 ### Key Subsystems
 
 - **Config** (`config.py`): Priority resolution: CLI args > env vars > `.agentchanti.yaml` > defaults
