@@ -741,6 +741,14 @@ class GhostPlan:
                 kind="tests-never-collected", step_id="-",
                 detail=f"{path}: {reason}"))
 
+        # Long assertion loops that stop simulating partway through. Same
+        # candidate set as above, and for the same reason: the suites that
+        # exposed this were as often unplanned writes as planned targets.
+        for path, reason in degenerate_long_runs(self.root, _candidates):
+            out.append(Disagreement(
+                kind="degenerate-long-run", step_id="-",
+                detail=f"{path}: {reason}"))
+
         for planned, actual in sorted(self.case_mismatches.items()):
             out.append(Disagreement(
                 kind="filename-case-mismatch", step_id="-",
@@ -1362,6 +1370,329 @@ def _python_test_counts(text: str) -> tuple[int, int]:
             if node.name.startswith("test"):
                 pytest_only += 1
     return unittest_visible, pytest_only
+
+
+# ── Long runs that stop running ──────────────────────────────────────
+#
+# The blind spot this closes: a suite can satisfy "run >= 2000 frames and
+# assert the invariants hold" while simulating fifty. `Game.update` opens
+# with `if self.state is not PLAYING: return`, so once the ghosts catch a
+# parked player every later iteration is a no-op — and the invariant
+# assertions keep passing, against a frozen state, all the way to 2000.
+# Every gate goes green and no other check in the pipeline can see it.
+#
+# Detected structurally, from the two halves that have to be true at once:
+# the advance method early-returns on a state guard, and a long assertion
+# loop calls it without ever pinning the state to a live value. Both come
+# from the project's own source, so nothing here is a hardcoded guess
+# about what a "game" or a "frame" is.
+
+_MIN_LONG_RUN = 200            # below this, a loop is not claiming endurance
+
+
+def _state_guard(fn) -> Optional[tuple[str, set[str]]]:
+    """``(state_attr, live_values)`` if *fn* opens with an early return.
+
+    Only the unambiguous spellings are read — ``is not X``, ``!= X``,
+    ``not in (X, Y)`` and their negated forms. Anything cleverer yields
+    ``None``, because a guard this check misreads would accuse a test that
+    is doing nothing wrong.
+
+    The whole guard prologue is scanned, not just the first statement: a
+    real ``update()`` opened with ``if not math.isfinite(dt): raise`` and
+    put the state guard second, which a ``body[0]`` reading missed
+    entirely.
+    """
+    body = [s for s in fn.body
+            if not (isinstance(s, ast.Expr)
+                    and isinstance(s.value, ast.Constant)
+                    and isinstance(s.value.value, str))]
+    node = None
+    for stmt in body:
+        # The prologue is guards only; the first real work ends it.
+        if not isinstance(stmt, ast.If) or stmt.orelse or len(stmt.body) != 1:
+            break
+        leave = stmt.body[0]
+        if isinstance(leave, ast.Raise):
+            continue                     # validation guard, keep looking
+        if not isinstance(leave, ast.Return) or leave.value is not None:
+            break
+        guard = _parse_state_guard(stmt.test)
+        if guard is not None:
+            return guard
+    return None
+
+
+def _parse_state_guard(test) -> Optional[tuple[str, set[str]]]:
+    """The ``(attr, live)`` a bare-return guard condition expresses."""
+    negated = False
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        test, negated = test.operand, True
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return None
+    if not isinstance(test.left, ast.Attribute):
+        return None
+    attr = test.left.attr
+    op, right = test.ops[0], test.comparators[0]
+
+    def _names(node) -> set[str]:
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, ast.Attribute):
+            return {node.attr}
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            out: set[str] = set()
+            for elt in node.elts:
+                got = _names(elt)
+                if not got:
+                    return set()
+                out |= got
+            return out
+        return set()
+
+    live = _names(right)
+    if not live:
+        return None
+    # `is not X` / `!= X` leaves X live; negation flips an `is`/`==`.
+    if isinstance(op, (ast.IsNot, ast.NotEq)) and not negated:
+        return attr, live
+    if isinstance(op, (ast.Is, ast.Eq)) and negated:
+        return attr, live
+    if isinstance(op, ast.NotIn) and not negated:
+        return attr, live
+    if isinstance(op, ast.In) and negated:
+        return attr, live
+    return None
+
+
+def guarded_advance_methods(text: str) -> dict[str, tuple[str, set[str]]]:
+    """``method -> (state_attr, live_values)`` for every guarded advancer."""
+    out: dict[str, tuple[str, set[str]]] = {}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return out
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        guard = _state_guard(node)
+        if guard is None:
+            continue
+        attr, live = guard
+        if node.name in out:                  # same name, differing guards
+            prev_attr, prev_live = out[node.name]
+            if prev_attr == attr:
+                out[node.name] = (attr, prev_live | live)
+            continue
+        out[node.name] = (attr, live)
+    return out
+
+
+def _loop_iterations(node: ast.For) -> int:
+    """Literal ``range(...)`` length, or ``-1`` when it is not knowable."""
+    call = node.iter
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        return -1
+    if call.func.id != "range" or call.keywords:
+        return -1
+    args = call.args
+    if not all(isinstance(a, ast.Constant) and isinstance(a.value, int)
+               for a in args):
+        return -1
+    if len(args) == 1:
+        return args[0].value
+    if len(args) == 2:
+        return args[1].value - args[0].value
+    return -1
+
+
+def _pins_state_live(stmts, attr: str, live: set[str]) -> bool:
+    """Does any statement here constrain *attr* to a live value?
+
+    A tautology is deliberately not a guard: ``assertIn(game.state,
+    (PLAYING, WIN, GAME_OVER))`` admits the terminal states it was
+    supposed to rule out, and was written verbatim by a real run.
+    """
+    _PINNING = {"assertEqual", "assertIs", "assertNotEqual", "assertIsNot"}
+
+    def _reads_state(node) -> bool:
+        return any(isinstance(n, ast.Attribute) and n.attr == attr
+                   for n in ast.walk(node))
+
+    def _compare_pins(cmp_node) -> bool:
+        if not isinstance(cmp_node, ast.Compare) or len(cmp_node.ops) != 1:
+            return False
+        if not _reads_state(cmp_node.left):
+            return False
+        op = cmp_node.ops[0]
+        right = cmp_node.comparators[0]
+        name = (right.id if isinstance(right, ast.Name)
+                else right.attr if isinstance(right, ast.Attribute) else None)
+        if name is None:
+            return False
+        if isinstance(op, (ast.Eq, ast.Is)):
+            return name in live
+        if isinstance(op, (ast.NotEq, ast.IsNot)):
+            return name not in live     # ruling out a terminal state
+        return False
+
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assert) and _compare_pins(node.test):
+                return True
+            if not isinstance(node, ast.Call):
+                continue
+            fname = (node.func.attr if isinstance(node.func, ast.Attribute)
+                     else node.func.id if isinstance(node.func, ast.Name)
+                     else "")
+            if fname in _PINNING and len(node.args) >= 2:
+                target, expected = node.args[0], node.args[1]
+                if not _reads_state(target):
+                    continue
+                name = (expected.id if isinstance(expected, ast.Name)
+                        else expected.attr
+                        if isinstance(expected, ast.Attribute) else None)
+                if name is None:
+                    continue
+                if fname in ("assertEqual", "assertIs") and name in live:
+                    return True
+                if (fname in ("assertNotEqual", "assertIsNot")
+                        and name not in live):
+                    return True
+            elif fname in ("assertTrue", "assertFalse") and node.args:
+                if fname == "assertTrue" and _compare_pins(node.args[0]):
+                    return True
+            elif fname == "assertIn" and len(node.args) >= 2:
+                # Only a guard when every admitted value is live.
+                if not _reads_state(node.args[0]):
+                    continue
+                allowed = node.args[1]
+                if isinstance(allowed, (ast.Tuple, ast.List, ast.Set)):
+                    names = {e.id if isinstance(e, ast.Name) else
+                             e.attr if isinstance(e, ast.Attribute) else None
+                             for e in allowed.elts}
+                    if None not in names and names and names <= live:
+                        return True
+    return False
+
+
+def degenerate_long_runs(root: str, paths: Iterable[str]
+                         ) -> list[tuple[str, str]]:
+    """``(path, reason)`` for long assertion loops that can quietly stop.
+
+    Silent unless the project itself supplies both halves of the proof:
+    a state-guarded advance method, and a test looping over it enough
+    times to be claiming endurance. A test that pins the state to a live
+    value — inside the loop or right after it — is doing the honest thing
+    and is never reported, and neither is one that breaks out on its own.
+    """
+    paths = sorted(set(paths))
+    advancers: dict[str, tuple[str, set[str]]] = {}
+    for path in paths:
+        if not path.endswith(".py") or is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        for name, guard in guarded_advance_methods(text).items():
+            advancers.setdefault(name, guard)
+    if not advancers:
+        return []
+
+    out: list[tuple[str, str]] = []
+    for path in paths:
+        if not is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for loop in ast.walk(fn):
+                if not isinstance(loop, ast.For):
+                    continue
+                iterations = _loop_iterations(loop)
+                if iterations < _MIN_LONG_RUN:
+                    continue
+                called = {
+                    n.func.attr for n in ast.walk(loop)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in advancers
+                }
+                if not called:
+                    continue
+                if any(isinstance(n, ast.Break) for n in ast.walk(loop)):
+                    continue           # the test already handles stopping
+                method = sorted(called)[0]
+                attr, live = advancers[method]
+                before, after = _siblings(fn, loop)
+                if _pins_state_live(list(loop.body) + after, attr, live):
+                    continue
+                if _extends_lifetime(before):
+                    continue
+                out.append((path, (
+                    f"{fn.name} loops {iterations} times over `{method}()`, "
+                    f"which returns immediately once `{attr}` leaves "
+                    f"{'/'.join(sorted(live))} — nothing in the loop or "
+                    f"after it pins `{attr}` to a live value, so the run "
+                    f"can end early and every remaining iteration asserts "
+                    f"against a frozen state and still passes")))
+                break                  # one finding per test function
+    return out
+
+
+def _siblings(fn, loop: ast.For) -> tuple[list, list]:
+    """``(before, after)`` statements around *loop* in its own block.
+
+    Both halves matter. A post-loop ``assertEqual(game.state, PLAYING)``
+    is a real guard — it fails when the run ended early — and a pre-loop
+    statement is where a test disables the thing that would end the run.
+    """
+    for node in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and loop in block:
+                i = block.index(loop)
+                return block[:i], block[i + 1:]
+    return [], []
+
+
+# A timer set to this or beyond is nobody's real gameplay value; it is a
+# test deliberately holding the simulation open.
+_KEEPALIVE_MIN = 1000
+
+
+def _extends_lifetime(stmts) -> bool:
+    """Did the test deliberately stop the run from ending?
+
+    Two independent runs wrote exactly this before a long loop —
+    ``game.frightened_timer = 1_000_000.0`` and
+    ``game.spawn_protection_timer = 1_000_000.0`` — to keep ghosts from
+    ending a simulation they wanted to observe for 2000 frames. Both were
+    live for every frame. A test that did this thought about termination,
+    and accusing it of ignoring termination is how a check gets ignored.
+    """
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if not isinstance(node, (ast.Assign, ast.AugAssign)):
+                continue
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            if not any(isinstance(t, ast.Attribute) for t in targets):
+                continue
+            value = node.value
+            if (isinstance(value, ast.Constant)
+                    and isinstance(value.value, (int, float))
+                    and not isinstance(value.value, bool)
+                    and value.value >= _KEEPALIVE_MIN):
+                return True
+    return False
 
 
 def uncollected_test_files(root: str, paths: Iterable[str],

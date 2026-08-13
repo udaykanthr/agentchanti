@@ -11,6 +11,7 @@ import pytest
 
 from agentchanti.orchestrator.ghost import (
     HOLDS, INAPPLICABLE, UNKNOWN, VIOLATED, GhostPlan, MIN_STEP_STRENGTH,
+    degenerate_long_runs,
 )
 from agentchanti.orchestrator.plan_step import PlanStep
 
@@ -961,3 +962,169 @@ def test_unparseable_test_file_is_not_accused(tmp_path):
     ghost.resolve(["5.1"], language="python")
     assert not [g for g in ghost.disagreements(["5.1"])
                 if g.kind == "tests-never-collected"]
+
+
+# ── degenerate long runs ─────────────────────────────────────────────
+#
+# The blind spot: a suite that satisfies "run 2000+ frames and assert the
+# invariants" while simulating fifty, because `update()` early-returns
+# once the run ends and every later iteration asserts a frozen state.
+
+_GAME = '''\
+PLAYING = "playing"
+GAME_OVER = "over"
+
+
+class Game:
+    def __init__(self):
+        self.state = PLAYING
+
+    def update(self, dt):
+        if self.state is not PLAYING:
+            return
+        self.tick = dt
+'''
+
+
+def _project(root, test_body, game=_GAME):
+    _write(root, "game.py", game)
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, PLAYING, GAME_OVER\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_long(self):\n"
+           "        game = Game()\n" + test_body)
+    return ["game.py", "test_sim.py"]
+
+
+def test_unguarded_long_run_is_reported(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n")
+    found = degenerate_long_runs(root, paths)
+    assert len(found) == 1
+    assert "2000 times" in found[0][1]
+    assert "update()" in found[0][1]
+
+
+def test_state_pinned_inside_loop_is_silent(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertEqual(game.state, PLAYING)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_state_pinned_after_loop_is_silent(tmp_path):
+    """A post-loop check still fails when the run ended early."""
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "        self.assertEqual(game.state, PLAYING)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_ruling_out_the_terminal_state_is_a_pin(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertNotEqual(game.state, GAME_OVER)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_tautological_state_assertion_is_not_a_pin(tmp_path):
+    """`assertIn(state, (PLAYING, GAME_OVER))` admits what it should exclude.
+
+    Written verbatim by a real run, in a 2100-iteration loop that
+    simulated 246 frames.
+    """
+    root = str(tmp_path)
+    paths = _project(
+        root, "        for _ in range(2100):\n"
+              "            game.update(0.016)\n"
+              "            self.assertIn(game.state, (PLAYING, GAME_OVER))\n")
+    assert len(degenerate_long_runs(root, paths)) == 1
+
+
+def test_deliberately_extended_lifetime_is_silent(tmp_path):
+    """A test that disables the thing ending the run thought about it."""
+    root = str(tmp_path)
+    paths = _project(root, "        game.spawn_protection_timer = 1_000_000.0\n"
+                           "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_guard_behind_a_validation_prologue_is_still_found(tmp_path):
+    """The state guard is not always the first statement.
+
+    A real `update()` opened with `if not math.isfinite(dt): raise`, which
+    a `body[0]` reading missed entirely.
+    """
+    root = str(tmp_path)
+    game = ('PLAYING = "playing"\n\n\nclass Game:\n'
+            '    def __init__(self):\n        self.state = PLAYING\n\n'
+            '    def update(self, dt):\n'
+            '        if dt < 0:\n            raise ValueError("dt")\n'
+            '        if self.state != PLAYING:\n            return\n'
+            '        self.tick = dt\n')
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n", game=game)
+    assert len(degenerate_long_runs(root, paths)) == 1
+
+
+def test_short_loop_is_not_a_long_run(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(10):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_loop_that_breaks_out_is_silent(tmp_path):
+    """Breaking on termination is not asserting against a frozen state."""
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            if game.state != PLAYING:\n"
+                           "                break\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_unguarded_advance_method_is_never_accused(tmp_path):
+    """No early-return guard means no frames can be silently skipped."""
+    root = str(tmp_path)
+    game = ('PLAYING = "playing"\n\n\nclass Game:\n'
+            '    def __init__(self):\n        self.state = PLAYING\n\n'
+            '    def update(self, dt):\n        self.tick = dt\n')
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n", game=game)
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_unparseable_test_file_is_not_accused_of_degeneracy(tmp_path):
+    root = str(tmp_path)
+    _write(root, "game.py", _GAME)
+    _write(root, "test_sim.py", "def broken(:\n")
+    assert degenerate_long_runs(root, ["game.py", "test_sim.py"]) == []
+
+
+def test_degenerate_long_run_surfaces_as_a_disagreement(tmp_path):
+    """End-to-end: the finding reaches the reported disagreement list."""
+    root = str(tmp_path)
+    _project(root, "        for _ in range(2000):\n"
+                   "            game.update(0.016)\n"
+                   "            self.assertTrue(game.ok)\n")
+    ghost = GhostPlan.build(
+        [_step("1.1", target_files=["game.py", "test_sim.py"])], root)
+    ghost.resolve(["1.1"], language="python")
+
+    gaps = [g for g in ghost.disagreements(["1.1"])
+            if g.kind == "degenerate-long-run"]
+    assert len(gaps) == 1
+    assert "test_sim.py" in gaps[0].detail
