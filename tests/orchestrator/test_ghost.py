@@ -804,3 +804,118 @@ def test_to_dict_is_serializable(tmp_path):
     _write(root, "a.py", "X = 1\n")
     ghost.resolve(["1.1"], language="python")
     assert json.loads(json.dumps(ghost.to_dict()))["tally"][HOLDS] >= 1
+
+
+# ── test files the declared runner never collects ────────────────────
+
+
+UNITTEST_STYLE = (
+    "import unittest\n\n\n"
+    "class TestThing(unittest.TestCase):\n"
+    "    def test_a(self):\n        pass\n"
+    "    def test_b(self):\n        pass\n"
+)
+PYTEST_STYLE = (
+    "def test_initial_position(Player, tmp_path):\n    pass\n\n\n"
+    "def test_moves(Player):\n    pass\n"
+)
+
+
+def test_pytest_style_file_under_unittest_is_reported(tmp_path):
+    """20 of 22 tests were invisible to the project's own command.
+
+    Observed: an agent loop wrote four pytest-style modules while the
+    acceptance command was `python -m unittest -v`, which collects only
+    TestCase subclasses. unittest reported 2 tests and passed; pytest on
+    the same directory reported 22.
+    """
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest -v")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+    _write(root, "tests/test_player.py", PYTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    gaps = ghost.disagreements(
+        ["5.1"], tracked_files=["tests/test_game.py", "tests/test_player.py"])
+
+    bad = [g for g in gaps if g.kind == "tests-never-collected"]
+    assert len(bad) == 1
+    assert "test_player.py" in bad[0].detail
+    assert "pytest-style" in bad[0].detail
+
+
+def test_unittest_style_file_is_not_reported(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest -v")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_pytest_runner_collects_both_styles(tmp_path):
+    """Under pytest the module-level style is perfectly valid."""
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_player.py"],
+                 verify_cmd="pytest -q")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_player.py", PYTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_unknown_runner_stays_silent(tmp_path):
+    """No identifiable runner means no rule to judge collection by."""
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_player.py"])
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_player.py", PYTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_empty_test_file_is_reported(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_empty.py"],
+                 verify_cmd="python -m unittest -v")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_empty.py", "import unittest\n")
+
+    ghost.resolve(["5.1"], language="python")
+    bad = [g for g in ghost.disagreements(["5.1"])
+           if g.kind == "tests-never-collected"]
+    assert len(bad) == 1
+    assert "no tests" in bad[0].detail
+
+
+def test_non_test_files_are_never_judged(tmp_path):
+    root = str(tmp_path)
+    step = _step("2.1", target_files=["game.py"],
+                 verify_cmd="python -m unittest -v")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "game.py", "class Game:\n    pass\n")
+
+    ghost.resolve(["2.1"], language="python")
+    assert not [g for g in ghost.disagreements(["2.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_unparseable_test_file_is_not_accused(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_bad.py"],
+                 verify_cmd="python -m unittest -v")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_bad.py", "def broken(:\n")
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]

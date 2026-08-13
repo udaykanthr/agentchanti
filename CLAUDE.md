@@ -80,6 +80,8 @@ Read-only reconciliation of the plan's *declared postconditions* against the rea
 
 `PLAN_ANCHORS` is the step-drift check, and the reason the ghost can repair as well as report. Where the planner supplied a file's body (`PlanStep.inline_code`, i.e. content mode), the structural names that body declares — CSS selectors, Python defs/classes/constants, JS exports — must still be present in the written file. A smaller model plans correctly and then deviates while executing an individual step, and nothing else notices: the file exists, parses, and often satisfies a gate that never names the missing piece.
 
+Run-level findings sit alongside the per-step ones: `unplanned-write`, `filename-case-mismatch`, and `tests-never-collected` — test files the run's own acceptance command will never collect, decided statically from the AST (`unittest` collects only `TestCase` subclasses; `pytest` also collects module-level `test_*` functions). It spans planned targets *and* untracked writes, because the four modules that exposed it were written by the agent loop and declared by no step. Silent when the runner cannot be identified, when the file will not parse, or when the runner is pytest.
+
 ### Ghost Heal (orchestrator/ghost_heal.py)
 
 Deterministic repair of what the shadow finds — no LLM call. Runs per wave (so later steps benefit) and once at the end, under `[GhostHeal]`. Governed by one rule: **never invent content; freely restore content the plan already specified.** Those are different things — writing an empty `.site-header {}` to satisfy a check makes a real defect undetectable, but writing the `.site-header` rule *the planner put in `inline_code`* invents nothing and enforces a decision already made.

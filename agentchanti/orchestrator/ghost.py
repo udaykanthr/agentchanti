@@ -318,6 +318,9 @@ class GhostPlan:
         # plan deliberately supplies goals instead of bodies.
         self.plan_content: dict[str, str] = {}
         self.plan_edits: dict[str, list[tuple[str, str]]] = {}
+        # Every command the plan names — verify gates and CMD bodies —
+        # so the run's own test runner can be identified.
+        self.declared_commands: list[str] = []
         self._lock = Lock()
 
     # -- construction --------------------------------------------------
@@ -338,6 +341,10 @@ class GhostPlan:
 
     def _add_step(self, step) -> None:
         sid = getattr(step, "id", "?")
+        for _cmd in (getattr(step, "verify_cmd", None),
+                     getattr(step, "command", None)):
+            if _cmd:
+                self.declared_commands.append(_cmd)
         node = self.steps.setdefault(sid, {"produces": set(), "requires": set()})
         targets = [_norm(t) for t in
                    (getattr(step, "target_files", None) or []) if t]
@@ -719,6 +726,20 @@ class GhostPlan:
             out.append(Disagreement(
                 kind="unplanned-write", step_id="-",
                 detail=f"{path} was written but no step declared it"))
+
+        # Test files the run's own acceptance command will never collect.
+        # Deliberately spans planned targets AND untracked writes: the
+        # four modules that exposed this were written by the agent loop
+        # and declared by no step, so a per-step check would have missed
+        # every one of them.
+        _runner = declared_runner(self.declared_commands)
+        _candidates = set(self.files) | {
+            _norm(p) for p in (tracked_files or ())}
+        for path, reason in uncollected_test_files(
+                self.root, _candidates, _runner):
+            out.append(Disagreement(
+                kind="tests-never-collected", step_id="-",
+                detail=f"{path}: {reason}"))
 
         for planned, actual in sorted(self.case_mismatches.items()):
             out.append(Disagreement(
@@ -1226,6 +1247,118 @@ def _check_plan_anchors(path: str, declared: str,
         f"the step drifted from the plan — the plan's own body for this "
         f"file declares {', '.join(sorted(missing))}, and the written "
         f"file does not")
+
+
+# ── Test files the declared runner will never collect ────────────────
+#
+# WHY THIS EXISTS
+# An agent loop wrote four test modules — 18KB across test_player.py,
+# test_main.py, test_ghost.py and test_game_map.py — in pytest style:
+# module-level `def test_x(Player, tmp_path)` with fixtures. The
+# project's own acceptance command was `python -m unittest -v`, which
+# collects only TestCase subclasses, so all four contributed exactly
+# zero tests. `python -m unittest` reported 2 tests and passed; pytest
+# on the same directory reported 22. Twenty tests were invisible to the
+# command the task was graded on, the files imported cleanly so nothing
+# errored, and every check in the pipeline stayed green.
+#
+# Collection is decided statically here rather than by running anything:
+# the rules are simple enough to read off the AST, and this module does
+# not execute commands.
+
+_TEST_NAME_RE = re.compile(r"(^|[/_.])test[_s]?\d*\.py$|conftest\.py$",
+                           re.IGNORECASE)
+
+_RUNNERS = (
+    ("unittest", re.compile(r"\bpython[0-9.]*\s+-m\s+unittest\b|\bunittest\b")),
+    ("pytest", re.compile(r"\bpytest\b")),
+)
+
+
+def is_python_test_file(path: str) -> bool:
+    base = os.path.basename(path.replace("\\", "/"))
+    if not base.endswith(".py") or base == "conftest.py":
+        return False
+    return base.startswith("test_") or base.endswith("_test.py")
+
+
+def declared_runner(commands: Iterable[str]) -> Optional[str]:
+    """Which Python test runner the plan's own commands name.
+
+    ``pytest`` wins a tie: it collects everything unittest does plus
+    module-level functions, so a project running both is only in trouble
+    when the unittest-only command is the acceptance gate.
+    """
+    found: set[str] = set()
+    for cmd in commands:
+        for name, pattern in _RUNNERS:
+            if pattern.search(cmd or ""):
+                found.add(name)
+    if "pytest" in found:
+        return "pytest"
+    if "unittest" in found:
+        return "unittest"
+    return None
+
+
+def _python_test_counts(text: str) -> tuple[int, int]:
+    """``(unittest_visible, pytest_only)`` test counts for one module."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return -1, -1                      # unparseable: no opinion
+    unittest_visible = 0
+    pytest_only = 0
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            bases = []
+            for b in node.bases:
+                if isinstance(b, ast.Attribute):
+                    bases.append(b.attr)
+                elif isinstance(b, ast.Name):
+                    bases.append(b.id)
+            if any(b.endswith("TestCase") for b in bases):
+                unittest_visible += sum(
+                    1 for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name.startswith("test"))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                pytest_only += 1
+    return unittest_visible, pytest_only
+
+
+def uncollected_test_files(root: str, paths: Iterable[str],
+                           runner: Optional[str]) -> list[tuple[str, str]]:
+    """``(path, reason)`` for test files the *runner* will never collect.
+
+    Silent when the runner cannot be identified, when a file will not
+    parse, or when the runner is pytest (which collects both styles) —
+    absence of a clear rule is not evidence of a broken test file.
+    """
+    if runner != "unittest":
+        return []
+    out: list[tuple[str, str]] = []
+    for path in sorted(set(paths)):
+        if not is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        visible, pytest_style = _python_test_counts(text)
+        if visible < 0:
+            continue                        # unparseable
+        if visible > 0:
+            continue
+        if pytest_style > 0:
+            out.append((path, (
+                f"{pytest_style} test(s) are written pytest-style "
+                f"(module-level functions), and `unittest` collects only "
+                f"TestCase subclasses — none of them run under the "
+                f"project's own acceptance command")))
+        else:
+            out.append((path, "defines no tests the declared runner collects"))
+    return out
 
 
 def _check_gate(cmd: str, gates: list[str]) -> tuple[str, str]:
