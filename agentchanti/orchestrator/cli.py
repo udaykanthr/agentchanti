@@ -1773,9 +1773,15 @@ def _main_impl():
             continue
 
         log.info(f"Wave {wave_idx+1}: executing steps {[i+1 for i in pending]}")
+        # `splitlines()[0]` on an empty description raises, and a status
+        # line must never be able to kill a run. Observed: a 20B model in
+        # content mode emitted 7 of 9 steps as target+content with no
+        # prose at all, and the pipeline crashed with IndexError at the
+        # start of wave 2 — after wave 1 had already succeeded.
         set_activity(
             f"wave {wave_idx+1}/{len(waves)} steps {[i+1 for i in pending]}: "
-            + "; ".join(steps[i].splitlines()[0][:60] for i in pending)
+            + "; ".join((steps[i].splitlines() or ["(no description)"])[0][:60]
+                        for i in pending)
         )
 
         if len(pending) == 1:

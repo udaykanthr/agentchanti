@@ -3020,9 +3020,41 @@ def update_step_after_execution(
 # Legacy compatibility helpers
 # ---------------------------------------------------------------------------
 
+def _synthesized_description(step: PlanStep) -> str:
+    """A usable instruction for a step whose prose the planner omitted.
+
+    ``description`` is not decoration — it is the text the coder, the
+    classifier and the status line all work from, so an empty one leaves
+    the step with no instruction at all. Weaker models in content mode
+    routinely emit ``target:`` plus a ``content:`` body and no prose
+    (observed: 7 of 9 steps from a 20B plan), which crashed the wave
+    banner outright and would have handed the coder an empty task.
+
+    Everything here comes from what the step already declares, so nothing
+    is invented — it is the same facts, rendered as a sentence.
+    """
+    verb = "Run" if step.step_type == "CMD" else "Create"
+    targets = ", ".join(step.target_files) if step.target_files else ""
+    if step.step_type == "CMD" and step.command:
+        return f"Run: {step.command}"
+    if targets:
+        text = f"{verb} {targets}"
+        if step.exports:
+            text += f" exporting {', '.join(step.exports)}"
+        return text
+    if step.command:
+        return f"Run: {step.command}"
+    return f"Step {step.id}"
+
+
 def steps_as_text_list(steps: list[PlanStep]) -> list[str]:
-    """Convert PlanStep list to legacy list[str] for backward compat."""
-    return [s.description for s in steps]
+    """Convert PlanStep list to legacy list[str] for backward compat.
+
+    A step whose description the planner omitted gets one synthesized
+    from its own declarations rather than an empty string.
+    """
+    return [s.description.strip() or _synthesized_description(s)
+            for s in steps]
 
 
 def steps_dependencies_dict(steps: list[PlanStep]) -> dict[int, set[int]]:
