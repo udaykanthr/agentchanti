@@ -654,6 +654,32 @@ class GhostPlan:
                 total += exp.weight
         return total
 
+    def declared_strength(self, step_id: str) -> int:
+        """Weight of what the step CLAIMED, whatever came of checking it.
+
+        Distinct from :meth:`step_strength`, which counts only confirmed
+        evidence. "Did this step assert anything that could have failed?"
+        is a question about the declaration, not about whether we managed
+        to confirm it.
+
+        Observed: a CMD step declared
+        ``verify: python -c "import pygame; assert pygame.version.verstr
+        .startswith('2.6')"`` — a genuinely falsifiable gate — but the
+        gate never entered the ledger, so it resolved UNKNOWN, banked no
+        evidence, and the step was reported as asserting nothing that
+        could have failed. The step's claim was real; only our record of
+        it was missing.
+        """
+        node = self.steps.get(step_id)
+        if not node:
+            return 0
+        total = 0
+        for exp_id in node["produces"] | node["requires"]:
+            exp = self.expectations.get(exp_id)
+            if exp is not None and exp.verdict != INAPPLICABLE:
+                total += exp.weight
+        return total
+
     def tally(self) -> dict[str, int]:
         counts = {HOLDS: 0, VIOLATED: 0, UNKNOWN: 0, INAPPLICABLE: 0}
         for exp in self.expectations.values():
@@ -681,12 +707,13 @@ class GhostPlan:
                     detail=f"{exp.subject}"
                            + (f" [{exp.detail}]" if exp.detail else "")
                            + (f" — {exp.evidence}" if exp.evidence else "")))
-            if self.step_strength(sid) < MIN_STEP_STRENGTH:
+            if self.declared_strength(sid) < MIN_STEP_STRENGTH:
                 out.append(Disagreement(
                     kind="no-checkable-claim", step_id=sid,
-                    detail=("step reported done but asserted nothing that "
-                            "could have failed — its declared effects are "
-                            "all self-satisfied or unverifiable")))
+                    detail=("step reported done but declared nothing that "
+                            "could have failed — no target, no gate, and "
+                            "any file it names is one the plan supplied "
+                            "the contents of")))
 
         for path in self.unplanned_writes(tracked_files):
             out.append(Disagreement(
@@ -703,12 +730,30 @@ class GhostPlan:
 
         if not pipeline_success:
             counts = self.tally()
-            if counts[VIOLATED] == 0 and counts[HOLDS] > 0:
+            # Every other kind here proves SHAPE — the file exists, parses,
+            # declares the right names, matches the plan's body. None of
+            # them can see behaviour, so on their own they are no basis at
+            # all for telling someone their failure is the harness's fault.
+            #
+            # Observed: a 20B run produced eight structurally perfect files
+            # — 41 postconditions green, every plan-declared anchor present
+            # — whose suite failed with "Ghost out of map bounds at (5, 7)".
+            # A real logic bug, a correctly-failed run, and this check
+            # confidently blamed the harness. A confirmed-green acceptance
+            # gate is the only evidence that speaks to behaviour, so
+            # without one the honest answer is silence.
+            behavioural = [
+                e for e in self.expectations.values()
+                if e.kind == KIND_GATE_PASSED and e.verdict == HOLDS
+            ]
+            if counts[VIOLATED] == 0 and behavioural:
                 out.append(Disagreement(
                     kind="failed-but-clean", step_id="-",
                     detail=(f"run marked FAILED while all {counts[HOLDS]} "
-                            "resolved postcondition(s) hold — suspect the "
-                            "harness before the model")))
+                            f"resolved postcondition(s) hold, including "
+                            f"{len(behavioural)} acceptance gate(s) that "
+                            f"went green — suspect the harness before the "
+                            f"model")))
         return out
 
     def report(self, done_step_ids: Iterable[str], *,

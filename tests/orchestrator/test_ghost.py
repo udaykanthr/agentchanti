@@ -630,6 +630,31 @@ def test_inline_only_step_asserts_nothing(tmp_path):
     assert ghost.step_strength("1.1") >= MIN_STEP_STRENGTH
 
 
+def test_unconfirmed_gate_still_counts_as_a_claim(tmp_path):
+    """A declared gate is an assertion even when we cannot confirm it.
+
+    Observed on a 20B-model run: a CMD step declared
+    `verify: python -c "import pygame; assert pygame.version.verstr
+    .startswith('2.6')"` — genuinely falsifiable — but the gate never
+    entered the ledger, so it resolved UNKNOWN and the step was reported
+    as asserting nothing that could have failed.
+    """
+    root = str(tmp_path)
+    step = PlanStep(
+        id="1.1", step_type="CMD", command="pip install pygame==2.6.1",
+        verify_cmd='python -c "import pygame; assert pygame.version.verstr"')
+    ghost = GhostPlan.build([step], root)
+
+    ghost.resolve(["1.1"], language="python", gate_cmds=[])
+    gate = next(e for e in ghost.expectations.values()
+                if e.kind == "GATE_PASSED")
+    assert gate.verdict == UNKNOWN          # unconfirmed
+    assert ghost.step_strength("1.1") == 0  # banked no evidence
+    assert ghost.declared_strength("1.1") >= MIN_STEP_STRENGTH
+    assert not [g for g in ghost.disagreements(["1.1"])
+                if g.kind == "no-checkable-claim"]
+
+
 def test_step_with_no_declarations_has_zero_strength(tmp_path):
     ghost = GhostPlan.build([_step("1.1")], str(tmp_path))
     ghost.resolve(["1.1"], language="python")
@@ -651,14 +676,36 @@ def test_unreadable_file_yields_no_strength(tmp_path):
 # ── run-level disagreements ──────────────────────────────────────────
 
 
-def test_failed_but_clean_is_flagged(tmp_path):
+def test_failed_but_clean_needs_a_green_acceptance_gate(tmp_path):
+    """Structural checks cannot adjudicate a failed run."""
     root = str(tmp_path)
-    ghost = GhostPlan.build([_step("1.1", target_files=["a.py"])], root)
+    ghost = GhostPlan.build(
+        [_step("1.1", target_files=["a.py"], verify_cmd="pytest -q")], root)
     _write(root, "a.py", "x = 1\n")
 
-    ghost.resolve(["1.1"], language="python")
+    ghost.resolve(["1.1"], language="python", gate_cmds=["pytest -q"])
     gaps = ghost.disagreements(["1.1"], pipeline_success=False)
     assert any(g.kind == "failed-but-clean" for g in gaps)
+
+
+def test_structurally_perfect_but_behaviourally_broken_stays_silent(tmp_path):
+    """Shape is not behaviour, and only a green gate speaks to behaviour.
+
+    Observed on a 20B content-mode run: eight structurally perfect files
+    — 41 postconditions green, every plan-declared anchor present — whose
+    suite failed with "Ghost out of map bounds at (5, 7)". A real logic
+    bug and a correctly-failed run, which this check told the user to
+    blame on the harness.
+    """
+    root = str(tmp_path)
+    ghost = GhostPlan.build(
+        [_step("1.1", target_files=["a.py"], exports=["Game"])], root)
+    _write(root, "a.py", "class Game:\n    pass\n")
+
+    ghost.resolve(["1.1"], language="python", gate_cmds=[])
+    assert ghost.tally()[VIOLATED] == 0          # nothing structural is wrong
+    gaps = ghost.disagreements(["1.1"], pipeline_success=False)
+    assert not [g for g in gaps if g.kind == "failed-but-clean"]
 
 
 def test_successful_clean_run_reports_nothing(tmp_path):
