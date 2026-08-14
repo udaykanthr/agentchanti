@@ -6,6 +6,7 @@ check pass. The second is the one that keeps the shadow worth reading.
 """
 
 import os
+import sys
 
 import pytest
 
@@ -30,10 +31,26 @@ def _write(root, rel, text):
 
 
 def _make_venv(root, packages=()):
-    scripts = os.path.join(root, "venv", "Scripts")
-    os.makedirs(scripts, exist_ok=True)
-    open(os.path.join(scripts, "python.exe"), "wb").close()
-    site = os.path.join(root, "venv", "Lib", "site-packages")
+    """Minimal venv skeleton, in the running platform's layout.
+
+    The detector looks for ``Scripts/python.exe`` on Windows and
+    ``bin/python`` everywhere else, so a fixture that hardcodes either
+    layout leaves the venv undetected on the other and there is no gap
+    left for the healer to close.
+    """
+    if os.name == "nt":
+        bin_dir = os.path.join(root, "venv", "Scripts")
+        exe = "python.exe"
+        site = os.path.join(root, "venv", "Lib", "site-packages")
+    else:
+        bin_dir = os.path.join(root, "venv", "bin")
+        exe = "python"
+        site = os.path.join(
+            root, "venv", "lib",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            "site-packages")
+    os.makedirs(bin_dir, exist_ok=True)
+    open(os.path.join(bin_dir, exe), "wb").close()
     os.makedirs(site, exist_ok=True)
     for pkg in packages:
         os.makedirs(os.path.join(site, f"{pkg}-1.0.dist-info"), exist_ok=True)
@@ -101,7 +118,8 @@ def test_install_targets_the_project_interpreter(tmp_path):
     GhostHealer(ghost, ex).heal(["2.1"], language="python")
 
     cmd = ex.commands[0]
-    assert "venv" in cmd and "python.exe" in cmd
+    interpreter = "python.exe" if os.name == "nt" else "python"
+    assert "venv" in cmd and interpreter in cmd
     assert not cmd.startswith("python -m pip")
 
 

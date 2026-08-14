@@ -6,6 +6,7 @@ it stays silent (UNKNOWN) whenever the evidence is inconclusive.
 """
 
 import os
+import sys
 
 import pytest
 
@@ -136,9 +137,12 @@ def test_absent_target_violates_exists(tmp_path):
 def test_case_mismatch_is_its_own_finding(tmp_path):
     """A wrong-case filename resolves on Windows and breaks on Linux.
 
-    EXISTS must still HOLD — the file genuinely works on this machine,
-    and failing it would be false. The portability defect is reported
-    separately instead of distorting that verdict.
+    The verdict is therefore filesystem-dependent, and both readings are
+    correct. Where the name resolves, EXISTS must still HOLD — the file
+    genuinely works on this machine, and failing it would be false, so
+    the portability defect is reported separately instead of distorting
+    that verdict. Where it does not resolve, the declared target really
+    is absent, and VIOLATED is the honest answer.
     """
     root = str(tmp_path)
     ghost = GhostPlan.build(
@@ -146,12 +150,15 @@ def test_case_mismatch_is_its_own_finding(tmp_path):
     _write(root, "src/Board.py", "class Board:\n    pass\n")
 
     ghost.resolve(["2.1"], language="python")
-    assert ghost.expectations["file:src/board.py#exists"].verdict == HOLDS
+    exists = ghost.expectations["file:src/board.py#exists"]
 
     if ghost.case_mismatches:            # case-insensitive filesystem
+        assert exists.verdict == HOLDS
         assert ghost.case_mismatches["src/board.py"] == "Board.py"
         gaps = ghost.disagreements(["2.1"])
         assert any(g.kind == "filename-case-mismatch" for g in gaps)
+    else:                                # case-sensitive filesystem
+        assert exists.verdict == VIOLATED
 
 
 def test_extension_mismatch_is_named_in_the_evidence(tmp_path):
@@ -525,11 +532,27 @@ def test_no_ledger_is_unknown_not_violated(tmp_path):
 
 
 def _make_venv(root, packages=()):
-    """Minimal venv skeleton the Executor's detector will accept."""
-    scripts = os.path.join(root, "venv", "Scripts")
-    os.makedirs(scripts, exist_ok=True)
-    open(os.path.join(scripts, "python.exe"), "wb").close()
-    site = os.path.join(root, "venv", "Lib", "site-packages")
+    """Minimal venv skeleton the Executor's detector will accept.
+
+    Built for the running platform. The detector looks for
+    ``Scripts/python.exe`` on Windows and ``bin/python`` everywhere else,
+    so a fixture that hardcodes either layout is simply invisible on the
+    other — the venv goes undetected and every dependency verdict
+    collapses to UNKNOWN instead of the HOLDS/VIOLATED under test.
+    """
+    if os.name == "nt":
+        bin_dir = os.path.join(root, "venv", "Scripts")
+        exe = "python.exe"
+        site = os.path.join(root, "venv", "Lib", "site-packages")
+    else:
+        bin_dir = os.path.join(root, "venv", "bin")
+        exe = "python"
+        site = os.path.join(
+            root, "venv", "lib",
+            f"python{sys.version_info.major}.{sys.version_info.minor}",
+            "site-packages")
+    os.makedirs(bin_dir, exist_ok=True)
+    open(os.path.join(bin_dir, exe), "wb").close()
     os.makedirs(site, exist_ok=True)
     for pkg in packages:
         os.makedirs(os.path.join(site, f"{pkg}-1.0.dist-info"), exist_ok=True)
