@@ -512,6 +512,10 @@ def _is_safe_source_fix(file_path: str, new_content: str, memory) -> bool:
 # Normalisation regexes used to compute a stable error "shape" hash —
 # stripping line/column numbers, timings, absolute paths and hex pointers
 # so cosmetic churn across attempts doesn't hide a repeating error.
+# How much of each end of a normalised error the signature hashes. Errors
+# shorter than both windows together are hashed whole.
+_SIG_WINDOW = 600
+
 _ERROR_SIG_STRIP_RE = re.compile(
     r'(?:'
     r':\d+(?::\d+)?'              # :line or :line:col
@@ -536,8 +540,28 @@ def _error_signature(err: str) -> str:
         return ""
     norm = _ERROR_SIG_STRIP_RE.sub('', err)
     norm = re.sub(r'\s+', ' ', norm).strip()
+    # Head AND tail, because a test runner front-loads whatever is
+    # invariant and leaves the discriminating part until last. A TEST
+    # step's error_info opens with a constant summary line, then the
+    # verbose listing of test names in alphabetical order; what actually
+    # differs between two attempts — which assertion blew up, and the
+    # `FAILED (failures=F, errors=E)` tally — is at the very end.
+    #
+    # Hashing only `norm[:600]` therefore collided on genuinely different
+    # failures. Measured live: two consecutive attempts of one step
+    # produced error_info of 1692 and 1038 characters — provably not the
+    # same string — and both hashed to 1a3d09c05029, so the loop reported
+    # "previous fix changed nothing" twice about fixes that had changed
+    # the error. For a CODE step the signature is the ONLY signal the
+    # diagnosis loop has, since a bare traceback carries no test counts
+    # for `_diagnosis_score` to read, and an earlier run reverted a
+    # correct fix on exactly this comparison.
+    if len(norm) <= 2 * _SIG_WINDOW:
+        material = norm
+    else:
+        material = f"{norm[:_SIG_WINDOW]}…{norm[-_SIG_WINDOW:]}"
     return hashlib.sha1(
-        norm[:600].encode('utf-8', errors='replace')).hexdigest()[:12]
+        material.encode('utf-8', errors='replace')).hexdigest()[:12]
 
 
 def _diagnosis_score(err: str) -> int | None:
