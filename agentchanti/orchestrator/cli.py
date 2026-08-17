@@ -1130,6 +1130,15 @@ def _main_impl():
         from ..language import task_requests_tests
         args._raw_task_requests_tests = task_requests_tests(args.task)
 
+        # The user's own words, kept before enrichment overwrites them.
+        # The acceptance seed fingerprints the task to decide whether a
+        # contract on disk was written for THIS task, and the enriched
+        # spec is LLM output — it varies between runs of the identical
+        # prompt, so fingerprinting it would re-seed on every run and
+        # replace a contract that was perfectly good. Only the raw text
+        # is stable enough to answer "is this the same task".
+        args._raw_task = args.task
+
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
         intent_spec = parse_intent_spec(args.task)
@@ -1850,8 +1859,15 @@ def _main_impl():
     if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
         try:
             from .acceptance_seed import seed_acceptance_tests
+            # The enriched task is what the suite should be WRITTEN from
+            # — it is the fuller statement of the requirement — but the
+            # raw task is what decides whether an existing contract was
+            # written for this same task, because only the raw text is
+            # stable across runs. See `_raw_task` above.
             seed_acceptance_tests(args.task, os.getcwd(), llm_client,
-                                  language=language)
+                                  language=language,
+                                  identity_task=getattr(args, "_raw_task",
+                                                        None))
         except Exception as _seed_exc:      # never fail a run over this
             # WARNING, not DEBUG. Losing the run's only independent check
             # is not a detail, and a silent skip is how the first live

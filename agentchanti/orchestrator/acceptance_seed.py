@@ -215,13 +215,22 @@ def _should_seed(task: str, root: str, path: str) -> bool:
 
 
 def seed_acceptance_tests(task: str, root: str, llm_client,
-                          language: str | None = None) -> str | None:
+                          language: str | None = None,
+                          identity_task: str | None = None) -> str | None:
     """Write a task-derived suite and return its path, or None.
 
     Returns None — silently, and without writing — whenever the honest
     answer is "no independent check was established": a non-Python
     project, a task with nothing checkable in it, an unusable response, or
     a suite already present that is better evidence than this one.
+
+    *task* is what the suite is WRITTEN from — the caller passes the
+    enriched requirement, which is the fuller statement. *identity_task*
+    is what decides whether a contract on disk belongs to this same task,
+    and must be the user's raw text: the enriched form is LLM output and
+    differs between runs of an identical prompt, so fingerprinting it
+    would re-seed every run and discard a contract that was fine.
+    Defaults to *task* for callers that have only one of them.
     """
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)
@@ -229,8 +238,9 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if not task or not task.strip():
         return None
 
+    identity = identity_task if (identity_task or "").strip() else task
     path = os.path.join(root, SEED_BASENAME)
-    if not _should_seed(task, root, path):
+    if not _should_seed(identity, root, path):
         return None
 
     try:
@@ -254,7 +264,7 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     body = "\n" + src
     try:
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(_header(task, body) + body)
+            fh.write(_header(identity, body) + body)
     except OSError as exc:
         log.warning("[AcceptanceSeed] could not write %s: %s", path, exc)
         return None

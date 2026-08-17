@@ -189,6 +189,44 @@ def test_the_header_does_not_break_the_suite(tmp_path):
     assert "import unittest" in written
 
 
+def test_identity_is_judged_on_the_raw_task_not_the_enriched_one(tmp_path):
+    """The enriched task is LLM output and differs between runs.
+
+    Measured 2026-08-18: the first live seed stamped the fingerprint of
+    the IntentAgent's REQUIREMENTS_SPEC, not the prompt, so the very
+    next run of the identical prompt would have seen a different hash
+    and re-seeded — trading the old never-regenerates bug for an
+    always-regenerates one.
+    """
+    enriched_a = CUBE + "\n\nREQUIREMENTS_SPEC: goal one, phrased this way."
+    enriched_b = CUBE + "\n\nREQUIREMENTS_SPEC: goal one, worded differently."
+
+    assert seed_acceptance_tests(enriched_a, str(tmp_path), _client(GOOD),
+                                 language="python",
+                                 identity_task=CUBE) is not None
+    client = _client(GOOD)
+    assert seed_acceptance_tests(enriched_b, str(tmp_path), client,
+                                 language="python",
+                                 identity_task=CUBE) is None
+    client.generate_response.assert_not_called()
+
+
+def test_the_suite_is_still_written_from_the_enriched_task(tmp_path):
+    """Identity and content come from different strings on purpose."""
+    enriched = CUBE + "\n\nREQUIREMENTS_SPEC: the fuller statement."
+    client = _client(GOOD)
+    seed_acceptance_tests(enriched, str(tmp_path), client, language="python",
+                          identity_task=CUBE)
+    prompt = client.generate_response.call_args[0][0]
+    assert "the fuller statement" in prompt
+
+
+def test_identity_task_defaults_to_the_task(tmp_path):
+    assert _seed(CUBE, tmp_path) is not None
+    assert _seed(CUBE, tmp_path) is None          # same task, no re-seed
+    assert _seed(SNAKE, tmp_path) is not None     # different task, re-seed
+
+
 def test_a_re_seed_is_still_independent_evidence(tmp_path):
     """Re-seeding happens before any step runs, so the snapshot taken a
     moment later still records it as pre-existing."""
