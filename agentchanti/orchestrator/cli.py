@@ -961,6 +961,32 @@ def _main_impl():
             # Legacy checkpoint without plan_steps — create wrappers
             plan_steps_parsed = from_legacy_steps(steps, dependencies)
 
+        # A restored plan never passed through the gate checks: they live
+        # in the planning branch, which resume skips entirely. The
+        # run-time refusals still hold, but the backstop that makes a
+        # destructive gate *impossible* rather than merely refused has to
+        # run here too — otherwise a checkpoint is a way to smuggle one
+        # past it. Measured: a resume brought back, verbatim, the gate
+        # that had already burned the run which wrote the checkpoint.
+        from .gate_safety import neutralize_destructive_gates
+        from .plan_step import unrunnable_gate_reason
+        for _sid, _was, _why in neutralize_destructive_gates(
+                plan_steps_parsed):
+            log.warning(
+                "[GateSafety] restored step %s: dropped the destructive "
+                "tail of its verify: %s — was `%s`", _sid, _why, _was)
+        # Unrunnable gates are reported, not removed. Dropping one would
+        # let the step pass unchecked, and the stall breaker now ends
+        # such a step cheaply; a loud line is what a reader needs to know
+        # the plan, not the code, is what failed.
+        for _ps in plan_steps_parsed:
+            _why = unrunnable_gate_reason(getattr(_ps, "verify_cmd", "") or "")
+            if _why:
+                log.warning(
+                    "[Plan] restored gate for step %s can never pass on "
+                    "this platform: %s — gate: %s",
+                    _ps.id, _why, _ps.verify_cmd)
+
         language = checkpoint_state.get("language", language)
 
         # Restore intent_spec — the planning phase that normally produces it
