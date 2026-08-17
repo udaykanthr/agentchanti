@@ -1505,6 +1505,35 @@ def _state_guard(fn) -> Optional[_EarlyReturnGuard]:
     return None
 
 
+def _state_value_name(node) -> Optional[str]:
+    """The state value a node names, however the project spells it.
+
+    A state vocabulary is as often a set of plain strings as a set of
+    module-level constants, and reading only `Name`/`Attribute` left
+    ``if self._state in ("win", "game_over"): return`` unparsed — which
+    found no guard, which made the suite no candidate, which disarmed
+    `degenerate-long-run` entirely for every project that spells its
+    states as strings.
+
+    Measured 2026-08-17: a glm-5.2 run shipped a game whose entities never
+    moved at dt below ~0.2, under a 20000-iteration test loop that passed
+    because a frozen board violates no invariant. The task prompt for it
+    *mandates* string states (``state -> "start" | "playing" | "win" |
+    "game_over"``), so the check could never have fired on that task.
+
+    Only `str` constants count. A state is a value from a named
+    vocabulary; numbers and booleans are not, and admitting them would
+    read `if self.done is True: return` as a state guard.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
 def _parse_state_guard(test) -> Optional[_EarlyReturnGuard]:
     """The state fact a bare-return guard condition expresses.
 
@@ -1530,19 +1559,16 @@ def _parse_state_guard(test) -> Optional[_EarlyReturnGuard]:
     op, right = test.ops[0], test.comparators[0]
 
     def _names(node) -> set[str]:
-        if isinstance(node, ast.Name):
-            return {node.id}
-        if isinstance(node, ast.Attribute):
-            return {node.attr}
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             out: set[str] = set()
             for elt in node.elts:
-                got = _names(elt)
-                if not got:
+                got = _state_value_name(elt)
+                if got is None:
                     return set()
-                out |= got
+                out.add(got)
             return out
-        return set()
+        one = _state_value_name(node)
+        return {one} if one is not None else set()
 
     named = _names(right)
     if not named:
@@ -1792,8 +1818,10 @@ def _pins_state_working(stmts, spec: _EarlyReturnGuard) -> bool:
             return False
         op = cmp_node.ops[0]
         right = cmp_node.comparators[0]
-        name = (right.id if isinstance(right, ast.Name)
-                else right.attr if isinstance(right, ast.Attribute) else None)
+        # Read the same spellings the guard side reads, or a suite that
+        # pins with `assertEqual(game.state, "playing")` would look
+        # unpinned and get flagged for a run it genuinely protects.
+        name = _state_value_name(right)
         if name is None:
             return False
         if isinstance(op, (ast.Eq, ast.Is)):
@@ -1815,9 +1843,7 @@ def _pins_state_working(stmts, spec: _EarlyReturnGuard) -> bool:
                 target, expected = node.args[0], node.args[1]
                 if not _reads_state(target):
                     continue
-                name = (expected.id if isinstance(expected, ast.Name)
-                        else expected.attr
-                        if isinstance(expected, ast.Attribute) else None)
+                name = _state_value_name(expected)
                 if name is None:
                     continue
                 if fname in ("assertEqual", "assertIs") and spec.proceeds(name):
@@ -1834,9 +1860,7 @@ def _pins_state_working(stmts, spec: _EarlyReturnGuard) -> bool:
                     continue
                 allowed = node.args[1]
                 if isinstance(allowed, (ast.Tuple, ast.List, ast.Set)):
-                    names = {e.id if isinstance(e, ast.Name) else
-                             e.attr if isinstance(e, ast.Attribute) else None
-                             for e in allowed.elts}
+                    names = {_state_value_name(e) for e in allowed.elts}
                     if None not in names and spec.all_proceed(names):
                         return True
     return False
