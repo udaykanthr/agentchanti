@@ -90,6 +90,20 @@ def _record_loop_run(step_idx: int, turns_used: int,
         step_idx + 1, turns_used, outcome, recovery, dict(tool_counts))
 
 
+def _finish_unstarted(step_idx: int, attempt_label: str, recovery: bool,
+                      summary: str) -> tuple[bool, str]:
+    """End a loop that never began, recording it like any other run.
+
+    A step refused before turn 1 is still a loop run as far as telemetry
+    is concerned — leaving it out would make the session summary claim
+    fewer attempts than the pipeline actually made, and the zero turns
+    are precisely the number worth seeing.
+    """
+    _record_loop_run(step_idx, 0, Counter(), "gate-unrunnable", recovery)
+    record_attempt(step_idx, attempt_label, "gate-unrunnable", [], [], summary)
+    return False, summary
+
+
 def get_loop_stats() -> list[dict]:
     """All loop runs recorded in this process (copy)."""
     with _stats_lock:
@@ -762,6 +776,52 @@ def run_agent_loop(
     Returns the same ``(success, error_info)`` contract as the step
     handlers in ``step_handlers.py``.
     """
+    # A gate the shell cannot execute is decidable before a single token
+    # is spent, and it is the same conclusion the stall breaker reaches
+    # after three verdicts — with the turns already paid for. Measured
+    # 2026-08-18: the plan-time check named this exact gate as
+    # unrunnable at 00:38:48, nothing consumed the warning, and the run
+    # then spent 180k tokens and 14 turns proving it right. An advisory
+    # nobody acts on is indistinguishable from silence.
+    #
+    # Translating first, refusing second: an unrunnable gate whose other
+    # dialect IS runnable is a defective instrument with a working
+    # equivalent, and using it is strictly better than failing the step.
+    # Only when no runnable reading exists is the step ended here.
+    if verify_cmd:
+        # Imported here: plan_step is a heavy module and this is the only
+        # place in the loop that needs it.
+        from .plan_step import unrunnable_gate_reason
+        _unrunnable = unrunnable_gate_reason(verify_cmd)
+        if _unrunnable:
+            _runnable = next(
+                (v for _r, v in platform_equivalent_variants(verify_cmd)
+                 if not unrunnable_gate_reason(v)), None)
+            if _runnable:
+                _logger.warning(
+                    "[GateIntegrity] step %d: the gate cannot run as "
+                    "written (%s) — using the equivalent this platform's "
+                    "shell can execute:\n  original: %s\n  using: %s",
+                    step_idx + 1, _unrunnable, verify_cmd, _runnable)
+                # The ledger must learn it too, or the monotonic recheck
+                # re-runs the original, fails exactly as it always did,
+                # and reads that as a regression.
+                record_gate_repair(verify_cmd, _runnable,
+                                   "unrunnable-on-this-platform")
+                verify_cmd = _runnable
+            else:
+                _logger.error(
+                    "[GateIntegrity] step %d: refusing to start — the "
+                    "gate cannot run on this platform in any reading, so "
+                    "no work the step does could satisfy it: %s\n  gate: %s",
+                    step_idx + 1, _unrunnable, verify_cmd)
+                return _finish_unstarted(
+                    step_idx, attempt_label, _recovery,
+                    f"{GATE_STALLED_MARKER} the step was never started: its "
+                    f"verify command cannot run on this platform, so no "
+                    f"edit could change the verdict. {_unrunnable}\n"
+                    f"Gate: {verify_cmd}")
+
     preloaded = _preload_target_files(tools, preload_files,
                                       preload_full_paths)
     listing = _preload_listing(tools)

@@ -198,6 +198,114 @@ class TestStallBreaker:
             assert observe_gate_verdict(None, self.FAIL, d) is None
 
 
+class TestRefusedBeforeTurnOne:
+    """The advisory that nothing consumed.
+
+    Measured 2026-08-18: the plan-time check named this gate unrunnable
+    at 00:38:48, and the run then spent 180k tokens and 14 turns across
+    two models proving it right. The same conclusion the stall breaker
+    reaches after three verdicts is available before the first token.
+    """
+
+    def setup_method(self):
+        from agentchanti.orchestrator.gate_integrity import reset_repairs
+        reset_gate_verdicts()
+        reset_repairs()
+
+    def _run(self, monkeypatch, gate, on_windows=True):
+        """Run the loop against stubs that answer with no tool calls.
+
+        Anything past the refusal therefore ends at "no-tools", which is
+        enough to tell "the loop was entered" from "the step was refused
+        before turn 1" without a live model.
+        """
+        from agentchanti.llm.chat_types import ChatResponse
+        from agentchanti.orchestrator import agent_loop
+
+        monkeypatch.setattr(gate_integrity.os, "name",
+                            "nt" if on_windows else "posix")
+        started = []
+
+        def _spy(tools, *a, **kw):
+            started.append(True)
+            return ""
+
+        monkeypatch.setattr(agent_loop, "_preload_target_files", _spy)
+        monkeypatch.setattr(agent_loop, "_preload_listing",
+                            lambda *_a, **_kw: "")
+
+        class _Tools:
+            project_root = "."
+
+            def definitions(self):
+                return []
+
+        class _Client:
+            def chat(self, messages, tools=None):
+                return ChatResponse(text="nothing to do")
+
+        ok, info = agent_loop.run_agent_loop(
+            _Client(), _Tools(), "step", "task", verify_cmd=gate, step_idx=0)
+        return ok, info, started
+
+    def test_a_gate_with_no_runnable_reading_ends_the_step_at_once(
+            self, monkeypatch):
+        from agentchanti.orchestrator import agent_loop
+
+        # `wait` alone: nothing to translate to, so no runnable variant.
+        ok, info, started = self._run(monkeypatch, "wait")
+        assert ok is False
+        assert agent_loop.GATE_STALLED_MARKER in info
+        assert "never started" in info
+        assert started == []            # not one turn was taken
+
+    def test_the_refusal_suppresses_escalation_too(self, monkeypatch):
+        from agentchanti.orchestrator import agent_loop
+
+        _ok, info, _ = self._run(monkeypatch, "wait")
+        # Same marker the escalation wrapper checks, so a stronger model
+        # is never sent at a gate its shell cannot run either.
+        assert agent_loop.GATE_STALLED_MARKER in info
+
+    def test_a_translatable_gate_is_repaired_and_the_step_runs(
+            self, monkeypatch):
+        from agentchanti.orchestrator.gate_integrity import repaired_gate
+
+        ok, _info, started = self._run(
+            monkeypatch, 'python -c "assert 1" > /dev/null')
+        # The loop was entered: an unrunnable gate with a working
+        # equivalent is a defective instrument, not a dead step.
+        assert started == [True]
+        assert repaired_gate('python -c "assert 1" > /dev/null') is not None
+        assert ok is False              # no LLM behind the stub
+
+    def test_a_runnable_gate_is_untouched(self, monkeypatch):
+        _ok, _info, started = self._run(monkeypatch, "python -m unittest")
+        assert started == [True]
+
+    def test_no_gate_at_all_is_not_refused(self, monkeypatch):
+        _ok, _info, started = self._run(monkeypatch, None)
+        assert started == [True]
+
+    def test_on_posix_the_same_gate_runs(self, monkeypatch):
+        _ok, _info, started = self._run(
+            monkeypatch, "python x.py > /dev/null", on_windows=False)
+        assert started == [True]
+
+    def test_the_refusal_is_recorded_as_a_zero_turn_run(self, monkeypatch):
+        from agentchanti.orchestrator.agent_loop import (
+            get_loop_stats, reset_attempt_journal,
+        )
+
+        reset_attempt_journal()
+        before = len(get_loop_stats())
+        self._run(monkeypatch, "wait")
+        runs = get_loop_stats()[before:]
+        assert len(runs) == 1
+        assert runs[0]["turns"] == 0
+        assert runs[0]["outcome"] == "gate-unrunnable"
+
+
 class TestEscalationIsSuppressed:
     def test_a_stalled_gate_does_not_reach_the_stronger_model(self,
                                                               monkeypatch):
