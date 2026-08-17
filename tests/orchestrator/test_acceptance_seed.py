@@ -139,3 +139,40 @@ def test_it_is_written_before_any_step_could_have_shaped_it(tmp_path):
     assert "assertLessEqual" in prompt        # monotonicity is not progress
     assert "hundreds of" in prompt            # a range needs exercising
     assert "RANGE" in prompt
+
+
+def test_the_cli_call_site_uses_names_that_exist():
+    """The isolated tests above all passed while the live call raised
+    NameError: 'task' is not defined — the call site was never exercised.
+    This checks the three names it passes are actually bound in the
+    enclosing function."""
+    import ast
+    import inspect
+
+    from agentchanti.orchestrator import cli
+
+    tree = ast.parse(inspect.getsource(cli))
+    call = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "seed_acceptance_tests"):
+            call = node
+            break
+    assert call is not None, "cli.py no longer seeds acceptance tests"
+
+    fn = next(f for f in ast.walk(tree)
+              if isinstance(f, ast.FunctionDef) and f.name == "_main_impl")
+    bound = {t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+             for t in ast.walk(n) if isinstance(t, ast.Name)}
+    bound |= {n.arg for n in ast.walk(fn) if isinstance(n, ast.arg)}
+
+    used = [a for a in call.args if isinstance(a, ast.Name)]
+    used += [k.value for k in call.keywords if isinstance(k.value, ast.Name)]
+    for name in used:
+        assert name.id in bound, (
+            f"seed_acceptance_tests is passed `{name.id}`, which is not "
+            f"bound in _main_impl")
+    # The task text must reach it via args, not a bare local.
+    assert any(isinstance(a, ast.Attribute) and a.attr == "task"
+               for a in call.args), "the task text is not passed through"

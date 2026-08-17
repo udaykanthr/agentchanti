@@ -1777,10 +1777,15 @@ def _main_impl():
     if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
         try:
             from .acceptance_seed import seed_acceptance_tests
-            seed_acceptance_tests(task, os.getcwd(), llm_client,
+            seed_acceptance_tests(args.task, os.getcwd(), llm_client,
                                   language=language)
         except Exception as _seed_exc:      # never fail a run over this
-            log.debug("[AcceptanceSeed] skipped: %s", _seed_exc)
+            # WARNING, not DEBUG. Losing the run's only independent check
+            # is not a detail, and a silent skip is how the first live
+            # attempt at this shipped a NameError that nothing noticed.
+            log.warning("[AcceptanceSeed] skipped (%s: %s) — this run has "
+                        "no seeded independent evidence",
+                        type(_seed_exc).__name__, _seed_exc)
 
     from .evidence import snapshot_test_files as _snap_tests
     _pre_existing_tests = _snap_tests(os.getcwd())
