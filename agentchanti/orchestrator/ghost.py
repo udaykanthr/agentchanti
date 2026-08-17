@@ -308,6 +308,10 @@ class GhostPlan:
         self.files: dict[str, GhostFile] = {}
         self.steps: dict[str, dict] = {}      # step id -> {produces, requires}
         self.journal: list[Observation] = []
+        # gate expectation id -> {path: digest} at the wave the gate first
+        # went green. A gate's verdict expires when the files it was
+        # exercising are rewritten under it; see `_gate_still_witnessed`.
+        self._gate_witness: dict[str, dict[str, str]] = {}
         # path -> the spelling actually on disk, when it differs only by
         # case. Case-insensitive filesystems resolve the plan's spelling
         # happily, so this never fails EXISTS; it is reported separately.
@@ -543,10 +547,71 @@ class GhostPlan:
                 continue
             self.observe(exp_id, verdict, evidence, stage)
 
+    # The expectation kinds whose subject is a path in the tree — the
+    # files a step's gate was exercising when it went green.
+    _FILE_KINDS = frozenset({KIND_EXISTS, KIND_TOUCHED, KIND_PARSES,
+                             KIND_EXPORTS, KIND_PLAN_ANCHORS})
+
+    def _gate_still_witnessed(self, exp: Expectation, content,
+                              evidence: str) -> tuple[str, str]:
+        """Does a gate that passed still describe the tree on disk?
+
+        The ledger records that a command went green; it cannot record
+        that the files it exercised were rewritten afterwards, and the
+        verdict was folded as HOLDS forever regardless. Measured: gate 3.1
+        of a Pac-Man run passed against a `game.py` that step 5's
+        diagnosis then rewrote into a `TypeError` on every `advance()`.
+        The run shipped that file while the ghost still reported the gate
+        green, and `failed-but-clean` cited it as grounds to blame the
+        harness.
+
+        Resolution happens once per wave, so the first HOLDS records what
+        the step's declared files hashed to at the moment it passed, and
+        every later wave compares. A changed file does not make the gate
+        VIOLATED — the command really did pass once, and it might well
+        pass again — it makes it UNKNOWN, which is the whole point of the
+        four-valued discipline: an answer about a tree that no longer
+        exists is not evidence about the one that does.
+        """
+        sid = exp.id.split(":")[1] if exp.id.startswith("gate:") else ""
+        node = self.steps.get(sid)
+        if not node:
+            return HOLDS, evidence
+        now: dict[str, str] = {}
+        for other_id in sorted(node.get("produces", set())):
+            other = self.expectations.get(other_id)
+            if other is None or other.kind not in self._FILE_KINDS:
+                continue
+            text = content(other.subject)
+            if text is None:
+                continue
+            now[other.subject] = _digest(text)
+        if not now:
+            return HOLDS, evidence
+        seen = self._gate_witness.get(exp.id)
+        if seen is None:
+            self._gate_witness[exp.id] = now
+            return HOLDS, evidence
+        changed = sorted(p for p, h in now.items()
+                         if p in seen and seen[p] != h)
+        if changed:
+            listed = ", ".join(changed[:3])
+            if len(changed) > 3:
+                listed += f" (+{len(changed) - 3} more)"
+            return UNKNOWN, (
+                f"passed earlier, but {listed} changed afterwards — the "
+                f"gate's verdict describes a state of the tree that no "
+                f"longer exists")
+        return HOLDS, evidence
+
     def _check(self, exp: Expectation, content, gates: list[str],
                language: str | None) -> tuple[str, str]:
         if exp.kind == KIND_GATE_PASSED:
-            return _check_gate(exp.subject, gates)
+            verdict, evidence = _check_gate(exp.subject, gates)
+            if verdict == HOLDS:
+                verdict, evidence = self._gate_still_witnessed(
+                    exp, content, evidence)
+            return verdict, evidence
 
         if exp.kind == KIND_IMPORT_EDGE:
             return _check_edge(exp.subject, exp.detail,
@@ -817,10 +882,38 @@ class GhostPlan:
             # confidently blamed the harness. A confirmed-green acceptance
             # gate is the only evidence that speaks to behaviour, so
             # without one the honest answer is silence.
-            behavioural = [
-                e for e in self.expectations.values()
-                if e.kind == KIND_GATE_PASSED and e.verdict == HOLDS
-            ]
+            #
+            # And a green gate is only evidence about the step it belongs
+            # to. Asking "is there ANY green gate in this run" answers a
+            # different question from "is there green evidence about the
+            # thing that FAILED", and the two come apart the moment a plan
+            # has more than one step. Measured twice, both blaming the
+            # harness for the model: a run whose gates 2.1/3.1/4.1 were
+            # green and whose step 5 failed having never recorded a gate
+            # at all, and a run with four green gates whose step 6 failed
+            # `verify` three times over. So when the run halted partway,
+            # only a green gate on a step that did NOT complete counts.
+            #
+            # When every step DID complete and the run still failed, the
+            # original question is the right one — that is the shape this
+            # finding was written for.
+            done_set = set(done)
+            incomplete = [sid for sid in self.steps if sid not in done_set]
+            if incomplete:
+                behavioural = [
+                    e for sid in incomplete
+                    for exp_id in (self.steps.get(sid) or {}).get(
+                        "produces", set())
+                    | (self.steps.get(sid) or {}).get("requires", set())
+                    for e in (self.expectations.get(exp_id),)
+                    if e is not None and e.kind == KIND_GATE_PASSED
+                    and e.verdict == HOLDS
+                ]
+            else:
+                behavioural = [
+                    e for e in self.expectations.values()
+                    if e.kind == KIND_GATE_PASSED and e.verdict == HOLDS
+                ]
             if counts[VIOLATED] == 0 and behavioural:
                 out.append(Disagreement(
                     kind="failed-but-clean", step_id="-",
