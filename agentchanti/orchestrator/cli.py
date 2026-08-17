@@ -1150,6 +1150,10 @@ def _main_impl():
         MAX_PLAN_RETRIES = 3
         plan = None
         raw_steps = None
+        # The previous attempt's steps, kept so a re-plan cannot silently
+        # weaken a gate it was never asked to touch. See
+        # plan_step.carry_forward_strong_gates.
+        _previous_plan_steps: list = []
 
         for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
             display.show_status(
@@ -1225,6 +1229,7 @@ def _main_impl():
                 fix_nested_workspace_collision,
                 fix_import_dependencies, project_file_reader, check_gate_quality,
                 check_gate_consistency, repair_verify_commands,
+                carry_forward_strong_gates,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
@@ -1241,6 +1246,24 @@ def _main_impl():
                         f"[Plan] Parsed {len(plan_steps_parsed)} structured steps: "
                         f"{[(s.id, s.step_type, s.index) for s in plan_steps_parsed]}"
                     )
+                    # A re-plan is triggered by one unusable gate but
+                    # regenerates every step, so gates that were never in
+                    # question get rewritten too — and the planner has no
+                    # reason to preserve the strength of the ones it was
+                    # not asked about. Restore those before judging this
+                    # attempt, so a carried gate can also end the churn.
+                    if _previous_plan_steps:
+                        _kept = carry_forward_strong_gates(
+                            _previous_plan_steps, plan_steps_parsed)
+                        if _kept:
+                            log.info(
+                                "[Plan] Carried %d strong acceptance gate(s) "
+                                "across the re-plan: %s",
+                                len(_kept), ", ".join(_kept))
+                    # Remember the objects, not a copy: the in-place gate
+                    # repairs further down mutate these same steps, so the
+                    # next attempt inherits the best version of this one.
+                    _previous_plan_steps = plan_steps_parsed
                     errors = validate_plan(plan_steps_parsed)
                     if errors:
                         log.warning(f"[Plan] Validation warnings: {errors}")
