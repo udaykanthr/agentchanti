@@ -116,6 +116,16 @@ def _declares_nothing(spec: str) -> bool:
     return not cleaned or cleaned in _NO_DECLARATION
 
 
+def _canonical_name(name: str) -> str:
+    """Collapse an identifier to a convention-free key.
+
+    ``runHeadless``, ``run_headless``, ``RunHeadless`` and ``run-headless``
+    all land on ``runheadless``. Only case and separators are removed, so
+    two genuinely different names never collide.
+    """
+    return re.sub(r"[^0-9a-z]+", "", (name or "").lower())
+
+
 def _export_satisfied(spec: str, actual: set[str]) -> bool:
     """Does *actual* provide the declared export *spec*?
 
@@ -150,6 +160,24 @@ def _export_satisfied(spec: str, actual: set[str]) -> bool:
     if actual == {"default"}:
         return True
 
+    # Same name, different naming convention. Every `exports:` example in
+    # the planner prompt is JavaScript (`app, startServer`), so a planner
+    # naming a *Python* file's symbols answers in camelCase — `exports:
+    # runHeadless` against a file that defines `run_headless`. Measured on
+    # a Pac-Man run: two violated-exports findings against an artifact that
+    # passed all nine behavioural probes, which is the shape this function
+    # exists to stop, since findings that are always wrong bury the one
+    # that is right.
+    #
+    # Case and separators are the only difference forgiven. A planner that
+    # invented a different name — `runHeadlessSimulation` where the file
+    # defines `run_headless` — still falls through to the warning, because
+    # that is a real disagreement and not a spelling of the same word.
+    canonical = {_canonical_name(a) for a in actual}
+    canonical.discard("")
+    if _canonical_name(spec) in canonical:
+        return True
+
     # The prompt asks for `exports: <Symbol1>, <Symbol2>`, but a weaker
     # planner answers in English:
     #
@@ -160,7 +188,7 @@ def _export_satisfied(spec: str, actual: set[str]) -> bool:
     # in one clean run, both wrong. Look for any identifier in the prose
     # that the file really exports.
     words = _IDENTIFIER_RE.findall(spec)
-    if any(w in actual for w in words):
+    if any(w in actual or _canonical_name(w) in canonical for w in words):
         return True
 
     # Still prose, and nothing in it matched. A sentence is not a symbol
