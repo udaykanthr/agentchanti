@@ -79,6 +79,7 @@ _DEFAULTS = {
     "wave_snapshots": True,
     "ghost_shadow": True,
     "require_independent_evidence": False,
+    "seed_acceptance_tests": True,
     "ghost_heal": True,
     "ghost_heal_source_edits": True,
     "plan_mode": "content",
@@ -469,6 +470,9 @@ class Config:
         self.REQUIRE_INDEPENDENT_EVIDENCE = _get_bool(
             "REQUIRE_INDEPENDENT_EVIDENCE", "require_independent_evidence",
             _DEFAULTS["require_independent_evidence"])
+        self.SEED_ACCEPTANCE_TESTS = _get_bool(
+            "SEED_ACCEPTANCE_TESTS", "seed_acceptance_tests",
+            _DEFAULTS["seed_acceptance_tests"])
 
         # Deterministic repair of the gaps the shadow finds
         # (orchestrator/ghost_heal.py): installing a declared dependency

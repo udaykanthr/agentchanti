@@ -860,6 +860,9 @@ class Executor:
         'composer.json', 'composer.lock',
         'Pipfile', 'Pipfile.lock', 'poetry.lock',
         'requirements.txt',
+        # The task-derived acceptance suite. It is independent
+        # evidence for exactly as long as the run leaves it alone.
+        'test_acceptance_contract.py',
         '.agentchanti.yaml', '.agentchanti.yml',
         # Django / framework entry points — overwriting strips imports and
         # the if __name__ == '__main__' guard, causing silent no-op execution

@@ -1767,6 +1767,21 @@ def _main_impl():
     # pre-state and before the first step, because the question at the end
     # is not "is there a suite" but "is there a suite the agent did not
     # write". See orchestrator/evidence.py.
+    # A greenfield build has no pre-existing suite, so it is judged by
+    # tests it wrote itself — and three measured runs shipped exit 0 over
+    # artifacts that failed every external probe while their own tests
+    # were green. Seeding one from the TASK, here, before any step has
+    # run, is the only moment a check can be written that the code cannot
+    # have shaped. It is snapshotted below like any other pre-existing
+    # file, so rewriting it forfeits independence and says so.
+    if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
+        try:
+            from .acceptance_seed import seed_acceptance_tests
+            seed_acceptance_tests(task, os.getcwd(), llm_client,
+                                  language=language)
+        except Exception as _seed_exc:      # never fail a run over this
+            log.debug("[AcceptanceSeed] skipped: %s", _seed_exc)
+
     from .evidence import snapshot_test_files as _snap_tests
     _pre_existing_tests = _snap_tests(os.getcwd())
     if _pre_existing_tests:
