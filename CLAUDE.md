@@ -44,7 +44,7 @@ Both paths share the same execution engine in `orchestrator/pipeline.py`.
    - **CMD**: Runs shell commands via `Executor.run_command()`
    - **CODE**: Coder generates code -> Reviewer checks -> retry loop (up to 3x) -> diagnosis on failure
    - **TEST**: TesterAgent generates tests -> runs them -> Coder fixes failures
-5. `orchestrator/diagnosis.py` handles failure analysis and auto-fix
+5. `orchestrator/diagnosis.py` handles failure analysis and auto-fix, driven by `_run_diagnosis_loop` (see **Diagnosis Loop** below for what it keeps and what it ships)
 
 ### Language Detection (agentchanti/language.py)
 
@@ -67,6 +67,22 @@ Default execution path for CODE/TEST steps when the provider supports native too
 Failure recovery: `run_recovery_loop()` gives one bounded loop attempt when a CMD step's planned command fails (`_handle_cmd_step`) or when any step reaches `_run_diagnosis_loop` — with the loop enabled it replaces the diagnose→fix→re-run machinery entirely; `RECOVERY_FAILED_MARKER` in the error prevents double attempts.
 
 Telemetry: every loop run records turns/tool-call counts/outcome/recovery-flag (`get_loop_stats()`, `loop_stats_summary()`); the CLI logs a `[AgentLoop] session:` summary line at the end of each run.
+
+### Diagnosis Loop (orchestrator/pipeline.py `_run_diagnosis_loop`)
+
+The classic path's failure recovery: up to `MAX_DIAGNOSIS_RETRIES` (3) rounds of diagnose → apply fix → re-execute the step, the last of which escalates to `models.escalation`. Reached only with `agent_loop: false` or on a provider without tool support — `run_recovery_loop()` replaces it entirely otherwise.
+
+It is governed by one rule the loop spent two incidents learning: **an error signature says whether two failures are different, never which one is worse.** Both halves of that blindness shipped a broken artifact from a run that had already produced the fix. Inequality kept regressions — two chunk edits took a suite from 4 failures to 19 errors to 39 errors, each adopted as the new baseline because "the error moved on", and the final restore shipped the 39-error state, a `Game` that could not be constructed. Equality discarded a correction — a test-fix loop rewrote a gate-verified `game.py` so that `if entity.at_center:` became `entity.at_center()` on a `@property`, every `advance()` raised `TypeError`, diagnosis attempt 1 root-caused it exactly, and the loop reverted that one-character fix under *"previous fix changed nothing"*. Every wave commit in the project's own git was clean; only the working tree was broken. Re-applying the reverted fix takes the suite from 9 errors + 1 failure to 1 failure, which is what the revert cost.
+
+The enabling defect sat one layer down. `_parse_test_counts` had no `unittest` branch, so every failing `unittest` run collapsed to the `(0, 1)` fallback and a ten-failure suite scored identically to a one-failure suite — no logic above it could tell whether a fix had helped. It now reads `Ran N tests` with `FAILED (failures=F, errors=E)`, clamping the pass count at zero because `subTest` can report more failures than there are test methods.
+
+`_diagnosis_score` builds on that by counting failing tests, which is the comparison that has a direction. It returns `None` — never a guess — for anything no test-runner parser can read, such as a CODE step's bare traceback, and those cases fall back to the signature exactly as before. An unknown score must never read as an improvement.
+
+The loop then separates two questions that one variable used to answer. What the **next attempt builds on** is still "did this improve", now by count rather than by difference. What the step is **left holding** is `_best_snapshot`: the best-scoring state seen anywhere in the loop, recorded *before* any revert can discard it and re-checked once after the loop ends — because the final attempt is the escalated one, the most likely of the three to be right, and the top-of-loop check never sees it (there is no attempt 4). That is precisely how one run lost a correct `gpt-5.6-sol` fix.
+
+What it does **not** claim is that the loop now converges. A step whose failures are unscorable is unchanged and still directionless, and a scored step that never improves still halts the pipeline — the fix decides what gets shipped when every attempt fails, not whether they fail. Both incidents are replayed by `tests/orchestrator/test_diagnosis_restores_best.py`, which drives the real loop and asserts on what is left on disk; all four fail against the prior code. `test_diagnosis_best_snapshot.py` pins the scoring itself, including that pytest/Jest/Go parsing is untouched.
+
+One thing is deliberately still open: in the measured run the two signatures compared *equal* while the same two states, reconstructed offline, hash differently (`60e31bb78818` vs `9d945c0b3a29`). Scoring routes around that question rather than answering it, so both signatures, both scores and the `error_info` length are logged at debug level at the decision point for the next occurrence.
 
 ### Benchmarks (benchmarks/)
 
