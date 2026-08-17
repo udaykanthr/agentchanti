@@ -1739,6 +1739,17 @@ def _main_impl():
     from .ghost_heal import start_healer, reset_healer
     reset_ghost()
     reset_healer()
+
+    # Which test files predate the run? Taken here, alongside the ghost's
+    # pre-state and before the first step, because the question at the end
+    # is not "is there a suite" but "is there a suite the agent did not
+    # write". See orchestrator/evidence.py.
+    from .evidence import snapshot_test_files as _snap_tests
+    _pre_existing_tests = _snap_tests(os.getcwd())
+    if _pre_existing_tests:
+        log.info(f"[Evidence] {len(_pre_existing_tests)} pre-existing test "
+                 f"file(s) recorded as independent evidence candidates")
+
     if getattr(cfg, "GHOST_SHADOW", True) and plan_steps_parsed:
         _ghost = start_ghost(plan_steps_parsed, os.getcwd())
         # Healing is what turns detection into value: the shadow saw a
@@ -2176,8 +2187,40 @@ def _main_impl():
     _ghost_final_report(plan_steps_parsed, step_results, memory, language,
                         pipeline_success)
 
+    # ── Whose evidence is this? ──────────────────────────────────────
+    # The user's acceptance commands are the only instrument here the
+    # model neither wrote nor can edit, so they are the only ones allowed
+    # to fail the run outright. Everything else feeds a second verdict —
+    # verified vs merely completed — which changes what the run may
+    # CLAIM without inventing a failure it cannot prove.
+    from .evidence import classify as _classify_evidence
+    from .evidence import run_acceptance_commands as _run_acceptance
+    _acceptance_cmds = list(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
+    _acceptance_passed = None
+    if pipeline_success and _acceptance_cmds:
+        _acceptance_passed, _acc_failures = _run_acceptance(
+            executor, _acceptance_cmds)
+        if _acceptance_passed is False:
+            pipeline_success = False
+            log.error("Pipeline failed: user acceptance command(s) did not "
+                      "pass — " + "; ".join(_acc_failures[:3]))
+
+    _evidence = _classify_evidence(
+        os.getcwd(), _pre_existing_tests,
+        tests_ran=bool(verif_ok) or any(
+            getattr(s, "step_type", "") == "TEST" for s in plan_steps_parsed),
+        acceptance_passed=_acceptance_passed,
+        acceptance_cmds=_acceptance_cmds)
+    log.info(_evidence.log_line())
+
+    if (pipeline_success and not _evidence.independent
+            and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
+        log.error("Pipeline failed: require_independent_evidence is set and "
+                  "nothing outside this run's own output verified it")
+        pipeline_success = False
+
     if pipeline_success:
-        display.finish(success=True)
+        display.finish(success=True, evidence=_evidence)
         clear_checkpoint(checkpoint_file)
         from .agent_loop import loop_stats_summary as _als_fn
         _als = _als_fn()

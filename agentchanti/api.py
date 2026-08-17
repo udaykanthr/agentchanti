@@ -61,6 +61,12 @@ class TaskResult:
     log_file: str = ""
     error: str = ""
     answer: str = ""  # populated for QUESTION tasks that produce no code changes
+    # Did anything the agent did NOT write in this run agree that it
+    # worked? `success` means the plan ran; this means someone else
+    # checked. See orchestrator/evidence.py — a run whose only passing
+    # tests it wrote itself is `success=True, verified=False`.
+    verified: bool = False
+    evidence: str = ""
 
 
 def run_task(
@@ -559,6 +565,11 @@ def _run_task_impl(
     step_results: dict[int, str] = {}
     pipeline_success = True
 
+    # Test files that predate the run — the only ones whose passing is
+    # not the agent grading its own homework (orchestrator/evidence.py).
+    from .orchestrator.evidence import snapshot_test_files as _snap_tests
+    _pre_existing_tests = _snap_tests(os.getcwd())
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Analysing project...", "Requesting steps from
     # planner...", etc. stay pinned to the STATUS panel for the entire run
@@ -730,8 +741,33 @@ def _run_task_impl(
     files_written = [f for f in memory.all_files().keys()
                      if not f.startswith("_")]
 
+    from .orchestrator.pipeline import _is_test_file
+    from .orchestrator.evidence import classify as _classify_evidence
+    from .orchestrator.evidence import run_acceptance_commands as _run_acc
+    _acceptance_cmds = list(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
+    _acceptance_passed = None
+    if pipeline_success and _acceptance_cmds:
+        _acceptance_passed, _acc_failures = _run_acc(executor, _acceptance_cmds)
+        if _acceptance_passed is False:
+            pipeline_success = False
+            log.error("Pipeline failed: user acceptance command(s) did not "
+                      "pass — " + "; ".join(_acc_failures[:3]))
+    _evidence = _classify_evidence(
+        os.getcwd(), _pre_existing_tests,
+        tests_ran=any(_is_test_file(f) for f in files_written),
+        acceptance_passed=_acceptance_passed,
+        acceptance_cmds=_acceptance_cmds)
+    log.info(_evidence.log_line())
+    if (pipeline_success and not _evidence.independent
+            and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
+        log.error("Pipeline failed: require_independent_evidence is set and "
+                  "nothing outside this run's own output verified it")
+        pipeline_success = False
+
     return TaskResult(
         success=pipeline_success,
+        verified=_evidence.independent,
+        evidence=_evidence.log_line(),
         files_written=files_written,
         plan_steps=steps,
         token_usage={

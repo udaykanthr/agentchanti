@@ -1161,8 +1161,17 @@ class CLIDisplay:
 
     # ── Finish screen ─────────────────────────────────────────────────────────
 
-    def finish(self, success: bool = True):
-        """Show a final summary screen after pipeline completes."""
+    def finish(self, success: bool = True, evidence=None):
+        """Show a final summary screen after pipeline completes.
+
+        *evidence* (orchestrator/evidence.Evidence) separates "the plan
+        ran" from "something the agent did not write agreed". A run whose
+        only passing tests were written during that same run gets a
+        deliberately weaker headline: measured over six benchmark runs,
+        two printed "All tasks completed successfully!" over a game whose
+        player could not move, because the suite they were judged by was
+        their own.
+        """
         self._stop_spinner()
         if self._live:
             # Before the proxies are dropped — see _flush_live_proxies. This
@@ -1182,9 +1191,19 @@ class CLIDisplay:
             console = Console()
 
             status_text = Text()
-            if success:
+            _unverified = success and evidence is not None and not evidence.independent
+            if _unverified:
+                # Not a failure, and deliberately not a tick either.
+                status_text.append("  ~  ", style="bold yellow")
+                status_text.append(evidence.headline, style="bold white")
+                status_text.append("\n     ", style="dim")
+                status_text.append(evidence.detail, style="dim yellow")
+            elif success:
                 status_text.append("  ✓  ", style="bold green")
                 status_text.append("All tasks completed successfully!", style="bold white")
+                if evidence is not None:
+                    status_text.append("\n     ", style="dim")
+                    status_text.append(f"Verified by {evidence.kind}.", style="dim green")
             else:
                 status_text.append("  ✗  ", style="bold red")
                 status_text.append("Some tasks failed — check logs for details.", style="bold white")
@@ -1215,10 +1234,14 @@ class CLIDisplay:
             console.print(Panel(summary, title=title, border_style="yellow",
                                 box=rich_box.ROUNDED, padding=(0, 2)))
         else:
-            symbol = "✔" if success else "✘"
+            unverified = (success and evidence is not None
+                          and not evidence.independent)
+            symbol = "~" if unverified else ("✔" if success else "✘")
             print(f"\n{symbol} Done  |  {_format_elapsed(elapsed)}"
                   f"  |  Tokens: {t.total_tokens:,}"
                   + (f"  |  Cost: ${t.total_cost:.4f}" if t.total_cost > 0 else ""))
+            if unverified:
+                print(f"  {evidence.headline}")
 
     # ── Static helpers (backward compat) ──────────────────────────────────────
 

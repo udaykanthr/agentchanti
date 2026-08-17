@@ -44,6 +44,11 @@ _TOKENS_RE = re.compile(r"Total tokens:\s*([\d,]+)")
 _LOOP_STATS_RE = re.compile(r"\[AgentLoop\] session: (.+)")
 _FAILED_RE = re.compile(r"Pipeline failed")
 _FINISHED_RE = re.compile(r"Finished\. Total tokens")
+# orchestrator/evidence.py: "Evidence: independent (kind) — detail".
+# The claim column alone was misleading — two runs showed claim=True
+# for artifacts that failed every behavioural probe, because the only
+# thing that had agreed with them was a suite they wrote themselves.
+_EVIDENCE_RE = re.compile(r"Evidence: (independent|self-authored) \((\S+)\)")
 
 # The final summary line, emitted on BOTH the success and failure paths:
 #   Total tokens: N (sent=S [cached=C (P%), full-price=F], recv=R)
@@ -99,6 +104,14 @@ def parse_pipeline_claim(log_text: str) -> bool | None:
     if _FINISHED_RE.search(log_text):
         return True
     return None
+
+
+def parse_evidence(log_text: str) -> str | None:
+    """"indep:<kind>" / "self:<kind>" for the run's evidence provenance."""
+    m = _EVIDENCE_RE.search(log_text)
+    if not m:
+        return None
+    return ("indep" if m.group(1) == "independent" else "self") + ":" + m.group(2)
 
 
 def parse_loop_stats(log_text: str) -> str | None:
@@ -318,6 +331,7 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
         "plan_mode": plan_mode or "(config default)",
         "ground_truth": ground_truth,
         "pipeline_claim": parse_pipeline_claim(log_text),
+        "evidence": parse_evidence(log_text),
         "tokens": parse_total_tokens(log_text),
         **parse_token_breakdown(log_text),
         "wall_s": wall_s,
@@ -342,6 +356,7 @@ def _fmt(n) -> str:
 
 def print_table(results: list[dict]) -> None:
     hdr = (f"{'task':<20} {'loop':<5} {'plan':<9} {'truth':<6} {'claim':<6} "
+           f"{'evidence':<22} "
            f"{'total':>9} {'sent':>9} {'cached':>9} {'cch%':>5} "
            f"{'fullpr':>9} {'recv':>8} {'time_s':>7}  loop_stats")
     print("\n" + hdr)
@@ -355,6 +370,7 @@ def print_table(results: list[dict]) -> None:
               f"{plan:<9} "
               f"{'PASS' if r['ground_truth'] else 'FAIL':<6} "
               f"{str(r['pipeline_claim']):<6} "
+              f"{str(r.get('evidence') or '-'):<22} "
               f"{_fmt(r['tokens']):>9} {_fmt(r.get('sent')):>9} "
               f"{_fmt(r.get('cached')):>9} "
               f"{(f'{pct}%' if isinstance(pct, int) else '-'):>5} "
