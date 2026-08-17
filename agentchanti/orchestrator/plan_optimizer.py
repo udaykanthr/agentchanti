@@ -872,6 +872,56 @@ def _merge_install_steps_structured(steps: list) -> list:
     return merged
 
 
+def _merged_gate(group: list) -> str:
+    """The gate for a merged step: every member's gate, conjoined.
+
+    The merge takes N steps' worth of work and leaves one step to be
+    judged. Keeping only the primary's ``verify:`` silently discards the
+    other N-1 — and the primary's is not the best of them, only the
+    first.
+
+    Measured 2026-08-17: five steps targeting ``main.py`` merged into
+    one. The primary's gate was ``python main.py > /dev/null 2>&1 &
+    timeout 3 python -c "...psutil..." & wait`` — four separate things
+    cmd.exe cannot do — while the four discarded gates were plain
+    ``python -c "from main import CubeCollectorGame; ..."`` commands that
+    all ran fine. The merge kept the only unrunnable gate of the five and
+    threw away four working ones; the step then failed 20 times across
+    two models for 467k tokens without a single attempt being about the
+    code.
+
+    So: conjoin with ``&&`` — the same resolution `carry_forward_strong_
+    gates` reaches, for the same reason, that each gate was written to
+    catch something and a step satisfying all of them is strictly better
+    checked. Two exclusions, both load-bearing:
+
+    * an UNRUNNABLE gate is dropped rather than conjoined. ``A && B``
+      where A can never pass never passes, so conjoining one broken gate
+      would poison every good gate merged with it — the incident, made
+      worse.
+    * a gate redundant with one already kept is skipped, reusing the
+      containment and same-test-runner rules from ``plan_step``.
+    """
+    from .plan_step import _gates_are_redundant, unrunnable_gate_reason
+
+    kept: list[str] = []
+    for step in group:
+        cmd = (getattr(step, "verify_cmd", "") or "").strip()
+        if not cmd:
+            continue
+        reason = unrunnable_gate_reason(cmd)
+        if reason:
+            _logger.warning(
+                "[PlanOptimizer] dropping step %s's gate from the merge — "
+                "it can never pass: %s", getattr(step, "id", "?"), reason)
+            continue
+        if any(_gates_are_redundant(k, cmd) or _gates_are_redundant(cmd, k)
+               for k in kept):
+            continue
+        kept.append(cmd)
+    return " && ".join(kept)
+
+
 def _merge_same_file_steps_structured(steps: list) -> list:
     """Merge CODE steps that target the same single file."""
     # Group CODE steps by their single target file
@@ -922,6 +972,7 @@ def _merge_same_file_steps_structured(steps: list) -> list:
         primary.depends_on = [d for d in all_deps if d not in merged_away]
         primary.exports = all_exports
         primary.imports_from = all_imports
+        primary.verify_cmd = _merged_gate(group)
 
         # Rewire: anything depending on merged-away steps → depends on primary
         for s in steps:

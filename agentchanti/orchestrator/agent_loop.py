@@ -25,7 +25,8 @@ from threading import Lock
 from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
 from ..executor import NO_OUTPUT_MARKER
 from ..llm.chat_types import Message, ToolCall
-from .gate_integrity import platform_equivalent_variants, record_gate_repair
+from .gate_integrity import (observe_gate_verdict, platform_equivalent_variants,
+                             record_gate_repair)
 
 _logger = logging.getLogger(__name__)
 
@@ -124,6 +125,12 @@ _attempts: dict[int, list[dict]] = {}
 # escalation_already_failed() to keep the ladder monotonic.
 ESCALATION_ATTEMPT_LABEL = "escalation (stronger model)"
 
+# Marker prepended to error_info when the gate was proven to be measuring
+# something other than the artifact. Read by the escalation wrapper: a
+# stronger model cannot satisfy an instrument that ignores the code, and
+# sending it in spends a second full turn budget to learn that again.
+GATE_STALLED_MARKER = "[gate-stalled]"
+
 
 def record_attempt(step_idx: int, label: str, outcome: str,
                    edited: list[str], commands: list[tuple[str, bool]],
@@ -147,6 +154,12 @@ def get_attempts(step_idx: int) -> list[dict]:
 def reset_attempt_journal() -> None:
     with _journal_lock:
         _attempts.clear()
+    # Gate verdicts are per-run for the same reason the journal is: they
+    # are keyed by command text, and a second run in the same process
+    # (library API, tests) would otherwise inherit the first run's
+    # observations and could declare a fresh gate stalled on sight.
+    from .gate_integrity import reset_gate_verdicts
+    reset_gate_verdicts()
 
 
 def attempt_digest(step_idx: int) -> str:
@@ -799,6 +812,12 @@ def run_agent_loop(
     _dirty_since_gate = False
     _gate_cache: str | None = None
 
+    # Set once the gate is proven to be measuring something other than
+    # the artifact (see gate_integrity.observe_gate_verdict). Ends the
+    # loop and suppresses the escalation, which would otherwise spend a
+    # stronger model's whole turn budget on the same broken instrument.
+    _stalled_reason: str | None = None
+
     def _finish(outcome: str, turns: int,
                 result: tuple[bool, str]) -> tuple[bool, str]:
         _record_loop_run(step_idx, turns, tool_counts, outcome, _recovery)
@@ -822,6 +841,27 @@ def run_agent_loop(
 
     from .wave_snapshots import (describe_abnormal_exit, is_abnormal_exit,
                                  log_crash_diagnostics)
+
+    def _artifact_digest() -> str:
+        """A fingerprint of the files this attempt has written so far.
+
+        Cheap and approximate on purpose: it only has to distinguish
+        "the code changed between these two verdicts" from "it did not".
+        Unreadable files hash as their name, so a delete still moves the
+        digest.
+        """
+        import hashlib
+
+        root = getattr(tools, "project_root", "") or ""
+        h = hashlib.sha1()
+        for path in sorted(set(edited_files)):
+            h.update(path.encode("utf-8", "replace"))
+            try:
+                with open(os.path.join(root, path), "rb") as fh:
+                    h.update(fh.read())
+            except OSError:
+                pass
+        return h.hexdigest()
 
     def _verify_once(cmd: str | None = None) -> str:
         # Last line of defence, and the only one covering gates the plan
@@ -910,6 +950,14 @@ def run_agent_loop(
         # subprocess on a question already about to be answered.
         if not verify_passed(result):
             result = _try_platform_variants(result)
+        # Observed only after every repair path has had its turn, so a
+        # gate that self-heals or passes under another dialect never
+        # counts as stalled. The digest is what makes the observation
+        # evidence: it says the code under the gate really did change.
+        nonlocal _stalled_reason
+        if _stalled_reason is None:
+            _stalled_reason = observe_gate_verdict(
+                verify_cmd, result, _artifact_digest())
         return result
 
     def _gate_result() -> str:
@@ -1151,6 +1199,10 @@ def run_agent_loop(
             if (verify_cmd and edited_files and not final_turn
                     and (_dirty_since_gate or _self_gate is not None)):
                 _early = _gate_result()
+                if not verify_passed(_early) and _stalled_reason:
+                    return _finish("gate-stalled", turn, (False, (
+                        f"{GATE_STALLED_MARKER} {_stalled_reason}\n\n"
+                        f"{truncate_middle(_early, 1000)}")))
                 if verify_passed(_early):
                     _missing = _missing_required(tools, required_files)
                     if _missing:
@@ -1224,6 +1276,12 @@ def run_agent_loop(
                     "accepting the variant as the gate", step_idx + 1,
                     last_ok_cmd)
                 return _finish("verified-variant", turn, (True, summary))
+            # After the variant escape, so a gate that merely needed the
+            # other dialect is never called stalled.
+            if _stalled_reason:
+                return _finish("gate-stalled", turn, (False, (
+                    f"{GATE_STALLED_MARKER} {_stalled_reason}\n\n"
+                    f"{truncate_middle(result, 1000)}")))
             if final_turn:
                 return _finish("verify-failed", turn, (False, (
                     f"Verification still failing after {max_turns} turns:\n"
@@ -1300,6 +1358,17 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
     if success or escalation_client is None or escalation_client is llm_client:
         return success, info
     if not getattr(escalation_client, "supports_tools", lambda: False)():
+        return success, info
+    if GATE_STALLED_MARKER in (info or ""):
+        # The gate has been proven not to measure the artifact, so a
+        # stronger model has nothing to be stronger AT. Measured: after
+        # the weak model's ten turns against an unrunnable gate, the
+        # escalation spent ten more and 467k tokens total, every verdict
+        # byte-identical to the first.
+        _logger.warning(
+            "[AgentLoop] step %d: NOT escalating — the gate is the defect, "
+            "not the code; a stronger model cannot satisfy it either",
+            kw.get("step_idx", 0) + 1)
         return success, info
     _logger.info(
         "[AgentLoop] step %d: loop failed — escalating to stronger model",

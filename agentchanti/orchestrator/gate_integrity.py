@@ -119,6 +119,72 @@ def collapse_posix_escapes(cmd: str) -> Tuple[str, bool]:
     return ''.join(out), changed
 
 
+# ---------------------------------------------------------------------------
+# POSIX idioms that cmd.exe cannot execute at all
+# ---------------------------------------------------------------------------
+#
+# Distinct from the backslash problem above, which is one text read two
+# ways. These are constructs that simply do not exist under cmd.exe, so
+# the gate fails on the SHELL before the code under test is ever
+# consulted. A syntax check cannot see them — the inline payload is
+# perfectly valid Python — and the failure is identical no matter what
+# the step writes.
+#
+# Measured 2026-08-17, a gate carrying four of them at once::
+#
+#     python main.py > /dev/null 2>&1 & timeout 3 python -c "...psutil..." & wait
+#
+# `> /dev/null` makes cmd try to create the path `\dev\null` and exit 1
+# before anything else runs; `timeout N <cmd>` is a POSIX coreutil and
+# Windows' `timeout` takes `/t N` with no command, answering "Invalid
+# syntax"; `wait` does not exist; and `&` is a sequential separator here,
+# not a background operator, so nothing was ever backgrounded either.
+# Twenty turns across two models, 467k tokens, every attempt returning
+# the identical error.
+_POSIX_ONLY_IDIOMS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"(^|\s)\d?>\s*/dev/null"),
+     "`> /dev/null` — cmd.exe tries to create the path \\dev\\null and "
+     "exits 1 before the command runs (use `> nul`)"),
+    (re.compile(r"(^|\s)timeout\s+\d+\s+\S"),
+     "`timeout N <command>` — Windows' timeout takes `/t N` and runs no "
+     "command, so it answers 'Invalid syntax'"),
+    (re.compile(r"(^|&|\||;)\s*wait\s*($|&|\||;)"),
+     "`wait` — no such command on Windows"),
+    (re.compile(r"(^|\s)2>&1\s*&\s*$"),
+     "a trailing `&` — cmd.exe reads `&` as a sequential separator, not "
+     "as 'run in the background'"),
+]
+
+
+def posix_only_idiom_reason(cmd: str) -> str | None:
+    """Why *cmd* cannot run under this platform's shell, or None.
+
+    Returns None on POSIX, where every one of these is correct. The check
+    is about the shell the gate will actually be handed to, so it must
+    never fire on a platform where the idiom works.
+    """
+    if not cmd or os.name != 'nt':
+        return None
+    for pattern, reason in _POSIX_ONLY_IDIOMS:
+        if pattern.search(cmd):
+            return (f"the gate uses a POSIX shell idiom this platform "
+                    f"cannot run: {reason}")
+    return None
+
+
+def _to_cmd_dialect(cmd: str) -> str:
+    """Rewrite POSIX-only idioms into their cmd.exe equivalents.
+
+    A pure text transform, in the same spirit as the backslash collapse:
+    it changes dialect, never meaning, and the result is only ever
+    *believed if it passes*.
+    """
+    out = re.sub(r"(^|\s)(\d?)>\s*/dev/null", r"\1\2> nul", cmd)
+    out = re.sub(r"(^|\s)timeout\s+\d+\s+", r"\1", out)
+    out = re.sub(r"(^|&|\||;)\s*wait\s*($|&|\||;)", r"\1\2", out)
+    return re.sub(r"\s*&\s*$", "", out).strip()
+
+
 def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
     """Other readings of *cmd* under a different shell dialect.
 
@@ -128,10 +194,15 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
     """
     if not cmd or os.name != 'nt':
         return []
+    variants: List[Tuple[str, str]] = []
     collapsed, changed = collapse_posix_escapes(cmd)
-    if not changed or collapsed == cmd:
-        return []
-    return [("posix-backslash-collapse", collapsed)]
+    if changed and collapsed != cmd:
+        variants.append(("posix-backslash-collapse", collapsed))
+    if posix_only_idiom_reason(cmd):
+        translated = _to_cmd_dialect(cmd)
+        if translated and translated != cmd:
+            variants.append(("posix-shell-idioms", translated))
+    return variants
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +236,91 @@ def repaired_gate(cmd: str | None) -> str | None:
         return None
     with _repairs_lock:
         return _repairs.get(cmd)
+
+
+# ---------------------------------------------------------------------------
+# The stall breaker: a gate that returns the same verdict about changed code
+# ---------------------------------------------------------------------------
+#
+# The two mechanisms above catch a gate broken in a way that can be NAMED —
+# a mis-escape, an idiom of the wrong shell. This one needs no diagnosis at
+# all, and that is the point: it catches the class rather than the spelling.
+#
+# A gate is a measurement of the artifact. If the artifact changes and the
+# measurement does not — byte for byte, repeatedly — then whatever the gate
+# is measuring, it is not the artifact. That is decidable from the loop's
+# own observations, with no parser and no knowledge of the language.
+#
+# Measured 2026-08-17: one gate, `Exit code 1, output=246 chars` on all
+# twenty attempts, while main.py went through 17 distinct content hashes —
+# ten turns of Haiku, then ten of an escalated gpt-5.6-sol, 467k tokens,
+# and not one attempt was ever about the code. Three identical verdicts
+# were enough to know that at turn three.
+#
+# Keyed by command text for the same reason as `_repairs`: the primary
+# loop, the escalation and the recovery loop all enforce the same gate,
+# and the escalation is exactly the expensive repetition worth stopping.
+_STALL_THRESHOLD = 3
+
+_verdicts: dict[str, dict] = {}
+_verdicts_lock = threading.Lock()
+
+
+def reset_gate_verdicts() -> None:
+    """Forget every observation. Called per run, like the gate ledger."""
+    with _verdicts_lock:
+        _verdicts.clear()
+
+
+def observe_gate_verdict(cmd: str | None, result: str,
+                         artifact_digest: str) -> str | None:
+    """Record one verdict; return a reason once the gate is proven stalled.
+
+    Stalled means all three of:
+
+    * at least ``_STALL_THRESHOLD`` verdicts for this exact command,
+    * every one of them byte-identical **and failing** — a gate that ever
+      passed is measuring something, and one whose message varies is
+      responding to the code,
+    * at least two distinct artifact digests, which is the half that
+      makes this evidence rather than impatience. Without it, a model
+      that edited nothing for three turns would look the same as a
+      broken gate.
+
+    Returns None while any of those is unmet, so the ordinary case — a
+    gate failing differently as the code improves — is untouched.
+    """
+    if not cmd:
+        return None
+    with _verdicts_lock:
+        entry = _verdicts.setdefault(
+            cmd, {"results": [], "digests": set(), "reported": False})
+        entry["results"].append((result or "").strip())
+        entry["digests"].add(artifact_digest)
+        if entry["reported"]:
+            return None
+        results = entry["results"]
+        if len(results) < _STALL_THRESHOLD:
+            return None
+        if len(set(results[-_STALL_THRESHOLD:])) != 1:
+            return None
+        if any(r.startswith("exit: success") for r in results):
+            return None
+        if len(entry["digests"]) < 2:
+            return None
+        entry["reported"] = True
+
+    _logger.error(
+        "[GateIntegrity] gate STALLED — %d identical failing verdicts over "
+        "%d different versions of the code. The gate is not measuring the "
+        "artifact:\n  gate: %s",
+        len(results), len(entry["digests"]), cmd)
+    return (
+        f"the gate returned the IDENTICAL failure {len(results)} times "
+        f"while the code changed {len(entry['digests'])} times, so it is "
+        f"not measuring the artifact — the gate is the defect, not the "
+        f"code. Gate: {cmd}"
+    )
 
 
 def effective_gate(cmd: str | None) -> str | None:

@@ -2006,7 +2006,8 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     """
     if not cmd:
         return None
-    for structural in (_interpreter_target_error, _placeholder_error):
+    for structural in (_interpreter_target_error, _placeholder_error,
+                       _posix_idiom_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2020,6 +2021,19 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         if payload:
             return check(_unescape_shell_quotes(payload))
     return None
+
+
+def _posix_idiom_error(cmd: str) -> Optional[str]:
+    """A shell construct the running platform cannot execute.
+
+    Structural like the two above it: no output of the step can change
+    the verdict, because the shell rejects the command before the code
+    is consulted. Lives in `gate_integrity`, which owns the question of
+    what a given shell does with a given text, and is silent on POSIX
+    where these idioms are correct.
+    """
+    from .gate_integrity import posix_only_idiom_reason
+    return posix_only_idiom_reason(cmd)
 
 
 def _unescape_shell_quotes(payload: str) -> str:
