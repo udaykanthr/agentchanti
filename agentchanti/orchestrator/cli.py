@@ -1235,6 +1235,9 @@ def _main_impl():
                 reclassify_manifest_steps, plan_looks_truncated,
                 plan_salvageable, route_blind_edits,
             )
+            from .gate_safety import (
+                check_gate_safety, neutralize_destructive_gates,
+            )
             plan_steps_parsed: list[PlanStep] | None = None
 
             _is_structured = is_structured_plan(plan)
@@ -1344,7 +1347,15 @@ def _main_impl():
                     # green, pipeline "Finished". Send the plan back with
                     # the specific complaint rather than accepting gates
                     # that can only ever pass.
-                    _gate_gaps = (check_gate_quality(plan_steps_parsed)
+                    # A gate that damages the machine is judged FIRST and
+                    # separately. The other two checks read a gate as a
+                    # measurement and ask how good it is; this one asks
+                    # what else it does. Measured: a planner gate ending
+                    # `taskkill /im python.exe /f` force-killed every
+                    # python.exe on the box — the pipeline included — and
+                    # every existing check had passed it. See gate_safety.
+                    _gate_gaps = (check_gate_safety(plan_steps_parsed)
+                                  + check_gate_quality(plan_steps_parsed)
                                   + check_gate_consistency(plan_steps_parsed))
 
                     # Repair the offending lines before considering a
@@ -1384,11 +1395,33 @@ def _main_impl():
                             f"`{getattr(_by_id.get(sid), 'verify_cmd', '')}`"
                             f" — {why}"
                             for sid, why in _gate_gaps)
+                        # Spelled out separately when a gate is unsafe
+                        # rather than merely weak: "assert a concrete
+                        # value" is not the correction for a command that
+                        # kills processes, and a planner told only that
+                        # will keep the destructive tail while making the
+                        # assertion stronger.
+                        _unsafe_ids = {sid for sid, _ in
+                                       check_gate_safety(plan_steps_parsed)}
+                        _safety_note = (
+                            "\n\nSteps " + ", ".join(sorted(_unsafe_ids)) +
+                            " are a different problem: their verify: RUNS A "
+                            "DESTRUCTIVE COMMAND. A gate is re-run after "
+                            "every later wave, so its side effects happen "
+                            "repeatedly. Never kill processes by name "
+                            "(taskkill /im, pkill, killall), delete trees "
+                            "(rm -rf, del /s, git clean), or reset the "
+                            "working tree. A gate must only observe. If you "
+                            "need to check that the app starts, assert it "
+                            "from inside a short python -c that imports and "
+                            "constructs it — do not launch a blocking "
+                            "process and kill it."
+                        ) if _unsafe_ids else ""
                         planner_context += (
                             "\n\n[PLANNER CORRECTION] These steps have a "
                             "verify: command that passes as long as the "
                             "file parses, so it can never detect wrong "
-                            "behaviour:\n" + _detail +
+                            "behaviour:\n" + _detail + _safety_note +
                             "\n\nRewrite EVERY one of those verify: lines "
                             "so it asserts a concrete value the step's "
                             "description promises (or runs a test suite). "
@@ -1402,6 +1435,20 @@ def _main_impl():
                             "on wrong behaviour: %s",
                             MAX_PLAN_RETRIES, len(_gate_gaps),
                             ", ".join(sid for sid, _ in _gate_gaps))
+
+                    # Backstop, on the accepted plan. Repair and re-plan
+                    # both get their chance above and both can fail — and
+                    # the branch immediately above deliberately proceeds
+                    # with gates that are still imperfect. That is right
+                    # for a weak gate and wrong for a destructive one:
+                    # there is no attempt count after which running
+                    # `taskkill /im python.exe /f` becomes acceptable.
+                    for _sid, _was, _why in neutralize_destructive_gates(
+                            plan_steps_parsed):
+                        log.warning(
+                            "[GateSafety] step %s: dropped the destructive "
+                            "tail of its verify: %s — was `%s`",
+                            _sid, _why, _was)
 
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:

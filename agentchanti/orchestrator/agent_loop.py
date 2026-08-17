@@ -824,7 +824,26 @@ def run_agent_loop(
                                  log_crash_diagnostics)
 
     def _verify_once(cmd: str | None = None) -> str:
-        return tools.execute_all([_verify_call(cmd or verify_cmd)])[0].content
+        # Last line of defence, and the only one covering gates the plan
+        # never declared: `verify_cmd_for_language`, a failed CMD step's
+        # recovery gate (which is the failed command verbatim), and the
+        # platform variants built from either. A gate here runs
+        # unattended and repeatedly, so it is refused outright rather
+        # than trimmed — trimming belongs to plan time, where the planner
+        # can still be asked for a better command. The refusal string
+        # does not start with `exit: success`, so `verify_passed` reads
+        # it as a failure and the step cannot exit green on it.
+        from .gate_safety import destructive_reason
+        _cmd = cmd or verify_cmd
+        _unsafe = destructive_reason(_cmd or "")
+        if _unsafe:
+            _logger.error("[GateSafety] refusing to run this gate: %s",
+                          _unsafe)
+            return (f"gate REFUSED — it runs a destructive command: "
+                    f"{_unsafe}. A verify command must only observe; it is "
+                    f"re-run after every later wave, so its side effects "
+                    f"happen repeatedly.")
+        return tools.execute_all([_verify_call(_cmd)])[0].content
 
     def _try_platform_variants(result: str) -> str:
         """Re-run the gate under the other shell dialect's reading of it.
