@@ -23,14 +23,39 @@ What it deliberately does NOT do:
 * Invent behaviour. The prompt asks only for assertions the task states in
   so many words; a task that says nothing checkable yields no file, and no
   file is an honest "nothing independent verified this".
-* Overwrite. If a suite is already there — the user's own, or a previous
-  run's — that is better evidence than anything generated here.
+* Overwrite anyone else's suite. A test file this module did not write is
+  better evidence than anything generated here, and is never touched.
 * Decide the run. A failing seed test is reported through the normal
   acceptance path; it never silently rewrites a verdict.
+
+WHEN THE TASK CHANGES
+---------------------
+"A suite already exists, so skip" was too coarse by exactly one case: a
+suite this module seeded **for a different task**. Measured 2026-08-17,
+across four runs in one directory. Run 1 seeded a contract from a
+"Panda3D cube collector" prompt. The prompt was then rewritten into a
+Snake game, and every subsequent run logged ``skipped: 1 test file(s)
+already predate the run and are stronger evidence`` and then
+``Evidence: independent (pre-existing-tests)``. Both statements were true
+under the old rule and the conclusion was worthless: the surviving file
+asserts only that ``main.py`` does not exit within five seconds, which
+holds for any Panda3D script that starts at all, Snake or otherwise. The
+banner read exactly the same as it had when the check genuinely matched
+the task.
+
+So the seed stamps its own header — the task it was written for, and a
+hash of the body it wrote — and re-seeds when the task no longer matches.
+Both halves of the header are load-bearing. Without the task hash there
+is no way to tell a current contract from a stale one; without the body
+hash, regenerating would silently discard edits someone made by hand.
+A file whose body no longer matches is treated as adopted by its editor
+and left alone, the same refusal `ghost_heal` makes when a written file
+declares something the plan's body does not.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -42,6 +67,48 @@ log = logging.getLogger("agentchanti")
 SEED_BASENAME = "test_acceptance_contract.py"
 
 _FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+# First line of a seeded file. A comment, so it costs the suite nothing,
+# and self-describing, so it survives a wiped .agentchanti directory —
+# the state that decides whether to re-seed must live with the artifact
+# it describes, not beside it.
+_HEADER_RE = re.compile(
+    r"^#\s*agentchanti:acceptance-seed\s+task=([0-9a-f]+)\s+body=([0-9a-f]+)\s*$"
+)
+
+
+def _fingerprint(text: str) -> str:
+    """Stable short hash, insensitive to whitespace-only edits.
+
+    Reflowing a prompt must not count as changing the task — the check
+    is meant to fire when what is being ASKED FOR changes, not when a
+    line was rewrapped.
+    """
+    normalized = " ".join((text or "").split())
+    return hashlib.sha1(normalized.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _header(task: str, body: str) -> str:
+    return (f"# agentchanti:acceptance-seed task={_fingerprint(task)} "
+            f"body={_fingerprint(body)}\n")
+
+
+def seed_state(path: str) -> tuple[str, str, str] | None:
+    """``(task_hash, body_hash, body)`` for a file this module wrote.
+
+    None means "not ours" — no header, or an unreadable file — and is the
+    answer that makes the module leave a user's own suite alone.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            first = fh.readline()
+            body = fh.read()
+    except OSError:
+        return None
+    match = _HEADER_RE.match(first.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2), body
 
 _PROMPT = """\
 You are writing the ACCEPTANCE TEST for a task, BEFORE any code exists.
@@ -104,6 +171,49 @@ def existing_test_files(root: str) -> list[str]:
     return found
 
 
+def _should_seed(task: str, root: str, path: str) -> bool:
+    """Whether to write a contract now, logging the reason either way.
+
+    Four answers, and the order matters. Someone else's suite wins over
+    everything — including a stale seed of ours sitting beside it —
+    because the whole point of the skip is that independent evidence we
+    did not author already exists.
+    """
+    others = [f for f in existing_test_files(root)
+              if os.path.normpath(f) != os.path.normpath(SEED_BASENAME)]
+    if others:
+        log.info("[AcceptanceSeed] skipped: %d test file(s) already predate "
+                 "the run and are stronger evidence (%s)",
+                 len(others), ", ".join(sorted(others)[:3]))
+        return False
+
+    if not os.path.exists(path):
+        return True
+
+    state = seed_state(path)
+    if state is None:
+        # No header: written by a user, or by a build of this module
+        # from before the header existed. Either way it is not ours to
+        # replace, and it is still real pre-existing evidence.
+        log.info("[AcceptanceSeed] skipped: %s predates the run and this "
+                 "module did not write it", SEED_BASENAME)
+        return False
+
+    task_hash, body_hash, body = state
+    if _fingerprint(body) != body_hash:
+        log.info("[AcceptanceSeed] skipped: %s was edited since it was "
+                 "seeded — whoever changed it owns it now", SEED_BASENAME)
+        return False
+    if task_hash == _fingerprint(task):
+        log.info("[AcceptanceSeed] skipped: %s was seeded from this same "
+                 "task and still applies", SEED_BASENAME)
+        return False
+
+    log.info("[AcceptanceSeed] re-seeding: %s was written for a DIFFERENT "
+             "task, so it is not evidence about this one", SEED_BASENAME)
+    return True
+
+
 def seed_acceptance_tests(task: str, root: str, llm_client,
                           language: str | None = None) -> str | None:
     """Write a task-derived suite and return its path, or None.
@@ -119,11 +229,8 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if not task or not task.strip():
         return None
 
-    already = existing_test_files(root)
-    if already:
-        log.info("[AcceptanceSeed] skipped: %d test file(s) already predate "
-                 "the run and are stronger evidence (%s)",
-                 len(already), ", ".join(sorted(already)[:3]))
+    path = os.path.join(root, SEED_BASENAME)
+    if not _should_seed(task, root, path):
         return None
 
     try:
@@ -141,10 +248,13 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
 
     if not src.endswith("\n"):
         src += "\n"
-    path = os.path.join(root, SEED_BASENAME)
+    # The body is hashed as it will sit on disk — everything after the
+    # header line — so a later run can tell "unchanged since we wrote it"
+    # from "someone has taken this over".
+    body = "\n" + src
     try:
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(src)
+            fh.write(_header(task, body) + body)
     except OSError as exc:
         log.warning("[AcceptanceSeed] could not write %s: %s", path, exc)
         return None

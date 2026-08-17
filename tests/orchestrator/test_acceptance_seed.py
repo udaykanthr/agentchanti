@@ -103,6 +103,102 @@ def test_the_seed_is_a_test_file_the_snapshot_will_record(tmp_path):
     assert SEED_BASENAME in snap
 
 
+# ── re-seeding when the task changes ─────────────────────────────────
+#
+# Measured 2026-08-17 in one directory: a contract seeded from a
+# "Panda3D cube collector" prompt survived the prompt being rewritten
+# into a Snake game, and three later runs reported
+# `Evidence: independent (pre-existing-tests)` over a file whose only
+# assertion was that main.py does not exit within five seconds.
+
+CUBE = "Build a Panda3D game where a cube collects red spheres."
+SNAKE = "Build a Panda3D Snake game with a grid and food."
+
+
+def _seed(task, tmp_path, response=GOOD):
+    return seed_acceptance_tests(task, str(tmp_path), _client(response),
+                                 language="python")
+
+
+def test_a_changed_task_re_seeds(tmp_path):
+    assert _seed(CUBE, tmp_path) is not None
+    first = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+
+    second_suite = GOOD.replace("test_player_moves", "test_snake_grows")
+    assert _seed(SNAKE, tmp_path, second_suite) is not None
+    second = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+
+    assert "test_snake_grows" in second
+    assert second != first
+
+
+def test_the_same_task_does_not_re_seed(tmp_path):
+    assert _seed(CUBE, tmp_path) is not None
+    before = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+
+    client = _client(GOOD)
+    assert seed_acceptance_tests(CUBE, str(tmp_path), client,
+                                 language="python") is None
+    # Not merely unchanged on disk — no generation was even attempted.
+    client.generate_response.assert_not_called()
+    assert (tmp_path / SEED_BASENAME).read_text(encoding="utf-8") == before
+
+
+def test_whitespace_only_task_edits_do_not_re_seed(tmp_path):
+    assert _seed(CUBE, tmp_path) is not None
+    reflowed = CUBE.replace(" ", "\n  ")
+    assert _seed(reflowed, tmp_path) is None
+
+
+def test_a_hand_edited_seed_is_never_clobbered(tmp_path):
+    """Whoever edited it owns it — the same refusal ghost_heal makes."""
+    assert _seed(CUBE, tmp_path) is not None
+    path = tmp_path / SEED_BASENAME
+    edited = path.read_text(encoding="utf-8") + "\n# my own extra check\n"
+    path.write_text(edited, encoding="utf-8")
+
+    assert _seed(SNAKE, tmp_path) is None
+    assert path.read_text(encoding="utf-8") == edited
+
+
+def test_a_suite_without_our_header_is_left_alone(tmp_path):
+    """A user's own file at the same path is not ours to replace."""
+    path = tmp_path / SEED_BASENAME
+    path.write_text("import unittest\n# hand written\n", encoding="utf-8")
+    assert _seed(SNAKE, tmp_path) is None
+    assert "hand written" in path.read_text(encoding="utf-8")
+
+
+def test_someone_elses_suite_beats_a_stale_seed(tmp_path):
+    """Another test file means real independent evidence already exists,
+    so there is nothing for a re-seed to add."""
+    assert _seed(CUBE, tmp_path) is not None
+    (tmp_path / "test_mine.py").write_text("import unittest\n",
+                                           encoding="utf-8")
+    before = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+    assert _seed(SNAKE, tmp_path) is None
+    assert (tmp_path / SEED_BASENAME).read_text(encoding="utf-8") == before
+
+
+def test_the_header_does_not_break_the_suite(tmp_path):
+    """It rides in the file the runner collects, so it must be inert."""
+    _seed(CUBE, tmp_path)
+    written = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+    assert written.startswith("# agentchanti:acceptance-seed task=")
+    compile(written, SEED_BASENAME, "exec")
+    assert "import unittest" in written
+
+
+def test_a_re_seed_is_still_independent_evidence(tmp_path):
+    """Re-seeding happens before any step runs, so the snapshot taken a
+    moment later still records it as pre-existing."""
+    from agentchanti.orchestrator.evidence import snapshot_test_files
+
+    _seed(CUBE, tmp_path)
+    _seed(SNAKE, tmp_path, GOOD.replace("test_player_moves", "test_snake"))
+    assert SEED_BASENAME in snapshot_test_files(str(tmp_path))
+
+
 def test_rewriting_the_seed_forfeits_independence(tmp_path):
     """The rule that makes seeding safe: if a later step edits it, the
     hash changes and the run says so rather than claiming verification."""
