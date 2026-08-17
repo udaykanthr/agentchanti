@@ -3289,7 +3289,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 original_error_cmd=_orig_cmd,
                 step_text=step_text,
                 task=_task_goal,
-                step_target_files=_step_targets)
+                step_target_files=_step_targets,
+                final_attempt=(diag_attempt == MAX_DIAGNOSIS_RETRIES))
 
             if not fix_applied:
                 # ── Test-only retry for TEST steps ──

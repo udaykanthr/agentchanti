@@ -81,7 +81,7 @@ from typing import Iterable, Optional
 # graph of planned modules, but this module stats real files and compares
 # against FileMemory keys (which keep their dots), so it needs a
 # normaliser that only collapses separators and a leading `./`.
-from .plan_graph import _export_satisfied, module_key
+from .plan_graph import _canonical_name, _export_satisfied, module_key
 
 _logger = logging.getLogger(__name__)
 
@@ -552,6 +552,32 @@ class GhostPlan:
     _FILE_KINDS = frozenset({KIND_EXISTS, KIND_TOUCHED, KIND_PARSES,
                              KIND_EXPORTS, KIND_PLAN_ANCHORS})
 
+    def _export_has_consumer(self, exp: Expectation) -> bool:
+        """Does any step declare that it imports this symbol from here?
+
+        A broken export contract only costs something when a step tries to
+        import it — that is the `gate_integrity` shape, where one bad name
+        rejected working code for a whole run. With no consumer the same
+        disagreement is a naming preference the code won on its own.
+
+        Convention-insensitive on the symbol, for the same reason
+        `_export_satisfied` is: a plan shown only JavaScript examples
+        writes `runHeadless` where the importer wrote `run_headless`, and
+        that is one name, not two.
+        """
+        want = (exp.detail or "").strip()
+        if not want:
+            return False
+        want_key = _canonical_name(want)
+        for other in self.expectations.values():
+            if other.kind != KIND_IMPORT_EDGE or other.subject != exp.subject:
+                continue
+            for sym in (other.detail or "").split(","):
+                sym = sym.strip()
+                if sym and (sym == want or _canonical_name(sym) == want_key):
+                    return True
+        return False
+
     def _gate_still_witnessed(self, exp: Expectation, content,
                               evidence: str) -> tuple[str, str]:
         """Does a gate that passed still describe the tree on disk?
@@ -778,6 +804,7 @@ class GhostPlan:
         done = list(done_step_ids)
         out: list[Disagreement] = []
 
+        drifted: list[str] = []
         for sid in done:
             node = self.steps.get(sid)
             if not node:
@@ -785,6 +812,22 @@ class GhostPlan:
             for exp_id in sorted(node["produces"] | node["requires"]):
                 exp = self.expectations.get(exp_id)
                 if exp is None or exp.verdict != VIOLATED:
+                    continue
+                # A declared export nobody imports is a naming
+                # disagreement, not a defect: the contract is broken and
+                # nothing can break because of it. The pipeline already
+                # draws this line — `_missing_declared_exports` fires
+                # "only on an import/attribute error naming a declared
+                # export" — and the noise is real: three findings in one
+                # run whose artifact passed all nine external probes,
+                # where the coder had written `Collectible` for `Pellet`
+                # and `draw_*` for `render_game`. Enough of those bury the
+                # one that matters. They collapse into a single run-level
+                # note instead, the same way six `unplanned-write`
+                # findings collapse into `plan-declares-no-targets`.
+                if (exp.kind == KIND_EXPORTS
+                        and not self._export_has_consumer(exp)):
+                    drifted.append(f"{exp.subject} [{exp.detail}]")
                     continue
                 out.append(Disagreement(
                     kind=f"violated-{exp.kind.lower().replace('_', '-')}",
@@ -859,6 +902,16 @@ class GhostPlan:
             out.append(Disagreement(
                 kind="unprogressed-long-run", step_id="-",
                 detail=f"{path}: {reason}"))
+
+        if drifted:
+            shown = ", ".join(sorted(drifted)[:4])
+            if len(drifted) > 4:
+                shown += f" (+{len(drifted) - 4} more)"
+            out.append(Disagreement(
+                kind="export-drift", step_id="-",
+                detail=(f"the plan declared {len(drifted)} export(s) the "
+                        f"code renamed, and no step imports any of them, "
+                        f"so nothing can break: {shown}")))
 
         for planned, actual in sorted(self.case_mismatches.items()):
             out.append(Disagreement(

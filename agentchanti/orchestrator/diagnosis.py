@@ -904,7 +904,8 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                original_error_cmd: str | None = None,
                step_text: str = '',
                task: str = '',
-               step_target_files: list[str] | None = None) -> tuple:
+               step_target_files: list[str] | None = None,
+               final_attempt: bool = False) -> tuple:
     """Apply fixes from a diagnosis response.
 
     Returns ``(applied, cmds_succeeded, has_fix_commands, executed_cmds,
@@ -1324,7 +1325,31 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                 for tag, i1, i2, j1, j2 in _sm.get_opcodes()
                 if tag != 'equal')
             _change_ratio = _changed / max(_orig_len, 1)
-            if _change_ratio > _threshold:
+            # The last diagnosis attempt is the ESCALATED one, and on it
+            # this ratio costs more than it protects. Rejecting means the
+            # step fails regardless — there is no attempt 4 — so the only
+            # thing the threshold buys is never finding out what the
+            # stronger model's answer was. Measured: gpt-5.6-sol spent 70s
+            # on the most expensive call of a run and returned a fix that
+            # changed 63% of lines; it was rejected, the "test-only"
+            # fallback then produced nothing actionable twice, and the run
+            # halted having discarded the one answer it had paid most for.
+            #
+            # The downside is also bounded now in a way it was not when
+            # this threshold was written: `_run_diagnosis_loop` keeps the
+            # best-scoring snapshot and restores it, so a large fix that
+            # makes things worse is measured and reverted rather than
+            # shipped. The full-file-replacement block above still applies
+            # — that guards wholesale rewrites, which is a different claim
+            # from "this fix is large".
+            if final_attempt and _change_ratio > _threshold:
+                log.info(
+                    "Step %d: Diff guard allowing large fix for %s on the "
+                    "final escalated attempt — changes %.0f%% of lines "
+                    "(threshold %.0f%%); the loop restores its best "
+                    "snapshot if this scores worse",
+                    step_idx + 1, _fp, _change_ratio * 100, _threshold * 100)
+            elif _change_ratio > _threshold:
                 log.warning(
                     "Step %d: Diff guard rejected diagnosis fix for %s — "
                     "changes %.0f%% of lines (threshold %.0f%%)",
