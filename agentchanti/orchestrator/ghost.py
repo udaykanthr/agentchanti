@@ -787,6 +787,14 @@ class GhostPlan:
                 kind="varied-input-ignored", step_id="-",
                 detail=f"{path}: {reason}"))
 
+        # The third in the family: the loop ran, the input was read, work
+        # happened every iteration — and nothing ever asserted that any of
+        # it accomplished anything.
+        for path, reason in unprogressed_long_runs(self.root, _candidates):
+            out.append(Disagreement(
+                kind="unprogressed-long-run", step_id="-",
+                detail=f"{path}: {reason}"))
+
         for planned, actual in sorted(self.case_mismatches.items()):
             out.append(Disagreement(
                 kind="filename-case-mismatch", step_id="-",
@@ -1428,6 +1436,16 @@ def _python_test_counts(text: str) -> tuple[int, int]:
 
 _MIN_LONG_RUN = 200            # below this, a loop is not claiming endurance
 
+# `unprogressed-long-run` uses a higher bar than `degenerate-long-run`,
+# because it fires on far more loops: it does not require the object to be
+# able to stop, only for the assertions to be blind to whether it did.
+# At 200 it flagged a *state-vocabulary* test — 200 frames sampling
+# `state` into a set, then asserting the set's members are legal — from a
+# run whose artifact passed all nine external probes. That test is not
+# claiming endurance and asserting progress is not its job. Every loop
+# measured as genuinely unprotected was 600 or more.
+_MIN_ENDURANCE_RUN = 500
+
 
 @dataclass(frozen=True)
 class _EarlyReturnGuard:
@@ -1939,6 +1957,153 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
                     f"object can stop advancing while every remaining "
                     f"iteration asserts against unchanged state and "
                     f"still passes")))
+                break                  # one finding per test function
+    return out
+
+
+def _asserts_progress(stmts) -> bool:
+    """Does any assertion here require that something CHANGED?
+
+    The distinction the check turns on. An endurance loop is only worth
+    the frames it runs if at least one of its assertions would fail
+    against a frozen world, and most do not:
+
+      assertFalse(map.is_wall(*e.tile))   invariant — true of a still board
+      assertLessEqual(cur, prev)          monotone — 172 <= 172 passes
+      assertGreater(pellets, 0)           strict, but against a literal
+      assertIn(state, VALID_STATES)       a vocabulary, not a movement
+
+    Only a STRICT relation between two things that both vary can say
+    "this moved": ``assertNotEqual(g.player.tile, before)``,
+    ``assertLess(counts[-1], initial)``. Non-strict operators admit
+    equality by construction, and a comparison against a literal is
+    fixed at both ends of the run, so neither is evidence.
+    """
+    _STRICT = {"assertNotEqual", "assertIsNot", "assertLess", "assertGreater"}
+
+    def _varies(node) -> bool:
+        # A literal cannot have changed; anything computed might have.
+        return not isinstance(node, ast.Constant)
+
+    def _strict_compare(node) -> bool:
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            return False
+        if not isinstance(node.ops[0], (ast.NotEq, ast.IsNot, ast.Lt, ast.Gt)):
+            return False
+        return _varies(node.left) and _varies(node.comparators[0])
+
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assert) and _strict_compare(node.test):
+                return True
+            if not isinstance(node, ast.Call):
+                continue
+            fname = (node.func.attr if isinstance(node.func, ast.Attribute)
+                     else node.func.id if isinstance(node.func, ast.Name)
+                     else "")
+            if fname in _STRICT and len(node.args) >= 2:
+                if _varies(node.args[0]) and _varies(node.args[1]):
+                    return True
+            elif fname == "assertTrue" and node.args:
+                if _strict_compare(node.args[0]):
+                    return True
+            elif fname == "assertFalse" and node.args:
+                # assertFalse(a == b) is assertNotEqual(a, b).
+                inner = node.args[0]
+                if (isinstance(inner, ast.Compare) and len(inner.ops) == 1
+                        and isinstance(inner.ops[0], (ast.Eq, ast.Is))
+                        and _varies(inner.left)
+                        and _varies(inner.comparators[0])):
+                    return True
+    return False
+
+
+def unprogressed_long_runs(root: str, paths: Iterable[str]
+                           ) -> list[tuple[str, str]]:
+    """``(path, reason)`` for long runs that never assert anything moved.
+
+    The sibling `degenerate-long-run` cannot see, and the third defect
+    class in this family. That check asks whether the loop stopped doing
+    work; `varied-input-ignored` asks whether the work read the input at
+    all. Neither covers a loop whose object reads its input, does work
+    every single iteration, and still goes nowhere.
+
+    Measured 2026-08-17, glm-5.2 on the Pac-Man task with agent_loop on.
+    `Entity._move` stepped toward the current tile centre before stepping
+    forward, so once past the centre the correction moved it *backward*,
+    and at small dt that consumed the whole travel budget:
+
+        advance(0.01) -> x=1.04 -> x=1.0 -> x=1.04 ...
+
+    Net displacement zero, forever, at any dt below roughly 0.2. The suite
+    drove 20000 frames at 1/60 and passed, because its only assertion was
+    `assertLessEqual(cur, prev)` on a pellet count that never moved. Every
+    external probe of dt-scaling and of `press()` failed on the shipped
+    artifact while all 19 of its own tests were green.
+
+    What this reports is that the endurance claim is **unprotected** — the
+    loop's assertions would all hold if the object had frozen on iteration
+    one — not that the run is measurably degenerate. That discriminator is
+    dynamic and not in the AST, exactly as for `varied-input-ignored`. The
+    fix for both is the same one line: assert that something changed.
+
+    Deliberately NOT silenced by a `break`. Breaking on a terminal state is
+    how a careful test ends a run; it says nothing about whether the run
+    accomplished anything, which is the entire question here.
+    """
+    paths = sorted(set(paths))
+    advancers: dict[str, tuple[str, set[str]]] = {}
+    for path in paths:
+        if not path.endswith(".py") or is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        for qualified, guard in guarded_advance_methods(text).items():
+            advancers.setdefault(qualified, guard)
+    if not advancers:
+        return []
+
+    out: list[tuple[str, str]] = []
+    for path in paths:
+        if not is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+        bindings = _class_bindings(tree)
+        helpers = _local_functions(tree)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for loop in ast.walk(fn):
+                if not isinstance(loop, ast.For):
+                    continue
+                iterations = _loop_iterations(loop)
+                if iterations < _MIN_ENDURANCE_RUN:
+                    continue
+                called, bodies = _reached_advancers(
+                    loop, bindings, advancers, helpers)
+                if not called:
+                    continue
+                before, after = _siblings(fn, loop)
+                # The whole test function gets the benefit of the doubt:
+                # a progress assertion after the loop protects the run
+                # just as well as one inside it.
+                reached = list(loop.body) + after + bodies
+                if _asserts_progress(reached):
+                    continue
+                method = sorted(called)[0]
+                out.append((path, (
+                    f"{fn.name} loops {iterations} times over `{method}()` "
+                    f"but never asserts that anything changed — every "
+                    f"assertion it makes would still hold if the object "
+                    f"had frozen on the first iteration, so the endurance "
+                    f"claim is unprotected")))
                 break                  # one finding per test function
     return out
 
