@@ -1867,7 +1867,14 @@ def _main_impl():
                  f"file(s) recorded as independent evidence candidates")
 
     if getattr(cfg, "GHOST_SHADOW", True) and plan_steps_parsed:
-        _ghost = start_ghost(plan_steps_parsed, os.getcwd())
+        # On a resume, the steps below `start_from` finished in an earlier
+        # run, against a tree the pre-state snapshot below cannot see —
+        # so every one of their postconditions would read as "the step
+        # changed nothing". They are named here so the ghost declines to
+        # judge them rather than reporting ten false violations.
+        _carried = [s.id for s in plan_steps_parsed
+                    if getattr(s, "index", -1) < start_from]
+        _ghost = start_ghost(plan_steps_parsed, os.getcwd(), _carried)
         # Healing is what turns detection into value: the shadow saw a
         # dependency missing from the app's interpreter at wave 2 of a
         # real run and said nothing more, while the smoke test crashed on

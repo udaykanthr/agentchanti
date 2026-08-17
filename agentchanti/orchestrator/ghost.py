@@ -307,6 +307,12 @@ class GhostPlan:
         self.expectations: dict[str, Expectation] = {}
         self.files: dict[str, GhostFile] = {}
         self.steps: dict[str, dict] = {}      # step id -> {produces, requires}
+        # Steps a checkpoint says were finished BEFORE this run started.
+        # Their files are still registered — they are planned targets, and
+        # dropping them would turn every later write to one into an
+        # `unplanned-write` — but nothing they declare is a claim THIS run
+        # makes, so no verdict about them is reported. See `_carried_note`.
+        self.carried: set[str] = set()
         self.journal: list[Observation] = []
         # gate expectation id -> {path: digest} at the wave the gate first
         # went green. A gate's verdict expires when the files it was
@@ -330,18 +336,57 @@ class GhostPlan:
     # -- construction --------------------------------------------------
 
     @classmethod
-    def build(cls, steps: Iterable, project_root: str = ".") -> "GhostPlan":
+    def build(cls, steps: Iterable, project_root: str = ".",
+              carried_step_ids: Iterable[str] = ()) -> "GhostPlan":
         """Derive expectations from a finalized plan and snapshot pre-state.
 
         Must be called after every plan-repair pass (blind-edit routing,
         verify repair, reclassification) and before the first step runs —
         the pre-state hashes are only meaningful if nothing has executed.
+
+        ``carried_step_ids`` are steps a checkpoint completed in an
+        EARLIER run. Their postconditions were satisfied against a tree
+        this run never saw, and the pre-state below is captured after
+        their work, so every one of them reads as "the step changed
+        nothing". Measured 2026-08-18: a resume that executed one step
+        reported ten `violated-touched` findings against four steps that
+        had finished in the previous run — noise that buried the single
+        real finding in the same list.
         """
         ghost = cls(project_root)
         for step in steps or ():
             ghost._add_step(step)
+        ghost.carried = {sid for sid in carried_step_ids if sid in ghost.steps}
+        ghost._mark_carried_inapplicable()
         ghost._capture_pre_state()
         return ghost
+
+    def _mark_carried_inapplicable(self) -> None:
+        """Retire expectations no pending step also declares.
+
+        Expectations are interned and shared, so one declared by both a
+        carried step and a pending one must still be resolved — the
+        pending step is going to make that claim for real. Only the
+        exclusively-carried ones are retired, which keeps the tally and
+        the evidence weight honest about what this run actually checked.
+        """
+        if not self.carried:
+            return
+        live: set[str] = set()
+        for sid, node in self.steps.items():
+            if sid in self.carried:
+                continue
+            live |= node["produces"] | node["requires"]
+        for sid in self.carried:
+            node = self.steps.get(sid) or {}
+            for exp_id in (node.get("produces", set())
+                           | node.get("requires", set())):
+                if exp_id in live:
+                    continue
+                exp = self.expectations.get(exp_id)
+                if exp is not None:
+                    exp.verdict = INAPPLICABLE
+                    exp.evidence = "step completed in an earlier run"
 
     def _add_step(self, step) -> None:
         sid = getattr(step, "id", "?")
@@ -525,6 +570,8 @@ class GhostPlan:
         """
         wanted: set[str] = set()
         for sid in step_ids:
+            if sid in self.carried:
+                continue      # not a claim this run made
             node = self.steps.get(sid)
             if node:
                 wanted |= node["produces"] | node["requires"]
@@ -801,7 +848,8 @@ class GhostPlan:
                       tracked_files: Iterable[str] = (),
                       pipeline_success: bool = True) -> list[Disagreement]:
         """Places the evidence contradicts the pipeline's own verdict."""
-        done = list(done_step_ids)
+        # A step this run did not execute cannot have disagreed with it.
+        done = [sid for sid in done_step_ids if sid not in self.carried]
         out: list[Disagreement] = []
 
         drifted: list[str] = []
@@ -2605,15 +2653,21 @@ def _check_gate(cmd: str, gates: list[str]) -> tuple[str, str]:
 _ghost: Optional[GhostPlan] = None
 
 
-def start_ghost(steps, project_root: str = ".") -> Optional[GhostPlan]:
+def start_ghost(steps, project_root: str = ".",
+                carried_step_ids: Iterable[str] = ()) -> Optional[GhostPlan]:
     """Build and install the run's ghost. Returns ``None`` on any failure."""
     global _ghost
     try:
-        _ghost = GhostPlan.build(steps, project_root)
+        _ghost = GhostPlan.build(steps, project_root, carried_step_ids)
         _logger.info(
             "[Ghost] tracking %d expectation(s) across %d step(s) and "
             "%d file(s)", len(_ghost.expectations), len(_ghost.steps),
             len(_ghost.files))
+        if _ghost.carried:
+            _logger.info(
+                "[Ghost] %d step(s) completed in an earlier run are not "
+                "judged by this one: %s",
+                len(_ghost.carried), ", ".join(sorted(_ghost.carried)))
     except Exception as exc:
         _ghost = None
         _logger.debug("[Ghost] disabled — build failed: %s", exc)
