@@ -878,9 +878,11 @@ def _main_impl():
                          _make_llm_for_agent("tester"),
                          prompt_suffix=tester_suffix)
 
-    # Escalation model for failed agent loops (config: models.escalation).
-    # When a step's loop fails with the regular model, one retry runs with
-    # this stronger one before the step is marked failed.
+    # Escalation model for failed steps (config: models.escalation), used by
+    # BOTH execution paths: the agent loop retries a failed step with it, and
+    # the classic diagnosis loop spends its final attempt on it. The banner
+    # said [AgentLoop] while classic silently never escalated, so a classic
+    # failure looked like the strong model had been tried and lost.
     if cfg.get_agent_model("escalation"):
         _escalation_client = _make_llm_for_agent("escalation")
         coder.escalation_client = _escalation_client
@@ -889,7 +891,8 @@ def _main_impl():
         # attach there too (observed: a failed npx-tailwind CMD recovery
         # never escalated because this was the one unwired path).
         llm_client.escalation_client = _escalation_client
-        log.info("[AgentLoop] Escalation model configured: %s (provider: %s)",
+        log.info("[Escalation] Model configured: %s (provider: %s) — "
+                 "agent-loop retries and the final classic diagnosis attempt",
                  cfg.get_agent_model("escalation"),
                  cfg.get_agent_provider("escalation") or provider)
 

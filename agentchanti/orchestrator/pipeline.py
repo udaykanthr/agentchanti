@@ -3101,6 +3101,20 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
     # ADVANCED the step from one that achieved nothing.
     _prev_error_sig = _error_signature(error_info)
 
+    # ── Escalation for the final attempt ─────────────────────────
+    # `models.escalation` used to reach the model only through
+    # `run_agent_loop_with_escalation`, so with `agent_loop: false` it was
+    # dead config: the startup banner announced the stronger model, the
+    # classic loop spent all three attempts on the base one, and the run
+    # halted having never asked. That reads as "even the strong model could
+    # not fix it" when the strong model was never called.
+    #
+    # Only the LAST attempt escalates. The earlier ones are cheap and often
+    # right (one measured run root-caused a typo'd attribute on attempt 1);
+    # escalating from the start would pay the premium on every failure.
+    _escalation_client = (getattr(coder, "escalation_client", None)
+                          or getattr(llm_client, "escalation_client", None))
+
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
             # Restore snapshot at the start of each attempt so that a
@@ -3142,9 +3156,22 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                      f"{diag_attempt}/{MAX_DIAGNOSIS_RETRIES}")
 
             step_type = display.steps[step_idx].get("type", "CODE")
+
+            _diag_client = llm_client
+            if (_escalation_client is not None
+                    and diag_attempt == MAX_DIAGNOSIS_RETRIES):
+                _diag_client = _escalation_client
+                _esc_model = getattr(_escalation_client, "model", "?")
+                log.info(
+                    "Task %d: final diagnosis attempt — escalating to %s",
+                    step_idx + 1, _esc_model)
+                display.step_info(
+                    step_idx,
+                    f"Escalating final diagnosis to {_esc_model}...")
+
             diagnosis = _diagnose_failure(
                 step_text, step_type, error_info,
-                memory, llm_client, display, step_idx,
+                memory, _diag_client, display, step_idx,
                 search_agent=search_agent, language=language,
                 previous_diagnosis=last_diagnosis_content,
                 kb_context_builder=kb_context_builder,
@@ -3309,7 +3336,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                             f"using #### [FILE]: format."
                         )
                         try:
-                            _dt_resp = llm_client.generate_response(
+                            _dt_resp = _diag_client.generate_response(
                                 _diag_test_prompt)
                             _dt_files = executor.parse_code_blocks(
                                 _dt_resp)
