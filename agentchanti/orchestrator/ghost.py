@@ -644,6 +644,19 @@ class GhostPlan:
             out.append(norm)
         return sorted(out)
 
+    def _declares_a_file(self) -> bool:
+        """Did any step name a target that is a file rather than a dir?
+
+        A plan whose only target is ``produces: venv\\`` has declared
+        nothing about its own source. Directory-ness is read from disk
+        rather than from the spelling, so a target named ``Makefile``
+        counts and one named ``tests`` does not.
+        """
+        for path in self.files:
+            if not os.path.isdir(os.path.join(self.root, path)):
+                return True
+        return False
+
     def step_strength(self, step_id: str) -> int:
         """Weight of the evidence a step actually produced.
 
@@ -722,10 +735,28 @@ class GhostPlan:
                             "any file it names is one the plan supplied "
                             "the contents of")))
 
-        for path in self.unplanned_writes(tracked_files):
+        # "No step declared this file" says something quite different
+        # depending on whether the plan declared any file at all. Against
+        # a plan with targets it names the one file that slipped past
+        # them; against a plan with none it is true of everything the run
+        # wrote, and repeating it per file buries the fact that matters —
+        # that the whole file layer of this check was never armed.
+        _writes = self.unplanned_writes(tracked_files)
+        if _writes and not self._declares_a_file():
+            shown = ", ".join(_writes[:6])
+            more = f", +{len(_writes) - 6} more" if len(_writes) > 6 else ""
             out.append(Disagreement(
-                kind="unplanned-write", step_id="-",
-                detail=f"{path} was written but no step declared it"))
+                kind="plan-declares-no-targets", step_id="-",
+                detail=(f"no step declared a file target, so nothing the "
+                        f"run wrote could be reconciled against the plan — "
+                        f"{len(_writes)} file(s) were written unchecked "
+                        f"({shown}{more}). Exports, anchors and content "
+                        f"regressions all went unexamined.")))
+        else:
+            for path in _writes:
+                out.append(Disagreement(
+                    kind="unplanned-write", step_id="-",
+                    detail=f"{path} was written but no step declared it"))
 
         # Test files the run's own acceptance command will never collect.
         # Deliberately spans planned targets AND untracked writes: the
@@ -747,6 +778,13 @@ class GhostPlan:
         for path, reason in degenerate_long_runs(self.root, _candidates):
             out.append(Disagreement(
                 kind="degenerate-long-run", step_id="-",
+                detail=f"{path}: {reason}"))
+
+        # And the sibling defect: the loop kept running, but the input it
+        # was varying never reached anything that reads it.
+        for path, reason in ignored_varied_inputs(self.root, _candidates):
+            out.append(Disagreement(
+                kind="varied-input-ignored", step_id="-",
                 detail=f"{path}: {reason}"))
 
         for planned, actual in sorted(self.case_mismatches.items()):
@@ -1383,20 +1421,62 @@ def _python_test_counts(text: str) -> tuple[int, int]:
 #
 # Detected structurally, from the two halves that have to be true at once:
 # the advance method early-returns on a state guard, and a long assertion
-# loop calls it without ever pinning the state to a live value. Both come
+# loop calls it without ever pinning that attribute to a working value.
+# Both come
 # from the project's own source, so nothing here is a hardcoded guess
 # about what a "game" or a "frame" is.
 
 _MIN_LONG_RUN = 200            # below this, a loop is not claiming endurance
 
 
-def _state_guard(fn) -> Optional[tuple[str, set[str]]]:
-    """``(state_attr, live_values)`` if *fn* opens with an early return.
+@dataclass(frozen=True)
+class _EarlyReturnGuard:
+    """Which values of an attribute make a method return without working.
+
+    A guard splits an attribute's values in two — those it bails on and
+    those it works on — and it may name either side. ``if self.mode is
+    not READY: return`` names the value it works on; ``if self.mode in
+    (FAILED, DONE): return`` names the ones it bails on. Both spellings
+    are ordinary, and reading only the first left a real method looking
+    unguarded, which is how a 700-iteration loop that did work in 17 of
+    them went unreported.
+
+    So the names are kept on the side they were written, and callers ask
+    :meth:`proceeds` / :meth:`halts` instead of testing set membership,
+    which is only correct for one of the two spellings.
+    """
+
+    attr: str
+    names: frozenset      # the values the guard condition actually names
+    halting: bool         # True when `names` are the ones it returns on
+
+    def proceeds(self, name: str) -> bool:
+        """Does *name* let the method get past the guard and do work?"""
+        return (name not in self.names) if self.halting else (
+            name in self.names)
+
+    def halts(self, name: str) -> bool:
+        """Does *name* make the method return immediately?"""
+        return (name in self.names) if self.halting else (
+            name not in self.names)
+
+    def all_proceed(self, names) -> bool:
+        return bool(names) and all(self.proceeds(n) for n in names)
+
+    def describe_exit(self) -> str:
+        """How the finding says the attribute crossed into halting."""
+        listed = "/".join(sorted(self.names))
+        return (f"reaches {listed}" if self.halting else f"leaves {listed}")
+
+
+def _state_guard(fn) -> Optional[_EarlyReturnGuard]:
+    """The state guard *fn* opens with, if it opens with one.
 
     Only the unambiguous spellings are read — ``is not X``, ``!= X``,
-    ``not in (X, Y)`` and their negated forms. Anything cleverer yields
-    ``None``, because a guard this check misreads would accuse a test that
-    is doing nothing wrong.
+    ``not in (X, Y)``, their negated forms, and the mirror-image
+    spellings that name the terminal states instead (``== X``, ``in (X,
+    Y)``). Anything cleverer yields ``None``, because a guard this check
+    misreads would accuse a test that is doing nothing wrong.
 
     The whole guard prologue is scanned, not just the first statement: a
     real ``update()`` opened with ``if not math.isfinite(dt): raise`` and
@@ -1425,13 +1505,13 @@ def _state_guard(fn) -> Optional[tuple[str, set[str]]]:
     return None
 
 
-def _parse_state_guard(test) -> Optional[tuple[str, set[str]]]:
-    """The ``(attr, live)`` a bare-return guard condition expresses.
+def _parse_state_guard(test) -> Optional[_EarlyReturnGuard]:
+    """The state fact a bare-return guard condition expresses.
 
     An ``or`` is enough on its own: ``if self.state != PLAYING or dt ==
     0.0: return`` leaves early whenever the state leaves PLAYING, whatever
     the other disjunct says. An ``and`` is not, since the guard may then
-    decline to fire on a dead state, so it is left unread.
+    decline to fire on a halting value, so it is left unread.
     """
     if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
         for value in test.values:
@@ -1464,23 +1544,27 @@ def _parse_state_guard(test) -> Optional[tuple[str, set[str]]]:
             return out
         return set()
 
-    live = _names(right)
-    if not live:
+    named = _names(right)
+    if not named:
         return None
-    # `is not X` / `!= X` leaves X live; negation flips an `is`/`==`.
-    if isinstance(op, (ast.IsNot, ast.NotEq)) and not negated:
-        return attr, live
-    if isinstance(op, (ast.Is, ast.Eq)) and negated:
-        return attr, live
-    if isinstance(op, ast.NotIn) and not negated:
-        return attr, live
-    if isinstance(op, ast.In) and negated:
-        return attr, live
-    return None
+    # Only equality and membership say anything unambiguous about which
+    # values a guard fires on; an ordering comparison does not.
+    if not isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq,
+                           ast.In, ast.NotIn)):
+        return None
+    # The method returns when the condition is true. So `is not X` names
+    # the value it works on, and `is X` names one it returns on.
+    # Negation swaps which side that is.
+    names_the_working_value = isinstance(op, (ast.IsNot, ast.NotEq,
+                                              ast.NotIn))
+    if negated:
+        names_the_working_value = not names_the_working_value
+    return _EarlyReturnGuard(attr=attr, names=frozenset(named),
+                             halting=not names_the_working_value)
 
 
-def guarded_advance_methods(text: str) -> dict[str, tuple[str, set[str]]]:
-    """``"Class.method" -> (state_attr, live_values)`` for guarded advancers.
+def guarded_advance_methods(text: str) -> dict[str, _EarlyReturnGuard]:
+    """``"Class.method" -> _EarlyReturnGuard`` for every guarded advancer.
 
     Keyed by class, not by bare method name, because the name alone does
     not identify the code a call reaches. `Game.update` is state-guarded
@@ -1488,7 +1572,7 @@ def guarded_advance_methods(text: str) -> dict[str, tuple[str, set[str]]]:
     are not, and a test driving the player and ghost directly skips no
     frames at all. Matching on `update` reported it as if it did.
     """
-    out: dict[str, tuple[str, set[str]]] = {}
+    out: dict[str, _EarlyReturnGuard] = {}
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
@@ -1546,14 +1630,126 @@ def _class_bindings(tree) -> dict[str, str]:
     return out
 
 
+def _binding_key(node) -> Optional[str]:
+    """The binding key an expression names, if it names one at all.
+
+    The same two spellings :func:`_class_bindings` records: a bare
+    ``game`` and a fixture's ``self.game``.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
 def _receiver_key(func: ast.Attribute) -> Optional[str]:
     """The binding key for the object a method call is made on."""
-    recv = func.value
-    if isinstance(recv, ast.Name):
-        return recv.id
-    if isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name):
-        return f"{recv.value.id}.{recv.attr}"
+    return _binding_key(func.value)
+
+
+# How far to follow a test's own helpers looking for the advance call.
+# One level is what the artifacts need; the limit exists so a mutually
+# recursive pair cannot walk forever.
+_MAX_HELPER_DEPTH = 3
+
+
+def _local_functions(tree) -> dict[str, ast.AST]:
+    """``name -> def`` for the module's own functions and methods.
+
+    A name defined twice is dropped rather than guessed at, for the same
+    reason :func:`_class_bindings` drops a conflicted receiver.
+    """
+    out: dict[str, ast.AST] = {}
+    seen_twice: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in out:
+                seen_twice.add(node.name)
+            out[node.name] = node
+    for name in seen_twice:
+        out.pop(name, None)
+    return out
+
+
+def _called_helper(func) -> Optional[str]:
+    """The local function a call names — ``helper()`` or ``self.helper()``."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+            and func.value.id == "self"):
+        return func.attr
     return None
+
+
+def _reached_advancers(node, bindings: dict[str, str], advancers: dict,
+                       helpers: dict[str, ast.AST], *,
+                       local: Optional[dict[str, str]] = None,
+                       depth: int = 0,
+                       seen: frozenset = frozenset()
+                       ) -> tuple[set[str], list]:
+    """``(advancer keys, helper bodies)`` reachable from *node*.
+
+    A loop rarely calls the advance method itself. The natural way to
+    write "assert the invariants every frame" is a helper that updates
+    and then asserts, and the loop calls the helper — which is exactly
+    what the artifact that motivated this did:
+
+        def update_and_check(self, game, dt):
+            game.update(dt, self.keys)
+            self.assert_walkable(game)
+
+        for frame in range(700):
+            self.update_and_check(self.game, dt)
+
+    Reading only direct calls, ``called`` came back empty and a loop
+    running 17 of its 700 frames was never looked at. So a call into a
+    local helper is followed, with the helper's parameters bound from
+    the arguments at the call site — that is how ``game`` inside the
+    helper is known to be the ``Game`` the fixture built.
+
+    The bodies come back too, because every silence has to be judged
+    against them as well: a helper that pins the state, or restarts a
+    finished run, is doing the honest thing on behalf of its callers.
+    """
+    local = local or {}
+    called: set[str] = set()
+    bodies: list = []
+
+    def _resolve(key: Optional[str]) -> Optional[str]:
+        if not key:
+            return None
+        return local.get(key) or bindings.get(key)
+
+    for n in ast.walk(node):
+        if not isinstance(n, ast.Call):
+            continue
+        if isinstance(n.func, ast.Attribute):
+            cls = _resolve(_receiver_key(n.func))
+            if cls and f"{cls}.{n.func.attr}" in advancers:
+                called.add(f"{cls}.{n.func.attr}")
+        if depth >= _MAX_HELPER_DEPTH:
+            continue
+        name = _called_helper(n.func)
+        helper = helpers.get(name) if name else None
+        if helper is None or name in seen:
+            continue
+        params = [a.arg for a in helper.args.args]
+        if params and params[0] == "self":
+            params = params[1:]
+        sub: dict[str, str] = {}
+        for param, arg in zip(params, n.args):
+            cls = _resolve(_binding_key(arg))
+            if cls:
+                sub[param] = cls
+        deeper, deeper_bodies = _reached_advancers(
+            helper, bindings, advancers, helpers,
+            local=sub, depth=depth + 1, seen=seen | {name})
+        if deeper:
+            called |= deeper
+            bodies.append(helper)
+            bodies.extend(deeper_bodies)
+    return called, bodies
 
 
 def _loop_iterations(node: ast.For) -> int:
@@ -1574,14 +1770,16 @@ def _loop_iterations(node: ast.For) -> int:
     return -1
 
 
-def _pins_state_live(stmts, attr: str, live: set[str]) -> bool:
-    """Does any statement here constrain *attr* to a live value?
+def _pins_state_working(stmts, spec: _EarlyReturnGuard) -> bool:
+    """Does any statement here constrain the attribute to a value the
+    guarded method still does work on?
 
     A tautology is deliberately not a guard: ``assertIn(game.state,
     (PLAYING, WIN, GAME_OVER))`` admits the terminal states it was
     supposed to rule out, and was written verbatim by a real run.
     """
     _PINNING = {"assertEqual", "assertIs", "assertNotEqual", "assertIsNot"}
+    attr = spec.attr
 
     def _reads_state(node) -> bool:
         return any(isinstance(n, ast.Attribute) and n.attr == attr
@@ -1599,9 +1797,9 @@ def _pins_state_live(stmts, attr: str, live: set[str]) -> bool:
         if name is None:
             return False
         if isinstance(op, (ast.Eq, ast.Is)):
-            return name in live
+            return spec.proceeds(name)
         if isinstance(op, (ast.NotEq, ast.IsNot)):
-            return name not in live     # ruling out a terminal state
+            return spec.halts(name)   # ruling out a terminal state
         return False
 
     for stmt in stmts:
@@ -1622,16 +1820,16 @@ def _pins_state_live(stmts, attr: str, live: set[str]) -> bool:
                         if isinstance(expected, ast.Attribute) else None)
                 if name is None:
                     continue
-                if fname in ("assertEqual", "assertIs") and name in live:
+                if fname in ("assertEqual", "assertIs") and spec.proceeds(name):
                     return True
                 if (fname in ("assertNotEqual", "assertIsNot")
-                        and name not in live):
+                        and spec.halts(name)):
                     return True
             elif fname in ("assertTrue", "assertFalse") and node.args:
                 if fname == "assertTrue" and _compare_pins(node.args[0]):
                     return True
             elif fname == "assertIn" and len(node.args) >= 2:
-                # Only a guard when every admitted value is live.
+                # Only a guard when every admitted value is one it works on.
                 if not _reads_state(node.args[0]):
                     continue
                 allowed = node.args[1]
@@ -1639,7 +1837,7 @@ def _pins_state_live(stmts, attr: str, live: set[str]) -> bool:
                     names = {e.id if isinstance(e, ast.Name) else
                              e.attr if isinstance(e, ast.Attribute) else None
                              for e in allowed.elts}
-                    if None not in names and names and names <= live:
+                    if None not in names and spec.all_proceed(names):
                         return True
     return False
 
@@ -1649,10 +1847,11 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
     """``(path, reason)`` for long assertion loops that can quietly stop.
 
     Silent unless the project itself supplies both halves of the proof:
-    a state-guarded advance method, and a test looping over it enough
-    times to be claiming endurance. A test that pins the state to a live
-    value — inside the loop or right after it — is doing the honest thing
-    and is never reported, and neither is one that breaks out on its own.
+    a method that early-returns on one of its own attributes, and a test
+    looping over it enough times to be claiming endurance. A test that
+    pins that attribute to a value the method works on — inside the loop
+    or right after it — is doing the honest thing and is never reported,
+    and neither is one that breaks out on its own.
     """
     paths = sorted(set(paths))
     advancers: dict[str, tuple[str, set[str]]] = {}
@@ -1679,6 +1878,7 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
         except (SyntaxError, ValueError, RecursionError, MemoryError):
             continue
         bindings = _class_bindings(tree)
+        helpers = _local_functions(tree)
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -1689,36 +1889,32 @@ def degenerate_long_runs(root: str, paths: Iterable[str]
                 if iterations < _MIN_LONG_RUN:
                     continue
                 # Resolve each call's receiver to the class it was built
-                # from; an unresolved receiver is simply not evidence.
-                called = set()
-                for n in ast.walk(loop):
-                    if not isinstance(n, ast.Call) or not isinstance(
-                            n.func, ast.Attribute):
-                        continue
-                    key = _receiver_key(n.func)
-                    cls = bindings.get(key) if key else None
-                    if cls and f"{cls}.{n.func.attr}" in advancers:
-                        called.add(f"{cls}.{n.func.attr}")
+                # from, following the test's own helpers; an unresolved
+                # receiver is simply not evidence.
+                called, bodies = _reached_advancers(
+                    loop, bindings, advancers, helpers)
                 if not called:
                     continue
                 if any(isinstance(n, ast.Break) for n in ast.walk(loop)):
                     continue           # the test already handles stopping
                 method = sorted(called)[0]
-                attr, live = advancers[method]
+                spec = advancers[method]
                 before, after = _siblings(fn, loop)
-                if _pins_state_live(list(loop.body) + after, attr, live):
+                reached = list(loop.body) + after + bodies
+                if _pins_state_working(reached, spec):
                     continue
-                if _handles_termination(loop, attr, live):
+                if _handles_termination([loop] + bodies, spec):
                     continue
                 if _extends_lifetime(before):
                     continue
                 out.append((path, (
                     f"{fn.name} loops {iterations} times over `{method}()`, "
-                    f"which returns immediately once `{attr}` leaves "
-                    f"{'/'.join(sorted(live))} — nothing in the loop or "
-                    f"after it pins `{attr}` to a live value, so the run "
-                    f"can end early and every remaining iteration asserts "
-                    f"against a frozen state and still passes")))
+                    f"which returns immediately once `{spec.attr}` "
+                    f"{spec.describe_exit()} — nothing in the loop or after it "
+                    f"pins `{spec.attr}` to a value it works on, so the "
+                    f"object can stop advancing while every remaining "
+                    f"iteration asserts against unchanged state and "
+                    f"still passes")))
                 break                  # one finding per test function
     return out
 
@@ -1744,8 +1940,12 @@ def _siblings(fn, loop: ast.For) -> tuple[list, list]:
 _KEEPALIVE_MIN = 1000
 
 
-def _handles_termination(loop: ast.For, attr: str, live: set[str]) -> bool:
-    """Does the loop body branch on the run having *ended*?
+def _handles_termination(nodes, spec: _EarlyReturnGuard) -> bool:
+    """Does the loop branch on the run having *ended*?
+
+    Takes every node the loop reaches, helper methods included: a suite
+    that restarts a finished run does it wherever the per-frame work
+    lives, and that is as often in a shared helper as in the loop body.
 
     The third honest pattern, after pinning and breaking: notice the run
     ended and start another one. A real suite wrote
@@ -1757,19 +1957,20 @@ def _handles_termination(loop: ast.For, attr: str, live: set[str]) -> bool:
     actual PLAYING update loop" — 2000 of 2000 frames live across six
     restarts.
 
-    Branching on the *live* state is a different thing and is not
+    Branching on a value the method still works on is a different thing
+    and is not
     accepted: ``if game.state == PLAYING and frame % 11 == 0: send_input()``
     only gates input, and the loop it appeared in degenerated anyway. The
-    condition has to be one that a dead run satisfies.
+    condition has to be one that a halted object satisfies.
     """
     def _tests_terminal(test) -> bool:
         if isinstance(test, ast.BoolOp):
             return any(_tests_terminal(v) for v in test.values)
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            return False              # `not <live>` is read below, not here
+            return False        # `not <working>` is read below, not here
         if not isinstance(test, ast.Compare) or len(test.ops) != 1:
             return False
-        if not any(isinstance(n, ast.Attribute) and n.attr == attr
+        if not any(isinstance(n, ast.Attribute) and n.attr == spec.attr
                    for n in ast.walk(test.left)):
             return False
         op, right = test.ops[0], test.comparators[0]
@@ -1782,14 +1983,18 @@ def _handles_termination(loop: ast.For, attr: str, live: set[str]) -> bool:
         if not names or "" in names:
             return False
         if isinstance(op, (ast.Eq, ast.Is, ast.In)):
-            return not (names & live)       # compares against a dead state
+            # compares against a value the method halts on
+            return all(spec.halts(n) for n in names)
         if isinstance(op, (ast.NotEq, ast.IsNot, ast.NotIn)):
-            return bool(names & live)       # "not still live"
+            # "not still working"
+            return any(spec.proceeds(n) for n in names)
         return False
 
-    for node in ast.walk(loop):
-        if isinstance(node, (ast.If, ast.While)) and _tests_terminal(node.test):
-            return True
+    for root in nodes:
+        for node in ast.walk(root):
+            if (isinstance(node, (ast.If, ast.While))
+                    and _tests_terminal(node.test)):
+                return True
     return False
 
 
@@ -1818,6 +2023,183 @@ def _extends_lifetime(stmts) -> bool:
                     and value.value >= _KEEPALIVE_MIN):
                 return True
     return False
+
+
+# ── inputs a test varies that the code never reads ───────────────────
+#
+# The sibling of `degenerate-long-run`, and the one it cannot see. That
+# check asks whether the loop stopped doing work; this one asks whether
+# the work ever depended on what the loop was varying.
+#
+# Measured: a task demanded "run >= 600 frames with dt drawn randomly
+# from 0.008..0.05, not a fixed 1/60". The suite did exactly that, over
+# 600 and then 2000 iterations, and passed. `run_frame(self, dt)` never
+# mentions `dt` in its body — its own docstring says the parameter is
+# "accepted to mirror the interface the tests expect". Replaying the
+# suite with dt at 1e-9, 1/60 and 1e9 gives byte-identical results, so
+# the adversarial condition the whole task was written around could not
+# have failed. Every gate passed and no other check had anything to say.
+#
+# Nothing here is about time, frames or games: the rule is that a value
+# a loop deliberately varies must reach code that reads it.
+
+
+def _varying_names(loop: ast.For) -> set[str]:
+    """Names this loop rebinds to something fresh each iteration.
+
+    The loop variable itself, and anything assigned from a `random.*`
+    draw inside the body — the two ways a test says "this input is not
+    the same twice".
+    """
+    out: set[str] = set()
+    target = loop.target
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+    for stmt in loop.body:
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Assign) or not _draws_randomly(
+                    node.value):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    out.add(t.id)
+    return out
+
+
+def _draws_randomly(node) -> bool:
+    """Does this expression pull a fresh value from `random`?"""
+    for n in ast.walk(node):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "random"):
+            return True
+    return False
+
+
+def _is_varied(arg, varying: set[str]) -> bool:
+    if _draws_randomly(arg):
+        return True
+    return any(isinstance(n, ast.Name) and n.id in varying
+               for n in ast.walk(arg))
+
+
+def _reads_parameter(fn, param: str) -> bool:
+    """Does *fn* mention *param* anywhere in its body?
+
+    Any mention counts, load or store. A parameter that is reassigned
+    before use is doing something odd, but it is not proof the input was
+    discarded, and this check must only fire when that proof is total.
+    """
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id == param:
+            return True
+    return False
+
+
+def _project_methods(root: str, paths: Iterable[str]) -> dict[str, ast.AST]:
+    """``"Class.method" -> def`` across the project's non-test sources."""
+    out: dict[str, ast.AST] = {}
+    seen_twice: set[str] = set()
+    for path in paths:
+        if not path.endswith(".py") or is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    key = f"{node.name}.{item.name}"
+                    if key in out:
+                        seen_twice.add(key)
+                    out[key] = item
+    for key in seen_twice:
+        out.pop(key, None)          # never guess at an ambiguous target
+    return out
+
+
+def ignored_varied_inputs(root: str, paths: Iterable[str]
+                          ) -> list[tuple[str, str]]:
+    """``(path, reason)`` where a loop varies an input the callee drops.
+
+    Silent unless the proof is complete: the argument demonstrably
+    changes per iteration, the receiver resolves to a class built in
+    this project, that class's method is unambiguous, and the parameter
+    it lands on appears nowhere in the method body. A method taking
+    ``*args``/``**kwargs`` is never accused — the value may reach it by
+    a route this cannot see.
+    """
+    paths = sorted(set(paths))
+    methods = _project_methods(root, paths)
+    if not methods:
+        return []
+
+    out: list[tuple[str, str]] = []
+    for path in paths:
+        if not is_python_test_file(path):
+            continue
+        text = _read(root, path)
+        if text is None:
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+        bindings = _class_bindings(tree)
+        reported: set[tuple[str, str, str]] = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for loop in ast.walk(fn):
+                if not isinstance(loop, ast.For):
+                    continue
+                varying = _varying_names(loop)
+                if not varying and not any(
+                        _draws_randomly(n) for n in ast.walk(loop)):
+                    continue
+                for call in ast.walk(loop):
+                    if not isinstance(call, ast.Call) or not isinstance(
+                            call.func, ast.Attribute):
+                        continue
+                    cls = bindings.get(_receiver_key(call.func) or "")
+                    if not cls:
+                        continue
+                    target = methods.get(f"{cls}.{call.func.attr}")
+                    if target is None:
+                        continue
+                    if target.args.vararg or target.args.kwarg:
+                        continue
+                    params = [a.arg for a in target.args.args]
+                    if params and params[0] == "self":
+                        params = params[1:]
+                    for index, arg in enumerate(call.args):
+                        if index >= len(params):
+                            break
+                        param = params[index]
+                        if not _is_varied(arg, varying):
+                            continue
+                        if _reads_parameter(target, param):
+                            continue
+                        key = (fn.name, f"{cls}.{call.func.attr}", param)
+                        if key in reported:
+                            continue
+                        reported.add(key)
+                        out.append((path, (
+                            f"{fn.name} varies the argument passed as "
+                            f"`{param}` on every iteration and hands it to "
+                            f"`{cls}.{call.func.attr}()`, whose `{param}` "
+                            f"parameter is never read in its body — the "
+                            f"variation cannot change the outcome, so the "
+                            f"condition this loop exists to test is not "
+                            f"actually being applied")))
+    return out
 
 
 def uncollected_test_files(root: str, paths: Iterable[str],

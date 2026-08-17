@@ -6,6 +6,7 @@ it stays silent (UNKNOWN) whenever the evidence is inconclusive.
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from agentchanti.orchestrator.ghost import (
     HOLDS, INAPPLICABLE, UNKNOWN, VIOLATED, GhostPlan, MIN_STEP_STRENGTH,
     degenerate_long_runs,
+    ignored_varied_inputs,
 )
 from agentchanti.orchestrator.plan_step import PlanStep
 
@@ -1289,3 +1291,493 @@ def test_gating_input_on_the_live_state_is_not_handling_termination(tmp_path):
               "            game.update(0.016)\n"
               "            self.assertTrue(game.ok)\n")
     assert len(degenerate_long_runs(root, paths)) == 1
+
+
+# ── the guard spelled the other way round ────────────────────────────
+#
+# Measured on a Pac-Man run whose suite was fully green: `Game.update`
+# opened with `if self.state in (WIN, GAME_OVER): return` — the mirror
+# image of `is not PLAYING`, naming the states that end the run instead
+# of the one that keeps it going. Reading only the first spelling left
+# the class unguarded, so nothing was ever a long-run candidate, and the
+# suite's `range(700)` acceptance loop simulated 17 frames.
+
+_GAME_DEAD_LISTED = '''\
+PLAYING = "playing"
+WIN = "win"
+GAME_OVER = "over"
+
+
+class Game:
+    def __init__(self):
+        self.state = PLAYING
+
+    def update(self, dt):
+        if self.state in (WIN, GAME_OVER):
+            return
+        self.tick = dt
+'''
+
+
+def test_guard_listing_the_terminal_states_is_read(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n",
+                     game=_GAME_DEAD_LISTED)
+    found = degenerate_long_runs(root, paths)
+    assert len(found) == 1
+    assert "reaches GAME_OVER/WIN" in found[0][1]
+
+
+def test_equality_guard_on_one_terminal_state_is_read(tmp_path):
+    root = str(tmp_path)
+    game = _GAME_DEAD_LISTED.replace("if self.state in (WIN, GAME_OVER):",
+                                     "if self.state == GAME_OVER:")
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n",
+                     game=game)
+    assert len(degenerate_long_runs(root, paths)) == 1
+
+
+def test_ordering_comparison_is_still_not_a_state_guard(tmp_path):
+    """An ordering test says nothing this check can read."""
+    root = str(tmp_path)
+    game = _GAME_DEAD_LISTED.replace("if self.state in (WIN, GAME_OVER):",
+                                     "if self.state < 0:")
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertTrue(game.ok)\n",
+                     game=game)
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_pinning_still_silences_a_dead_listed_guard(tmp_path):
+    """The silences must survive the spelling, not just the finding."""
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertEqual(game.state, PLAYING)\n",
+                     game=_GAME_DEAD_LISTED)
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_ruling_out_a_terminal_state_still_silences(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            self.assertNotEqual(game.state, WIN)\n",
+                     game=_GAME_DEAD_LISTED)
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_tautology_is_still_not_a_pin_when_the_guard_lists_the_dead(tmp_path):
+    root = str(tmp_path)
+    paths = _project(
+        root,
+        "        for _ in range(2000):\n"
+        "            game.update(0.016)\n"
+        "            self.assertIn(game.state, (PLAYING, WIN, GAME_OVER))\n",
+        game=_GAME_DEAD_LISTED)
+    assert len(degenerate_long_runs(root, paths)) == 1
+
+
+def test_restarting_a_finished_run_still_silences(tmp_path):
+    root = str(tmp_path)
+    paths = _project(root, "        for _ in range(2000):\n"
+                           "            game.update(0.016)\n"
+                           "            if game.state == GAME_OVER:\n"
+                           "                game.restart()\n",
+                     game=_GAME_DEAD_LISTED)
+    assert degenerate_long_runs(root, paths) == []
+
+
+# ── the advance call one level down ──────────────────────────────────
+#
+# The natural way to write "assert the invariants every frame" is a
+# helper that updates and then asserts, with the loop calling only the
+# helper. The receiver `self.update_and_check` binds to no class, so the
+# loop looked as though it advanced nothing at all.
+
+def _with_helper(root, loop_body, helper_body, game=_GAME):
+    _write(root, "game.py", game)
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, PLAYING, GAME_OVER\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.game = Game()\n\n"
+           "    def step(self, game, dt):\n" + helper_body + "\n"
+           "    def test_long(self):\n" + loop_body)
+    return ["game.py", "test_sim.py"]
+
+
+def test_advance_through_a_helper_is_found(tmp_path):
+    root = str(tmp_path)
+    paths = _with_helper(
+        root,
+        "        for _ in range(2000):\n"
+        "            self.step(self.game, 0.016)\n",
+        "        game.update(dt)\n"
+        "        self.assertTrue(game.ok)\n")
+    found = degenerate_long_runs(root, paths)
+    assert len(found) == 1
+    assert "`Game.update()`" in found[0][1]
+
+
+def test_a_helper_that_pins_the_state_silences_its_callers(tmp_path):
+    """The helper runs every iteration, so its pin is the loop's pin."""
+    root = str(tmp_path)
+    paths = _with_helper(
+        root,
+        "        for _ in range(2000):\n"
+        "            self.step(self.game, 0.016)\n",
+        "        game.update(dt)\n"
+        "        self.assertEqual(game.state, PLAYING)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_a_helper_that_restarts_the_run_silences_its_callers(tmp_path):
+    root = str(tmp_path)
+    paths = _with_helper(
+        root,
+        "        for _ in range(2000):\n"
+        "            self.step(self.game, 0.016)\n",
+        "        game.update(dt)\n"
+        "        if game.state is not PLAYING:\n"
+        "            game.restart()\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_helper_driving_an_unguarded_class_is_not_evidence(tmp_path):
+    """`Player.update` is not state-guarded, and routing it through a
+    helper must not make it look as though it were."""
+    root = str(tmp_path)
+    game = _GAME + (
+        "\n\nclass Player:\n"
+        "    def update(self, dt):\n"
+        "        self.moved = dt\n")
+    _write(root, "game.py", game)
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, Player, PLAYING\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.player = Player()\n\n"
+           "    def step(self, player, dt):\n"
+           "        player.update(dt)\n\n"
+           "    def test_long(self):\n"
+           "        for _ in range(2000):\n"
+           "            self.step(self.player, 0.016)\n")
+    assert degenerate_long_runs(root, ["game.py", "test_sim.py"]) == []
+
+
+def test_helper_recursion_terminates(tmp_path):
+    root = str(tmp_path)
+    _write(root, "game.py", _GAME)
+    _write(root, "test_sim.py",
+           "import unittest\n"
+           "from game import Game, PLAYING\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.game = Game()\n\n"
+           "    def step(self, game, dt):\n"
+           "        self.step(game, dt)\n\n"
+           "    def test_long(self):\n"
+           "        for _ in range(2000):\n"
+           "            self.step(self.game, 0.016)\n")
+    assert degenerate_long_runs(root, ["game.py", "test_sim.py"]) == []
+
+
+# ── a plan that declared no file at all ──────────────────────────────
+
+
+def test_plan_with_no_file_target_reports_once_not_per_file(tmp_path):
+    """Observed: a 20B planner named its files in prose and emitted no
+    `target:` line on any of six CODE/TEST steps. Every source file the
+    run produced was then reported as an unplanned write — six findings
+    that were each true of the plan and useless about the code, burying
+    the one write that really was a stray."""
+    root = str(tmp_path)
+    os.makedirs(os.path.join(root, "venv"), exist_ok=True)
+    ghost = GhostPlan.build([_step("1.1", step_type="CMD",
+                                   target_files=["venv"])], root)
+    found = ghost.disagreements(
+        ["1.1"], tracked_files=["game.py", "map.py", "temp.py"])
+    kinds = [d.kind for d in found]
+    assert kinds.count("plan-declares-no-targets") == 1
+    assert "unplanned-write" not in kinds
+    detail = [d.detail for d in found
+              if d.kind == "plan-declares-no-targets"][0]
+    assert "3 file(s)" in detail
+
+
+def test_one_declared_file_restores_the_per_file_finding(tmp_path):
+    """The plan-level finding is about a plan that declared nothing. As
+    soon as one step declares a file, a stray write is a stray write."""
+    root = str(tmp_path)
+    _write(root, "a.py", "A = 1\n")
+    ghost = GhostPlan.build([_step("1.1", target_files=["a.py"])], root)
+    found = ghost.disagreements(["1.1"], tracked_files=["a.py", "sneaky.py"])
+    kinds = [d.kind for d in found]
+    assert kinds.count("unplanned-write") == 1
+    assert "plan-declares-no-targets" not in kinds
+
+
+# ── the check is about a shape, not about games ──────────────────────
+#
+# Every artifact that motivated `degenerate-long-run` happened to be a
+# generated game, which is a fact about what got benchmarked, not about
+# what the rule reads. What it actually requires is a class whose
+# advance method early-returns on a state comparison, and a long literal
+# loop that reaches it without pinning that state — a shape shared by
+# schedulers, retry loops, workflow engines and stream consumers. These
+# tests are written in a domain with no game vocabulary anywhere, and
+# fail the moment any is baked into the module.
+
+_INGEST = '''\
+RUNNING = "running"
+FAILED = "failed"
+COMPLETED = "completed"
+
+
+class Ingest:
+    def __init__(self):
+        self.status = RUNNING
+
+    def drain(self, batch):
+        if self.status in (FAILED, COMPLETED):
+            return
+        self.rows = batch
+'''
+
+
+def _ingest_project(root, test_body):
+    _write(root, "ingest.py", _INGEST)
+    _write(root, "test_ingest.py",
+           "import unittest\n"
+           "from ingest import Ingest, RUNNING, FAILED\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_drains_everything(self):\n"
+           "        worker = Ingest()\n" + test_body)
+    return ["ingest.py", "test_ingest.py"]
+
+
+def test_a_worker_loop_that_can_stop_draining_is_reported(tmp_path):
+    root = str(tmp_path)
+    paths = _ingest_project(root, "        for _ in range(5000):\n"
+                                  "            worker.drain(10)\n"
+                                  "            self.assertTrue(worker.rows)\n")
+    found = degenerate_long_runs(root, paths)
+    assert len(found) == 1
+    assert "`Ingest.drain()`" in found[0][1]
+    assert "`status` reaches COMPLETED/FAILED" in found[0][1]
+
+
+def test_a_worker_loop_that_pins_its_status_is_silent(tmp_path):
+    root = str(tmp_path)
+    paths = _ingest_project(root, "        for _ in range(5000):\n"
+                                  "            worker.drain(10)\n"
+                                  "            self.assertEqual(worker.status, RUNNING)\n")
+    assert degenerate_long_runs(root, paths) == []
+
+
+def test_findings_survive_renaming_every_identifier(tmp_path):
+    """The proof that nothing about the domain is hardcoded: rename the
+    class, the method, the attribute and the states, and the same loop
+    is still reported — with the new names, read back out of the source.
+    """
+    root = str(tmp_path)
+    swaps = {"Ingest": "Widget", "drain": "poke", "status": "phase",
+             "RUNNING": "ACTIVE", "FAILED": "ABORTED",
+             "COMPLETED": "FINISHED", "worker": "gadget", "rows": "blobs"}
+
+    def _rename(text):
+        for old, new in swaps.items():
+            text = re.sub(rf"\b{old}\b", new, text)
+        return text
+
+    _write(root, "ingest.py", _rename(_INGEST))
+    _write(root, "test_ingest.py", _rename(
+        "import unittest\n"
+        "from ingest import Ingest, RUNNING, FAILED\n\n\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_drains_everything(self):\n"
+        "        worker = Ingest()\n"
+        "        for _ in range(5000):\n"
+        "            worker.drain(10)\n"
+        "            self.assertTrue(worker.rows)\n"))
+    found = degenerate_long_runs(root, ["ingest.py", "test_ingest.py"])
+    assert len(found) == 1
+    assert "`Widget.poke()`" in found[0][1]
+    assert "`phase` reaches ABORTED/FINISHED" in found[0][1]
+
+
+# ── inputs a test varies that the code never reads ───────────────────
+#
+# Measured: a task demanded ">= 600 frames with dt drawn randomly from
+# 0.008..0.05, not a fixed 1/60". The suite looped 600 and then 2000
+# times doing exactly that, and passed. `run_frame(self, dt)` never
+# mentions `dt` — its docstring said the parameter was "accepted to
+# mirror the interface the tests expect". Replaying at dt = 1e-9, 1/60
+# and 1e9 gave byte-identical results. Every gate was green.
+
+_SAMPLER = '''\
+class Sampler:
+    def __init__(self):
+        self.seen = 0
+
+    def take(self, amount):
+        self.seen += 1
+'''
+
+
+def _sampler_project(root, test_body, source=_SAMPLER):
+    _write(root, "sampler.py", source)
+    _write(root, "test_sampler.py",
+           "import random\n"
+           "import unittest\n"
+           "from sampler import Sampler\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.sampler = Sampler()\n\n"
+           "    def test_varies(self):\n" + test_body)
+    return ["sampler.py", "test_sampler.py"]
+
+
+def test_randomised_argument_the_callee_drops_is_reported(tmp_path):
+    root = str(tmp_path)
+    paths = _sampler_project(
+        root, "        for _ in range(600):\n"
+              "            amount = random.uniform(0.008, 0.05)\n"
+              "            self.sampler.take(amount)\n")
+    found = ignored_varied_inputs(root, paths)
+    assert len(found) == 1
+    assert "`amount`" in found[0][1]
+    assert "`Sampler.take()`" in found[0][1]
+
+
+def test_argument_passed_inline_is_also_seen(tmp_path):
+    """`take(random.uniform(...))` needs no intermediate variable."""
+    root = str(tmp_path)
+    paths = _sampler_project(
+        root, "        for _ in range(600):\n"
+              "            self.sampler.take(random.uniform(0.008, 0.05))\n")
+    assert len(ignored_varied_inputs(root, paths)) == 1
+
+
+def test_the_loop_variable_counts_as_variation(tmp_path):
+    root = str(tmp_path)
+    paths = _sampler_project(
+        root, "        for step in range(600):\n"
+              "            self.sampler.take(step)\n")
+    assert len(ignored_varied_inputs(root, paths)) == 1
+
+
+def test_a_parameter_the_callee_reads_is_silent(tmp_path):
+    """The whole point: this is about the input never arriving."""
+    root = str(tmp_path)
+    source = _SAMPLER.replace("        self.seen += 1",
+                              "        self.seen += amount")
+    paths = _sampler_project(
+        root, "        for _ in range(600):\n"
+              "            amount = random.uniform(0.008, 0.05)\n"
+              "            self.sampler.take(amount)\n",
+        source=source)
+    assert ignored_varied_inputs(root, paths) == []
+
+
+def test_a_constant_argument_is_not_variation(tmp_path):
+    """A fixed-value long run claims endurance, not adversarial input,
+    and is `degenerate-long-run`'s business rather than this check's."""
+    root = str(tmp_path)
+    paths = _sampler_project(
+        root, "        for _ in range(2000):\n"
+              "            self.sampler.take(0.008)\n")
+    assert ignored_varied_inputs(root, paths) == []
+
+
+def test_var_positional_callee_is_never_accused(tmp_path):
+    """`*args` may route the value somewhere this cannot follow."""
+    root = str(tmp_path)
+    source = ("class Sampler:\n"
+              "    def take(self, amount, *args):\n"
+              "        self.seen = args\n")
+    paths = _sampler_project(
+        root, "        for _ in range(600):\n"
+              "            self.sampler.take(random.random())\n",
+        source=source)
+    assert ignored_varied_inputs(root, paths) == []
+
+
+def test_unresolved_receiver_is_not_evidence(tmp_path):
+    """Same rule as everywhere else here: an unbound receiver proves
+    nothing, so nothing is claimed."""
+    root = str(tmp_path)
+    _write(root, "sampler.py", _SAMPLER)
+    _write(root, "test_sampler.py",
+           "import random\n"
+           "import unittest\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_varies(self):\n"
+           "        for _ in range(600):\n"
+           "            self.whatever.take(random.random())\n")
+    assert ignored_varied_inputs(
+        root, ["sampler.py", "test_sampler.py"]) == []
+
+
+def test_an_ambiguous_method_name_is_dropped(tmp_path):
+    """Two classes with the same qualified name is not a target."""
+    root = str(tmp_path)
+    source = (_SAMPLER + "\n\nclass Sampler:\n"
+              "    def take(self, amount):\n"
+              "        self.total = amount\n")
+    paths = _sampler_project(
+        root, "        for _ in range(600):\n"
+              "            self.sampler.take(random.random())\n",
+        source=source)
+    assert ignored_varied_inputs(root, paths) == []
+
+
+def test_the_finding_survives_renaming_every_identifier(tmp_path):
+    """Nothing about time, frames, dt or games is in the rule."""
+    root = str(tmp_path)
+    _write(root, "throttle.py",
+           "class Throttle:\n"
+           "    def admit(self, weight):\n"
+           "        self.calls = 1\n")
+    _write(root, "test_throttle.py",
+           "import random\n"
+           "import unittest\n"
+           "from throttle import Throttle\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def setUp(self):\n"
+           "        self.throttle = Throttle()\n\n"
+           "    def test_weights(self):\n"
+           "        for _ in range(300):\n"
+           "            w = random.choice([1, 5, 9])\n"
+           "            self.throttle.admit(w)\n")
+    found = ignored_varied_inputs(root, ["throttle.py", "test_throttle.py"])
+    assert len(found) == 1
+    assert "`weight`" in found[0][1] and "`Throttle.admit()`" in found[0][1]
+
+
+def test_ignored_input_surfaces_as_a_disagreement(tmp_path):
+    root = str(tmp_path)
+    _write(root, "sampler.py", _SAMPLER)
+    _write(root, "test_sampler.py",
+           "import random\n"
+           "import unittest\n"
+           "from sampler import Sampler\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_varies(self):\n"
+           "        sampler = Sampler()\n"
+           "        for _ in range(600):\n"
+           "            sampler.take(random.random())\n")
+    ghost = GhostPlan.build(
+        [_step("1.1", target_files=["sampler.py", "test_sampler.py"])], root)
+    ghost.resolve(["1.1"], language="python")
+    found = [d for d in ghost.disagreements(["1.1"])
+             if d.kind == "varied-input-ignored"]
+    assert len(found) == 1
