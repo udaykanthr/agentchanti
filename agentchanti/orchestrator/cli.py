@@ -2344,12 +2344,31 @@ def _main_impl():
             log.error("Pipeline failed: user acceptance command(s) did not "
                       "pass — " + "; ".join(_acc_failures[:3]))
 
+    # Run the surviving pre-existing tests before claiming they passed.
+    # They are the run's only independent instrument, and until this was
+    # added the claim rested on `tests_ran` — a flag about the pipeline's
+    # OWN tests. Two measured runs reported them as passing while every
+    # test in them errored.
+    from .evidence import (run_pre_existing_tests as _run_survivors,
+                           surviving_pre_existing_tests as _survivors)
+    _surv = _survivors(os.getcwd(), _pre_existing_tests)
+    _surv_passed, _surv_detail = (None, "")
+    if _surv:
+        _surv_passed, _surv_detail = _run_survivors(executor, os.getcwd(),
+                                                    _surv)
+        log.info("[Evidence] pre-existing suite(s) %s — %s",
+                 {True: "PASSED", False: "FAILED"}.get(_surv_passed,
+                                                       "could not be run"),
+                 _surv_detail)
+
     _evidence = _classify_evidence(
         os.getcwd(), _pre_existing_tests,
         tests_ran=bool(verif_ok) or any(
             getattr(s, "step_type", "") == "TEST" for s in plan_steps_parsed),
         acceptance_passed=_acceptance_passed,
-        acceptance_cmds=_acceptance_cmds)
+        acceptance_cmds=_acceptance_cmds,
+        survivors_passed=_surv_passed,
+        survivors_detail=_surv_detail)
     log.info(_evidence.log_line())
 
     if (pipeline_success and not _evidence.independent

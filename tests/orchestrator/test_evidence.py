@@ -89,13 +89,69 @@ def test_greenfield_run_is_completed_but_unverified(tmp_path):
 
 
 def test_untouched_seeded_suite_is_independent(tmp_path):
+    """Untouched AND actually run and passed.
+
+    `survivors_passed` is what makes this a measurement. Before it
+    existed the verdict rested on `tests_ran` — a flag about the
+    pipeline's OWN tests — and two measured runs (2026-08-17 and
+    2026-08-18) reported a seeded contract as having passed while every
+    test in it errored.
+    """
     root = str(tmp_path)
     _write(root, "test_calc.py", "def test_add(): assert add(2, 2) == 4\n")
     snap = snapshot_test_files(root)
-    verdict = classify(root, snap, tests_ran=True)
+    verdict = classify(root, snap, tests_ran=True, survivors_passed=True)
     assert verdict.independent
     assert verdict.kind == INDEPENDENT_PRE_EXISTING
     assert "test_calc.py" in verdict.detail
+
+
+def test_a_surviving_suite_nobody_ran_is_not_evidence(tmp_path):
+    """The measured defect, pinned: surviving is not the same as passing."""
+    root = str(tmp_path)
+    _write(root, "test_calc.py", "def test_add(): assert add(2, 2) == 4\n")
+    snap = snapshot_test_files(root)
+    verdict = classify(root, snap, tests_ran=True, survivors_passed=None)
+    assert not verdict.independent
+    assert "none could be run" in verdict.detail
+
+
+def test_a_failing_pre_existing_suite_is_reported_as_such(tmp_path):
+    """The one instrument the run did not author disagreeing with it is
+    a stronger statement than a generic "unverified"."""
+    from agentchanti.orchestrator.evidence import PRE_EXISTING_FAILED
+
+    root = str(tmp_path)
+    _write(root, "test_calc.py", "def test_add(): assert add(2, 2) == 4\n")
+    snap = snapshot_test_files(root)
+    verdict = classify(root, snap, tests_ran=True, survivors_passed=False,
+                       survivors_detail="test_calc.py: AssertionError")
+    assert not verdict.independent
+    assert verdict.kind == PRE_EXISTING_FAILED
+    assert "AssertionError" in verdict.detail
+
+
+def test_running_survivors_reports_pass_fail_and_unknown(tmp_path):
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    class _Exec:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def run_command(self, cmd, timeout=None):
+            return self.ok, "Ran 1 test" if self.ok else "FAILED (errors=1)"
+
+    root = str(tmp_path)
+    ok, detail = run_pre_existing_tests(_Exec(True), root, ["test_a.py"])
+    assert ok is True and "passed" in detail
+
+    ok, detail = run_pre_existing_tests(_Exec(False), root, ["test_a.py"])
+    assert ok is False and "test_a.py" in detail
+
+    # No runnable file, and no executor: both mean "cannot answer",
+    # which must never read as a pass.
+    assert run_pre_existing_tests(_Exec(True), root, [])[0] is None
+    assert run_pre_existing_tests(None, root, ["test_a.py"])[0] is None
 
 
 def test_rewriting_the_seeded_suite_forfeits_independence(tmp_path):

@@ -61,9 +61,12 @@ _SKIP_DIRS = {
     "dist", "build", ".tox", ".next", "site-packages",
 }
 
+_logger = logging.getLogger(__name__)
+
 INDEPENDENT_ACCEPTANCE = "acceptance-commands"
 INDEPENDENT_PRE_EXISTING = "pre-existing-tests"
 SELF_AUTHORED = "self-authored"
+PRE_EXISTING_FAILED = "pre-existing-tests-failed"
 NO_TESTS = "no-tests"
 
 
@@ -140,12 +143,54 @@ def surviving_pre_existing_tests(root: str,
     return survivors
 
 
+
+def run_pre_existing_tests(executor, root: str,
+                           survivors: Iterable[str]) -> tuple[bool | None, str]:
+    """Actually run the surviving pre-existing tests. ``(passed, detail)``.
+
+    ``None`` means the question could not be answered — no survivors, no
+    executor, or nothing runnable — and must never be read as a pass.
+
+    This exists because `classify` used to report those files as having
+    "passed" on the strength of `tests_ran`, a flag about whether the
+    pipeline ran ANY tests of its own. Measured twice, 2026-08-17 and
+    2026-08-18: both runs logged `Evidence: independent (pre-existing-
+    tests) ... passed: test_acceptance_contract.py` over a contract that
+    errored on every test it had. The word "passed" was asserted, never
+    measured, in the one layer whose entire job is to check that
+    something independent agreed.
+    """
+    files = [f for f in (survivors or ()) if f.endswith(".py")]
+    if not files or executor is None:
+        return None, "no runnable pre-existing test file"
+    failures: list[str] = []
+    ran = 0
+    for rel in files:
+        cmd = "python -m unittest " + rel.replace("/", os.sep)
+        try:
+            ok, out = executor.run_command(cmd, timeout=300)
+        except Exception as exc:
+            _logger.debug("[Evidence] %s could not run: %s", rel, exc)
+            continue
+        ran += 1
+        if not ok:
+            tail = " | ".join((out or "").strip().splitlines()[-3:])
+            failures.append(f"{rel}: {tail[:200]}")
+    if ran == 0:
+        return None, "no pre-existing test file could be run"
+    if failures:
+        return False, "; ".join(failures[:3])
+    return True, f"{ran} pre-existing test file(s) ran and passed"
+
+
 def classify(root: str,
              snapshot: dict[str, str],
              *,
              tests_ran: bool,
              acceptance_passed: Optional[bool] = None,
-             acceptance_cmds: Iterable[str] = ()) -> Evidence:
+             acceptance_cmds: Iterable[str] = (),
+             survivors_passed: Optional[bool] = None,
+             survivors_detail: str = "") -> Evidence:
     """What kind of evidence does this run's success actually rest on?
 
     ``acceptance_passed`` is tri-state: ``None`` when the user supplied no
@@ -160,12 +205,27 @@ def classify(root: str,
                         f"passed: {shown}")
 
     survivors = surviving_pre_existing_tests(root, snapshot)
-    if survivors and tests_ran:
+    if survivors:
         shown = ", ".join(survivors[:3])
         more = f" (+{len(survivors) - 3} more)" if len(survivors) > 3 else ""
-        return Evidence(True, INDEPENDENT_PRE_EXISTING,
-                        f"{len(survivors)} test file(s) that predate the run "
-                        f"and it did not modify passed: {shown}{more}")
+        # A surviving file is only evidence once it has been RUN and
+        # passed. `tests_ran` says the pipeline ran tests of its own,
+        # which is a different question and was the wrong one to ask.
+        if survivors_passed is True:
+            return Evidence(True, INDEPENDENT_PRE_EXISTING,
+                            f"{len(survivors)} test file(s) that predate the "
+                            f"run and it did not modify passed: {shown}{more}")
+        if survivors_passed is False:
+            # Louder than "unverified": the one instrument this run did
+            # not author disagrees with it.
+            return Evidence(False, PRE_EXISTING_FAILED,
+                            f"the pre-existing test file(s) this run did not "
+                            f"modify FAILED: {survivors_detail or shown}")
+        return Evidence(False, SELF_AUTHORED,
+                        f"{len(survivors)} pre-existing test file(s) survived "
+                        f"({shown}{more}) but none could be run, so nothing "
+                        f"independent has actually agreed"
+                        + (f" — {survivors_detail}" if survivors_detail else ""))
 
     # Everything below here is a run judged only by its own work.
     if snapshot and not survivors:
