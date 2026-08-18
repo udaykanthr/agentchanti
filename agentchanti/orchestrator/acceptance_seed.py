@@ -146,6 +146,12 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    unittest records as an ERROR *after* your assertions have already
    passed, turning a green contract red. Let objects be garbage
    collected instead.
+7. Never assert on the program's SOURCE TEXT. No `inspect.getsource`, no
+   `ast.parse` of the module under test, no reading `__file__` and
+   searching it for identifiers. "The source mentions `reset`" passes a
+   stub that mentions it and fails correct code that calls the method
+   `restart`; you would be testing vocabulary, not behaviour. Build the
+   objects and call the methods.
 
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """

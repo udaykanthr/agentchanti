@@ -94,10 +94,87 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
+# Reading the module's own text instead of running it. A test that greps
+# source is weak and brittle at once: it passes a stub that merely
+# MENTIONS the right words, and it fails correct code that names things
+# differently.
+#
+# Measured 2026-08-18 09:26. A contract asserted
+#
+#     self.assertTrue("reset" in values or "restart" in values ...,
+#                     "Boundary or self collisions must reset the game")
+#
+# over a token set extracted from the module's AST. The artifact defines
+# `reset_game` and calls it on every collision — 16 resets under an
+# external probe — but the token is `reset_game`, membership is exact,
+# and the run was failed by a substring that was not a whole token. The
+# same contract also "proved" scoring with
+# `any(isinstance(n, ast.AugAssign) ...)`, which any `x += 1` anywhere
+# satisfies.
+#
+# This is the lesson `verify_dt_invariance` already encodes by reserving
+# an exit code for could-not-verify: generated projects share no
+# vocabulary, so asserting on their vocabulary is not verification.
+_SOURCE_INSPECTION_CALLS = {
+    "getsource", "getsourcefile", "getsourcelines", "getfile",
+    "parse", "walk", "dump", "unparse", "getlines",
+}
+
+
+def _inspects_source(node: ast.AST) -> bool:
+    """Does this subtree read the program's text rather than run it?
+
+    Only the unambiguous readers count. A bare ``__file__`` deliberately
+    does not: iteration 5's contract used it to LOCATE a sibling script
+    to launch as a subprocess, which is running the program, not reading
+    it — flagging that would mislabel a legitimate test and spend a
+    repair cycle explaining the wrong thing.
+    """
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in _SOURCE_INSPECTION_CALLS:
+            # `ast.parse`, `inspect.getsource`, `linecache.getlines`.
+            value = sub.value
+            if isinstance(value, ast.Name) and value.id in (
+                    "ast", "inspect", "linecache"):
+                return True
+    return False
+
+
+def source_inspecting_tests(tree: ast.AST) -> list[str]:
+    """Names of test functions that read source instead of driving it."""
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test")
+                and _inspects_source(node)):
+            out.append(node.name)
+    return out
+
+
+def _excluded_node_ids(tree: ast.AST) -> set[int]:
+    """Every node inside a source-inspecting test.
+
+    Excluded at FUNCTION granularity rather than per assertion: a test
+    that parses the module is a source-inspection test, and its
+    assertions are about text whether or not each one names the parse.
+    """
+    excluded: set[int] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test")
+                and _inspects_source(node)):
+            for sub in ast.walk(node):
+                excluded.add(id(sub))
+    return excluded
+
+
 def _substantive_assertions(tree: ast.AST) -> int:
     """How many assertions could tell two implementations apart."""
     count = 0
+    skip = _excluded_node_ids(tree)
     for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
         if isinstance(node, ast.Assert):
             # A bare `assert` on anything but a constant is a real claim.
             if not _is_literal(node.test) and not _mentions_liveness(node.test):
@@ -152,6 +229,20 @@ def weak_contract_reason(src: str, min_substantive: int = 2) -> Optional[str]:
     if not tests:
         return None                       # `_looks_like_a_suite` covers this
 
+    # Judged BEFORE the count, and independently of it. A source-grep
+    # test is not merely worthless as evidence — it is a liability,
+    # because it can fail correct code that names things differently.
+    # Iteration 6's contract carried nine substantive assertions across
+    # two honest tests AND one grep test, so counting alone accepted it,
+    # and the grep test then failed a run whose artifact scored 20/20
+    # externally. One such test is enough to send the contract back.
+    grepping = source_inspecting_tests(tree)
+    if grepping:
+        return (f"{', '.join(grepping[:2])} inspects the program's source "
+                f"text instead of running it, which passes any stub that "
+                f"mentions the right words and fails correct code that "
+                f"names things differently")
+
     substantive = _substantive_assertions(tree)
     if substantive >= min_substantive:
         return None
@@ -173,6 +264,14 @@ value against something concrete — a literal the task states, or another
 observed value that must differ from it. Asserting that a process is
 still running, that an attribute exists, or that an object is not None
 says nothing about whether the behaviour the task describes works.
+
+Do NOT read the program's source text. No `inspect.getsource`, no
+`ast.parse` of the module, no opening `__file__` and searching it for
+identifiers. Checking that the code MENTIONS "reset" passes a stub that
+mentions it and fails correct code that calls the method `restart` —
+you are verifying vocabulary, not behaviour. Import the module, build
+the objects, call the methods, and assert on what they return and how
+the state changes.
 
 Keep the same rules as before (no mocks, no stubs, no assigning to
 state, import inside each test) and output ONLY the Python file in one

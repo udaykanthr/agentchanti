@@ -107,6 +107,98 @@ class TestRealContractsAreNotRejected:
         assert weak_contract_reason(src) is not None
 
 
+GREPS_SOURCE = '''
+import ast
+import inspect
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_source_mentions_the_right_things(self):
+        import game
+        source = inspect.getsource(game)
+        tree = ast.parse(source)
+        names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        self.assertIn("reset", names)
+        self.assertIn("score", names)
+        self.assertTrue(any(isinstance(n, ast.AugAssign) for n in ast.walk(tree)))
+
+    def test_it_really_moves(self):
+        import game
+        g = game.Game()
+        before = g.head
+        g.step()
+        self.assertNotEqual(g.head, before)
+        self.assertEqual(len(g.cells), 3)
+'''
+
+LAUNCHES_SIBLING = '''
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+class Contract(unittest.TestCase):
+    def test_it_plays(self):
+        import game
+        script = Path(__file__).parent / "game.py"
+        g = game.Game()
+        before = g.head
+        g.step()
+        self.assertNotEqual(g.head, before)
+        self.assertEqual(len(g.cells), 3)
+'''
+
+
+class TestSourceGrepIsRefused:
+    """Measured 2026-08-18 09:26.
+
+    A contract asserted `"reset" in values` over tokens pulled from the
+    module's AST. The artifact defines `reset_game` and calls it on every
+    collision — 16 resets under an external probe — but the token is
+    `reset_game`, membership is exact, and the run was failed by a
+    substring that was not a whole token.
+    """
+
+    def test_a_grep_test_sends_the_contract_back(self):
+        reason = weak_contract_reason(GREPS_SOURCE)
+        assert reason is not None
+        assert "source text" in reason
+
+    def test_it_outranks_a_healthy_assertion_count(self):
+        """The real case had NINE substantive assertions beside the grep.
+
+        Counting alone accepted it, and the grep test then failed a
+        correct run — so one such test is enough on its own.
+        """
+        from agentchanti.orchestrator.seed_strength import (
+            _substantive_assertions, source_inspecting_tests,
+        )
+        import ast as _ast
+
+        tree = _ast.parse(GREPS_SOURCE)
+        assert _substantive_assertions(tree) >= 2   # the honest test alone
+        assert len(source_inspecting_tests(tree)) == 1
+        assert weak_contract_reason(GREPS_SOURCE) is not None
+
+    def test_grep_assertions_do_not_count_toward_strength(self):
+        from agentchanti.orchestrator.seed_strength import _substantive_assertions
+        import ast as _ast
+
+        # Only the second test's two assertions may be counted.
+        assert _substantive_assertions(_ast.parse(GREPS_SOURCE)) == 2
+
+    def test_locating_a_sibling_script_is_not_source_inspection(self):
+        """`__file__` to find a script to LAUNCH is running it, not
+        reading it — flagging that would mislabel a legitimate test."""
+        from agentchanti.orchestrator.seed_strength import source_inspecting_tests
+        import ast as _ast
+
+        assert source_inspecting_tests(_ast.parse(LAUNCHES_SIBLING)) == []
+        assert weak_contract_reason(LAUNCHES_SIBLING) is None
+
+
 class TestSilences:
     def test_unparseable_source_is_another_checks_problem(self):
         assert weak_contract_reason("def broken(:\n") is None
