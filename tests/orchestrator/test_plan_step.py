@@ -1692,3 +1692,46 @@ verify: python -c "import main"
         init = next(s for s in steps if s.id == "2.1")
         self.assertNotIn("2.2", init.depends_on,
                          "other/pacman.py is not part of the src package")
+
+
+# ── descriptions the planner omitted ─────────────────────────────────
+
+
+def test_empty_description_is_synthesized_from_declarations():
+    """A step with no prose must still carry a usable instruction.
+
+    Observed: a 20B model in content mode emitted 7 of 9 steps as
+    target+content with no description at all. The empty string crashed
+    the wave banner (`"".splitlines()[0]`) at the start of wave 2, after
+    wave 1 had already succeeded, and would otherwise have handed the
+    coder a step with no instruction.
+    """
+    from agentchanti.orchestrator.plan_step import (
+        PlanStep, steps_as_text_list,
+    )
+    steps = [
+        PlanStep(id="2.1", step_type="CODE", description="",
+                 target_files=["consts.py"], exports=["TILE_SIZE", "MAP"]),
+        PlanStep(id="1.1", step_type="CMD", description="",
+                 command="pip install pygame"),
+        PlanStep(id="3.1", step_type="CODE", description="Real prose.",
+                 target_files=["game.py"]),
+    ]
+    texts = steps_as_text_list(steps)
+
+    assert all(t.strip() for t in texts)
+    assert all(t.splitlines() for t in texts)      # the crash condition
+    assert "consts.py" in texts[0] and "TILE_SIZE" in texts[0]
+    assert "pip install pygame" in texts[1]
+    assert texts[2] == "Real prose."
+
+
+def test_whitespace_only_description_also_synthesized():
+    from agentchanti.orchestrator.plan_step import (
+        PlanStep, steps_as_text_list,
+    )
+    step = PlanStep(id="2.1", step_type="CODE", description="   \n  ",
+                    target_files=["map.py"])
+    text = steps_as_text_list([step])[0]
+    assert text.splitlines()
+    assert "map.py" in text

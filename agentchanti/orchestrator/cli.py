@@ -311,6 +311,95 @@ def _reconcile_plan_graph(plan_graph, plan_steps, pending, step_results,
                 "import them", step.id, ", ".join(sorted(missing)[:8]))
 
 
+def _done_step_ids(plan_steps, indices, step_results) -> list[str]:
+    """Ids of the steps in *indices* the pipeline itself calls done."""
+    out: list[str] = []
+    for idx in indices:
+        if step_results.get(idx) != "done":
+            continue
+        step = next((s for s in (plan_steps or []) if s.index == idx), None)
+        if step is not None:
+            out.append(step.id)
+    return out
+
+
+def _ghost_resolve_wave(plan_steps, pending, step_results, language,
+                        stage: str) -> None:
+    """Resolve the ghost's expectations for a finished wave.
+
+    Wrapped whole: this is a shadow observer, and an observer that can
+    take down the run it observes is worse than no observer.
+    """
+    try:
+        from .ghost import get_ghost
+        from .wave_snapshots import get_gate_ledger
+
+        ghost = get_ghost()
+        if ghost is None:
+            return
+        done = _done_step_ids(plan_steps, pending, step_results)
+        if not done:
+            return
+        _gates = get_gate_ledger().gates().keys()
+        ghost.resolve(done, language=language, gate_cmds=_gates, stage=stage)
+
+        # Repair what can be repaired now, not after the run: a missing
+        # dependency healed at this wave is one the next wave's steps can
+        # rely on. Each heal re-checks its own expectation and reverts a
+        # source edit that did not close the gap.
+        from .ghost_heal import get_healer
+        healer = get_healer()
+        if healer is not None:
+            healer.heal(done, language=language, gate_cmds=_gates,
+                        stage=stage)
+    except Exception as exc:
+        log.debug("[Ghost] wave resolution skipped: %s", exc)
+
+
+def _ghost_final_report(plan_steps, step_results, memory, language,
+                        pipeline_success: bool) -> None:
+    """Re-resolve every step against the final tree and log disagreements.
+
+    A final pass matters even though each wave already resolved: later
+    waves, the bulk-test fix round and the smoke-test repair all edit
+    files an earlier wave had already certified, so the end-of-run state
+    is the only one that describes what actually shipped.
+    """
+    try:
+        from .ghost import get_ghost
+        from .wave_snapshots import get_gate_ledger
+
+        ghost = get_ghost()
+        if ghost is None:
+            return
+        all_indices = [s.index for s in (plan_steps or [])]
+        done = _done_step_ids(plan_steps, all_indices, step_results)
+        _gates = get_gate_ledger().gates().keys()
+        ghost.resolve(done, language=language, gate_cmds=_gates,
+                      stage="final")
+
+        # A last repair pass over the finished tree: later waves and the
+        # fix rounds can reopen a gap an earlier wave closed.
+        from .ghost_heal import get_healer
+        healer = get_healer()
+        if healer is not None:
+            healer.heal(done, language=language, gate_cmds=_gates,
+                        stage="final")
+            _heal_line = healer.summary()
+            if _heal_line:
+                log.info(_heal_line)
+                for _r in healer.results:
+                    log.info("[GhostHeal]   %s", _r.describe())
+        try:
+            tracked = list((memory.as_dict() or {}).keys())
+        except Exception:
+            tracked = []
+        ghost.report(done, tracked_files=tracked,
+                     pipeline_success=pipeline_success)
+    except Exception as exc:
+        log.debug("[Ghost] final report skipped: %s", exc)
+
+
 def _green_suites_contradicting(regressions) -> list[tuple[str, str]]:
     """Green suite gates that a rollback would sacrifice, else ``[]``.
 
@@ -1637,6 +1726,28 @@ def _main_impl():
                   len(_unresolved),
                   ", ".join(f"{sid}->{spec}" for sid, spec in _unresolved[:8]))
 
+    # ── Ghost: snapshot the plan's declared postconditions + pre-state ──
+    # Read-only shadow (orchestrator/ghost.py). Built HERE because the plan
+    # is final by this point — blind-edit routing, dependency fixes and
+    # verify repair have all run — and because no step has executed yet, so
+    # the file hashes it records are a true pre-run baseline. It never
+    # writes, never runs a command and never changes a verdict.
+    from .ghost import start_ghost, reset_ghost
+    from .ghost_heal import start_healer, reset_healer
+    reset_ghost()
+    reset_healer()
+    if getattr(cfg, "GHOST_SHADOW", True) and plan_steps_parsed:
+        _ghost = start_ghost(plan_steps_parsed, os.getcwd())
+        # Healing is what turns detection into value: the shadow saw a
+        # dependency missing from the app's interpreter at wave 2 of a
+        # real run and said nothing more, while the smoke test crashed on
+        # it six waves later. Repairs are mechanical and verified — see
+        # ghost_heal for the state-vs-content rule that bounds them.
+        if _ghost is not None and getattr(cfg, "GHOST_HEAL", True):
+            start_healer(_ghost, executor,
+                         allow_source_edits=getattr(
+                             cfg, "GHOST_HEAL_SOURCE_EDITS", True))
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
@@ -1662,9 +1773,15 @@ def _main_impl():
             continue
 
         log.info(f"Wave {wave_idx+1}: executing steps {[i+1 for i in pending]}")
+        # `splitlines()[0]` on an empty description raises, and a status
+        # line must never be able to kill a run. Observed: a 20B model in
+        # content mode emitted 7 of 9 steps as target+content with no
+        # prose at all, and the pipeline crashed with IndexError at the
+        # start of wave 2 — after wave 1 had already succeeded.
         set_activity(
             f"wave {wave_idx+1}/{len(waves)} steps {[i+1 for i in pending]}: "
-            + "; ".join(steps[i].splitlines()[0][:60] for i in pending)
+            + "; ".join((steps[i].splitlines() or ["(no description)"])[0][:60]
+                        for i in pending)
         )
 
         if len(pending) == 1:
@@ -1846,6 +1963,13 @@ def _main_impl():
         # than to debug from the resulting ImportError several waves later.
         _reconcile_plan_graph(plan_graph, plan_steps_parsed, pending,
                               step_results, memory, language)
+
+        # Same moment, shadow copy: resolve this wave's declared
+        # postconditions against the real tree. Observations accumulate in
+        # the ghost's journal; nothing is reported or acted on until the
+        # end of the run.
+        _ghost_resolve_wave(plan_steps_parsed, pending, step_results,
+                            language, f"wave {wave_idx + 1}")
 
         # Snapshot the wave, then re-run every gate recorded so far. A step
         # can break a sibling's already-green gate — including one recorded
@@ -2043,6 +2167,11 @@ def _main_impl():
     _token_line = (f"Total tokens: {token_tracker.total_tokens} "
                    f"({_sent_breakdown}, "
                    f"recv={token_tracker.total_completion_tokens})")
+
+    # Shadow reconciliation, on both the success and failure paths — the
+    # failed run is the one whose disagreements are most worth reading.
+    _ghost_final_report(plan_steps_parsed, step_results, memory, language,
+                        pipeline_success)
 
     if pipeline_success:
         display.finish(success=True)
