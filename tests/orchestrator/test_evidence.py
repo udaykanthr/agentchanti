@@ -235,6 +235,84 @@ def test_a_suite_that_exits_during_cleanup_is_inconclusive(tmp_path):
     assert "cleanup" in detail
 
 
+def test_a_framework_singleton_error_is_inconclusive(tmp_path):
+    """Measured 2026-08-18 09:54.
+
+    A contract built a fresh ShowBase in each of its five tests. Panda3D
+    permits one per process, so only the first could ever run and the
+    other four errored regardless of the code — while an external probe
+    scored that artifact 20/20.
+    """
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, ("Exception: Attempt to spawn multiple ShowBase "
+                           "instances!\n\nRan 5 tests\nFAILED (errors=4)")
+
+    ok, detail = run_pre_existing_tests(_Exec(), str(tmp_path), ["test_a.py"])
+    assert ok is None
+    assert "singleton" in detail
+
+
+SEED_HEADER = "# agentchanti:acceptance-seed task=abc123 body=def456\n"
+
+
+def test_a_failing_SEEDED_contract_cannot_convict_the_code(tmp_path):
+    """CLAUDE.md reserves the power to fail a run for user-supplied
+    `acceptance_cmds` — "the one instrument the model neither wrote nor
+    can edit". A seeded contract is written by a model, before the code
+    and in good faith, but still by a model: three of four consecutive
+    runs failed artifacts that scored 20/20 externally, once by demanding
+    the snake accept a reversal its own test name said must be refused.
+    """
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    (tmp_path / "test_acceptance_contract.py").write_text(
+        SEED_HEADER + "\nimport unittest\n", encoding="utf-8")
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, "AssertionError: (1, 0) == (1, 0)\nFAILED (failures=1)"
+
+    ok, detail = run_pre_existing_tests(_Exec(), str(tmp_path),
+                                        ["test_acceptance_contract.py"])
+    assert ok is None, "a model-written contract may not convict the code"
+    assert "cannot convict" in detail
+
+
+def test_a_failing_USER_suite_still_convicts(tmp_path):
+    """The demotion must not disarm a suite the user actually wrote."""
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    (tmp_path / "test_mine.py").write_text("import unittest\n", encoding="utf-8")
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, "AssertionError: 3 != 4\nFAILED (failures=1)"
+
+    ok, _detail = run_pre_existing_tests(_Exec(), str(tmp_path),
+                                         ["test_mine.py"])
+    assert ok is False
+
+
+def test_a_passing_seeded_contract_still_counts(tmp_path):
+    """Demoted only in the failing direction: green still establishes
+    evidence, which is what makes a greenfield run verifiable at all."""
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    (tmp_path / "test_acceptance_contract.py").write_text(
+        SEED_HEADER + "\nimport unittest\n", encoding="utf-8")
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return True, "Ran 5 tests\nOK"
+
+    ok, _detail = run_pre_existing_tests(_Exec(), str(tmp_path),
+                                         ["test_acceptance_contract.py"])
+    assert ok is True
+
+
 def test_a_real_assertion_failure_stays_a_failure(tmp_path):
     """The escape hatch must not explain away genuine disagreement."""
     from agentchanti.orchestrator.evidence import run_pre_existing_tests

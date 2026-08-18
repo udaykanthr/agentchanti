@@ -179,6 +179,17 @@ _INCONCLUSIVE_MARKERS = (
     ("KeyboardInterrupt", "the suite was interrupted"),
     ("ModuleNotFoundError: No module named 'unittest",
      "the test runner itself is unavailable"),
+    # A framework that permits one instance per process refuses the
+    # second, and that refusal is a property of the framework, not of the
+    # code under test. Measured 2026-08-18 09:54: a contract built a
+    # fresh ShowBase in each of its five tests, so only the first could
+    # ever run and the other four errored no matter what the artifact
+    # did — while an external probe scored that artifact 20/20.
+    ("Attempt to spawn multiple ShowBase instances",
+     "the suite builds a second instance of a framework singleton, which "
+     "only its first test can ever do"),
+    ("QApplication instance already exists",
+     "the suite builds a second instance of a framework singleton"),
 )
 
 
@@ -230,6 +241,20 @@ def shallow_survivors(root: str, survivors: Iterable[str]) -> Optional[str]:
             f"behaviour, so this only shows the build runs")
 
 
+def _was_seeded(root: str, rel: str) -> bool:
+    """Did this pipeline generate *rel*, rather than find it?
+
+    Decided from the file's own stamped header, so a suite the user
+    wrote keeps every bit of its authority — including the authority to
+    fail the run — while one the pipeline generated does not.
+    """
+    try:
+        from .acceptance_seed import seed_state
+        return seed_state(os.path.join(root, rel.replace("/", os.sep))) is not None
+    except Exception:
+        return False
+
+
 def run_pre_existing_tests(executor, root: str,
                            survivors: Iterable[str]) -> tuple[bool | None, str]:
     """Actually run the surviving pre-existing tests. ``(passed, detail)``.
@@ -266,6 +291,21 @@ def run_pre_existing_tests(executor, root: str,
         reason = inconclusive_failure_reason(out or "")
         if reason:
             inconclusive.append(f"{rel}: {reason}")
+        elif _was_seeded(root, rel):
+            # A contract this pipeline generated is not the instrument
+            # CLAUDE.md grants the power to fail a run — that is reserved
+            # for user-supplied `acceptance_cmds`, "the one instrument the
+            # model neither wrote nor can edit". A seeded contract was
+            # written by a model, before the code and in good faith, but
+            # still by a model: measured across three of four consecutive
+            # runs it failed artifacts that scored 20/20 externally, once
+            # by demanding the snake accept a reversal its own test name
+            # said must be refused. It can establish evidence when green;
+            # it may not convict when red.
+            inconclusive.append(
+                f"{rel}: the seeded contract failed ({tail[:120]}) — it was "
+                f"written by a model in this run, so it establishes evidence "
+                f"when it passes but cannot convict the code when it fails")
         else:
             failures.append(f"{rel}: {tail[:200]}")
     if ran == 0:
