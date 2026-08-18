@@ -6,7 +6,63 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-18
+
 ### Fixed
+
+- **A dependency install now lands in the venv the run actually uses.**
+  A planner step spelled `python -m venv venv && python3 -m pip install
+  pygame`. A Windows venv ships `python.exe` and no `python3.exe`, so the
+  name fell through to the ambient interpreter and pip reported "already
+  satisfied" against *its* site-packages; the project venv ended the run
+  holding nothing but pip, and every later command ran under it.
+
+  `Executor._inject_venv_path` cannot cover this, twice over: it is
+  computed before the command runs, so a venv the command itself creates
+  is not on PATH for the install that follows it, and prepending
+  `venv\Scripts` does nothing for a spelling that directory has no entry
+  for. Installs are now redirected to the interpreter by absolute path,
+  which settles both without depending on name resolution, and `--user`
+  is dropped, since pip refuses it inside a venv. Silent when no project
+  venv is in play — a project on the ambient interpreter is never
+  redirected into one — and silent after a `cd`.
+
+- **A missing package is repaired in the environment, not by editing the
+  app.** Everything downstream of that empty venv ran under it, so the
+  smoke test's `python main.py` crashed on `import pygame` every time.
+  The smoke test's only repair is an edit, so the only repair it made was
+  an edit: measured on both benchmark paths, it came back with a
+  graphical entry point that silently falls back to headless mode. The
+  app then "launched successfully" and every gate stayed green over a
+  game that never opens a window.
+
+  A launch crash naming a package the environment lacks is now installed
+  into the project venv before the crash is ever shown to a model, and
+  that repair does not consume a code-fix attempt, because nothing about
+  the code was wrong. Both crash shapes are read: the
+  `ModuleNotFoundError` traceback, and the advice an app prints when it
+  caught its own `ImportError`. Names the project defines and stdlib
+  names are refused — installing those fetches whatever squats on PyPI
+  under the spelling — and with no venv of its own the pipeline declines
+  rather than write to the ambient interpreter.
+
+- **`tests-never-collected` now asks where a test file sits, not only
+  what it contains.** unittest discovery recurses only into importable
+  packages, so a suite written to `tests/` with no `__init__.py`
+  contributes nothing to `python -m unittest`. Measured: a step spent
+  eight of ten turns watching its gate pass on the seeded acceptance
+  contract at the root while the six tests it had just written were
+  collected by nothing.
+
+  The check fires only when the plan's own command is bare root
+  discovery, since that is the only spelling under which importability
+  decides whether tests exist — `discover -s tests` makes that directory
+  its own top level, and a named target is not discovery at all. Ghost
+  heal closes the gap by creating the marker, which is the `EXISTS`
+  healer's rule applied to a file the plan did not name: empty *is* the
+  correct content of an `__init__.py`, so it invents nothing and instead
+  connects a declared target to a declared gate. Replayed against the
+  incident's tree, `python -m unittest` goes from 8 collected to 14.
 
 - **A gate that cannot pass on this platform no longer fails the step.**
   `verify_passed` already encoded "exit 0 is not proof"; this adds the

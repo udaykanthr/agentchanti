@@ -13,6 +13,8 @@ Tasks name their target files explicitly so ground-truth checks don't
 have to guess what the model called things.
 """
 
+from pathlib import Path
+
 BUGGY_CALC = '''\
 """Tiny calculator module."""
 
@@ -88,6 +90,73 @@ def _dj(args: str) -> str:
         f"(venv\\Scripts\\python.exe manage.py {args}) "
         f"else (python manage.py {args}))"
     )
+
+
+PACMAN_STRICT = """\
+Build a Pac-Man clone in Python with Pygame.
+
+Public API - exact names. An external harness drives these, so do not rename
+anything below and do not require any argument that is not listed:
+  game.Game(seed: int = 0)             constructs a playable game, no window
+  Game.advance(dt: float) -> None      advance the simulation by dt SECONDS
+  Game.state -> str                    "start" | "playing" | "win" | "game_over"
+  Game.start() -> None                 leave the start screen
+  Game.press(direction: str) -> None   "up" | "down" | "left" | "right"
+  Game.entities() -> list              each entity exposes .tile -> (x, y) ints
+  Game.pellets_remaining() -> int
+  Game.map.is_wall(x: int, y: int) -> bool
+  `python main.py --headless --frames 300` must run and exit 0
+
+Behaviour checked externally, not by your tests:
+1. No entity's .tile is ever a wall, at any dt drawn from 0.001..0.5.
+2. dt must genuinely scale motion: simulating 10 seconds must not leave every
+   entity on the same tile as simulating 0.1 seconds.
+3. press("left") then advancing one second must change the player's tile,
+   unless a wall blocks that direction. The same for the other three.
+4. pellets_remaining() starts above zero, never increases, and comes down as
+   the player moves across pellet tiles. state is "win" only at zero.
+5. Game.state is always one of the four documented strings.
+
+Constraints:
+- The player and all four ghosts spawn on walkable tiles, and no walkable
+  region of the maze is cut off from the player's.
+- Ghosts re-evaluate direction at tile centres, never by floating-point
+  equality with a boundary.
+- Four ghosts with distinct behaviour (chase, random, patrol), pellets and
+  power pellets, mouth animation while eating, and a start screen.
+- No external assets - draw with rectangles and circles.
+- Your tests must not reposition entities, assign to state, or stub any
+  method in order to pass. Drive the game only through the API above.
+- No parameter may be accepted and then ignored by its method body.
+
+Deliver working code and a passing `python -m unittest`.
+"""
+
+
+def _venv_py(args: str) -> str:
+    """Run the project's own interpreter when the pipeline made one.
+
+    Same reasoning as `_dj`: a plan step that creates a venv installs
+    pygame into it, not into the harness env, and a ground-truth check
+    run against the wrong interpreter reports a failure that is really a
+    missing import. Windows cmd syntax - success_cmds run with
+    shell=True on the host.
+    """
+    return ("(if exist venv\\Scripts\\python.exe "
+            f"(venv\\Scripts\\python.exe {args}) "
+            f"else (python {args}))")
+
+
+def _probe(check: str) -> str:
+    """A ground-truth probe, by absolute path out of the repo.
+
+    Deliberately NOT seeded into the task's `files`: the agent must not
+    be able to read, narrowly satisfy, or "repair" the thing judging it.
+    Every failure in this family so far came from acceptance the agent
+    authored itself.
+    """
+    probe = Path(__file__).resolve().parent / "probes" / "pacman_strict.py"
+    return _venv_py(f'"{probe}" {check}')
 
 
 TASKS = [
@@ -173,6 +242,35 @@ TASKS = [
                 "from django.test import Client; import sys; "
                 "r = Client().get('/dashboard/'); "
                 'sys.exit(0 if r.status_code in (301, 302) else 1)"'),
+        ],
+        "language": "python",
+    },
+    {
+        # The strict variant of the Pac-Man family. The loose wording
+        # ("assert these invariants in tests") kept passing while the
+        # artifact was broken, because it handed acceptance to the agent:
+        # one run's suite relocated four ghosts in setUp to hide a
+        # spawn-inside-a-wall crash, another ran 700 iterations of which
+        # 17 simulated anything, a third accepted `dt` and never read it.
+        # So this task pins the public API by name and judges it only
+        # from _PROBE, which lives in the repo and is never seeded into
+        # the workdir.
+        "id": "pacman-strict",
+        "task": PACMAN_STRICT,
+        "files": {},
+        "success_cmds": [
+            # The agent's own claim, kept alongside ground truth rather
+            # than standing in for it.
+            _venv_py("-m unittest -v"),
+            # It has to run, not just import. `[SmokeTest] No runnable
+            # Python entry point — skipping` fired on every earlier run
+            # in this family, so nothing ever launched the artifact.
+            _venv_py("main.py --headless --frames 300"),
+            _probe("spawns"),
+            _probe("walls"),
+            _probe("dt"),
+            _probe("input"),
+            _probe("pellets"),
         ],
         "language": "python",
     },

@@ -2006,7 +2006,8 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     """
     if not cmd:
         return None
-    for structural in (_interpreter_target_error, _placeholder_error):
+    for structural in (_interpreter_target_error, _placeholder_error,
+                       _posix_idiom_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2020,6 +2021,19 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         if payload:
             return check(_unescape_shell_quotes(payload))
     return None
+
+
+def _posix_idiom_error(cmd: str) -> Optional[str]:
+    """A shell construct the running platform cannot execute.
+
+    Structural like the two above it: no output of the step can change
+    the verdict, because the shell rejects the command before the code
+    is consulted. Lives in `gate_integrity`, which owns the question of
+    what a given shell does with a given text, and is silent on POSIX
+    where these idioms are correct.
+    """
+    from .gate_integrity import posix_only_idiom_reason
+    return posix_only_idiom_reason(cmd)
 
 
 def _unescape_shell_quotes(payload: str) -> str:
@@ -2319,6 +2333,171 @@ def repair_verify_commands(steps: list[PlanStep],
         step.verify_cmd = cmd
         repaired.append(sid)
     return repaired
+
+
+def _gate_key(step: PlanStep) -> Optional[str]:
+    """What makes two steps across re-plans "the same work".
+
+    The primary target file, because that is the one thing a re-plan
+    keeps stable while ids, ordering and dependencies all churn — the
+    churn is precisely why :func:`repair_verify_commands` exists. Falls
+    back to the id for steps that declare no target (CMD steps mostly),
+    where the id is the only handle there is.
+    """
+    for target in (step.target_files or []):
+        norm = _norm_target_path(target)
+        if norm:
+            return f"file:{norm}"
+    return f"id:{step.id}" if step.id else None
+
+
+def carry_forward_strong_gates(previous: list[PlanStep],
+                               current: list[PlanStep]) -> list[str]:
+    """Keep gates a re-plan would otherwise silently weaken.
+
+    A re-plan is triggered by ONE unusable gate, but it regenerates every
+    step, so gates that were never in question are rewritten too — and a
+    planner asked to strengthen step 4's gate has no reason to preserve
+    the strength of step 3's.
+
+    Measured. Plan attempt 1 of a Pac-Man run declared::
+
+        step 3.1 verify: python -c "... g.run_frame(0.02);
+                 assert g.player.pos[0] != g.player.prev_pos[0]"
+
+    which fails against exactly the artifact that run went on to ship: a
+    ``run_frame(dt)`` that ignores dt and a player that never moves. The
+    re-plan was triggered by step *4.1*, and attempt 2's step 3.1 came
+    back with ``assert len(g.ghosts)==4 and all(not g.map.is_wall(*pos)
+    ...)`` — true of a stub. One weak gate on one step cost the strongest
+    gate in the plan, and the run shipped a Pac-Man whose player could
+    not move, with everything green.
+
+    Note what that loss was NOT: both gates pass ``check_gate_quality``.
+    The replacement asserts a concrete value, so no weakness check can
+    see it — the plan simply traded a gate that would have caught the
+    defect for one that would not. So "keep the new one unless it looks
+    weak" is not enough, and the rule is:
+
+    * new gate absent or judged weak  → restore the old one
+    * new gate stands on its own      → keep BOTH, joined by ``&&``
+
+    Conjoining rather than choosing is the honest resolution when two
+    reasonable gates disagree: each was written to catch something, and
+    a step that must satisfy both is strictly better checked.
+
+    The bound on all of it is applicability. A carried gate that names a
+    module the new plan no longer produces would fail a correct step
+    forever, which is the failure mode ``gate_integrity`` exists for — a
+    bad gate once cost a run 182k tokens and failed working code. So a
+    gate is carried only when every *project* module it imports is still
+    produced by some step of the new plan. Returns the ids whose gate was
+    restored or strengthened.
+    """
+    if not previous or not current:
+        return []
+
+    weak_before = {sid for sid, _ in
+                   check_gate_quality(previous) + check_gate_consistency(previous)}
+    weak_now = {sid for sid, _ in
+                check_gate_quality(current) + check_gate_consistency(current)}
+
+    strong_old: dict[str, str] = {}
+    for step in previous:
+        key = _gate_key(step)
+        cmd = (step.verify_cmd or "").strip()
+        if not key or not cmd or step.id in weak_before:
+            continue
+        strong_old.setdefault(key, cmd)
+
+    old_modules = _plan_modules(previous)
+    new_modules = _plan_modules(current)
+
+    restored: list[str] = []
+    for step in current:
+        key = _gate_key(step)
+        if not key or key not in strong_old:
+            continue
+        carried = strong_old[key]
+        cmd_now = (step.verify_cmd or "").strip()
+        if cmd_now == carried or carried in cmd_now:
+            continue                      # already carrying this assertion
+        if not _gate_still_applies(carried, old_modules, new_modules):
+            continue                      # would fail a correct step forever
+        if cmd_now and step.id not in weak_now:
+            if _gates_are_redundant(carried, cmd_now):
+                continue
+            # Both can fail on wrong behaviour. Keep both rather than
+            # picking — this is the case that lost the measured gate.
+            step.verify_cmd = f"{carried} && {cmd_now}"
+        else:
+            step.verify_cmd = carried
+        restored.append(step.id)
+    return restored
+
+
+_SAME_SUITE_RUNNER_RE = re.compile(r"-m\s+(unittest|pytest|nose2)\b")
+
+
+def _gates_are_redundant(old: str, new: str) -> bool:
+    """Would running both add nothing over running the newer one?
+
+    Two cases seen replaying the measured plans, where conjoining was
+    technically correct and plainly wasteful:
+
+    * the older gate's assertions are a prefix of the newer one's,
+      differing only in spacing — ``assert TILE_SIZE == 20`` against
+      ``assert TILE_SIZE==20; assert WALL==1``
+    * both invoke the same test runner, so the second run re-executes the
+      first's suite for nothing (``unittest -v <path>`` and
+      ``unittest <path>``)
+    """
+    # Quotes go too, not just whitespace: the older command's closing `"`
+    # is what stopped the containment from matching when it really was a
+    # prefix. Over-matching here only declines to ADD a gate, which is the
+    # behaviour before this function existed — never a new failure.
+    def _squeeze(cmd: str) -> str:
+        return re.sub(r"""[\s"']+""", "", cmd)
+
+    if _squeeze(old) in _squeeze(new):
+        return True
+    old_runner = _SAME_SUITE_RUNNER_RE.search(old)
+    new_runner = _SAME_SUITE_RUNNER_RE.search(new)
+    return bool(old_runner and new_runner
+                and old_runner.group(1) == new_runner.group(1))
+
+
+_GATE_MODULE_RE = re.compile(r"\b(?:from|import)\s+([A-Za-z_][\w.]*)")
+
+
+def _plan_modules(steps: list[PlanStep]) -> set[str]:
+    """Importable module names the plan's own steps produce."""
+    out: set[str] = set()
+    for step in steps:
+        for target in (step.target_files or []):
+            norm = _norm_target_path(target)
+            if not norm.endswith(".py"):
+                continue
+            dotted = norm[:-3].replace("/", ".").replace("\\", ".")
+            out.add(dotted)
+            out.add(dotted.rsplit(".", 1)[-1])   # importable from its own dir
+    return out
+
+
+def _gate_still_applies(cmd: str, old_modules: set[str],
+                        new_modules: set[str]) -> bool:
+    """Would this command still be runnable against the new plan?
+
+    Only modules the OLD plan produced are judged. Anything else in the
+    command is stdlib or a third-party package, whose availability has
+    nothing to do with which decomposition the planner chose this time.
+    """
+    for name in _GATE_MODULE_RE.findall(cmd or ""):
+        root = name.split(".")[0]
+        for candidate in (name, root):
+            if candidate in old_modules and candidate not in new_modules:
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------

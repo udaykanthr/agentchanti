@@ -38,6 +38,60 @@ _TRACEBACK_FILE_RE = re.compile(
     r'File\s+"([^"]+)",\s+line\s+(\d+)',
 )
 
+# ---------------------------------------------------------------------------
+# Truncated-diagnosis salvage
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(r"^[ \t]*```", re.MULTILINE)
+
+# Appended to the diagnosis prompt on the retry that follows a response cut
+# off at the output cap. The first attempt already spent the whole budget, so
+# asking the same question again changes nothing — the retry has to ask for
+# LESS. Measured: a step-4 diagnosis stopped mid-block at a bare `if`, and the
+# useful part (a one-line root cause plus one small edit) would have fit in
+# under 500 tokens.
+_COMPACTION_DIRECTIVE = (
+    "\n\nIMPORTANT — your previous answer was CUT OFF at the output-token "
+    "limit and could not be applied. Answer again, much shorter:\n"
+    "- ROOT CAUSE: one sentence, no restatement of the error.\n"
+    "- Exactly ONE `#### [EDIT]:` block, for the SMALLEST scope that fixes "
+    "the cause — a single function or method, never a whole class and never "
+    "`#### [FILE]:`.\n"
+    "- If the fix cannot be expressed in one small block, edit a different, "
+    "narrower scope instead. Do not restate long literals (tables, maze "
+    "rows, fixtures) — pick a scope that does not contain them.\n"
+    "- No commentary before or after the block.\n"
+)
+
+
+def _has_code_block(text: str) -> bool:
+    """True when *text* holds at least one complete fenced block."""
+    return len(_FENCE_RE.findall(text or "")) >= 2
+
+
+def _drop_dangling_code_block(text: str) -> tuple[str, bool]:
+    """Strip a final fenced block that was never closed.
+
+    A response cut at the output cap ends inside its last block, so the
+    fence count is odd. That partial block is not a smaller fix — it is a
+    fragment (one real case ended at a bare ``if``), and handing it to
+    ``_apply_fix`` either corrupts the file or, when the chunk editor
+    refuses it, wastes the whole attempt. The ``#### [EDIT]:`` header that
+    introduced it goes too, so no marker is left pointing at nothing.
+
+    Returns ``(cleaned_text, dropped)``.
+    """
+    fences = list(_FENCE_RE.finditer(text or ""))
+    if not fences or len(fences) % 2 == 0:
+        return text, False
+
+    lines = text[:fences[-1].start()].rstrip().split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].lstrip().startswith("#### ["):
+        lines.pop()
+    return "\n".join(lines).rstrip() + "\n", True
+
 
 def _pre_investigate(error_info: str, memory: FileMemory,
                      executor: Executor, step_idx: int,
@@ -691,6 +745,57 @@ def _diagnose_failure(step_text: str, step_type: str, error_info: str,
 
     diagnosis = llm_client.generate_response(prompt)
 
+    # ── Truncated response: retry smaller, never parse the fragment ──
+    # The client already knows it hit the cap (`_last_truncated`), and the
+    # old code logged that fact and then parsed the answer anyway. What
+    # came back was a dangling block the chunk editor had to refuse —
+    # ~16k billed output tokens and ~85s for nothing, and the refusal then
+    # sent the step down the test-only fallback for the wrong reason.
+    if getattr(llm_client, "_last_truncated", False):
+        log.warning(
+            "Step %d: diagnosis hit the output-token limit — discarding the "
+            "truncated answer and retrying with a compaction directive",
+            step_idx + 1)
+        display.step_info(
+            step_idx, "Diagnosis was cut off — retrying with a smaller scope...")
+        truncated_first = diagnosis
+        try:
+            retry = llm_client.generate_response(prompt + _COMPACTION_DIRECTIVE)
+        except Exception as exc:            # noqa: BLE001 - keep attempt 1
+            log.warning("Step %d: compaction retry raised %s: %s — falling "
+                        "back to the salvaged first answer",
+                        step_idx + 1, type(exc).__name__, exc)
+            retry = ""
+
+        retry_truncated = getattr(llm_client, "_last_truncated", False)
+        if retry.strip() and not retry_truncated:
+            diagnosis = retry
+            log.info("Step %d: compaction retry returned a complete answer",
+                     step_idx + 1)
+        else:
+            # Both were cut off. Prefer whichever still holds a usable
+            # block once the fragment is stripped, and the compact one
+            # first — it was asked for the narrower scope.
+            for candidate in (retry, truncated_first):
+                cleaned, _ = _drop_dangling_code_block(candidate)
+                if _has_code_block(cleaned):
+                    diagnosis = cleaned
+                    break
+            else:
+                diagnosis = _drop_dangling_code_block(truncated_first)[0]
+            log.warning(
+                "Step %d: compaction retry was also cut off — using the "
+                "salvaged prefix (%s)", step_idx + 1,
+                "one or more complete edits"
+                if _has_code_block(diagnosis) else "root cause only, no edits")
+
+    # Salvage applies to the clean path too: a provider that reports no stop
+    # reason still leaves an odd fence count when it stops mid-block.
+    diagnosis, _dropped = _drop_dangling_code_block(diagnosis)
+    if _dropped:
+        log.warning("Step %d: dropped an unterminated code block from the "
+                    "diagnosis before applying it", step_idx + 1)
+
     sent_after, recv_after = token_tracker.snapshot()
     sent_delta = sent_after - sent_before
     recv_delta = recv_after - recv_before
@@ -799,7 +904,8 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                original_error_cmd: str | None = None,
                step_text: str = '',
                task: str = '',
-               step_target_files: list[str] | None = None) -> tuple:
+               step_target_files: list[str] | None = None,
+               final_attempt: bool = False) -> tuple:
     """Apply fixes from a diagnosis response.
 
     Returns ``(applied, cmds_succeeded, has_fix_commands, executed_cmds,
@@ -1219,7 +1325,31 @@ def _apply_fix(diagnosis: str, executor: Executor, memory: FileMemory,
                 for tag, i1, i2, j1, j2 in _sm.get_opcodes()
                 if tag != 'equal')
             _change_ratio = _changed / max(_orig_len, 1)
-            if _change_ratio > _threshold:
+            # The last diagnosis attempt is the ESCALATED one, and on it
+            # this ratio costs more than it protects. Rejecting means the
+            # step fails regardless — there is no attempt 4 — so the only
+            # thing the threshold buys is never finding out what the
+            # stronger model's answer was. Measured: gpt-5.6-sol spent 70s
+            # on the most expensive call of a run and returned a fix that
+            # changed 63% of lines; it was rejected, the "test-only"
+            # fallback then produced nothing actionable twice, and the run
+            # halted having discarded the one answer it had paid most for.
+            #
+            # The downside is also bounded now in a way it was not when
+            # this threshold was written: `_run_diagnosis_loop` keeps the
+            # best-scoring snapshot and restores it, so a large fix that
+            # makes things worse is measured and reverted rather than
+            # shipped. The full-file-replacement block above still applies
+            # — that guards wholesale rewrites, which is a different claim
+            # from "this fix is large".
+            if final_attempt and _change_ratio > _threshold:
+                log.info(
+                    "Step %d: Diff guard allowing large fix for %s on the "
+                    "final escalated attempt — changes %.0f%% of lines "
+                    "(threshold %.0f%%); the loop restores its best "
+                    "snapshot if this scores worse",
+                    step_idx + 1, _fp, _change_ratio * 100, _threshold * 100)
+            elif _change_ratio > _threshold:
                 log.warning(
                     "Step %d: Diff guard rejected diagnosis fix for %s — "
                     "changes %.0f%% of lines (threshold %.0f%%)",

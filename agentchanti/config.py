@@ -78,6 +78,8 @@ _DEFAULTS = {
     "agent_loop_max_turns": 8,
     "wave_snapshots": True,
     "ghost_shadow": True,
+    "require_independent_evidence": False,
+    "seed_acceptance_tests": True,
     "ghost_heal": True,
     "ghost_heal_source_edits": True,
     "plan_mode": "content",
@@ -446,6 +448,31 @@ class Config:
         # pipeline's own claim disagree.
         self.GHOST_SHADOW = _get_bool(
             "GHOST_SHADOW", "ghost_shadow", _DEFAULTS["ghost_shadow"])
+
+        # Acceptance commands the USER wrote (orchestrator/evidence.py).
+        # The only instrument in a run the model neither authored nor can
+        # edit, which is why these are also the only checks allowed to
+        # fail the run on their own. Absent by default: a run without them
+        # is reported as completed-but-unverified, never as failed.
+        _acc = os.getenv("ACCEPTANCE_CMDS")
+        if _acc is not None:
+            self.ACCEPTANCE_CMDS = [c for c in _acc.split(";") if c.strip()]
+        else:
+            _acc_yaml = yd.get("acceptance_cmds") or []
+            if isinstance(_acc_yaml, str):
+                _acc_yaml = [_acc_yaml]
+            self.ACCEPTANCE_CMDS = [str(c) for c in _acc_yaml if str(c).strip()]
+
+        # Turn "completed but nothing independent verified it" into a
+        # non-zero exit. Off by default so greenfield builds, which
+        # legitimately have no pre-existing suite, do not all start
+        # failing — the honest default is to say so, not to fail.
+        self.REQUIRE_INDEPENDENT_EVIDENCE = _get_bool(
+            "REQUIRE_INDEPENDENT_EVIDENCE", "require_independent_evidence",
+            _DEFAULTS["require_independent_evidence"])
+        self.SEED_ACCEPTANCE_TESTS = _get_bool(
+            "SEED_ACCEPTANCE_TESTS", "seed_acceptance_tests",
+            _DEFAULTS["seed_acceptance_tests"])
 
         # Deterministic repair of the gaps the shadow finds
         # (orchestrator/ghost_heal.py): installing a declared dependency

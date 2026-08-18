@@ -1725,6 +1725,11 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 
 8. **Declare exports explicitly**: For every CODE step, list the main symbols
    (functions, classes, constants) the file will export on the exports: line.
+   Spell them in the TARGET FILE'S OWN naming convention, not the one used
+   by the examples above — those are all JavaScript. A .py target exports
+   snake_case functions and CapWords classes (run_headless, GameMap), never
+   camelCase (runHeadless). Declaring a name the file would never define
+   makes the export contract unmeetable and misleads any step importing it.
 
 9. **NO meta-steps**: Do NOT include steps like "Analyze the project",
    "Review the code". Jump straight to actionable steps.

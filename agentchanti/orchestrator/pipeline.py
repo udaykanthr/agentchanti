@@ -512,6 +512,10 @@ def _is_safe_source_fix(file_path: str, new_content: str, memory) -> bool:
 # Normalisation regexes used to compute a stable error "shape" hash —
 # stripping line/column numbers, timings, absolute paths and hex pointers
 # so cosmetic churn across attempts doesn't hide a repeating error.
+# How much of each end of a normalised error the signature hashes. Errors
+# shorter than both windows together are hashed whole.
+_SIG_WINDOW = 600
+
 _ERROR_SIG_STRIP_RE = re.compile(
     r'(?:'
     r':\d+(?::\d+)?'              # :line or :line:col
@@ -536,8 +540,55 @@ def _error_signature(err: str) -> str:
         return ""
     norm = _ERROR_SIG_STRIP_RE.sub('', err)
     norm = re.sub(r'\s+', ' ', norm).strip()
+    # Head AND tail, because a test runner front-loads whatever is
+    # invariant and leaves the discriminating part until last. A TEST
+    # step's error_info opens with a constant summary line, then the
+    # verbose listing of test names in alphabetical order; what actually
+    # differs between two attempts — which assertion blew up, and the
+    # `FAILED (failures=F, errors=E)` tally — is at the very end.
+    #
+    # Hashing only `norm[:600]` therefore collided on genuinely different
+    # failures. Measured live: two consecutive attempts of one step
+    # produced error_info of 1692 and 1038 characters — provably not the
+    # same string — and both hashed to 1a3d09c05029, so the loop reported
+    # "previous fix changed nothing" twice about fixes that had changed
+    # the error. For a CODE step the signature is the ONLY signal the
+    # diagnosis loop has, since a bare traceback carries no test counts
+    # for `_diagnosis_score` to read, and an earlier run reverted a
+    # correct fix on exactly this comparison.
+    if len(norm) <= 2 * _SIG_WINDOW:
+        material = norm
+    else:
+        material = f"{norm[:_SIG_WINDOW]}…{norm[-_SIG_WINDOW:]}"
     return hashlib.sha1(
-        norm[:600].encode('utf-8', errors='replace')).hexdigest()[:12]
+        material.encode('utf-8', errors='replace')).hexdigest()[:12]
+
+
+def _diagnosis_score(err: str) -> int | None:
+    """How bad is this failure? Lower is better; ``None`` means unknown.
+
+    A signature only says whether two failures are *different*, never which
+    one is worse — and both halves of that blindness have shipped a broken
+    artifact. Inequality kept two fixes that took a suite from 4 failures to
+    39 errors; equality discarded a fix that removed nine errors. Counting
+    the failing tests gives the comparison a direction.
+
+    Returns ``None`` for anything that is not recognisable test-runner
+    output (a bare traceback from a CODE step's gate, say), because an
+    unknown score must never be treated as an improvement.
+    """
+    if not err:
+        return None
+    from .step_handlers import _parse_test_counts
+    try:
+        passed, total, _ = _parse_test_counts(err)
+    except Exception:
+        return None
+    # (0, 1) is the parser's "something failed, no counts available"
+    # fallback — real information would name a total above one.
+    if total <= 1:
+        return None
+    return max(0, total - passed)
 
 
 # Stack-trace patterns.  Catch both parenthesised JS frames
@@ -3093,13 +3144,35 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
         error_route.confidence, error_route.reason,
     )
 
-    # Snapshot files before the diagnosis loop so we can restore them
-    # if a fix attempt corrupts source code (compounding failures).
-    _diag_snapshot = memory.snapshot()
-
     # Error the loop is currently working against, used to tell a fix that
     # ADVANCED the step from one that achieved nothing.
     _prev_error_sig = _error_signature(error_info)
+
+    # Best state seen anywhere in this loop, by failing-test count. The
+    # signature logic below decides what the NEXT attempt builds on; this
+    # decides what the step is left holding if every attempt fails, and the
+    # two are not the same question. Measured: a run whose attempt-1 fix
+    # took the suite from 9 errors + 1 failure down to 1 failure had that
+    # fix reverted, diagnosed two more times from the worse state, and then
+    # shipped the 9-error file — a state it had already improved on and
+    # committed. Keeping the best snapshot costs one dict copy.
+    _best_snapshot = memory.snapshot()
+    _best_score = _diagnosis_score(error_info)
+    _prev_score = _best_score
+
+    # ── Escalation for the final attempt ─────────────────────────
+    # `models.escalation` used to reach the model only through
+    # `run_agent_loop_with_escalation`, so with `agent_loop: false` it was
+    # dead config: the startup banner announced the stronger model, the
+    # classic loop spent all three attempts on the base one, and the run
+    # halted having never asked. That reads as "even the strong model could
+    # not fix it" when the strong model was never called.
+    #
+    # Only the LAST attempt escalates. The earlier ones are cheap and often
+    # right (one measured run root-caused a typo'd attribute on attempt 1);
+    # escalating from the start would pay the premium on every failure.
+    _escalation_client = (getattr(coder, "escalation_client", None)
+                          or getattr(llm_client, "escalation_client", None))
 
     for diag_attempt in range(1, MAX_DIAGNOSIS_RETRIES + 1):
         try:
@@ -3117,24 +3190,58 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             # described state B, so the second diagnosis reasoned from a
             # premise that no longer matched the disk.
             #
-            # A CHANGED error means the previous fix moved the step
-            # forward — keep it and build on it. An unchanged error means
-            # the fix did nothing, so revert it before trying again.
+            # FEWER failing tests means the previous fix moved the step
+            # forward — keep it and build on it. As many or more means it
+            # did not, so revert before trying again. The count is the
+            # comparison that has a direction; the signature only says
+            # "different", which is why it was wrong in both directions
+            # (it kept fixes that took a suite from 4 failures to 39
+            # errors, and discarded one that removed nine errors). The
+            # signature stays as the fallback for errors no test-runner
+            # parser can score, such as a bare traceback from a gate.
             if diag_attempt > 1:
                 _cur_sig = _error_signature(error_info)
-                if _cur_sig != _prev_error_sig:
-                    _diag_snapshot = memory.snapshot()
-                    log.info(
-                        "Task %d: diagnosis attempt %d moved the error on — "
-                        "keeping the fix and building on it",
-                        step_idx + 1, diag_attempt - 1)
+                _cur_score = _diagnosis_score(error_info)
+
+                # A measured run reverted a correct fix under "changed
+                # nothing" while the same two states, reconstructed offline,
+                # hashed differently — so the inputs to this decision are
+                # worth having in the log the next time it looks wrong.
+                log.debug(
+                    "Task %d: diagnosis progress check — sig %s→%s, "
+                    "score %s→%s, error_info %d chars",
+                    step_idx + 1, _prev_error_sig, _cur_sig,
+                    _prev_score, _cur_score, len(error_info or ""))
+
+                if _cur_score is not None and _prev_score is not None:
+                    _advanced = _cur_score < _prev_score
+                    _why = f"{_prev_score} → {_cur_score} failing"
                 else:
-                    memory.restore(_diag_snapshot, executor=executor)
+                    _advanced = _cur_sig != _prev_error_sig
+                    _why = "error signature changed" if _advanced else \
+                           "error signature unchanged"
+
+                # Record the best state seen BEFORE any revert below can
+                # discard it. What the next attempt builds on and what the
+                # step is left holding are different questions.
+                if _cur_score is not None and (_best_score is None
+                                               or _cur_score < _best_score):
+                    _best_score = _cur_score
+                    _best_snapshot = memory.snapshot()
+
+                if _advanced:
                     log.info(
-                        "Task %d: Restored file snapshot before diagnosis "
-                        "attempt %d (previous fix changed nothing)",
-                        step_idx + 1, diag_attempt)
+                        "Task %d: diagnosis attempt %d moved the error on "
+                        "(%s) — keeping the fix and building on it",
+                        step_idx + 1, diag_attempt - 1, _why)
+                else:
+                    memory.restore(_best_snapshot, executor=executor)
+                    log.info(
+                        "Task %d: Restored best file snapshot before "
+                        "diagnosis attempt %d (previous fix did not improve "
+                        "on it: %s)", step_idx + 1, diag_attempt, _why)
                 _prev_error_sig = _cur_sig
+                _prev_score = _cur_score
 
             display.step_info(
                 step_idx, f"Diagnosing failure ({diag_attempt}/{MAX_DIAGNOSIS_RETRIES})...")
@@ -3142,9 +3249,22 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                      f"{diag_attempt}/{MAX_DIAGNOSIS_RETRIES}")
 
             step_type = display.steps[step_idx].get("type", "CODE")
+
+            _diag_client = llm_client
+            if (_escalation_client is not None
+                    and diag_attempt == MAX_DIAGNOSIS_RETRIES):
+                _diag_client = _escalation_client
+                _esc_model = getattr(_escalation_client, "model", "?")
+                log.info(
+                    "Task %d: final diagnosis attempt — escalating to %s",
+                    step_idx + 1, _esc_model)
+                display.step_info(
+                    step_idx,
+                    f"Escalating final diagnosis to {_esc_model}...")
+
             diagnosis = _diagnose_failure(
                 step_text, step_type, error_info,
-                memory, llm_client, display, step_idx,
+                memory, _diag_client, display, step_idx,
                 search_agent=search_agent, language=language,
                 previous_diagnosis=last_diagnosis_content,
                 kb_context_builder=kb_context_builder,
@@ -3169,7 +3289,8 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                 original_error_cmd=_orig_cmd,
                 step_text=step_text,
                 task=_task_goal,
-                step_target_files=_step_targets)
+                step_target_files=_step_targets,
+                final_attempt=(diag_attempt == MAX_DIAGNOSIS_RETRIES))
 
             if not fix_applied:
                 # ── Test-only retry for TEST steps ──
@@ -3309,7 +3430,7 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
                             f"using #### [FILE]: format."
                         )
                         try:
-                            _dt_resp = llm_client.generate_response(
+                            _dt_resp = _diag_client.generate_response(
                                 _diag_test_prompt)
                             _dt_files = executor.parse_code_blocks(
                                 _dt_resp)
@@ -3458,13 +3579,29 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
             display.step_info(step_idx, f"Diagnosis error: {type(exc).__name__}")
             continue
 
-    # Restore files to pre-diagnosis state so that destructive edits
-    # from failed diagnosis attempts (e.g. overwriting package.json
-    # with downgraded versions) don't persist on disk and corrupt
-    # future runs or resume attempts.
-    memory.restore(_diag_snapshot, executor=executor)
-    log.info(f"Task {step_idx+1}: Restored file snapshot after "
-             f"all diagnosis attempts failed.")
+    # The final attempt's result is never seen by the top-of-loop check
+    # above (there is no attempt N+1), and the final attempt is the
+    # escalated one — the most likely of the three to be right. A measured
+    # run had gpt-5.6-sol root-cause both real defects on attempt 3 and
+    # lose the fix here.
+    _final_score = _diagnosis_score(error_info)
+    if _final_score is not None and (_best_score is None
+                                     or _final_score < _best_score):
+        _best_score = _final_score
+        _best_snapshot = memory.snapshot()
+
+    # Restore files to the BEST state this loop reached, so that
+    # destructive edits from failed diagnosis attempts (e.g. overwriting
+    # package.json with downgraded versions) don't persist on disk and
+    # corrupt future runs or resume attempts. Best, not pre-diagnosis:
+    # the step still failed, but shipping a state the loop had already
+    # improved on — and in one measured run had already committed — is a
+    # loss the run creates for itself.
+    memory.restore(_best_snapshot, executor=executor)
+    log.info("Task %d: Restored best file snapshot after all diagnosis "
+             "attempts failed (%s).", step_idx + 1,
+             "no test counts available, pre-diagnosis state"
+             if _best_score is None else f"{_best_score} failing test(s)")
 
     display.step_info(
         step_idx, "Step failed after all fix attempts. Halting pipeline.")

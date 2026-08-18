@@ -352,6 +352,10 @@ def _ghost_resolve_wave(plan_steps, pending, step_results, language,
         if healer is not None:
             healer.heal(done, language=language, gate_cmds=_gates,
                         stage=stage)
+            # A test directory the run's own command cannot enter is a
+            # gap the same wave can close, and closing it early is what
+            # gives the later steps a gate that measures their own work.
+            healer.heal_uncollected_tests()
     except Exception as exc:
         log.debug("[Ghost] wave resolution skipped: %s", exc)
 
@@ -385,6 +389,7 @@ def _ghost_final_report(plan_steps, step_results, memory, language,
         if healer is not None:
             healer.heal(done, language=language, gate_cmds=_gates,
                         stage="final")
+            healer.heal_uncollected_tests()
             _heal_line = healer.summary()
             if _heal_line:
                 log.info(_heal_line)
@@ -878,9 +883,11 @@ def _main_impl():
                          _make_llm_for_agent("tester"),
                          prompt_suffix=tester_suffix)
 
-    # Escalation model for failed agent loops (config: models.escalation).
-    # When a step's loop fails with the regular model, one retry runs with
-    # this stronger one before the step is marked failed.
+    # Escalation model for failed steps (config: models.escalation), used by
+    # BOTH execution paths: the agent loop retries a failed step with it, and
+    # the classic diagnosis loop spends its final attempt on it. The banner
+    # said [AgentLoop] while classic silently never escalated, so a classic
+    # failure looked like the strong model had been tried and lost.
     if cfg.get_agent_model("escalation"):
         _escalation_client = _make_llm_for_agent("escalation")
         coder.escalation_client = _escalation_client
@@ -889,7 +896,8 @@ def _main_impl():
         # attach there too (observed: a failed npx-tailwind CMD recovery
         # never escalated because this was the one unwired path).
         llm_client.escalation_client = _escalation_client
-        log.info("[AgentLoop] Escalation model configured: %s (provider: %s)",
+        log.info("[Escalation] Model configured: %s (provider: %s) — "
+                 "agent-loop retries and the final classic diagnosis attempt",
                  cfg.get_agent_model("escalation"),
                  cfg.get_agent_provider("escalation") or provider)
 
@@ -957,6 +965,32 @@ def _main_impl():
         else:
             # Legacy checkpoint without plan_steps — create wrappers
             plan_steps_parsed = from_legacy_steps(steps, dependencies)
+
+        # A restored plan never passed through the gate checks: they live
+        # in the planning branch, which resume skips entirely. The
+        # run-time refusals still hold, but the backstop that makes a
+        # destructive gate *impossible* rather than merely refused has to
+        # run here too — otherwise a checkpoint is a way to smuggle one
+        # past it. Measured: a resume brought back, verbatim, the gate
+        # that had already burned the run which wrote the checkpoint.
+        from .gate_safety import neutralize_destructive_gates
+        from .plan_step import unrunnable_gate_reason
+        for _sid, _was, _why in neutralize_destructive_gates(
+                plan_steps_parsed):
+            log.warning(
+                "[GateSafety] restored step %s: dropped the destructive "
+                "tail of its verify: %s — was `%s`", _sid, _why, _was)
+        # Unrunnable gates are reported, not removed. Dropping one would
+        # let the step pass unchecked, and the stall breaker now ends
+        # such a step cheaply; a loud line is what a reader needs to know
+        # the plan, not the code, is what failed.
+        for _ps in plan_steps_parsed:
+            _why = unrunnable_gate_reason(getattr(_ps, "verify_cmd", "") or "")
+            if _why:
+                log.warning(
+                    "[Plan] restored gate for step %s can never pass on "
+                    "this platform: %s — gate: %s",
+                    _ps.id, _why, _ps.verify_cmd)
 
         language = checkpoint_state.get("language", language)
 
@@ -1101,6 +1135,15 @@ def _main_impl():
         from ..language import task_requests_tests
         args._raw_task_requests_tests = task_requests_tests(args.task)
 
+        # The user's own words, kept before enrichment overwrites them.
+        # The acceptance seed fingerprints the task to decide whether a
+        # contract on disk was written for THIS task, and the enriched
+        # spec is LLM output — it varies between runs of the identical
+        # prompt, so fingerprinting it would re-seed on every run and
+        # replace a contract that was perfectly good. Only the raw text
+        # is stable enough to answer "is this the same task".
+        args._raw_task = args.task
+
         # Update task if IntentAgent enriched it during pre_analyze
         args.task = getattr(planner, '_enriched_task', args.task)
         intent_spec = parse_intent_spec(args.task)
@@ -1147,6 +1190,10 @@ def _main_impl():
         MAX_PLAN_RETRIES = 3
         plan = None
         raw_steps = None
+        # The previous attempt's steps, kept so a re-plan cannot silently
+        # weaken a gate it was never asked to touch. See
+        # plan_step.carry_forward_strong_gates.
+        _previous_plan_steps: list = []
 
         for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
             display.show_status(
@@ -1222,10 +1269,14 @@ def _main_impl():
                 fix_nested_workspace_collision,
                 fix_import_dependencies, project_file_reader, check_gate_quality,
                 check_gate_consistency, repair_verify_commands,
+                carry_forward_strong_gates,
                 steps_as_text_list, steps_dependencies_dict,
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
                 plan_salvageable, route_blind_edits,
+            )
+            from .gate_safety import (
+                check_gate_safety, neutralize_destructive_gates,
             )
             plan_steps_parsed: list[PlanStep] | None = None
 
@@ -1238,6 +1289,24 @@ def _main_impl():
                         f"[Plan] Parsed {len(plan_steps_parsed)} structured steps: "
                         f"{[(s.id, s.step_type, s.index) for s in plan_steps_parsed]}"
                     )
+                    # A re-plan is triggered by one unusable gate but
+                    # regenerates every step, so gates that were never in
+                    # question get rewritten too — and the planner has no
+                    # reason to preserve the strength of the ones it was
+                    # not asked about. Restore those before judging this
+                    # attempt, so a carried gate can also end the churn.
+                    if _previous_plan_steps:
+                        _kept = carry_forward_strong_gates(
+                            _previous_plan_steps, plan_steps_parsed)
+                        if _kept:
+                            log.info(
+                                "[Plan] Carried %d strong acceptance gate(s) "
+                                "across the re-plan: %s",
+                                len(_kept), ", ".join(_kept))
+                    # Remember the objects, not a copy: the in-place gate
+                    # repairs further down mutate these same steps, so the
+                    # next attempt inherits the best version of this one.
+                    _previous_plan_steps = plan_steps_parsed
                     errors = validate_plan(plan_steps_parsed)
                     if errors:
                         log.warning(f"[Plan] Validation warnings: {errors}")
@@ -1318,7 +1387,15 @@ def _main_impl():
                     # green, pipeline "Finished". Send the plan back with
                     # the specific complaint rather than accepting gates
                     # that can only ever pass.
-                    _gate_gaps = (check_gate_quality(plan_steps_parsed)
+                    # A gate that damages the machine is judged FIRST and
+                    # separately. The other two checks read a gate as a
+                    # measurement and ask how good it is; this one asks
+                    # what else it does. Measured: a planner gate ending
+                    # `taskkill /im python.exe /f` force-killed every
+                    # python.exe on the box — the pipeline included — and
+                    # every existing check had passed it. See gate_safety.
+                    _gate_gaps = (check_gate_safety(plan_steps_parsed)
+                                  + check_gate_quality(plan_steps_parsed)
                                   + check_gate_consistency(plan_steps_parsed))
 
                     # Repair the offending lines before considering a
@@ -1358,11 +1435,33 @@ def _main_impl():
                             f"`{getattr(_by_id.get(sid), 'verify_cmd', '')}`"
                             f" — {why}"
                             for sid, why in _gate_gaps)
+                        # Spelled out separately when a gate is unsafe
+                        # rather than merely weak: "assert a concrete
+                        # value" is not the correction for a command that
+                        # kills processes, and a planner told only that
+                        # will keep the destructive tail while making the
+                        # assertion stronger.
+                        _unsafe_ids = {sid for sid, _ in
+                                       check_gate_safety(plan_steps_parsed)}
+                        _safety_note = (
+                            "\n\nSteps " + ", ".join(sorted(_unsafe_ids)) +
+                            " are a different problem: their verify: RUNS A "
+                            "DESTRUCTIVE COMMAND. A gate is re-run after "
+                            "every later wave, so its side effects happen "
+                            "repeatedly. Never kill processes by name "
+                            "(taskkill /im, pkill, killall), delete trees "
+                            "(rm -rf, del /s, git clean), or reset the "
+                            "working tree. A gate must only observe. If you "
+                            "need to check that the app starts, assert it "
+                            "from inside a short python -c that imports and "
+                            "constructs it — do not launch a blocking "
+                            "process and kill it."
+                        ) if _unsafe_ids else ""
                         planner_context += (
                             "\n\n[PLANNER CORRECTION] These steps have a "
                             "verify: command that passes as long as the "
                             "file parses, so it can never detect wrong "
-                            "behaviour:\n" + _detail +
+                            "behaviour:\n" + _detail + _safety_note +
                             "\n\nRewrite EVERY one of those verify: lines "
                             "so it asserts a concrete value the step's "
                             "description promises (or runs a test suite). "
@@ -1376,6 +1475,20 @@ def _main_impl():
                             "on wrong behaviour: %s",
                             MAX_PLAN_RETRIES, len(_gate_gaps),
                             ", ".join(sid for sid, _ in _gate_gaps))
+
+                    # Backstop, on the accepted plan. Repair and re-plan
+                    # both get their chance above and both can fail — and
+                    # the branch immediately above deliberately proceeds
+                    # with gates that are still imperfect. That is right
+                    # for a weak gate and wrong for a destructive one:
+                    # there is no attempt count after which running
+                    # `taskkill /im python.exe /f` becomes acceptable.
+                    for _sid, _was, _why in neutralize_destructive_gates(
+                            plan_steps_parsed):
+                        log.warning(
+                            "[GateSafety] step %s: dropped the destructive "
+                            "tail of its verify: %s — was `%s`",
+                            _sid, _why, _was)
 
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
@@ -1736,8 +1849,53 @@ def _main_impl():
     from .ghost_heal import start_healer, reset_healer
     reset_ghost()
     reset_healer()
+
+    # Which test files predate the run? Taken here, alongside the ghost's
+    # pre-state and before the first step, because the question at the end
+    # is not "is there a suite" but "is there a suite the agent did not
+    # write". See orchestrator/evidence.py.
+    # A greenfield build has no pre-existing suite, so it is judged by
+    # tests it wrote itself — and three measured runs shipped exit 0 over
+    # artifacts that failed every external probe while their own tests
+    # were green. Seeding one from the TASK, here, before any step has
+    # run, is the only moment a check can be written that the code cannot
+    # have shaped. It is snapshotted below like any other pre-existing
+    # file, so rewriting it forfeits independence and says so.
+    if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
+        try:
+            from .acceptance_seed import seed_acceptance_tests
+            # The enriched task is what the suite should be WRITTEN from
+            # — it is the fuller statement of the requirement — but the
+            # raw task is what decides whether an existing contract was
+            # written for this same task, because only the raw text is
+            # stable across runs. See `_raw_task` above.
+            seed_acceptance_tests(args.task, os.getcwd(), llm_client,
+                                  language=language,
+                                  identity_task=getattr(args, "_raw_task",
+                                                        None))
+        except Exception as _seed_exc:      # never fail a run over this
+            # WARNING, not DEBUG. Losing the run's only independent check
+            # is not a detail, and a silent skip is how the first live
+            # attempt at this shipped a NameError that nothing noticed.
+            log.warning("[AcceptanceSeed] skipped (%s: %s) — this run has "
+                        "no seeded independent evidence",
+                        type(_seed_exc).__name__, _seed_exc)
+
+    from .evidence import snapshot_test_files as _snap_tests
+    _pre_existing_tests = _snap_tests(os.getcwd())
+    if _pre_existing_tests:
+        log.info(f"[Evidence] {len(_pre_existing_tests)} pre-existing test "
+                 f"file(s) recorded as independent evidence candidates")
+
     if getattr(cfg, "GHOST_SHADOW", True) and plan_steps_parsed:
-        _ghost = start_ghost(plan_steps_parsed, os.getcwd())
+        # On a resume, the steps below `start_from` finished in an earlier
+        # run, against a tree the pre-state snapshot below cannot see —
+        # so every one of their postconditions would read as "the step
+        # changed nothing". They are named here so the ghost declines to
+        # judge them rather than reporting ten false violations.
+        _carried = [s.id for s in plan_steps_parsed
+                    if getattr(s, "index", -1) < start_from]
+        _ghost = start_ghost(plan_steps_parsed, os.getcwd(), _carried)
         # Healing is what turns detection into value: the shadow saw a
         # dependency missing from the app's interpreter at wave 2 of a
         # real run and said nothing more, while the smoke test crashed on
@@ -2173,8 +2331,59 @@ def _main_impl():
     _ghost_final_report(plan_steps_parsed, step_results, memory, language,
                         pipeline_success)
 
+    # ── Whose evidence is this? ──────────────────────────────────────
+    # The user's acceptance commands are the only instrument here the
+    # model neither wrote nor can edit, so they are the only ones allowed
+    # to fail the run outright. Everything else feeds a second verdict —
+    # verified vs merely completed — which changes what the run may
+    # CLAIM without inventing a failure it cannot prove.
+    from .evidence import classify as _classify_evidence
+    from .evidence import run_acceptance_commands as _run_acceptance
+    _acceptance_cmds = list(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
+    _acceptance_passed = None
+    if pipeline_success and _acceptance_cmds:
+        _acceptance_passed, _acc_failures = _run_acceptance(
+            executor, _acceptance_cmds)
+        if _acceptance_passed is False:
+            pipeline_success = False
+            log.error("Pipeline failed: user acceptance command(s) did not "
+                      "pass — " + "; ".join(_acc_failures[:3]))
+
+    # Run the surviving pre-existing tests before claiming they passed.
+    # They are the run's only independent instrument, and until this was
+    # added the claim rested on `tests_ran` — a flag about the pipeline's
+    # OWN tests. Two measured runs reported them as passing while every
+    # test in them errored.
+    from .evidence import (run_pre_existing_tests as _run_survivors,
+                           surviving_pre_existing_tests as _survivors)
+    _surv = _survivors(os.getcwd(), _pre_existing_tests)
+    _surv_passed, _surv_detail = (None, "")
+    if _surv:
+        _surv_passed, _surv_detail = _run_survivors(executor, os.getcwd(),
+                                                    _surv)
+        log.info("[Evidence] pre-existing suite(s) %s — %s",
+                 {True: "PASSED", False: "FAILED"}.get(_surv_passed,
+                                                       "could not be run"),
+                 _surv_detail)
+
+    _evidence = _classify_evidence(
+        os.getcwd(), _pre_existing_tests,
+        tests_ran=bool(verif_ok) or any(
+            getattr(s, "step_type", "") == "TEST" for s in plan_steps_parsed),
+        acceptance_passed=_acceptance_passed,
+        acceptance_cmds=_acceptance_cmds,
+        survivors_passed=_surv_passed,
+        survivors_detail=_surv_detail)
+    log.info(_evidence.log_line())
+
+    if (pipeline_success and not _evidence.independent
+            and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
+        log.error("Pipeline failed: require_independent_evidence is set and "
+                  "nothing outside this run's own output verified it")
+        pipeline_success = False
+
     if pipeline_success:
-        display.finish(success=True)
+        display.finish(success=True, evidence=_evidence)
         clear_checkpoint(checkpoint_file)
         from .agent_loop import loop_stats_summary as _als_fn
         _als = _als_fn()

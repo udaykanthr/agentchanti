@@ -3279,6 +3279,30 @@ def _parse_test_counts(output: str) -> tuple[int, int, list[dict]]:
         failed = int(m.group(2))
         return total - failed, total, _extract_failure_names(clean)
 
+    # ── Python unittest: "Ran 8 tests" + "OK" / "FAILED (failures=1, errors=9)" ──
+    # Without this branch every failing unittest run collapsed to the (0, 1)
+    # fallback below, so a suite with nine errors and one with a single
+    # assertion failure scored identically. That made "did the last fix
+    # help?" unanswerable for any unittest project — measured on a Pac-Man
+    # run whose correct fix took the suite from 9 errors + 1 failure to 1
+    # failure and was discarded as no progress.
+    m_ran = re.search(r'Ran\s+(\d+)\s+tests?\b', clean)
+    if m_ran:
+        total = int(m_ran.group(1))
+        failed = 0
+        m_res = re.search(r'FAILED\s*\(([^)]*)\)', clean)
+        if m_res:
+            for kind in ('failures', 'errors'):
+                mk = re.search(rf'\b{kind}\s*=\s*(\d+)', m_res.group(1))
+                if mk:
+                    failed += int(mk.group(1))
+            # "FAILED (...)" with an unparsable detail still means failure.
+            failed = failed or 1
+        if total:
+            # subTest can report more failures than there are test methods,
+            # so clamp rather than return a negative pass count.
+            return max(0, total - failed), total, _extract_failure_names(clean)
+
     # ── Fallback: overall pass/fail ──
     overall_pass = not re.search(r'\bFAIL\b|\bFAILED\b', clean, re.IGNORECASE)
     return (1, 1, []) if overall_pass else (0, 1, _extract_failure_names(clean))
@@ -3294,6 +3318,7 @@ def _extract_failure_names(clean: str) -> list[dict]:
         re.compile(r'✗\s+([\w/:. -]+)'),               # generic
         re.compile(r'--- FAIL:\s+([\w/.]+)'),           # Go
         re.compile(r'it\s+[\'"](.+?)[\'"].*failed'),   # Mocha/Jest
+        re.compile(r'^(?:FAIL|ERROR):\s+([\w.]+)', re.M),  # Python unittest
     ]
     seen: set[str] = set()
     for pat in _PATTERNS:

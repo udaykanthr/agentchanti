@@ -217,6 +217,75 @@ class GhostHealer:
             self.results.append(result)
         return out
 
+    def heal_uncollected_tests(self) -> list[HealResult]:
+        """Make a test directory reachable by the run's own test command.
+
+        ``unittest`` discovery recurses only into importable packages, so
+        a suite written to ``tests/`` with no ``__init__.py`` contributes
+        nothing to ``python -m unittest`` — and the gate stays green on
+        whatever else the root happens to hold. Measured: a step spent
+        eight turns watching its own gate pass while the six tests it had
+        just written were never collected.
+
+        This is the ``EXISTS`` healer's rule applied to a file the plan
+        did not name: empty *is* the correct content of an ``__init__.py``,
+        so creating one invents nothing. It restores a decision the plan
+        already made — the step declared ``tests/test_game.py`` as its
+        target and the run declared ``python -m unittest`` as its gate;
+        only the marker that connects them is missing.
+
+        Refuses, as everywhere else, rather than guessing: nothing happens
+        unless the file is genuinely unreachable, and a directory that
+        already holds an ``__init__.py`` is left alone.
+        """
+        from .ghost import (declared_runner, is_python_test_file,
+                            discovers_from_project_root,
+                            unreachable_package_dir)
+
+        out: list[HealResult] = []
+        try:
+            commands = list(self.ghost.declared_commands)
+        except Exception:
+            return out
+        if declared_runner(commands) != "unittest":
+            return out
+        if not discovers_from_project_root(commands):
+            return out
+
+        seen: set[str] = set()
+        for path in sorted(self.ghost.files):
+            if not is_python_test_file(path):
+                continue
+            missing = unreachable_package_dir(self.ghost.root, path)
+            if not missing or missing in seen:
+                continue
+            seen.add(missing)
+            key = f"uncollected:{missing}"
+            if key in self._attempted:
+                continue
+            self._attempted.add(key)
+            init = os.path.join(self.ghost.root, *missing.split("/"),
+                                "__init__.py")
+            action = (f"create {missing}/__init__.py so `unittest` "
+                      f"discovery can reach {path}")
+            try:
+                os.makedirs(os.path.dirname(init), exist_ok=True)
+                with open(init, "w", encoding="utf-8"):
+                    pass
+            except OSError as exc:
+                out.append(HealResult(key, "TESTS_COLLECTED", action,
+                                      ok=False, detail=str(exc)))
+                continue
+            # Verified the same way every other heal is: by re-asking the
+            # question, not by trusting that the write happened.
+            ok = unreachable_package_dir(self.ghost.root, path) is None
+            res = HealResult(key, "TESTS_COLLECTED", action, ok=ok)
+            _logger.info("[GhostHeal] tests-never-collected (%s) — %s",
+                         missing, res.describe())
+            out.append(res)
+            self.results.append(res)
+        return out
+
     def summary(self) -> str:
         if not self.results:
             return ""

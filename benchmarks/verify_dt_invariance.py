@@ -756,7 +756,17 @@ def _advance(g):
     channel carries the start request. Callers that have no input to send
     pass nothing and get the old single-argument behaviour.
     """
-    fn = g.step if hasattr(g, "step") else g.update
+    # `advance` is checked FIRST and was missing entirely: every artifact
+    # in the Pac-Man benchmark family exposes `Game.advance(dt)` because
+    # its task prompt mandates that exact name, and this file refused all
+    # of them with "could not verify" for want of one attribute lookup.
+    # A verifier that cannot drive the artifact proves nothing about it.
+    for _name in ("advance", "step", "update"):
+        fn = getattr(g, _name, None)
+        if callable(fn):
+            break
+    else:
+        raise SystemExit("no advance/step/update method on the game object")
     takes_input = _update_takes_input(fn)
 
     def advance(dt, value=None):

@@ -1,0 +1,294 @@
+"""Can the seeded contract tell a working artifact from a stub?
+
+The three contracts this benchmark actually produced, from one prompt on
+two models, are the fixtures: 23 mocked tests, 2 substantive ones, and
+one asserting only that a process had not exited. The third earned
+`Evidence: independent (pre-existing-tests)` honestly — it ran, it
+passed, and it would pass over any program that starts.
+"""
+
+import pytest
+
+from agentchanti.orchestrator.seed_strength import weak_contract_reason
+
+
+LIVENESS_ONLY = '''
+import subprocess
+import sys
+import time
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_game_starts_and_remains_running(self):
+        p = subprocess.Popen([sys.executable, "snake_game.py"])
+        time.sleep(2)
+        self.assertIsNone(p.poll(), "the game should still be running")
+        p.terminate()
+'''
+
+EXISTENCE_ONLY = '''
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_api_exists(self):
+        import snake_game
+        game = snake_game.Game()
+        self.assertIsNotNone(game)
+        self.assertTrue(hasattr(game, "move"))
+        self.assertIsInstance(game.positions, list)
+'''
+
+SUBSTANTIVE = '''
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_snake_moves_one_cell(self):
+        import snake_game
+        game = snake_game.Game()
+        before = game.positions[0]
+        game.move()
+        self.assertNotEqual(game.positions[0], before)
+
+    def test_snake_starts_with_three_segments(self):
+        import snake_game
+        game = snake_game.Game()
+        self.assertEqual(len(game.positions), 3)
+'''
+
+
+class TestWeakContractsAreCaught:
+    def test_liveness_only_is_weak(self):
+        reason = weak_contract_reason(LIVENESS_ONLY)
+        assert reason is not None
+        assert "stub" in reason
+
+    def test_existence_only_is_weak(self):
+        assert weak_contract_reason(EXISTENCE_ONLY) is not None
+
+    def test_a_tautology_is_weak(self):
+        src = ('import unittest\n\n\nclass C(unittest.TestCase):\n'
+               '    def test_x(self):\n        self.assertTrue(True)\n')
+        assert weak_contract_reason(src) is not None
+
+
+class TestRealContractsAreNotRejected:
+    def test_two_comparing_assertions_are_enough(self):
+        assert weak_contract_reason(SUBSTANTIVE) is None
+
+    def test_a_bare_assert_on_observed_state_counts(self):
+        src = ('import unittest\n\n\nclass C(unittest.TestCase):\n'
+               '    def test_x(self):\n'
+               '        import game\n'
+               '        g = game.Game()\n'
+               '        assert g.score == 0\n'
+               '        assert len(g.cells) == 3\n')
+        assert weak_contract_reason(src) is None
+
+    def test_membership_in_an_observed_collection_counts(self):
+        src = ('import unittest\n\n\nclass C(unittest.TestCase):\n'
+               '    def test_x(self):\n'
+               '        import game\n'
+               '        g = game.Game()\n'
+               '        self.assertIn(g.food, g.free_cells())\n'
+               '        self.assertIn(g.head, g.occupied())\n')
+        assert weak_contract_reason(src) is None
+
+    def test_membership_in_a_literal_set_does_not_count(self):
+        # `assertIn(state, ("a", "b", "c"))` admits every value the code
+        # can produce — the tautology `degenerate-long-run` also refuses.
+        src = ('import unittest\n\n\nclass C(unittest.TestCase):\n'
+               '    def test_x(self):\n'
+               '        import game\n'
+               '        g = game.Game()\n'
+               '        self.assertIn(g.state, ("start", "playing", "over"))\n')
+        assert weak_contract_reason(src) is not None
+
+
+GREPS_SOURCE = '''
+import ast
+import inspect
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_source_mentions_the_right_things(self):
+        import game
+        source = inspect.getsource(game)
+        tree = ast.parse(source)
+        names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        self.assertIn("reset", names)
+        self.assertIn("score", names)
+        self.assertTrue(any(isinstance(n, ast.AugAssign) for n in ast.walk(tree)))
+
+    def test_it_really_moves(self):
+        import game
+        g = game.Game()
+        before = g.head
+        g.step()
+        self.assertNotEqual(g.head, before)
+        self.assertEqual(len(g.cells), 3)
+'''
+
+LAUNCHES_SIBLING = '''
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+class Contract(unittest.TestCase):
+    def test_it_plays(self):
+        import game
+        script = Path(__file__).parent / "game.py"
+        g = game.Game()
+        before = g.head
+        g.step()
+        self.assertNotEqual(g.head, before)
+        self.assertEqual(len(g.cells), 3)
+'''
+
+
+class TestSourceGrepIsRefused:
+    """Measured 2026-08-18 09:26.
+
+    A contract asserted `"reset" in values` over tokens pulled from the
+    module's AST. The artifact defines `reset_game` and calls it on every
+    collision — 16 resets under an external probe — but the token is
+    `reset_game`, membership is exact, and the run was failed by a
+    substring that was not a whole token.
+    """
+
+    def test_a_grep_test_sends_the_contract_back(self):
+        reason = weak_contract_reason(GREPS_SOURCE)
+        assert reason is not None
+        assert "source text" in reason
+
+    def test_it_outranks_a_healthy_assertion_count(self):
+        """The real case had NINE substantive assertions beside the grep.
+
+        Counting alone accepted it, and the grep test then failed a
+        correct run — so one such test is enough on its own.
+        """
+        from agentchanti.orchestrator.seed_strength import (
+            _substantive_assertions, source_inspecting_tests,
+        )
+        import ast as _ast
+
+        tree = _ast.parse(GREPS_SOURCE)
+        assert _substantive_assertions(tree) >= 2   # the honest test alone
+        assert len(source_inspecting_tests(tree)) == 1
+        assert weak_contract_reason(GREPS_SOURCE) is not None
+
+    def test_grep_assertions_do_not_count_toward_strength(self):
+        from agentchanti.orchestrator.seed_strength import _substantive_assertions
+        import ast as _ast
+
+        # Only the second test's two assertions may be counted.
+        assert _substantive_assertions(_ast.parse(GREPS_SOURCE)) == 2
+
+    def test_locating_a_sibling_script_is_not_source_inspection(self):
+        """`__file__` to find a script to LAUNCH is running it, not
+        reading it — flagging that would mislabel a legitimate test."""
+        from agentchanti.orchestrator.seed_strength import source_inspecting_tests
+        import ast as _ast
+
+        assert source_inspecting_tests(_ast.parse(LAUNCHES_SIBLING)) == []
+        assert weak_contract_reason(LAUNCHES_SIBLING) is None
+
+
+class TestSilences:
+    def test_unparseable_source_is_another_checks_problem(self):
+        assert weak_contract_reason("def broken(:\n") is None
+
+    def test_a_module_with_no_tests_is_another_checks_problem(self):
+        assert weak_contract_reason("import unittest\n") is None
+
+    def test_empty_is_named(self):
+        assert weak_contract_reason("") == "empty"
+
+
+class TestTheSeedRetriesOnce:
+    def _client(self, *responses):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.generate_response.side_effect = [
+            "```python\n" + r + "```" for r in responses]
+        return c
+
+    def test_a_weak_first_draft_is_replaced(self, tmp_path):
+        from agentchanti.orchestrator.acceptance_seed import (
+            SEED_BASENAME, seed_acceptance_tests,
+        )
+        client = self._client(LIVENESS_ONLY, SUBSTANTIVE)
+        path = seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python")
+        assert path is not None
+        assert client.generate_response.call_count == 2
+        written = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+        assert "assertNotEqual" in written
+        assert "poll()" not in written
+
+    def test_a_strong_first_draft_costs_no_second_call(self, tmp_path):
+        from agentchanti.orchestrator.acceptance_seed import seed_acceptance_tests
+
+        client = self._client(SUBSTANTIVE)
+        assert seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python") is not None
+        assert client.generate_response.call_count == 1
+
+    def test_an_unusable_repair_response_is_asked_again(self, tmp_path):
+        """A bad RESPONSE is not a weak contract.
+
+        Measured 2026-08-18 09:04: the repair came back unparseable, the
+        single attempt was spent, and the run kept a contract with zero
+        discriminating assertions — the model was never asked twice.
+        """
+        from agentchanti.orchestrator.acceptance_seed import (
+            SEED_BASENAME, seed_acceptance_tests,
+        )
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.generate_response.side_effect = [
+            "```python\n" + LIVENESS_ONLY + "```",   # weak first draft
+            "I'm sorry, I cannot help with that.",   # unusable repair
+            "```python\n" + SUBSTANTIVE + "```",     # good second repair
+        ]
+        path = seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python")
+        assert path is not None
+        assert client.generate_response.call_count == 3
+        written = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+        assert "assertNotEqual" in written
+
+    def test_repair_attempts_are_bounded(self, tmp_path):
+        from agentchanti.orchestrator.acceptance_seed import seed_acceptance_tests
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.generate_response.side_effect = [
+            "```python\n" + LIVENESS_ONLY + "```",
+            "nonsense", "more nonsense", "still nonsense",
+        ]
+        assert seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python") is not None
+        # One draft + two repair attempts, and no further.
+        assert client.generate_response.call_count == 3
+
+    def test_a_still_weak_retry_keeps_the_contract_anyway(self, tmp_path):
+        """A shallow check that runs still catches a crashing artifact.
+
+        Refusing would trade a weak instrument for none at all — so it is
+        kept, and the log says plainly what it can and cannot catch.
+        """
+        from agentchanti.orchestrator.acceptance_seed import (
+            SEED_BASENAME, seed_acceptance_tests,
+        )
+        client = self._client(LIVENESS_ONLY, EXISTENCE_ONLY)
+        path = seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python")
+        assert path is not None
+        assert (tmp_path / SEED_BASENAME).exists()

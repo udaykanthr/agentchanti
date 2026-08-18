@@ -152,6 +152,18 @@ class GateLedger:
     def record(self, cmd: str, step_label: str = "") -> None:
         if not cmd:
             return
+        # The ledger is where a gate's side effects get multiplied: every
+        # recorded gate is re-run after every later wave. A destructive
+        # one is therefore worst exactly here, and is refused entry
+        # rather than being recorded and guarded at run time.
+        from .gate_safety import destructive_reason
+        unsafe = destructive_reason(cmd)
+        if unsafe:
+            _logger.error(
+                "[GateSafety] not recording a destructive gate (%s) — it "
+                "would be re-run after every later wave: %s",
+                step_label or "?", unsafe)
+            return
         with self._lock:
             if cmd not in self._gates:
                 self._gates[cmd] = step_label
