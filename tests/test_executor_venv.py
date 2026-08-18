@@ -138,3 +138,57 @@ class TestRunCommandUsesVenv:
         ok, out = executor.run_command(probe, cwd=str(tmp_path))
         assert ok
         assert out.splitlines()[0].strip().startswith(os.path.abspath(bin_dir))
+
+
+class TestRewriteVenvInstall:
+    """The install must land in the interpreter the rest of the run uses.
+
+    Measured 2026-08-18 on both benchmark paths: a planner step spelled
+    ``python -m venv venv && python3 -m pip install -U pygame`` left the
+    venv holding nothing but pip, because a Windows venv has no
+    ``python3.exe`` and the name fell through to the ambient interpreter.
+    Every later command ran under the empty venv.
+    """
+
+    def _venv_py(self, root, name="venv"):
+        return Executor._venv_python_at(os.path.abspath(str(root)), name)
+
+    def test_redirects_python3_install_to_a_venv_the_command_creates(
+            self, tmp_path):
+        # The venv does not exist yet — it is built by the first segment,
+        # so PATH injection (computed before the command ran) cannot help.
+        cmd = "python -m venv venv && python3 -m pip install -U pygame"
+        out = Executor._rewrite_venv_install(cmd, str(tmp_path))
+        assert self._venv_py(tmp_path) in out
+        assert "python3 -m pip" not in out
+
+    def test_drops_user_flag_when_redirecting(self, tmp_path):
+        # pip refuses `--user` inside a venv, so carrying the flag over
+        # would turn a wrong-target install into a failing one.
+        cmd = "python -m venv venv && python3 -m pip install -U pygame --user"
+        out = Executor._rewrite_venv_install(cmd, str(tmp_path))
+        assert "--user" not in out
+        assert self._venv_py(tmp_path) in out
+
+    def test_bare_pip_install_uses_the_existing_venv(self, tmp_path):
+        _make_fake_venv(tmp_path)
+        out = Executor._rewrite_venv_install("pip install pygame",
+                                             str(tmp_path))
+        assert out.startswith('"' + self._venv_py(tmp_path) + '" -m pip install')
+
+    def test_silent_without_a_project_venv(self, tmp_path):
+        # A project on the ambient interpreter must never be redirected
+        # into a venv that does not exist.
+        cmd = "pip install requests"
+        assert Executor._rewrite_venv_install(cmd, str(tmp_path)) == cmd
+
+    def test_leaves_non_install_commands_alone(self, tmp_path):
+        _make_fake_venv(tmp_path)
+        for cmd in ("python main.py", "npm install", "python -m venv venv"):
+            assert Executor._rewrite_venv_install(cmd, str(tmp_path)) == cmd
+
+    def test_stops_at_a_directory_change(self, tmp_path):
+        # After `cd`, "the project venv" is no longer the one we resolved.
+        _make_fake_venv(tmp_path)
+        cmd = "cd sub && pip install pygame"
+        assert Executor._rewrite_venv_install(cmd, str(tmp_path)) == cmd

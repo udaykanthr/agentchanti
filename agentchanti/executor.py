@@ -1478,6 +1478,109 @@ class Executor:
         # Only trust an unambiguous single sub-project venv.
         return hits[0] if len(hits) == 1 else None
 
+    # An install whose interpreter is spelled one of these is meant for
+    # "the project's Python". Only pip *installs* are redirected — a
+    # `python3 app.py` is the caller's business, an install that lands in
+    # the wrong interpreter poisons every later command.
+    _INSTALL_INTERPRETER = r'(?:python3?|py|python3\.\d+)(?:\.exe)?'
+    _VENV_CREATE_RE = re.compile(
+        r'(?:^|\s)' + _INSTALL_INTERPRETER + r'\s+-m\s+venv\s+"?([^"\s]+)"?',
+        re.IGNORECASE)
+    _PIP_MODULE_RE = re.compile(
+        r'(?:^|\s)(' + _INSTALL_INTERPRETER + r')\s+-m\s+pip\s+install\b',
+        re.IGNORECASE)
+    _PIP_DIRECT_RE = re.compile(
+        r'^\s*(pip3?(?:\.exe)?)\s+install\b', re.IGNORECASE)
+    # `--user` is refused outright inside a venv ("Can not perform a
+    # '--user' install"), so a redirected segment must shed it or the
+    # redirection turns a working install into a failing one.
+    _PIP_USER_FLAG_RE = re.compile(r'\s--user\b')
+
+    @staticmethod
+    def _venv_python_at(root: str, venv_dir: str) -> str:
+        """Path the interpreter of a venv named *venv_dir* under *root* WILL have.
+
+        Predicted rather than probed, because the venv this matters most
+        for does not exist yet: it is created by an earlier segment of the
+        very command being rewritten.
+        """
+        if os.name == 'nt':
+            return os.path.join(root, venv_dir, "Scripts", "python.exe")
+        return os.path.join(root, venv_dir, "bin", "python")
+
+    @staticmethod
+    def _rewrite_venv_install(cmd: str, cwd: str | None = None) -> str:
+        """Point a pip install at the venv the rest of the run will use.
+
+        Measured 2026-08-18, both benchmark paths, from a planner step
+        spelled ``python -m venv venv && python3 -m pip install -U pygame``:
+        a Windows venv ships ``python.exe`` and no ``python3.exe``, so
+        ``python3`` fell through to the Store alias and pip reported
+        "already satisfied" against the *ambient* site-packages. The venv
+        ended the run holding nothing but pip.
+
+        :meth:`_inject_venv_path` cannot cover this on its own, twice over.
+        It is computed before the command runs, so a venv the command
+        itself creates is not on PATH for the install that follows it; and
+        prepending the venv's bin dir does nothing for a spelling that
+        directory has no entry for. Redirecting the install to the
+        interpreter by absolute path settles both without depending on
+        name resolution at all.
+
+        Deliberately silent when no project venv is in play — a project
+        running on the ambient interpreter must never be redirected into
+        one, the same refusal ``PKG_PRESENT`` makes when it resolves
+        ``UNKNOWN``. Also silent once a segment has changed directory,
+        since the venv a later segment means is then no longer this one.
+        """
+        if "install" not in cmd.lower():
+            return cmd
+
+        segments = re.split(r'(\s*&&\s*)', cmd)
+        root = os.path.abspath(cwd or os.getcwd())
+
+        # The venv this command builds outranks any venv already on disk:
+        # it is the one the steps after it will be talking about.
+        created = Executor._VENV_CREATE_RE.search(cmd)
+        if created:
+            target = Executor._venv_python_at(root, created.group(1))
+        else:
+            bin_dir = Executor._venv_bin_dir(root)
+            if not bin_dir:
+                return cmd
+            target = os.path.join(
+                bin_dir, "python.exe" if os.name == 'nt' else "python")
+
+        quoted = f'"{target}"'
+        out: list[str] = []
+        rewrote = False
+        for seg in segments:
+            if re.match(r'\s*&&\s*$', seg):
+                out.append(seg)
+                continue
+            stripped = seg.strip()
+            if re.match(r'(?i)^cd\b', stripped):
+                # A later segment's "the project venv" is no longer ours.
+                out.extend(segments[len(out):])
+                break
+            new_seg = Executor._PIP_MODULE_RE.sub(
+                lambda m: m.group(0).replace(m.group(1), quoted, 1), seg)
+            new_seg = Executor._PIP_DIRECT_RE.sub(
+                lambda m: m.group(0).replace(
+                    m.group(1), f'{quoted} -m pip', 1), new_seg)
+            if new_seg != seg:
+                new_seg = Executor._PIP_USER_FLAG_RE.sub('', new_seg)
+                rewrote = True
+            out.append(new_seg)
+
+        if not rewrote:
+            return cmd
+        final = ''.join(out)
+        log.info(f"[Executor] Install redirected to the project venv "
+                 f"interpreter ({target}) — a package installed anywhere "
+                 f"else is invisible to every later command: {final}")
+        return final
+
     @staticmethod
     def _inject_venv_path(run_env: dict, cwd: str | None = None) -> None:
         """Prepend the project venv's bin dir to PATH in *run_env* (in place).
@@ -1594,6 +1697,10 @@ class Executor:
                 # Escape double quotes inside the command for PowerShell
                 escaped = cmd.replace('"', '\\"')
                 cmd = f'powershell -NoProfile -Command "{escaped}"'
+
+            # A pip install must land in the venv the later commands run
+            # under, whatever interpreter spelling the planner reached for.
+            cmd = Executor._rewrite_venv_install(cmd, cwd)
 
             # Safety net: add non-interactive flags to known interactive commands
             cmd = Executor._rewrite_interactive_cmd(cmd)

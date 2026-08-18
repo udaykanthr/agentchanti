@@ -115,6 +115,88 @@ def _launch(executor, cmd: str) -> tuple[bool, str]:
     return ok, out or ""
 
 
+# A launch crash that names a package the project environment lacks is an
+# ENVIRONMENT finding, and the fix loop below cannot see that: the only
+# repair it has is an edit, so the only repair it makes is an edit.
+# Measured 2026-08-18 on both benchmark paths — a venv holding nothing but
+# pip made `python main.py` crash on `import pygame`, and the fix the
+# model returned changed the graphical entry point into a silent fallback
+# to headless mode. The app then "launched successfully" and every gate
+# stayed green over a Pac-Man that never opens a window. Repairing the
+# environment first leaves the app saying what it meant to say.
+_MISSING_MODULE_RE = re.compile(r"No module named ['\"]([A-Za-z0-9_.-]+)['\"]")
+# The graceful spelling of the same crash, and the reason a bare
+# ModuleNotFoundError match is not enough: an app that catches its own
+# ImportError prints advice instead of a traceback ("Pygame is required.
+# Install it with: python -m pip install pygame") and exits non-zero.
+_PIP_HINT_RE = re.compile(
+    r"pip install\s+(?:-U\s+|--upgrade\s+)?([A-Za-z0-9_.-]+)", re.IGNORECASE)
+
+# Two, because a project can genuinely be missing two packages, and a
+# third round of the same repair means the install is not taking.
+_MAX_ENV_REPAIRS = 2
+
+
+def _dependency_named_by(output: str, memory_files: dict[str, str]) -> str | None:
+    """Third-party distribution the crash blames, or None.
+
+    Refuses a name the project itself defines and a name from the standard
+    library — installing either fetches whatever squats on PyPI under that
+    spelling, which is a far worse outcome than the crash. Module and
+    distribution names can differ (``cv2`` ships as ``opencv-python``);
+    when they do the install simply fails and the ordinary LLM fix path
+    runs untouched, so the guess costs one command and never a verdict.
+    """
+    import sys
+
+    project = {p.replace("\\", "/").rsplit("/", 1)[-1]
+               for p in (memory_files or {})}
+    for rx in (_MISSING_MODULE_RE, _PIP_HINT_RE):
+        m = rx.search(output or "")
+        if not m:
+            continue
+        name = m.group(1).split(".")[0].strip()
+        if len(name) < 2 or name.lower() == "pip":
+            continue
+        if f"{name}.py" in project or os.path.exists(name):
+            continue                      # the project's own module
+        if name in getattr(sys, "stdlib_module_names", frozenset()):
+            continue
+        return name
+    return None
+
+
+def _repair_missing_dependency(name: str, executor) -> bool:
+    """Install *name* into the interpreter the app is launched with.
+
+    Silent — and returning False — when the project has no venv of its
+    own: installing into the ambient interpreter would be this pipeline
+    writing to the user's machine on a guess, the same refusal
+    ``PKG_PRESENT`` makes when it resolves ``UNKNOWN``.
+    """
+    from .agent_loop import _venv_python
+
+    root = os.getcwd()
+    py = _venv_python(root)
+    if not py:
+        _logger.info(
+            "[SmokeTest] %s is missing but the project has no venv of its "
+            "own — leaving the ambient interpreter alone", name)
+        return False
+    ok, out = executor.run_command(f'"{py}" -c "import {name}"')
+    if ok:
+        return False                      # importable — not what crashed us
+    _logger.warning(
+        "[SmokeTest] launch failed on a missing dependency (%s) — installing "
+        "it into the project venv instead of editing the app, which would "
+        "fix the crash by removing the feature", name)
+    ok, out = executor.run_command(f'"{py}" -m pip install {name}', timeout=300)
+    if not ok:
+        _logger.warning("[SmokeTest] could not install %s: %s",
+                        name, (out or "")[-300:])
+    return bool(ok)
+
+
 def _files_from_traceback(output: str, memory_files: dict[str, str]) -> list[str]:
     """Map traceback file paths back to session files (max 4)."""
     matched: list[str] = []
@@ -802,7 +884,9 @@ def run_smoke_verification(
     out = ""
     prev_out = ""
     prev_fixed: list[str] = []
-    for attempt in range(max_fix_attempts + 1):
+    attempt = 0
+    env_repairs: list[str] = []
+    while True:
         ok, out = _launch(executor, cmd)
         if ok:
             _logger.info("[SmokeTest] App launched successfully (%s)", entry)
@@ -815,6 +899,18 @@ def run_smoke_verification(
         _logger.warning(
             "[SmokeTest] App crashed on launch (attempt %d/%d):\n%s",
             attempt + 1, max_fix_attempts + 1, out[-1500:])
+        # An environment repair is not a fix attempt: nothing about the
+        # code was wrong, so spending one of the code budget on it would
+        # push a genuine bug out of reach. Tried before the LLM sees the
+        # crash at all — asked to stop a missing import from crashing the
+        # app, a model deletes the import, and the feature with it.
+        if len(env_repairs) < _MAX_ENV_REPAIRS:
+            dep = _dependency_named_by(out, memory_files)
+            if dep and dep not in env_repairs and _repair_missing_dependency(
+                    dep, executor):
+                env_repairs.append(dep)
+                continue
+
         if attempt >= max_fix_attempts:
             break
         _show_status = getattr(display, "show_status", None)
@@ -842,6 +938,7 @@ def run_smoke_verification(
         if not fixed:
             break
         prev_fixed = fixed
+        attempt += 1
 
     return False, (
         f"[SmokeTest] Application crashes when launched with `{cmd}`:\n"
