@@ -901,6 +901,7 @@ def test_pytest_style_file_under_unittest_is_reported(tmp_path):
     step = _step("5.1", target_files=["tests/test_game.py"],
                  verify_cmd="python -m unittest -v")
     ghost = GhostPlan.build([step], root)
+    _write(root, "tests/__init__.py", "")
     _write(root, "tests/test_game.py", UNITTEST_STYLE)
     _write(root, "tests/test_player.py", PYTEST_STYLE)
 
@@ -919,6 +920,7 @@ def test_unittest_style_file_is_not_reported(tmp_path):
     step = _step("5.1", target_files=["tests/test_game.py"],
                  verify_cmd="python -m unittest -v")
     ghost = GhostPlan.build([step], root)
+    _write(root, "tests/__init__.py", "")
     _write(root, "tests/test_game.py", UNITTEST_STYLE)
 
     ghost.resolve(["5.1"], language="python")
@@ -956,6 +958,7 @@ def test_empty_test_file_is_reported(tmp_path):
     step = _step("5.1", target_files=["tests/test_empty.py"],
                  verify_cmd="python -m unittest -v")
     ghost = GhostPlan.build([step], root)
+    _write(root, "tests/__init__.py", "")
     _write(root, "tests/test_empty.py", "import unittest\n")
 
     ghost.resolve(["5.1"], language="python")
@@ -982,6 +985,7 @@ def test_unparseable_test_file_is_not_accused(tmp_path):
     step = _step("5.1", target_files=["tests/test_bad.py"],
                  verify_cmd="python -m unittest -v")
     ghost = GhostPlan.build([step], root)
+    _write(root, "tests/__init__.py", "")
     _write(root, "tests/test_bad.py", "def broken(:\n")
 
     ghost.resolve(["5.1"], language="python")
@@ -1781,3 +1785,90 @@ def test_ignored_input_surfaces_as_a_disagreement(tmp_path):
     found = [d for d in ghost.disagreements(["1.1"])
              if d.kind == "varied-input-ignored"]
     assert len(found) == 1
+
+
+# ── test files discovery cannot reach ────────────────────────────────
+#
+# Measured 2026-08-18: a step targeted `tests/test_game.py` with the gate
+# `python -m unittest`, and there was no `tests/__init__.py`. Discovery
+# recurses only into importable packages, so the six tests it wrote were
+# never collected — while the gate passed throughout on the seeded
+# acceptance contract at the ROOT. The step spent eight of ten turns
+# getting no signal from its own gate about its own work.
+
+
+def test_test_dir_without_init_is_reported(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    bad = [g for g in ghost.disagreements(["5.1"])
+           if g.kind == "tests-never-collected"]
+    assert len(bad) == 1
+    assert "__init__.py" in bad[0].detail
+
+
+def test_reachable_test_dir_is_not_reported(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/__init__.py", "")
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_root_level_test_file_needs_no_package(tmp_path):
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["test_game.py"],
+                 verify_cmd="python -m unittest")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_explicit_start_directory_is_not_accused(tmp_path):
+    """`discover -s tests` makes tests/ its own top level — it runs fine."""
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest discover -s tests")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_named_test_target_is_not_discovery(tmp_path):
+    """`python -m unittest tests.test_game` names its target outright."""
+    root = str(tmp_path)
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd="python -m unittest tests.test_game")
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py", UNITTEST_STYLE)
+
+    ghost.resolve(["5.1"], language="python")
+    assert not [g for g in ghost.disagreements(["5.1"])
+                if g.kind == "tests-never-collected"]
+
+
+def test_discovery_detection_reads_a_compound_gate():
+    from agentchanti.orchestrator.ghost import discovers_from_project_root
+
+    # The gate the measured run actually recorded.
+    assert discovers_from_project_root(
+        ["python -m unittest && python main.py --headless --frames 300"])
+    assert discovers_from_project_root(["python -m unittest -v"])
+    assert not discovers_from_project_root(["pytest -q"])
+    assert not discovers_from_project_root(
+        ["python -m unittest discover -s tests -t ."])

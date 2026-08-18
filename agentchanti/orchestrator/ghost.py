@@ -923,7 +923,7 @@ class GhostPlan:
         _candidates = set(self.files) | {
             _norm(p) for p in (tracked_files or ())}
         for path, reason in uncollected_test_files(
-                self.root, _candidates, _runner):
+                self.root, _candidates, _runner, self.declared_commands):
             out.append(Disagreement(
                 kind="tests-never-collected", step_id="-",
                 detail=f"{path}: {reason}"))
@@ -2585,9 +2585,69 @@ def ignored_varied_inputs(root: str, paths: Iterable[str]
     return out
 
 
+# `-s`/`-t` move discovery's start or top level, and a start directory
+# is importable as itself — `python -m unittest discover -s tests` runs a
+# suite that bare discovery from the root cannot see. Naming any explicit
+# test target is not discovery at all.
+_UNITTEST_DIR_FLAG_RE = re.compile(
+    r'(?:^|\s)(?:-s|-t|--start-directory|--top-level-directory)(?:[=\s]|$)')
+_UNITTEST_SEG_RE = re.compile(r'(?:^|\s)-m\s+unittest(?:\s+(.*))?$')
+
+
+def discovers_from_project_root(commands: Iterable[str]) -> bool:
+    """Does any declared command run bare ``unittest`` discovery at the root?
+
+    Only that spelling makes a directory's importability decide whether
+    its tests exist, so only that spelling licenses the finding below.
+    """
+    for cmd in commands or ():
+        for seg in re.split(r'&&|\|\||;', cmd or ""):
+            m = _UNITTEST_SEG_RE.search(seg.strip())
+            if not m:
+                continue
+            rest = (m.group(1) or "").strip()
+            if _UNITTEST_DIR_FLAG_RE.search(" " + rest):
+                continue
+            args = [t for t in rest.split()
+                    if t and t != "discover" and not t.startswith("-")]
+            if args:
+                continue              # names explicit tests, not discovery
+            return True
+    return False
+
+
+def unreachable_package_dir(root: str, path: str) -> Optional[str]:
+    """First directory above *path* that root discovery cannot enter.
+
+    ``unittest`` recurses only into importable packages: a directory with
+    no ``__init__.py`` is skipped whole, and every file under it is
+    invisible to the run's own acceptance command. Verified against the
+    interpreter rather than assumed — a ``tests/`` holding six tests
+    contributed nothing to ``python -m unittest`` until the file existed.
+    """
+    parts = [p for p in path.replace("\\", "/").split("/")[:-1] if p]
+    walked: list[str] = []
+    for part in parts:
+        walked.append(part)
+        rel = "/".join(walked)
+        if not os.path.isfile(os.path.join(root, *walked, "__init__.py")):
+            return rel
+    return None
+
+
 def uncollected_test_files(root: str, paths: Iterable[str],
-                           runner: Optional[str]) -> list[tuple[str, str]]:
+                           runner: Optional[str],
+                           commands: Iterable[str] = ()) -> list[tuple[str, str]]:
     """``(path, reason)`` for test files the *runner* will never collect.
+
+    Two ways a file goes uncollected, and they are independent: what the
+    file *contains* (pytest-style functions under a unittest runner), and
+    where it *sits* (a directory discovery cannot enter). The second was
+    missed until a run wrote six tests into a ``tests/`` with no
+    ``__init__.py``: the step's gate — ``python -m unittest`` — stayed
+    green throughout on a *different* file's tests, the seeded acceptance
+    contract at the root, so the step spent eight turns getting no signal
+    from its own gate about its own work.
 
     Silent when the runner cannot be identified, when a file will not
     parse, or when the runner is pytest (which collects both styles) —
@@ -2595,10 +2655,20 @@ def uncollected_test_files(root: str, paths: Iterable[str],
     """
     if runner != "unittest":
         return []
+    rooted = discovers_from_project_root(commands)
     out: list[tuple[str, str]] = []
     for path in sorted(set(paths)):
         if not is_python_test_file(path):
             continue
+        if rooted:
+            missing = unreachable_package_dir(root, path)
+            if missing:
+                out.append((path, (
+                    f"`{missing}/` has no __init__.py, and `unittest` "
+                    f"discovery recurses only into importable packages — "
+                    f"nothing under it runs under the project's own "
+                    f"acceptance command")))
+                continue
         text = _read(root, path)
         if text is None:
             continue

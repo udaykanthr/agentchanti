@@ -352,6 +352,10 @@ def _ghost_resolve_wave(plan_steps, pending, step_results, language,
         if healer is not None:
             healer.heal(done, language=language, gate_cmds=_gates,
                         stage=stage)
+            # A test directory the run's own command cannot enter is a
+            # gap the same wave can close, and closing it early is what
+            # gives the later steps a gate that measures their own work.
+            healer.heal_uncollected_tests()
     except Exception as exc:
         log.debug("[Ghost] wave resolution skipped: %s", exc)
 
@@ -385,6 +389,7 @@ def _ghost_final_report(plan_steps, step_results, memory, language,
         if healer is not None:
             healer.heal(done, language=language, gate_cmds=_gates,
                         stage="final")
+            healer.heal_uncollected_tests()
             _heal_line = healer.summary()
             if _heal_line:
                 log.info(_heal_line)

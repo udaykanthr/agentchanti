@@ -550,3 +550,73 @@ def test_healer_never_raises_on_junk(tmp_path):
 
     results = GhostHealer(ghost, Boom()).heal(["2.1"], language="python")
     assert all(not r.ok for r in results)
+
+
+# ── making a test directory reachable ────────────────────────────────
+
+
+def _tests_dir_project(root, verify="python -m unittest"):
+    step = _step("5.1", target_files=["tests/test_game.py"],
+                 verify_cmd=verify)
+    ghost = GhostPlan.build([step], root)
+    _write(root, "tests/test_game.py",
+           "import unittest\n\n\n"
+           "class T(unittest.TestCase):\n"
+           "    def test_a(self):\n        pass\n")
+    return ghost
+
+
+def test_creates_the_missing_package_marker(tmp_path):
+    """The six tests the step wrote were collected by nothing.
+
+    `python -m unittest` recurses only into importable packages, so the
+    gate went green on a different file's tests while the step's own work
+    was invisible to it.
+    """
+    root = str(tmp_path)
+    ghost = _tests_dir_project(root)
+    healer = GhostHealer(ghost, FakeExecutor())
+
+    results = healer.heal_uncollected_tests()
+    assert len(results) == 1 and results[0].ok
+    assert os.path.isfile(os.path.join(root, "tests", "__init__.py"))
+
+
+def test_leaves_a_reachable_directory_alone(tmp_path):
+    root = str(tmp_path)
+    ghost = _tests_dir_project(root)
+    _write(root, "tests/__init__.py", "# hand written\n")
+    healer = GhostHealer(ghost, FakeExecutor())
+
+    assert healer.heal_uncollected_tests() == []
+    with open(os.path.join(root, "tests", "__init__.py"),
+              encoding="utf-8") as fh:
+        assert fh.read() == "# hand written\n"     # never clobbered
+
+
+def test_silent_when_the_gate_names_its_own_start_directory(tmp_path):
+    # `discover -s tests` makes tests/ its own top level; there is no gap.
+    root = str(tmp_path)
+    ghost = _tests_dir_project(root, verify="python -m unittest discover -s tests")
+    healer = GhostHealer(ghost, FakeExecutor())
+
+    assert healer.heal_uncollected_tests() == []
+    assert not os.path.exists(os.path.join(root, "tests", "__init__.py"))
+
+
+def test_silent_under_pytest(tmp_path):
+    root = str(tmp_path)
+    ghost = _tests_dir_project(root, verify="pytest -q")
+    healer = GhostHealer(ghost, FakeExecutor())
+
+    assert healer.heal_uncollected_tests() == []
+    assert not os.path.exists(os.path.join(root, "tests", "__init__.py"))
+
+
+def test_attempted_only_once_per_directory(tmp_path):
+    root = str(tmp_path)
+    ghost = _tests_dir_project(root)
+    healer = GhostHealer(ghost, FakeExecutor())
+
+    assert len(healer.heal_uncollected_tests()) == 1
+    assert healer.heal_uncollected_tests() == []
