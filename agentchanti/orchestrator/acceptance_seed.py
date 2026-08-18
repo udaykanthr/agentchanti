@@ -66,6 +66,11 @@ log = logging.getLogger("agentchanti")
 # named so `_is_test_file` recognises it as a test.
 SEED_BASENAME = "test_acceptance_contract.py"
 
+# How many times to ask again when the first contract cannot fail. Two,
+# because one attempt is lost outright to an unusable response, and the
+# generation is cheap next to the run it is supposed to judge.
+_REPAIR_ATTEMPTS = 2
+
 _FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 # First line of a seeded file. A comment, so it costs the suite nothing,
@@ -328,16 +333,34 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     _weak = weak_contract_reason(src)
     if _weak:
         log.info("[AcceptanceSeed] first contract is too weak (%s) — asking "
-                 "once more for one that can fail", _weak)
-        retry = _generate(llm_client, task,
-                          extra=REPAIR_NOTE.format(reason=_weak))
-        if retry is not None and not mocking_reason(retry):
+                 "again for one that can fail", _weak)
+        # Two attempts, because an unusable RESPONSE is not the same as a
+        # weak contract and must not be read as one. Measured 2026-08-18
+        # 09:04: the repair came back unparseable, the single attempt was
+        # spent, and the run silently kept a contract with zero
+        # discriminating assertions — the strongest draft the model could
+        # have written was never asked for a second time.
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=REPAIR_NOTE.format(reason=_weak))
+            if retry is None:
+                log.info("[AcceptanceSeed] repair attempt %d/%d came back "
+                         "unusable — that is a bad response, not a weak "
+                         "contract, so asking again", _attempt,
+                         _REPAIR_ATTEMPTS)
+                continue
+            if mocking_reason(retry):
+                log.info("[AcceptanceSeed] repair attempt %d/%d mocks the "
+                         "system under test — asking again", _attempt,
+                         _REPAIR_ATTEMPTS)
+                continue
             _weak_after = weak_contract_reason(retry)
             if _weak_after is None:
-                log.info("[AcceptanceSeed] the second contract asserts real "
+                log.info("[AcceptanceSeed] the repaired contract asserts real "
                          "behaviour — using it")
                 src, _weak = retry, None
-            elif _substantive_count(retry) > _substantive_count(src):
+                break
+            if _substantive_count(retry) > _substantive_count(src):
                 # Not strong, but stronger; keeping the better of the two
                 # is never worse than keeping the first.
                 src, _weak = retry, _weak_after

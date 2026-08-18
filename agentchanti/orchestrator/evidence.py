@@ -72,19 +72,42 @@ NO_TESTS = "no-tests"
 
 @dataclass(frozen=True)
 class Evidence:
-    """What the run's success rests on."""
+    """What the run's success rests on.
+
+    ``shallow`` separates two things that used to read identically: a
+    check that could have failed and didn't, and one that could not have
+    failed at all. Measured 2026-08-18 across two consecutive runs — one
+    verified by a contract with seven discriminating assertions, the
+    next by one asserting only that the script existed and its process
+    had not exited — and both printed the same banner. A WARNING in the
+    log was the whole difference, which is the "advisory nobody acts on"
+    shape this project has been bitten by before.
+
+    It deliberately does NOT flip ``independent``. The shallow check is
+    still independent and still ran, so calling it self-authored would
+    be a different lie; and failing every run whose task admits only a
+    simple contract would be false precision. It changes what the run
+    may *claim*, not whether it passed.
+    """
 
     independent: bool
     kind: str
     detail: str
+    shallow: bool = False
 
     @property
     def headline(self) -> str:
-        return ("All tasks completed successfully!" if self.independent
-                else "Tasks completed — but nothing independent verified them.")
+        if not self.independent:
+            return "Tasks completed — but nothing independent verified them."
+        if self.shallow:
+            return ("Tasks completed — verified only that it runs, not that "
+                    "it works.")
+        return "All tasks completed successfully!"
 
     def log_line(self) -> str:
         verdict = "independent" if self.independent else "self-authored"
+        if self.shallow:
+            verdict += " but SHALLOW"
         return f"Evidence: {verdict} ({self.kind}) — {self.detail}"
 
 
@@ -175,6 +198,38 @@ def inconclusive_failure_reason(output: str) -> Optional[str]:
     return None
 
 
+def shallow_survivors(root: str, survivors: Iterable[str]) -> Optional[str]:
+    """Describe the survivors that cannot fail on wrong behaviour.
+
+    Read from source at verdict time rather than remembered from the
+    seeding step, so it covers a *user's* thin suite exactly as it covers
+    a generated one — the question "could this have failed?" does not
+    care who wrote the file.
+
+    None when at least one survivor is substantive: a run with one real
+    contract alongside a smoke test is verified, not shallow.
+    """
+    from .seed_strength import weak_contract_reason
+
+    files = [f for f in (survivors or ()) if f.endswith(".py")]
+    if not files:
+        return None
+    weak: list[str] = []
+    for rel in files:
+        try:
+            with open(os.path.join(root, rel.replace("/", os.sep)),
+                      encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError:
+            return None                   # unreadable: do not guess
+        reason = weak_contract_reason(src)
+        if reason is None:
+            return None                   # one real check is enough
+        weak.append(rel)
+    return (f"{', '.join(weak[:3])} asserts nothing that could fail on wrong "
+            f"behaviour, so this only shows the build runs")
+
+
 def run_pre_existing_tests(executor, root: str,
                            survivors: Iterable[str]) -> tuple[bool | None, str]:
     """Actually run the surviving pre-existing tests. ``(passed, detail)``.
@@ -257,9 +312,12 @@ def classify(root: str,
         # passed. `tests_ran` says the pipeline ran tests of its own,
         # which is a different question and was the wrong one to ask.
         if survivors_passed is True:
+            weak = shallow_survivors(root, survivors)
             return Evidence(True, INDEPENDENT_PRE_EXISTING,
                             f"{len(survivors)} test file(s) that predate the "
-                            f"run and it did not modify passed: {shown}{more}")
+                            f"run and it did not modify passed: {shown}{more}"
+                            + (f" — but {weak}" if weak else ""),
+                            shallow=bool(weak))
         if survivors_passed is False:
             # Louder than "unverified": the one instrument this run did
             # not author disagrees with it.

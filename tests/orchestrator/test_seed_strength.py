@@ -147,6 +147,45 @@ class TestTheSeedRetriesOnce:
                                      client, language="python") is not None
         assert client.generate_response.call_count == 1
 
+    def test_an_unusable_repair_response_is_asked_again(self, tmp_path):
+        """A bad RESPONSE is not a weak contract.
+
+        Measured 2026-08-18 09:04: the repair came back unparseable, the
+        single attempt was spent, and the run kept a contract with zero
+        discriminating assertions — the model was never asked twice.
+        """
+        from agentchanti.orchestrator.acceptance_seed import (
+            SEED_BASENAME, seed_acceptance_tests,
+        )
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.generate_response.side_effect = [
+            "```python\n" + LIVENESS_ONLY + "```",   # weak first draft
+            "I'm sorry, I cannot help with that.",   # unusable repair
+            "```python\n" + SUBSTANTIVE + "```",     # good second repair
+        ]
+        path = seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python")
+        assert path is not None
+        assert client.generate_response.call_count == 3
+        written = (tmp_path / SEED_BASENAME).read_text(encoding="utf-8")
+        assert "assertNotEqual" in written
+
+    def test_repair_attempts_are_bounded(self, tmp_path):
+        from agentchanti.orchestrator.acceptance_seed import seed_acceptance_tests
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.generate_response.side_effect = [
+            "```python\n" + LIVENESS_ONLY + "```",
+            "nonsense", "more nonsense", "still nonsense",
+        ]
+        assert seed_acceptance_tests("Build a snake game.", str(tmp_path),
+                                     client, language="python") is not None
+        # One draft + two repair attempts, and no further.
+        assert client.generate_response.call_count == 3
+
     def test_a_still_weak_retry_keeps_the_contract_anyway(self, tmp_path):
         """A shallow check that runs still catches a crashing artifact.
 

@@ -131,6 +131,81 @@ def test_a_failing_pre_existing_suite_is_reported_as_such(tmp_path):
     assert "AssertionError" in verdict.detail
 
 
+SHALLOW_SUITE = '''
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+class Contract(unittest.TestCase):
+    def test_it_starts(self):
+        script = Path(__file__).parent / "app.py"
+        self.assertTrue(script.is_file())
+        p = subprocess.Popen([sys.executable, str(script)])
+        self.assertIsNone(p.poll())
+        p.terminate()
+'''
+
+REAL_SUITE = '''
+import unittest
+
+
+class Contract(unittest.TestCase):
+    def test_it_moves(self):
+        import app
+        g = app.Game()
+        before = g.head
+        g.step()
+        self.assertNotEqual(g.head, before)
+        self.assertEqual(len(g.cells), 3)
+'''
+
+
+class TestShallowEvidenceIsNamed:
+    """Two consecutive runs printed the same banner: one verified by a
+    contract with seven discriminating assertions, the next by one
+    asserting only that the script existed and had not exited. A WARNING
+    in the log was the whole difference."""
+
+    def test_a_shallow_survivor_marks_the_verdict_shallow(self, tmp_path):
+        root = str(tmp_path)
+        _write(root, "test_smoke.py", SHALLOW_SUITE)
+        snap = snapshot_test_files(root)
+        verdict = classify(root, snap, tests_ran=True, survivors_passed=True)
+        assert verdict.independent          # it is independent, and it ran
+        assert verdict.shallow
+        assert "not that it works" in verdict.headline
+        assert "SHALLOW" in verdict.log_line()
+
+    def test_a_real_survivor_is_not_shallow(self, tmp_path):
+        root = str(tmp_path)
+        _write(root, "test_real.py", REAL_SUITE)
+        snap = snapshot_test_files(root)
+        verdict = classify(root, snap, tests_ran=True, survivors_passed=True)
+        assert verdict.independent
+        assert not verdict.shallow
+        assert verdict.headline == "All tasks completed successfully!"
+
+    def test_one_real_suite_among_thin_ones_is_enough(self, tmp_path):
+        root = str(tmp_path)
+        _write(root, "test_smoke.py", SHALLOW_SUITE)
+        _write(root, "test_real.py", REAL_SUITE)
+        snap = snapshot_test_files(root)
+        verdict = classify(root, snap, tests_ran=True, survivors_passed=True)
+        assert not verdict.shallow
+
+    def test_shallow_does_not_flip_independent(self, tmp_path):
+        """Calling it self-authored would be a different lie, and failing
+        every run whose task admits only a simple contract would be false
+        precision. It changes the claim, not the outcome."""
+        root = str(tmp_path)
+        _write(root, "test_smoke.py", SHALLOW_SUITE)
+        snap = snapshot_test_files(root)
+        verdict = classify(root, snap, tests_ran=True, survivors_passed=True)
+        assert verdict.independent is True
+
+
 def test_a_suite_that_exits_during_cleanup_is_inconclusive(tmp_path):
     """A broken instrument is not a failing artifact.
 
