@@ -140,6 +140,34 @@ Output ONLY the Python file in one ``` fenced block. No commentary.
 """
 
 
+# Rule 5 of the prompt says no mocks, and a suite that ignores it is not
+# an acceptance contract — it is a description of the code's shape that
+# agrees with itself. Measured 2026-08-17: a seeded contract patched
+# `panda3d.core.ShowBase.__init__`, an attribute that does not exist, and
+# 22 of its 23 tests ERRORED. It was still counted as this run's
+# independent evidence, because nothing ran it (see evidence.classify).
+# Refusing is the honest outcome: no file means "nothing independent
+# verified this", which is true, where an unrunnable file means the same
+# thing while looking like proof.
+_MOCK_MARKERS = (
+    "unittest.mock",
+    "from mock import",
+    "import mock",
+    "MagicMock",
+    "mock.patch",
+    "@patch",
+    "patch(",
+)
+
+
+def mocking_reason(src: str) -> str | None:
+    """Which forbidden stubbing construct this suite uses, or None."""
+    for marker in _MOCK_MARKERS:
+        if marker in src:
+            return marker
+    return None
+
+
 def _looks_like_a_suite(src: str) -> bool:
     """Cheap sanity gate — it must at least be a runnable test module."""
     if not src or "import unittest" not in src:
@@ -254,6 +282,13 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if not _looks_like_a_suite(src):
         log.warning("[AcceptanceSeed] response was not a usable test module "
                     "— no independent check seeded")
+        return None
+    _mock = mocking_reason(src)
+    if _mock:
+        log.warning("[AcceptanceSeed] response mocks the system under test "
+                    "(%s) — refusing it. A contract that stubs the code "
+                    "cannot be evidence about the code, and this run has "
+                    "no seeded independent check", _mock)
         return None
 
     if not src.endswith("\n"):

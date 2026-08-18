@@ -227,6 +227,37 @@ def test_identity_task_defaults_to_the_task(tmp_path):
     assert _seed(SNAKE, tmp_path) is not None     # different task, re-seed
 
 
+def test_a_suite_that_mocks_the_system_is_refused(tmp_path):
+    """Rule 5 of the prompt says no mocks, and it was unenforced.
+
+    Measured 2026-08-17: the seed wrote a contract patching
+    `panda3d.core.ShowBase.__init__` — an attribute that does not exist —
+    and 22 of its 23 tests ERRORED. It was still counted as that run's
+    independent evidence. No file is the honest outcome: it says
+    "nothing independent verified this", which is true, where an
+    unrunnable file says the same thing while looking like proof.
+    """
+    mocked = '''```python
+import unittest
+from unittest.mock import patch
+
+
+class Contract(unittest.TestCase):
+    def test_thing(self):
+        with patch('panda3d.core.ShowBase.__init__', return_value=None):
+            self.assertTrue(True)
+```'''
+    assert seed_acceptance_tests("Build a game.", str(tmp_path),
+                                 _client(mocked), language="python") is None
+    assert not (tmp_path / SEED_BASENAME).exists()
+
+
+def test_a_clean_suite_is_still_accepted(tmp_path):
+    """The refusal must not swallow ordinary suites."""
+    assert seed_acceptance_tests("Build a game.", str(tmp_path),
+                                 _client(GOOD), language="python") is not None
+
+
 def test_a_re_seed_is_still_independent_evidence(tmp_path):
     """Re-seeding happens before any step runs, so the snapshot taken a
     moment later still records it as pre-existing."""
