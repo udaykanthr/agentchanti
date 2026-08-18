@@ -272,22 +272,79 @@ def reset_gate_verdicts() -> None:
         _verdicts.clear()
 
 
+# Markers that the command got as far as executing project code. Any one
+# of them means a failure is ABOUT the artifact, however unchanging its
+# text — an interpreter traceback, or a test runner reporting results.
+# Their absence is what a shell rejecting the command looks like.
+_REACHED_CODE_MARKERS = (
+    "Traceback (most recent call last)",
+    "AssertionError",
+    "AttributeError",
+    "NameError",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+    "IndexError",
+    "FAILED (",
+    "= FAILURES =",
+    "short test summary",
+)
+
+
+def _reached_the_code(result: str) -> bool:
+    """Did this failure come from running the project, or from the shell?"""
+    text = result or ""
+    if any(m in text for m in _REACHED_CODE_MARKERS):
+        return True
+    # A runner that collected and ran tests reported on the code even
+    # when nothing raised. Matched by shape rather than by regex: a
+    # count sitting next to a runner word. split() handles newlines.
+    words = text.split()
+    for i, w in enumerate(words[:-1]):
+        nxt = words[i + 1].rstrip(",.:")
+        if w == "Ran" and nxt.isdigit():
+            return True
+        if w.rstrip(",.:").isdigit() and nxt in (
+                "passed", "failed", "test", "tests", "error", "errors"):
+            return True
+    return False
+
+
 def observe_gate_verdict(cmd: str | None, result: str,
                          artifact_digest: str) -> str | None:
     """Record one verdict; return a reason once the gate is proven stalled.
 
-    Stalled means all three of:
+    Stalled means all four of:
 
     * at least ``_STALL_THRESHOLD`` verdicts for this exact command,
     * every one of them byte-identical **and failing** — a gate that ever
       passed is measuring something, and one whose message varies is
       responding to the code,
-    * at least two distinct artifact digests, which is the half that
-      makes this evidence rather than impatience. Without it, a model
-      that edited nothing for three turns would look the same as a
-      broken gate.
+    * at least two distinct artifact digests, so a model that edited
+      nothing does not look like a broken gate,
+    * and the failure never reached the project's code at all.
 
-    Returns None while any of those is unmet, so the ordinary case — a
+    That last condition was missing, and its absence produced a wrong
+    verdict on the check's second live outing (2026-08-18 08:14). A gate
+    asserting `game.snake_positions` failed three times with a byte-
+    identical ``AttributeError`` while the model edited the file, so the
+    first three conditions held and the step was declared unmeasurable —
+    escalation suppressed. The recovery loop then satisfied that exact
+    gate in three turns, and it passes against the finished artifact.
+
+    The reasoning was simply wrong. An ``AttributeError`` naming a symbol
+    the code lacks is byte-identical across every edit that does not add
+    that symbol, and it is the most *diagnostic* failure a gate can
+    produce — the opposite of one that cannot see the code. What the
+    original incident had instead was a shell error (``The system cannot
+    find the path specified``) that named nothing about the project,
+    because cmd.exe rejected the command before any code ran.
+
+    So the discriminator is whether the command ever reached the code.
+    The bias is deliberate: a false negative costs turns the loop had
+    anyway, a false positive suppresses real work.
+
+    Returns None while any condition is unmet, so the ordinary case — a
     gate failing differently as the code improves — is untouched.
     """
     if not cmd:
@@ -307,6 +364,8 @@ def observe_gate_verdict(cmd: str | None, result: str,
         if any(r.startswith("exit: success") for r in results):
             return None
         if len(entry["digests"]) < 2:
+            return None
+        if _reached_the_code(results[-1]):
             return None
         entry["reported"] = True
 

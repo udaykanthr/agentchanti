@@ -197,6 +197,37 @@ class TestStallBreaker:
         for d in ("d1", "d2", "d3"):
             assert observe_gate_verdict(None, self.FAIL, d) is None
 
+    # ── the measured false positive ─────────────────────────────────
+    #
+    # 2026-08-18 08:14: a gate asserting `game.snake_positions` failed
+    # three times with a byte-identical AttributeError while the model
+    # edited the file. Every condition then in force held, so the step
+    # was declared unmeasurable and escalation suppressed — and the
+    # recovery loop satisfied that exact gate three turns later. The
+    # gate was measuring the artifact the whole time.
+
+    ATTR = ("exit: failure\nTraceback (most recent call last):\n"
+            "AttributeError: 'SnakeGame' object has no attribute "
+            "'snake_positions'")
+
+    def test_a_failure_from_inside_the_code_never_stalls(self):
+        for d in ("d1", "d2", "d3", "d4", "d5"):
+            assert observe_gate_verdict("g", self.ATTR, d) is None
+
+    def test_a_test_runner_verdict_never_stalls(self):
+        runner = "exit: failure\nRan 12 tests in 0.4s\nFAILED (failures=2)"
+        for d in ("d1", "d2", "d3", "d4"):
+            assert observe_gate_verdict("g", runner, d) is None
+
+    def test_a_shell_rejection_still_stalls(self):
+        # The original incident: cmd.exe refused the command outright,
+        # so nothing about the project was ever consulted.
+        shell = ("exit: failure\nThe system cannot find the path "
+                 "specified.")
+        assert observe_gate_verdict("g", shell, "d1") is None
+        assert observe_gate_verdict("g", shell, "d2") is None
+        assert observe_gate_verdict("g", shell, "d3") is not None
+
 
 class TestRefusedBeforeTurnOne:
     """The advisory that nothing consumed.
