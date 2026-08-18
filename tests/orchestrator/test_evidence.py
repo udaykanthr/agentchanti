@@ -131,6 +131,60 @@ def test_a_failing_pre_existing_suite_is_reported_as_such(tmp_path):
     assert "AssertionError" in verdict.detail
 
 
+def test_a_suite_that_exits_during_cleanup_is_inconclusive(tmp_path):
+    """A broken instrument is not a failing artifact.
+
+    Measured 2026-08-18 08:56: a seeded contract ended with
+    `finally: game.userExit()`. Panda3D's userExit calls sys.exit(),
+    unittest recorded the SystemExit as an ERROR, and a run whose every
+    assertion had PASSED exited non-zero under
+    require_independent_evidence. Verified by neutralising that one line:
+    `Ran 1 test — OK`.
+
+    Reporting it as a failure manufactures a regression out of silence,
+    which is the rule `GateLedger` and `verify_dt_invariance` already
+    follow.
+    """
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, (
+                "Traceback (most recent call last):\n"
+                '  File "test_acceptance_contract.py", line 144\n'
+                "    game.userExit()\n"
+                "SystemExit\n\nRan 1 test in 0.4s\n\nFAILED (errors=1)")
+
+    ok, detail = run_pre_existing_tests(_Exec(), str(tmp_path), ["test_a.py"])
+    assert ok is None, "a self-inflicted SystemExit is not a verdict"
+    assert "cleanup" in detail
+
+
+def test_a_real_assertion_failure_stays_a_failure(tmp_path):
+    """The escape hatch must not explain away genuine disagreement."""
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, ("AssertionError: 3 != 4\n\nRan 2 tests\n"
+                           "FAILED (failures=1)")
+
+    ok, _detail = run_pre_existing_tests(_Exec(), str(tmp_path), ["test_a.py"])
+    assert ok is False
+
+
+def test_an_error_in_the_code_under_test_stays_a_failure(tmp_path):
+    from agentchanti.orchestrator.evidence import run_pre_existing_tests
+
+    class _Exec:
+        def run_command(self, cmd, timeout=None):
+            return False, ("AttributeError: 'Game' object has no attribute "
+                           "'move'\n\nRan 1 test\nFAILED (errors=1)")
+
+    ok, _detail = run_pre_existing_tests(_Exec(), str(tmp_path), ["test_a.py"])
+    assert ok is False
+
+
 def test_running_survivors_reports_pass_fail_and_unknown(tmp_path):
     from agentchanti.orchestrator.evidence import run_pre_existing_tests
 

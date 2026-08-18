@@ -135,6 +135,12 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    ImportError fail that test. Do not guard with try/except or skip.
 5. No mocks, no stubs, no reaching into private attributes, no assigning
    to state. Drive the system only through the public API the task names.
+6. NEVER call `sys.exit()`, `quit()`, `os._exit()` or a framework's exit
+   helper (`userExit()`, `destroy()` that exits) — not in the test, not
+   in a `finally:`, not in `tearDown`. They raise SystemExit, which
+   unittest records as an ERROR *after* your assertions have already
+   passed, turning a green contract red. Let objects be garbage
+   collected instead.
 
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """

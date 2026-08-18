@@ -144,6 +144,37 @@ def surviving_pre_existing_tests(root: str,
 
 
 
+# A suite can fail for reasons that say nothing about the code. The one
+# measured here (2026-08-18 08:56) is a contract whose `finally:` called
+# `game.userExit()`; Panda3D's userExit calls sys.exit(), unittest reports
+# the resulting SystemExit as an ERROR, and a run whose every assertion
+# had PASSED exited non-zero under require_independent_evidence. The
+# instrument broke during cleanup, after judging the code favourably.
+_INCONCLUSIVE_MARKERS = (
+    ("SystemExit", "the suite called sys.exit()/userExit() during cleanup, "
+                   "so unittest recorded an error after its assertions ran"),
+    ("KeyboardInterrupt", "the suite was interrupted"),
+    ("ModuleNotFoundError: No module named 'unittest",
+     "the test runner itself is unavailable"),
+)
+
+
+def inconclusive_failure_reason(output: str) -> Optional[str]:
+    """Why this red suite produced no verdict about the code, or None.
+
+    Only markers that are unambiguous about the *instrument* breaking.
+    Anything else — an assertion, an AttributeError in the code under
+    test, a collection error naming a project module — is a real failure
+    and must stay one, or this becomes a machine for explaining away
+    disagreement.
+    """
+    text = output or ""
+    for marker, reason in _INCONCLUSIVE_MARKERS:
+        if marker in text:
+            return reason
+    return None
+
+
 def run_pre_existing_tests(executor, root: str,
                            survivors: Iterable[str]) -> tuple[bool | None, str]:
     """Actually run the surviving pre-existing tests. ``(passed, detail)``.
@@ -164,6 +195,7 @@ def run_pre_existing_tests(executor, root: str,
     if not files or executor is None:
         return None, "no runnable pre-existing test file"
     failures: list[str] = []
+    inconclusive: list[str] = []
     ran = 0
     for rel in files:
         cmd = "python -m unittest " + rel.replace("/", os.sep)
@@ -173,13 +205,26 @@ def run_pre_existing_tests(executor, root: str,
             _logger.debug("[Evidence] %s could not run: %s", rel, exc)
             continue
         ran += 1
-        if not ok:
-            tail = " | ".join((out or "").strip().splitlines()[-3:])
+        if ok:
+            continue
+        tail = " | ".join((out or "").strip().splitlines()[-3:])
+        reason = inconclusive_failure_reason(out or "")
+        if reason:
+            inconclusive.append(f"{rel}: {reason}")
+        else:
             failures.append(f"{rel}: {tail[:200]}")
     if ran == 0:
         return None, "no pre-existing test file could be run"
     if failures:
         return False, "; ".join(failures[:3])
+    if inconclusive:
+        # The suite broke itself rather than judging the code, so it
+        # produced no verdict — the same distinction `GateLedger`
+        # already draws between a crash and a real failure, and the
+        # reason `verify_dt_invariance` reserves an exit code for
+        # "could not verify". Reporting it as a failure would
+        # manufacture a regression out of silence.
+        return None, "; ".join(inconclusive[:3])
     return True, f"{ran} pre-existing test file(s) ran and passed"
 
 
