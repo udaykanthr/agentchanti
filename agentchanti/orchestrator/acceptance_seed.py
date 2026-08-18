@@ -168,6 +168,36 @@ def mocking_reason(src: str) -> str | None:
     return None
 
 
+def _substantive_count(src: str) -> int:
+    """How many discriminating assertions a candidate has, for ranking."""
+    import ast
+
+    from .seed_strength import _substantive_assertions
+    try:
+        return _substantive_assertions(ast.parse(src))
+    except SyntaxError:
+        return 0
+
+
+def _generate(llm_client, task: str, extra: str = "") -> str | None:
+    """One generation round: prompt, extract the fence, sanity-check it."""
+    prompt = _PROMPT.format(task=task.strip())
+    if extra:
+        prompt += "\n\n" + extra
+    try:
+        raw = llm_client.generate_response(prompt)
+    except Exception as exc:
+        log.warning("[AcceptanceSeed] generation failed: %s", exc)
+        return None
+    match = _FENCE_RE.search(raw or "")
+    src = (match.group(1) if match else (raw or "")).strip()
+    if not _looks_like_a_suite(src):
+        log.warning("[AcceptanceSeed] response was not a usable test module "
+                    "— no independent check seeded")
+        return None
+    return src
+
+
 def _looks_like_a_suite(src: str) -> bool:
     """Cheap sanity gate — it must at least be a runnable test module."""
     if not src or "import unittest" not in src:
@@ -271,17 +301,8 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if not _should_seed(identity, root, path):
         return None
 
-    try:
-        raw = llm_client.generate_response(_PROMPT.format(task=task.strip()))
-    except Exception as exc:
-        log.warning("[AcceptanceSeed] generation failed: %s", exc)
-        return None
-
-    match = _FENCE_RE.search(raw or "")
-    src = (match.group(1) if match else (raw or "")).strip()
-    if not _looks_like_a_suite(src):
-        log.warning("[AcceptanceSeed] response was not a usable test module "
-                    "— no independent check seeded")
+    src = _generate(llm_client, task)
+    if src is None:
         return None
     _mock = mocking_reason(src)
     if _mock:
@@ -290,6 +311,38 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                     "cannot be evidence about the code, and this run has "
                     "no seeded independent check", _mock)
         return None
+
+    # Strength, judged once and repaired once. Measured across three runs
+    # of one prompt: 2 substantive tests, then 1 that asserted only that
+    # the process had not exited — which passes over any program that
+    # starts. Accurately measuring a weak instrument still reports a weak
+    # measurement as a strong claim, so ask again with the specific
+    # complaint, the same shape as `repair_verify_commands`.
+    from .seed_strength import REPAIR_NOTE, weak_contract_reason
+    _weak = weak_contract_reason(src)
+    if _weak:
+        log.info("[AcceptanceSeed] first contract is too weak (%s) — asking "
+                 "once more for one that can fail", _weak)
+        retry = _generate(llm_client, task,
+                          extra=REPAIR_NOTE.format(reason=_weak))
+        if retry is not None and not mocking_reason(retry):
+            _weak_after = weak_contract_reason(retry)
+            if _weak_after is None:
+                log.info("[AcceptanceSeed] the second contract asserts real "
+                         "behaviour — using it")
+                src, _weak = retry, None
+            elif _substantive_count(retry) > _substantive_count(src):
+                # Not strong, but stronger; keeping the better of the two
+                # is never worse than keeping the first.
+                src, _weak = retry, _weak_after
+    if _weak:
+        # Kept rather than refused: a weak check that runs still catches a
+        # crashing artifact, and refusing would trade a shallow instrument
+        # for none at all. Said out loud, because "independent" will be
+        # reported about it.
+        log.warning("[AcceptanceSeed] the seeded contract remains SHALLOW "
+                    "(%s) — this run's independent evidence can catch a "
+                    "broken build but not wrong behaviour", _weak)
 
     if not src.endswith("\n"):
         src += "\n"
