@@ -644,6 +644,25 @@ def _run_task_impl(
                     pipeline_success = False
                     break
 
+        # Is the seeded contract an instrument or a bug? Validated only
+        # statically when written (it could not be executed — no code
+        # existed yet), while every measured failure of one has been a
+        # runtime crash. This is the first point it CAN be run. A no-op
+        # unless a contract this pipeline wrote is present, and kept here
+        # so the library path cannot silently diverge from cli.py the day
+        # seeding is wired into it — the reason `repair_failed_acceptance`
+        # lives in both.
+        try:
+            from .orchestrator.acceptance_seed import verify_contract_runs
+            _fixed = verify_contract_runs(executor, os.getcwd(), llm_client,
+                                          task)
+            if _fixed:
+                _rel, _new_digest = _fixed
+                _pre_existing_tests[_rel] = _new_digest
+        except Exception as _vc_exc:       # never fail a run over this
+            log.warning("[AcceptanceSeed] runnability check skipped "
+                        "(%s: %s)", type(_vc_exc).__name__, _vc_exc)
+
         if not pipeline_success:
             break
 

@@ -635,6 +635,75 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     return False
 
 
+def _prompt_for_acceptance_cmds(cfg, auto: bool) -> list:
+    """Ask for an instrument the model cannot write, before the work starts.
+
+    `require_independent_evidence` is satisfiable three ways, and they are
+    not equally strong. User `acceptance_cmds` and a user's own pre-existing
+    suite are genuinely outside the run. A contract the pipeline seeds is
+    not: it is a model output, written before the code exists — so it can
+    only guess at the API — and measured across four runs of one prompt it
+    produced three distinct false verdicts over artifacts that scored
+    17-18/18 against external probes.
+
+    When the seeded contract is the ONLY thing that could satisfy the flag,
+    the run is about to rest its verdict on an instrument nobody outside it
+    wrote. That is worth one question now, while the answer is still cheap
+    — the alternative is finding out on the last line, which is exactly the
+    failure mode the unsatisfiable-evidence pre-flight above exists to stop.
+
+    Returns the commands supplied (also written into *cfg*), or ``[]``.
+    """
+    advice = (
+        "Add `acceptance_cmds:` to .agentchanti.yaml — a command the agent "
+        "can neither write nor edit, such as `python acceptance_check.py` "
+        "or `npm --prefix app run e2e` — or keep a test file the agent does "
+        "not touch. Either one outranks a generated contract.")
+    if auto:
+        log.warning(
+            "[Evidence] require_independent_evidence is set, but the only "
+            "thing that can satisfy it here is a contract this pipeline "
+            "writes itself: no `acceptance_cmds` are configured and no "
+            "pre-existing test file predates the run. A seeded contract is "
+            "written before the code exists and judged only statically, so "
+            "it is the weakest evidence this flag accepts. %s", advice)
+        return []
+
+    log.warning(
+        "[Evidence] Nothing outside this run can verify it yet — the only "
+        "available evidence is a contract the pipeline writes itself.")
+    try:
+        print()
+        print("  This run has no independent acceptance check.")
+        print("  Enter shell command(s) that prove the task is done — one "
+              "per line, blank line to finish.")
+        print("  They will be run at the end and are read-only to the "
+              "agent. Press Enter now to continue without one.")
+        cmds = []
+        while True:
+            line = input("  acceptance> ").strip()
+            if not line:
+                break
+            cmds.append(line)
+    except (EOFError, KeyboardInterrupt):
+        # Not a terminal, or the user declined. Neither is an error, and
+        # neither should stop the run: the artifacts are still worth
+        # having, exactly as the unsatisfiable-evidence branch reasons.
+        print()
+        cmds = []
+
+    if not cmds:
+        log.warning("[Evidence] continuing without an independent check. %s",
+                    advice)
+        return []
+
+    existing = list(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
+    cfg.ACCEPTANCE_CMDS = existing + cmds
+    log.info("[Evidence] %d acceptance command(s) supplied at the prompt: %s",
+             len(cmds), "; ".join(cmds))
+    return cmds
+
+
 def _main_impl():
     # Dispatch `agentchanti kb ...` to the KB CLI before argparse sees it,
     # so the KB subcommand tree is fully independent of the main task args.
@@ -1942,6 +2011,11 @@ def _main_impl():
     from .ghost_heal import start_healer, reset_healer
     reset_ghost()
     reset_healer()
+    # Repair bookkeeping is module-level, so a second run in the same
+    # process (library API, tests) would otherwise inherit the first
+    # run's "already handled" verdict and never check its own contract.
+    from .acceptance_seed import reset_contract_repairs
+    reset_contract_repairs()
 
     # Which test files predate the run? Taken here, alongside the ghost's
     # pre-state and before the first step, because the question at the end
@@ -2009,6 +2083,12 @@ def _main_impl():
     if getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False):
         _have_acc = bool(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
         _seedable = not language or language.lower() in ("python", "py")
+        # A pre-existing file this pipeline SEEDED is not a user's suite.
+        # Counting it here would report the strong case ("someone else's
+        # tests are present") for the weak one ("we wrote our own check").
+        from .evidence import _was_seeded as _seeded_file
+        _user_tests = [rel for rel in (_pre_existing_tests or {})
+                       if not _seeded_file(os.getcwd(), rel)]
         if not (_have_acc or _pre_existing_tests or _seedable):
             log.warning(
                 "[Evidence] require_independent_evidence is set, but nothing "
@@ -2019,6 +2099,27 @@ def _main_impl():
                 "the result. Add `acceptance_cmds:` to .agentchanti.yaml — "
                 "a command the agent cannot edit — or unset "
                 "`require_independent_evidence`.", language)
+        elif not _have_acc and not _user_tests:
+            # Satisfiable, but only by a contract this pipeline generates.
+            # That is the weakest form the flag admits: the check is a
+            # model output like any other, it is written before the code
+            # exists so it can only guess at the API, and measured across
+            # four runs it produced three distinct false verdicts over
+            # artifacts that scored 17-18/18 against external probes.
+            #
+            # Asked HERE rather than reported at the end, because here the
+            # answer is still cheap — the alternative is learning on the
+            # last line that the whole run rested on an instrument nobody
+            # outside it wrote.
+            _asked = _prompt_for_acceptance_cmds(cfg, auto=args.auto)
+            if _asked:
+                _acc_instruments = _acc_files(_asked, os.getcwd())
+                if _acc_instruments:
+                    memory._acceptance_files = _acc_instruments
+                    log.info(
+                        "[Evidence] %d acceptance instrument(s) protected "
+                        "from agent writes: %s", len(_acc_instruments),
+                        ", ".join(sorted(_acc_instruments)))
 
     # The top-level directories the final plan names as target roots. A
     # sub-project root is otherwise a claim about the ONE tree the run
@@ -2292,6 +2393,33 @@ def _main_impl():
         # end of the run.
         _ghost_resolve_wave(plan_steps_parsed, pending, step_results,
                             language, f"wave {wave_idx + 1}")
+
+        # Same moment: is the seeded contract an instrument or a bug? It
+        # was validated statically before any code existed — compiled,
+        # scanned for mocks, walked for strength — and never executed,
+        # while every measured failure of one has been a RUNTIME crash in
+        # framework introspection it had to write blind. This is the first
+        # point at which it CAN be run, and running it here instead of at
+        # the end is the difference between a cheap repair and 400k tokens
+        # spent proving a broken instrument right. Repairs only a crash,
+        # never a failed assertion — the code is legitimately incomplete
+        # at this point, and rewriting the check because it says so is the
+        # cheat this whole module exists to prevent.
+        if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
+            try:
+                from .acceptance_seed import verify_contract_runs
+                _fixed = verify_contract_runs(
+                    executor, os.getcwd(), llm_client, args.task,
+                    identity_task=getattr(args, "_raw_task", None))
+                if _fixed:
+                    # The snapshot must learn the new bytes, or the repair
+                    # reads downstream as "the agent edited the contract"
+                    # and forfeits the independence it just protected.
+                    _rel, _new_digest = _fixed
+                    _pre_existing_tests[_rel] = _new_digest
+            except Exception as _vc_exc:   # never fail a run over this
+                log.warning("[AcceptanceSeed] runnability check skipped "
+                            "(%s: %s)", type(_vc_exc).__name__, _vc_exc)
 
         # Snapshot the wave, then re-run every gate recorded so far. A step
         # can break a sibling's already-green gate — including one recorded

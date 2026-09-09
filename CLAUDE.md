@@ -245,6 +245,40 @@ A failing acceptance check now gets the same bounded recovery every other failur
 
 **The banner stays honest about it.** `Evidence.repaired` is modelled on `shallow`: it does **not** flip `independent`, because the check was never edited and really did run and really did pass, so the evidence is genuinely independent — what changes is the claim. `All tasks completed successfully!` and `All tasks completed — verified after 2 repair round(s).` are different results, and averaging them in a benchmark would hide exactly the variance worth measuring.
 
+### A Contract Nothing Ever Ran (acceptance_seed.py `verify_contract_runs`)
+
+Every check the seeder had was **static**. `_looks_like_a_suite` compiles the source, `mocking_reason` reads its imports, `weak_contract_reason` walks its AST — and not one of them executes it. Every measured failure of a seeded contract has been a **runtime** failure, so the entire ladder was blind to the only defect class that actually occurs.
+
+Measured across four runs of the Panda3D-Snake prompt, 2026-09-08/09 (two on this branch, two on `main` — the defect is not a regression, it is original):
+
+    ambient_lights[0].getColor()[:3]   TypeError — LVecBase4f has no slice
+    self.win.requestProperties(...)    AttributeError — it is a GraphicsBuffer
+    a DirectGui label's text, scraped  AssertionError — no label exists headless
+
+All three compile. All three were trusted. All four artifacts scored 17–18/18 against an external probe, so in every case the instrument was wrong and the code was right.
+
+They cluster in **framework introspection** for a structural reason, and that reason is the same one that makes the seeding work at all: the contract is written *before any code exists*, which is what makes it independent — and also means it cannot name the artifact's own API. To assert anything concrete it must anchor on the only vocabulary it can predict, the framework named in the task. Framework introspection is then the worst possible thing to write blind: version-dependent (`setTitle` vs `WindowProperties`), environment-dependent (windowed vs headless), and unrunnable by its author.
+
+The contract genuinely cannot be executed when it is written — there is nothing to import yet. The first moment it *can* be is as soon as the code exists, and that is where this runs, per wave next to `_ghost_resolve_wave`. Previously the first execution was `run_pre_existing_tests` at the very end: one such contract was swept into a step's own gate by a planner-declared `verify: python -m unittest -v` (bare discovery collects it alongside the run's tests) and cost **30 turns, an escalation and 402k tokens** proving a broken instrument right, over a game whose own suite was 5/5 green.
+
+What it repairs is deliberately narrow. **A crash is repaired; a failed assertion never is.** unittest already draws that line — an ERROR is the instrument breaking, a FAILURE is the instrument judging — and at this point in a run the code is legitimately incomplete, so a contract that disagrees with it may be entirely right. Rewriting the check because it says the code is wrong is precisely the cheat this module exists to prevent. `ModuleNotFoundError`/`ImportError` is not a defect either, just code that does not exist yet, and defers to the next wave.
+
+Three refusals bound the repair, because a crash is trivially "fixed" by checking less: a repair that **mocks** the system under test is rejected, one with fewer substantive assertions than the original is rejected (`_substantive_count`, the same ranking the weakness repair uses), and one that **still crashes** restores the original — two broken contracts are not better than one. A file with no seed header is never touched, so a user's own suite is out of scope entirely.
+
+The caller **must** apply the returned digest to its pre-existing-test snapshot, and both `cli.py` and `api.py` do. Without it the repair reads downstream as "the agent edited the contract" and forfeits the very independence it was protecting — `surviving_pre_existing_tests` re-hashes from disk precisely so that no one can claim otherwise.
+
+Two halves of the repair request are load-bearing, and a live run found both missing. **The contract itself goes in the prompt.** Without it the model is being asked to fix a file it cannot see, under a base prompt whose framing is *"BEFORE any code exists"* — and it did the only thing that framing allows: regenerated from scratch, concluded the task named no importable module, and returned a contract whose single test was `self.fail(...)`. The strength guard caught that, so nothing was written, but the request was malformed. Its own prior output is safe to show; the **artifact is not**, because a contract shaped by the code it judges is no longer independent of it, and a test pins that the source never reaches the prompt. **And the repair is asked more than once**, for the reason the weakness repair directly above it already documents: measured live, the single attempt came back having burned all 16,384 output tokens on reasoning (`Response hit the output-token limit`), which is an unusable *response*, not a repair that was judged and rejected — spending the budget on it left the contract broken and the run ended exactly as it would have without any of this.
+
+Verified twice. Replaying all three measured incidents against their real artifacts: the two crashes request a repair carrying the actual traceback, and the assertion failure is correctly left alone. Then live, against a planted contract that compiles, imports the built project and raises `TypeError` — `runs=False, FAILED (errors=1)` before, `runs=True, OK` after, the header's task hash unchanged, still 2 substantive assertions, no `self.fail`, no `skipTest`, no `try/except`, and the repair touched only the crashing expression. The known hole is the third incident: a contract that runs and is simply *wrong* is still only caught at the end, where a seeded contract cannot convict the code anyway.
+
+### Asking For Evidence Before Spending The Run (cli.py `_prompt_for_acceptance_cmds`)
+
+`require_independent_evidence` is satisfiable three ways and they are not equally strong: user `acceptance_cmds`, a user's own pre-existing suite, or a contract this pipeline seeds. The pre-flight above already refuses to let an **unsatisfiable** configuration run silently. This is the same argument one notch weaker — satisfiable, but only by an instrument nobody outside the run wrote, which is the case that produced all three false verdicts above.
+
+Asked at plan time, before a token is spent, because that is while the answer is still cheap; the alternative is learning on the last line that the whole run rested on a check the run wrote itself. Interactive sessions are prompted for commands and adopt them into `cfg.ACCEPTANCE_CMDS` (appending, never replacing) and into `_acceptance_files`, so anything supplied is immediately read-only to the agent. `--auto` is warned rather than prompted — an unattended run must not block on a question nobody can answer — and a closed stdin is treated as declining, not as an error. Declining always continues: the artifacts are still worth having, exactly as the unsatisfiable branch reasons.
+
+The discriminator is `_was_seeded`, not the presence of a test file. Counting the seeded contract as "a pre-existing suite" would report the strong case for the weak one, and the prompt would never fire in the single case it exists for.
+
 ### A Stylesheet Nothing Imports (orchestrator/style_coupling.py `reachable_stylesheets`)
 
 `find_style_drift` asked "is this class defined in some `.css` on disk?". The question that matters is "is it defined in a stylesheet the app actually **loads**?", and the gap between them let the smoke test's own repair loop drive itself green by writing into dead code.
