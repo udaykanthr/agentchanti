@@ -568,7 +568,15 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
     # having burned all 16,384 output tokens on reasoning ("Response hit
     # the output-token limit"), the contract stayed broken, and the run
     # ended exactly as it would have without any of this.
-    retry = None
+    identity = identity_task if (identity_task or "").strip() else task
+    latest = tail
+    # Why the PREVIOUS attempt was rejected. Sending an identical prompt
+    # twice asks a blind question: measured live 2026-09-09, both attempts
+    # came back weaker than the original (0 then 1 substantive assertion
+    # against 2) because nothing told the model that the first had been
+    # refused, or why. The still-crashing branch below already feeds its
+    # error back; every other rejection now does the same.
+    rejected = ""
     for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
         # The contract itself goes in the prompt. Without it the model was
         # being asked to fix a file it could not see, under a base prompt
@@ -580,8 +588,9 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
         # the code it judges is no longer independent of it.
         candidate = _generate(
             llm_client, task,
-            extra=_UNRUNNABLE_NOTE.format(output=tail,
-                                          contract=state[2].strip()))
+            extra=_UNRUNNABLE_NOTE.format(output=latest,
+                                          contract=state[2].strip())
+                  + rejected)
         if candidate is None:
             log.info("[AcceptanceSeed] runnability repair %d/%d came back "
                      "unusable — that is a bad response, not a verdict on "
@@ -593,6 +602,11 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
             log.info("[AcceptanceSeed] runnability repair %d/%d mocks the "
                      "system under test (%s) — asking again", _attempt,
                      _REPAIR_ATTEMPTS, _mock)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it mocked or "
+                "stubbed the system under test (%s). A contract that stubs "
+                "the code cannot be evidence about the code — drive the "
+                "real objects." % _mock)
             continue
         # A crash is trivially "fixed" by asserting less. Rank the repair
         # the same way the weakness repair does, and refuse a trade of
@@ -603,47 +617,63 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                      "%d) — that trades a broken check for a shallow one, "
                      "so asking again", _attempt, _REPAIR_ATTEMPTS,
                      _substantive_count(candidate), original_strength)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it kept only %d "
+                "meaningful assertion(s) where the contract above has %d. "
+                "You removed checks instead of fixing the crash. Reproduce "
+                "EVERY assertion from the contract above, changing only the "
+                "expression that raised."
+                % (_substantive_count(candidate), original_strength))
             continue
-        retry = candidate
-        break
-    if retry is None:
-        log.warning("[AcceptanceSeed] no usable repair after %d attempt(s) "
-                    "— keeping the original contract; this run's seeded "
-                    "evidence will be reported as inconclusive",
-                    _REPAIR_ATTEMPTS)
-        return None
 
-    identity = identity_task if (identity_task or "").strip() else task
-    if not retry.endswith("\n"):
-        retry += "\n"
-    body = "\n" + retry
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(_header(identity, body) + body)
-    except OSError as exc:
-        log.warning("[AcceptanceSeed] could not write the repair: %s", exc)
-        return None
+        # Static checks passed, so prove it the only way that counts: run
+        # it. The write has to happen first — the contract is executed by
+        # its own name, from the project root, exactly as the end-of-run
+        # check will execute it.
+        if not candidate.endswith("\n"):
+            candidate += "\n"
+        body = "\n" + candidate
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_header(identity, body) + body)
+        except OSError as exc:
+            log.warning("[AcceptanceSeed] could not write the repair: %s",
+                        exc)
+            return None
 
-    ok_after, out_after = _run_contract(executor, root)
-    if not ok_after and _errors_reported(out_after) > 0:
-        # Still crashing. Put the original back: two broken contracts are
+        ok_after, out_after = _run_contract(executor, root)
+        if ok_after or _errors_reported(out_after) == 0:
+            from .evidence import _digest
+            digest = _digest(path)
+            if digest is None:
+                return None
+            log.info("[AcceptanceSeed] the contract now runs (%s) — "
+                     "repaired before the run spent its budget proving a "
+                     "broken instrument right",
+                     "and passes" if ok_after else "and judges the code")
+            return SEED_BASENAME, digest
+
+        # Still crashing. Restore the original — two broken contracts are
         # not better than one, and the original at least had whatever
-        # strength the seeding checks approved.
+        # strength the seeding checks approved — then feed the NEW error
+        # back. Measured live 2026-09-09: a candidate that passed every
+        # static check and then crashed ended the repair outright, which
+        # threw away the most useful signal available (a fresh, specific
+        # error about the attempt just made) while attempts remained.
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(original)
         except OSError:
             pass
-        log.warning("[AcceptanceSeed] the repaired contract still crashes — "
-                    "restored the original; this run's seeded evidence will "
-                    "be reported as inconclusive")
-        return None
+        latest = "\n".join((out_after or "").strip().splitlines()[-25:])
+        rejected = ("\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it still "
+                    "crashed, with the error shown above. Fix that one, and "
+                    "keep every assertion.")
+        log.info("[AcceptanceSeed] runnability repair %d/%d still crashes — "
+                 "restored the original and asking again with the new "
+                 "error:\n%s", _attempt, _REPAIR_ATTEMPTS, latest)
 
-    from .evidence import _digest
-    digest = _digest(path)
-    if digest is None:
-        return None
-    log.info("[AcceptanceSeed] the contract now runs (%s) — repaired before "
-             "the run spent its budget proving a broken instrument right",
-             "and passes" if ok_after else "and judges the code")
-    return SEED_BASENAME, digest
+    log.warning("[AcceptanceSeed] no usable repair after %d attempt(s) — "
+                "keeping the original contract; this run's seeded evidence "
+                "will be reported as inconclusive", _REPAIR_ATTEMPTS)
+    return None

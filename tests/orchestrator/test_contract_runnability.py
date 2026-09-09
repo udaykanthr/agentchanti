@@ -100,6 +100,22 @@ REPAIRED = """
             self.assertEqual(game.colour, 1)
 """
 
+# Passes every static check — compiles, imports unittest, defines a test,
+# and asserts just as much as the original — and still crashes when run.
+STILL_CRASHING = """
+    import unittest
+
+    import project
+
+
+    class Contract(unittest.TestCase):
+        def test_behaviour(self):
+            game = project.Game()
+            self.assertEqual(game.advance(), "moved")
+            self.assertEqual(game.score, 0)
+            self.assertEqual(len(game.palette), 3)
+"""
+
 # A "repair" that fixes the crash by asserting almost nothing.
 GUTTED = """
     import unittest
@@ -262,6 +278,49 @@ def test_a_failing_but_working_contract_is_left_alone(project):
     assert result is None
     assert open(path, encoding="utf-8").read() == before
     assert not client.prompts, "an honest disagreement triggered a rewrite"
+
+
+def test_a_repair_that_still_crashes_is_retried_with_the_new_error(project):
+    """The defect the classic end-to-end run exposed.
+
+    A candidate that passes every static check and then crashes used to
+    end the repair outright — throwing away the most useful signal there
+    is (a fresh, specific error about the attempt just made) while
+    attempts remained. Measured live 2026-09-09: the run restored the
+    original, logged "the repaired contract still crashes" without
+    saying how, and reported inconclusive evidence.
+    """
+    path = _write_contract(project, CRASHING)
+    client = ScriptedClient(textwrap.dedent(STILL_CRASHING).strip(),
+                            textwrap.dedent(REPAIRED).strip())
+
+    result = verify_contract_runs(RealExecutor(project), str(project),
+                                  client, "a snake game")
+
+    assert result is not None, "a crashing candidate ended the repair"
+    assert len(client.prompts) == 2, "the model was never asked again"
+    # The second ask must carry the SECOND crash, not the first one again.
+    assert "palette" in client.prompts[-1], \
+        "the new error never reached the model"
+    assert seed_state(path) is not None
+    proc = subprocess.run([sys.executable, "-m", "unittest", SEED_BASENAME],
+                          cwd=str(project), capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_the_original_survives_every_failed_repair(project):
+    """Two broken contracts are not better than one."""
+    path = _write_contract(project, CRASHING)
+    before = open(path, encoding="utf-8").read()
+    crashing = textwrap.dedent(STILL_CRASHING).strip()
+    client = ScriptedClient(crashing, crashing)   # never recovers
+
+    result = verify_contract_runs(RealExecutor(project), str(project),
+                                  client, "a snake game")
+
+    assert result is None
+    assert open(path, encoding="utf-8").read() == before, \
+        "a failed repair was left on disk"
 
 
 def test_a_contract_whose_project_does_not_exist_yet_is_deferred(tmp_path):
