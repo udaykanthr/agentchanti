@@ -167,6 +167,14 @@ def _is_test_file(file_path: str) -> bool:
     # when they live inside a __tests__ directory.
     if ext.lower() not in _SOURCE_EXTS:
         return False
+    # A package marker is not a suite. `_TEST_DIR_RE` matches every .py
+    # under `tests/`, which swept `tests/__init__.py` in — and no runner
+    # collects it, so it can only ever report "ran 0 tests". Measured
+    # 2026-09-10: a 71-byte docstring-only `__init__.py` was recorded as
+    # a pre-existing evidence candidate, ran nothing, and its empty
+    # result failed a run whose every gate, suite and contract was green.
+    if basename == "__init__.py":
+        return False
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
 

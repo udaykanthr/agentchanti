@@ -279,6 +279,22 @@ Asked at plan time, before a token is spent, because that is while the answer is
 
 The discriminator is `_was_seeded`, not the presence of a test file. Counting the seeded contract as "a pre-existing suite" would report the strong case for the weak one, and the prompt would never fire in the single case it exists for.
 
+### An Empty Suite Is A Verdict In Neither Direction (evidence.py `empty_suite_reason`)
+
+`verify_passed()` already refuses to call an empty gate run a pass, and `_green_suites_contradicting` already refuses to let an empty suite overrule a failing gate. Both rest on one fact: **the exit code cannot distinguish "nothing was wrong" from "nothing was checked"** — most runners exit 0 on an empty collection (`--passWithNoTests` is an explicit request for it) while unittest on Python 3.12+ exits 5. `run_pre_existing_tests`, the layer of last resort, read the status first and so got it wrong in *both* directions.
+
+Measured 2026-09-10, a pinball bug-fix run: every gate green, ghost 18/18 holding with 0 violated, pytest green, smoke test launched, seeded contract passed — and the run exited non-zero on `[Evidence] pre-existing suite(s) FAILED — tests/__init__.py: Ran 0 tests in 0.000s | | NO TESTS RAN`. The convicting instrument was a **71-byte docstring-only package marker**. Three defects had to line up, and each is fixed:
+
+`_is_test_file` matched it, because `_TEST_DIR_RE` matches every `.py` under `tests/` and nothing excluded `__init__.py`. No runner collects a package marker, so it can only ever report zero tests — it is now never a test file.
+
+The status was read before the question "did anything run", so an empty red result convicted the code. The silent half is worse and was also live: an empty **green** result was counted as a pass and established independent evidence, which is the same manufactured proof `verify_passed` exists to prevent. `empty_suite_reason` is now asked first, and answers for both.
+
+The genuine pass was then discarded anyway, because the inconclusive branch sat above it. A file that really passed is evidence; a sibling that produced no verdict subtracts nothing from it. Ordering matters here exactly as much as classification — a real failure still outranks a pass, which is the protection this layer exists for and is pinned by its own test.
+
+`EMPTY_SUITE_RE` moved to `evidence.py` and `cli.py` imports it, so the monotonic-gate check and the evidence verdict cannot disagree about the same file — the resolution `references_subproject` already uses, and a test asserts they are one object.
+
+Worth noting what made the survivor set so thin: step 2's whole purpose was to add a regression test to `tests/test_pinball_game.py`, and touching it correctly forfeits it as independent evidence. For any bug-fix task whose plan must modify the existing suite, the survivor set shrinks *because* the run did its job — which leaves the seeded contract carrying the entire verdict, and it did.
+
 ### A Stylesheet Nothing Imports (orchestrator/style_coupling.py `reachable_stylesheets`)
 
 `find_style_drift` asked "is this class defined in some `.css` on disk?". The question that matters is "is it defined in a stylesheet the app actually **loads**?", and the gap between them let the smoke test's own repair loop drive itself green by writing into dead code.

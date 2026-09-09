@@ -407,20 +407,12 @@ def _ghost_final_report(plan_steps, step_results, memory, language,
         log.debug("[Ghost] final report skipped: %s", exc)
 
 
-# A suite that collected nothing. Every runner says so in its own words,
-# and all of them exit 0 while doing it — `--passWithNoTests` is even an
-# explicit request for that. The verdict is therefore not readable from
-# the exit code, only from the output.
-_EMPTY_SUITE_RE = re.compile(
-    r"no test files found"          # vitest
-    r"|no tests ran"                # pytest
-    r"|collected 0 items"           # pytest
-    r"|no tests found"              # jest
-    r"|ran 0 tests"                 # unittest
-    r"|\[no test files\]"           # go test
-    r"|no tests to run",            # misc
-    re.IGNORECASE,
-)
+# A suite that collected nothing. One definition, in evidence.py, because
+# both callers ask the same question — "did this suite actually run
+# anything" — and an answer that differs between the monotonic-gate check
+# and the evidence verdict would be a disagreement about the same file.
+# Same resolution as `references_subproject`, for the same reason.
+from .evidence import EMPTY_SUITE_RE as _EMPTY_SUITE_RE  # noqa: E402
 
 
 def _gate_scope(cmd: str) -> str:

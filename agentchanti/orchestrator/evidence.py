@@ -245,6 +245,44 @@ _INCONCLUSIVE_MARKERS = (
 )
 
 
+# A suite that collected nothing. Every runner says so in its own words,
+# and the exit code cannot be trusted either way: most exit 0 while doing
+# it (`--passWithNoTests` is an explicit request for exactly that), while
+# unittest on Python 3.12+ exits 5. So "nothing was wrong" and "nothing
+# was checked" are indistinguishable from the status alone — only the
+# output separates them.
+#
+# Defined HERE rather than in cli.py, which had its own copy for the
+# monotonic-gate check, so the two cannot drift apart: the question
+# "did this suite actually run anything" has one answer per project.
+EMPTY_SUITE_RE = re.compile(
+    r"no test files found"          # vitest
+    r"|no tests ran"                # pytest, and unittest's "NO TESTS RAN"
+    r"|collected 0 items"           # pytest
+    r"|no tests found"              # jest
+    r"|ran 0 tests"                 # unittest
+    r"|\[no test files\]"           # go test
+    r"|no tests to run",            # misc
+    re.IGNORECASE,
+)
+
+
+def empty_suite_reason(output: str) -> Optional[str]:
+    """Why this run proves nothing because it collected no tests, or None.
+
+    Separate from :func:`inconclusive_failure_reason`, which is about the
+    instrument *breaking*. An empty collection is the instrument working
+    perfectly and having nothing to say, and it must be read as a verdict
+    in NEITHER direction — `verify_passed` already refuses to call it a
+    pass for gates, and `_green_suites_contradicting` already refuses to
+    let it overrule one.
+    """
+    if EMPTY_SUITE_RE.search(output or ""):
+        return ("it collected no tests, so it executed nothing and proves "
+                "nothing about the code in either direction")
+    return None
+
+
 def inconclusive_failure_reason(output: str) -> Optional[str]:
     """Why this red suite produced no verdict about the code, or None.
 
@@ -328,6 +366,7 @@ def run_pre_existing_tests(executor, root: str,
         return None, "no runnable pre-existing test file"
     failures: list[str] = []
     inconclusive: list[str] = []
+    passed: list[str] = []
     ran = 0
     for rel in files:
         cmd = "python -m unittest " + rel.replace("/", os.sep)
@@ -337,7 +376,20 @@ def run_pre_existing_tests(executor, root: str,
             _logger.debug("[Evidence] %s could not run: %s", rel, exc)
             continue
         ran += 1
+        # Asked BEFORE the exit code, because the exit code cannot answer
+        # it. An empty collection exits 0 on most runners and 5 on
+        # unittest 3.12+, so reading the status first gets it wrong in
+        # BOTH directions: a green empty run was counted as a pass and
+        # established independent evidence, and a red one was counted as
+        # the code failing. Measured 2026-09-10 — `tests/__init__.py`, a
+        # 71-byte package marker, failed a run whose every gate, suite
+        # and seeded contract was green.
+        _empty = empty_suite_reason(out or "")
+        if _empty:
+            inconclusive.append(f"{rel}: {_empty}")
+            continue
         if ok:
+            passed.append(rel)
             continue
         tail = " | ".join((out or "").strip().splitlines()[-3:])
         reason = inconclusive_failure_reason(out or "")
@@ -364,13 +416,24 @@ def run_pre_existing_tests(executor, root: str,
         return None, "no pre-existing test file could be run"
     if failures:
         return False, "; ".join(failures[:3])
+    if passed:
+        # A file that really passed is evidence, and a sibling that
+        # produced no verdict subtracts nothing from it. Ordering this
+        # ABOVE the inconclusive branch is the difference between a run
+        # earning the result it proved and losing it to an empty
+        # __init__.py sitting in the same directory.
+        detail = f"{len(passed)} pre-existing test file(s) ran and passed"
+        if inconclusive:
+            detail += (f"; {len(inconclusive)} produced no verdict "
+                       f"({'; '.join(inconclusive[:2])})")
+        return True, detail
     if inconclusive:
-        # The suite broke itself rather than judging the code, so it
-        # produced no verdict — the same distinction `GateLedger`
-        # already draws between a crash and a real failure, and the
-        # reason `verify_dt_invariance` reserves an exit code for
-        # "could not verify". Reporting it as a failure would
-        # manufacture a regression out of silence.
+        # The suite broke itself, or collected nothing, rather than
+        # judging the code — so it produced no verdict. The same
+        # distinction `GateLedger` already draws between a crash and a
+        # real failure, and the reason `verify_dt_invariance` reserves an
+        # exit code for "could not verify". Reporting it as a failure
+        # would manufacture a regression out of silence.
         return None, "; ".join(inconclusive[:3])
     return True, f"{ran} pre-existing test file(s) ran and passed"
 
