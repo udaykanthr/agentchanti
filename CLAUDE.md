@@ -279,6 +279,26 @@ Asked at plan time, before a token is spent, because that is while the answer is
 
 The discriminator is `_was_seeded`, not the presence of a test file. Counting the seeded contract as "a pre-existing suite" would report the strong case for the weak one, and the prompt would never fire in the single case it exists for.
 
+### Three Letters Inside An English Word (language.py `_keyword_pattern`)
+
+`detect_language_from_task` tested each keyword with a plain `in`, and its answer **outranks** `detect_language()` — the function that reads the manifests and source files actually on disk (`detect_language_from_task(task) or detect_language()`, in both `cli.py` and `api.py`). So three letters inside an ordinary English word decide the language of a project that is sitting right there.
+
+Measured 2026-09-10, on an existing Panda3D project with thirteen `.py` files and a `requirements.txt`:
+
+    Task: Fix the ball is getting struck in the corners by changing the
+          shapes of board, Also add more bouncing trigger objects
+    Language: go (Go)
+    Performing pre-execution baseline test analysis via go test ./...
+    [Executor] Test runner `go` is not installed or not on PATH.
+
+`gin` is a Go web framework and it sits inside "chan**gin**g". The run then ran the wrong baseline command, fed a wrong directive into planning (*"Initialize or repair the test environment if needed"*), and spent an LLM call correcting itself (`LLM corrected language: go → python`). The self-correction is why this was survivable rather than fatal — and why it went unnoticed.
+
+Surveyed across ten ordinary task strings, **nine** picked up a false language: `gin` inside changing/engine/login/plugin/margin/imagine/origin, `rust` inside frustrated/crusty, `node` inside nodes, `vite` inside invite, `nest` inside nested/honest, `pip` inside pipeline. After the fix, one — `pip-free`, which genuinely does contain `pip` as a hyphen-delimited token, and resolves to the default language anyway.
+
+Boundaries are **alphanumeric lookarounds, not `\b`**, because several keywords legitimately begin or end with punctuation — `c#`, `c++`, `.net`, `next.js`, `create-next-app` — and `\b` places its boundary between `c` and `#`, silently losing them. A test pins those specifically. Hyphen counts as a boundary, which `create-next-app` requires.
+
+The ordering is left alone: a keyword guess outranking the disk is right for a greenfield run, where an empty directory offers no other signal, and it is what lets "build me a Django app" work in an empty folder. With whole-token matching the guess no longer fires on prose, which is what made the ordering dangerous.
+
 ### A Contract That Needs A Human (acceptance_seed.py `interactive_reason`)
 
 `unrunnable_gate_reason` refuses a gate this platform's shell cannot execute, because no output of the step could change the verdict. An **interactive contract is the same category one layer over**: no behaviour of the code can make it finish. The weakness, mocking and source-grep screens all ask whether the contract checks the right thing; none asked whether it can ever terminate.

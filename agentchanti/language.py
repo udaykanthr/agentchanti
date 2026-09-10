@@ -6,6 +6,7 @@ import json
 import os
 import re
 from collections import Counter
+from functools import lru_cache
 
 
 # ── Extension → Language mapping ──
@@ -257,16 +258,41 @@ def detect_language(directory: str = ".") -> str:
     return ext_counts.most_common(1)[0][0]
 
 
+@lru_cache(maxsize=None)
+def _keyword_pattern(keyword: str) -> "re.Pattern":
+    """Match *keyword* only as a whole token, never inside another word.
+
+    A plain substring test reads a language out of ordinary English, and
+    the caller's answer outranks the files actually on disk. Measured
+    2026-09-10: "Fix the ball is getting struck in the corners by
+    chan-GIN-g the shapes of board" selected **Go**, because `gin` is a Go
+    web framework, and the run then chose `go test ./...` as its baseline
+    for a Panda3D project with thirteen `.py` files. Surveyed over ten
+    ordinary task strings, nine picked up a false language: `gin` inside
+    "changing"/"engine"/"login"/"plugin"/"margin"/"imagine"/"origin",
+    `rust` inside "frustrated"/"crusty", `node` inside "nodes", `vite`
+    inside "invite", `nest` inside "nested"/"honest", `pip` inside
+    "pipeline".
+
+    Boundaries are alphanumeric-only rather than `\\b`, because several
+    keywords legitimately start or end with punctuation — `c#`, `c++`,
+    `.net`, `next.js`, `create-next-app` — and `\\b` places its boundary
+    in the wrong spot for those.
+    """
+    return re.compile(
+        r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])")
+
+
 def detect_language_from_task(task: str) -> str | None:
     """Try to infer the language from keywords in the task string.
 
     Returns ``None`` if no match is found (caller should fall back to
     ``detect_language``).
     """
-    task_lower = task.lower()
+    task_lower = (task or "").lower()
     for lang, keywords in _TASK_KEYWORDS.items():
         for kw in keywords:
-            if kw in task_lower:
+            if _keyword_pattern(kw).search(task_lower):
                 return lang
     return None
 
