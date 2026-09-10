@@ -279,6 +279,24 @@ Asked at plan time, before a token is spent, because that is while the answer is
 
 The discriminator is `_was_seeded`, not the presence of a test file. Counting the seeded contract as "a pre-existing suite" would report the strong case for the weak one, and the prompt would never fire in the single case it exists for.
 
+### A Contract That Needs A Human (acceptance_seed.py `interactive_reason`)
+
+`unrunnable_gate_reason` refuses a gate this platform's shell cannot execute, because no output of the step could change the verdict. An **interactive contract is the same category one layer over**: no behaviour of the code can make it finish. The weakness, mocking and source-grep screens all ask whether the contract checks the right thing; none asked whether it can ever terminate.
+
+Measured 2026-09-10, a 3D pinball run. The seeded contract opened a **Tkinter window** and asked a person to watch the game and type scores in:
+
+    score_before = self.integer("Score before the final scoring hit")
+    self.action("Press Esc in the game. Do not close it with the window manager.")
+    print("\nThe game is still open; press Esc in its window when finished.")
+
+Every gate was green, the suite passed, the smoke test launched the app, and the game **demonstrably worked** — confirmed afterwards by screenshot, ~1090 fps, and a full-power launch that cleared the lane into the arena. The run still exited non-zero under `require_independent_evidence`, because nobody was there to answer.
+
+It is also **self-concealing**, which is what makes it worse than an ordinary unsatisfiable check: it leaves a real application window parked on the desktop waiting for a keypress. That reads as a hung program, and it sent the reader debugging a rendering bug that did not exist — three separate hypotheses (a `_resize` early-return, a `window-event` handler override, focus auto-pause) all disproved by measurement before the contract itself turned out to be the whole story.
+
+Matched **anywhere in the source, not line-anchored**: the measured contract imported tkinter lazily inside a method (`    import tkinter as tk`), so an `^import` scan would have missed the one construct that mattered. Judged on constructs rather than prose, because matching words like "press" or "observe" would fire on `assertEqual(hud["controls_text"], "Press Space to launch")` — a legitimate assertion, and a test pins that it is not accused.
+
+Repaired rather than refused outright: a contract that asks a human usually checks the RIGHT behaviours and only reads them the wrong way, so the strong draft is worth recovering. Refused if the retry is still interactive — keeping it would guarantee a failed run over code that may be perfect, and no file is the honest outcome. Screened in the runnability repair path too, since a repair is free to introduce this defect even when the original did not. Rule 8 of the seeding prompt forbids it up front, because never generating one is cheaper than detecting and regenerating.
+
 ### An Empty Suite Is A Verdict In Neither Direction (evidence.py `empty_suite_reason`)
 
 `verify_passed()` already refuses to call an empty gate run a pass, and `_green_suites_contradicting` already refuses to let an empty suite overrule a failing gate. Both rest on one fact: **the exit code cannot distinguish "nothing was wrong" from "nothing was checked"** — most runners exit 0 on an empty collection (`--passWithNoTests` is an explicit request for it) while unittest on Python 3.12+ exits 5. `run_pre_existing_tests`, the layer of last resort, read the status first and so got it wrong in *both* directions.

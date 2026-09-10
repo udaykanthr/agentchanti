@@ -153,6 +153,13 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    `restart`; you would be testing vocabulary, not behaviour. Build the
    objects and call the methods.
 
+8. NEVER require a human. No `input()`, no `tkinter` or any other GUI
+   prompt, no "press a key", no asking someone to look at the screen and
+   report what they saw. Nobody is watching this run: a contract that
+   waits for a person never finishes, fails the run over code that may be
+   perfect, and leaves an application window open that looks hung. Assert
+   on the program's own state and returned values instead.
+
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
 
@@ -183,6 +190,72 @@ def mocking_reason(src: str) -> str | None:
         if marker in src:
             return marker
     return None
+
+
+# A contract that needs a PERSON cannot pass an unattended run, whatever
+# the code does — the same category as a gate this platform's shell cannot
+# execute, which `unrunnable_gate_reason` already refuses at plan time. The
+# weakness, mocking and source-grep screens all ask whether the contract
+# CHECKS the right thing; none asked whether it can ever finish.
+#
+# Measured 2026-09-10, a 3D pinball run. The seeded contract opened a
+# Tkinter prompt window and asked a human to observe the game and type
+# scores in:
+#
+#     score_before = self.integer("Score before the final scoring hit")
+#     self.action("Press Esc in the game. Do not close it with the window
+#                  manager.")
+#     print("\nThe game is still open; press Esc in its window ...")
+#
+# The run had every gate green, a suite that passed and a game that
+# demonstrably worked — verified afterwards by screenshot, 1090 fps and a
+# full-power launch that cleared the lane — and still exited non-zero,
+# because nobody was there to answer. Worse, it is self-concealing: it
+# leaves a real game window parked on the desktop, which reads as a hung
+# application rather than as a contract waiting for input.
+#
+# Matched anywhere in the source, not line-anchored: the measured contract
+# imported tkinter lazily inside a method (`    import tkinter as tk`), so
+# an `^import` scan would have missed the one construct that mattered.
+_INTERACTIVE_MARKERS = (
+    "tkinter",
+    "input(",
+    "raw_input(",
+    "getpass",
+    "msvcrt.getch",
+    "sys.stdin.read",        # also covers .readline()
+    "PySimpleGUI",
+    "pyautogui",
+)
+
+
+def interactive_reason(src: str) -> str | None:
+    """Which human-in-the-loop construct makes this contract unattendable."""
+    for marker in _INTERACTIVE_MARKERS:
+        if marker in src:
+            return marker
+    return None
+
+
+_INTERACTIVE_NOTE = """
+
+Your contract CANNOT RUN UNATTENDED: it uses `{marker}`, which asks a
+person to look at something, type something, or press a key. This run has
+no operator. The contract will launch the application, wait forever for
+input nobody will give, and fail — over code that may be perfect — while
+leaving a window open that looks like a hung program.
+
+Rewrite it to assert the same behaviours PROGRAMMATICALLY. Hard rules:
+
+  - No `tkinter`, no `input()`, no `getpass`, no reading stdin, no
+    screenshot-and-ask. Nothing that waits for a human.
+  - Do NOT weaken what you check to achieve this. Drive the program's own
+    public API, read its state back, and assert on the values.
+  - If a behaviour is genuinely only observable on screen, assert on the
+    state that produces it (positions, scores, phase, returned values)
+    rather than asking someone to look.
+  - The test must terminate on its own, every time, with no keypress.
+"""
 
 
 def _substantive_count(src: str) -> int:
@@ -328,6 +401,36 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                     "cannot be evidence about the code, and this run has "
                     "no seeded independent check", _mock)
         return None
+
+    # Repaired rather than refused outright: a contract that asks a human
+    # usually checks the RIGHT behaviours and only reads them the wrong
+    # way, so the strong draft is worth recovering. Refused if the retry is
+    # still interactive — keeping it would guarantee a failed run.
+    _human = interactive_reason(src)
+    if _human:
+        log.info("[AcceptanceSeed] the contract needs a human (%s) — it can "
+                 "never pass an unattended run, asking again for one that "
+                 "asserts programmatically", _human)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=_INTERACTIVE_NOTE.format(marker=_human))
+            if retry is None or mocking_reason(retry):
+                continue
+            _still = interactive_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract runs "
+                         "unattended — using it")
+                src, _human = retry, None
+                break
+            _human = _still
+        if _human:
+            log.warning(
+                "[AcceptanceSeed] the contract still needs a human (%s) after "
+                "%d attempt(s) — refusing it. It would launch the app, wait "
+                "for input nobody will give, and fail the run over code that "
+                "may be perfect; no file is the honest outcome",
+                _human, _REPAIR_ATTEMPTS)
+            return None
 
     # Strength, judged once and repaired once. Measured across three runs
     # of one prompt: 2 substantive tests, then 1 that asserted only that
@@ -607,6 +710,15 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                 "stubbed the system under test (%s). A contract that stubs "
                 "the code cannot be evidence about the code — drive the "
                 "real objects." % _mock)
+            continue
+        # A repair is free to introduce this defect even when the original
+        # did not, so the runnability path screens for it too.
+        _human = interactive_reason(candidate)
+        if _human:
+            log.info("[AcceptanceSeed] runnability repair %d/%d needs a "
+                     "human (%s) — asking again", _attempt,
+                     _REPAIR_ATTEMPTS, _human)
+            rejected = _INTERACTIVE_NOTE.format(marker=_human)
             continue
         # A crash is trivially "fixed" by asserting less. Rank the repair
         # the same way the weakness repair does, and refuse a trade of
