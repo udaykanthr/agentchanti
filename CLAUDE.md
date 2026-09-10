@@ -279,6 +279,22 @@ Asked at plan time, before a token is spent, because that is while the answer is
 
 The discriminator is `_was_seeded`, not the presence of a test file. Counting the seeded contract as "a pre-existing suite" would report the strong case for the weak one, and the prompt would never fire in the single case it exists for.
 
+### A File Labelled "Full Source" That Was Not (agents/intent.py `_read_file_range`)
+
+`_read_full_file` capped at 300 lines and headed the result `(full source)` regardless of what it had actually read. It also appended `... (N more lines)`, so the model was told two contradictory things at once — and then given no way to resolve them: `KB_SEARCH` returns symbol chunks, `FIND_USAGES` returns callers, and `RUN_CMD`'s allowlist (git / ls / grep / test runners) contains **no file reader**.
+
+Measured 2026-09-10. `pinball/table.py` is 454 lines; the agent received lines 1-300 under a header promising the whole file, and spent three iterations asking in prose:
+
+    Iteration 1: KB_SEARCH 'table.py full source including complete build_table'
+    Iteration 2: KB_SEARCH '...lines 303-454 including rail helper and all...'
+    Iteration 3: KB_SEARCH '...lines 330-454... do not truncate'
+
+It named the file's exact last line (454), so it knew precisely what it was missing. ~28k uncached prompt tokens later it concluded having never seen the second half of `build_table` — the exact function the task was about ("changing the shapes of board"). The model behaved correctly throughout; the tool misreported its own limits, which is the same failure shape as a contract that leaves a window open or a runner that says `NO TESTS RAN`.
+
+Three parts, all fixed. The **header now states what was read** (`(complete, 454 lines)` or `(lines 1-800 of 1200; TRUNCATED)`), never `full source` over a partial read. The **cap moved to 800 lines**, which covers ordinary modules on the one path whose own comment says semantic snippets are insufficient. And **`READ_FILE: <path>[:<start>-<end>]` exists**, bounded at 600 lines per call, so the model can act on the truncation notice — which names it explicitly, and says outright that KB_SEARCH cannot return the rest.
+
+Path handling is the part worth guarding: the first cut used `rel.lstrip("./")`, which strips *characters* rather than a prefix and silently turned `../../../etc/passwd` into `etc/passwd` — a traversal neutralised by accident rather than refused, and legitimate relative paths mangled the same way. Resolution now goes through `os.path.commonpath` against the project root, and a test asserts the refusal rather than the accident.
+
 ### Three Letters Inside An English Word (language.py `_keyword_pattern`)
 
 `detect_language_from_task` tested each keyword with a plain `in`, and its answer **outranks** `detect_language()` — the function that reads the manifests and source files actually on disk (`detect_language_from_task(task) or detect_language()`, in both `cli.py` and `api.py`). So three letters inside an ordinary English word decide the language of a project that is sitting right there.

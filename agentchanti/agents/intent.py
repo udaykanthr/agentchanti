@@ -50,6 +50,16 @@ _CMD_MAX_LINES = 80
 _CMD_MAX_CHARS = 4000
 _CMD_TIMEOUT_SECS = 15
 
+# Auto-load cap for `_read_full_file`. 300 cut an ordinary 405-line module in
+# half on the one path whose own comment says semantic snippets are
+# insufficient; 800 covers the great majority of source files while still
+# bounding a runaway. Anything longer is reachable through READ_FILE.
+_AUTOLOAD_MAX_LINES = 800
+
+# READ_FILE: <path>[:<start>-<end>] — the escape hatch the model kept asking
+# for in prose. Bounded per call so a large file cannot flood the context.
+_READ_FILE_MAX_LINES = 600
+
 # ── Directive argument sanitization ──────────────────────────────────────────
 # Reasoning models occasionally leak fake system banners or hallucinated tool
 # output into their responses (e.g. "</think>│─ SAVED CONTEXT ─│" or fabricated
@@ -574,6 +584,7 @@ class IntentAgent(Agent):
     Supported commands the LLM can emit:
       SEARCH: <query>      — delegates to SearchAgent (web search)
       KB_SEARCH: <query>   — queries local source + global KB docs
+      READ_FILE: <path>[:<start>-<end>] — exact lines from one project file
       RUN_CMD: <command>   — runs a safe read-only shell command and returns output
       FIND_USAGES: <name>  — finds callers of a component/function
     """
@@ -1141,6 +1152,42 @@ class IntentAgent(Agent):
                         )
                         if cli_display:
                             cli_display.update_last_intent_event("no results")
+                    continue
+
+                # ── READ_FILE command ─────────────────────────────────────────
+                # Checked before SEARCH so a path containing "search" cannot
+                # be mistaken for one.
+                read_match = re.search(
+                    r'\bREAD_FILE:\s*(.+)$', response, re.MULTILINE | re.IGNORECASE,
+                )
+                if read_match:
+                    spec = read_match.group(1).strip()
+                    cmd_key = f"READ_FILE:{_normalize_dedup_key(spec)}"
+                    if cmd_key in executed_commands:
+                        _logger.info(
+                            "[IntentAnalysis] Iteration %d: READ_FILE '%s' already "
+                            "executed — forcing conclude.", iteration, spec,
+                        )
+                        accumulated_context += (
+                            f"[READ_FILE '{spec}' already ran — the content is "
+                            f"above. Conclude with REQUIREMENTS_SPEC.]\n\n"
+                        )
+                        force_conclude = True
+                        continue
+                    executed_commands.add(cmd_key)
+                    _logger.info(
+                        "[IntentAnalysis] Iteration %d: READ_FILE '%s'",
+                        iteration, spec,
+                    )
+                    if cli_display:
+                        cli_display.show_intent_event("kb", f"READ_FILE: {spec}",
+                                                      iteration=iteration,
+                                                      max_iterations=0)
+                    file_result = self._read_file_range(kb_context_builder, spec)
+                    accumulated_context += f"{file_result}\n\n"
+                    if cli_display:
+                        cli_display.update_last_intent_event(
+                            f"{len(file_result):,} chars")
                     continue
 
                 # ── SEARCH command ────────────────────────────────────────────
@@ -1788,7 +1835,15 @@ class IntentAgent(Agent):
             "        evidence, then on the next line emit exactly one tool call.\n\n"
             "        Available tools:\n\n"
             "        KB_SEARCH: <query>\n"
-            "          When: you need source code for a file or symbol not yet shown.\n\n"
+            "          When: you need source code for a file or symbol not yet shown.\n"
+            "          It returns SYMBOL CHUNKS. It can never return the rest of a\n"
+            "          file that was shown to you TRUNCATED — use READ_FILE for that.\n\n"
+            "        READ_FILE: <path>[:<start>-<end>]\n"
+            "          When: a file above is marked TRUNCATED, or you need specific\n"
+            "          lines. This is the ONLY tool that returns exact line ranges.\n"
+            "          Examples:\n"
+            "            READ_FILE: pinball/table.py:301-405\n"
+            "            READ_FILE: pinball/table.py\n\n"
             "        FIND_USAGES: <ComponentName or functionName>\n"
             "          When: you need to see both sides of an interface — what a\n"
             "          component DECLARES vs what its CALLER PASSES.\n\n"
@@ -1904,12 +1959,99 @@ class IntentAgent(Agent):
         return result
 
     @staticmethod
+    def _read_file_range(kb_context_builder, spec: str) -> str:
+        """``path[:start-end]`` → those lines, or an explicit refusal.
+
+        Exists because the model had no way to obey its own conclusion. It
+        could see a file was truncated and could name the lines it needed —
+        "lines 303-454", "do not truncate" — while every action available to
+        it (KB_SEARCH, FIND_USAGES, RUN_CMD's allowlist) was structurally
+        incapable of returning them.
+
+        Read-only, inside the project root, and bounded per call. Paths that
+        escape the root are refused the same way `AgentTools` refuses them.
+        """
+        project_root = getattr(kb_context_builder, '_project_root', None)
+        if not project_root:
+            return ""
+        raw = (spec or "").strip().strip('`"\'')
+        start = 1
+        end = None
+        # Split only on the LAST colon group, so Windows drive letters and
+        # paths containing ':' do not get mangled.
+        m = re.search(r'^(.*?):(\d+)\s*-\s*(\d+)$', raw)
+        if m:
+            raw, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+        rel = raw.replace("\\", "/")
+        # `lstrip("./")` would strip CHARACTERS, not a prefix — it turns
+        # "../../../etc/passwd" into "etc/passwd", neutralising a traversal by
+        # accident instead of refusing it (and mangling legitimate relative
+        # paths on the way). Strip only a real "./" prefix, then decide the
+        # traversal question on the resolved path.
+        while rel.startswith("./"):
+            rel = rel[2:]
+        root_abs = os.path.abspath(project_root)
+        abs_path = os.path.abspath(os.path.join(root_abs, rel))
+        if os.path.commonpath([root_abs, abs_path]) != root_abs:
+            return f"READ_FILE refused: '{rel}' is outside the project root."
+        if not os.path.isfile(abs_path):
+            # Fall back to a basename walk, matching _read_full_file, so the
+            # model naming just "table.py" still succeeds.
+            found = None
+            skip = {"node_modules", ".git", "dist", "build", ".next", "__pycache__"}
+            base = os.path.basename(rel).lower()
+            for dirpath, dirnames, filenames in os.walk(project_root):
+                dirnames[:] = [d for d in dirnames if d not in skip]
+                for fname in filenames:
+                    if fname.lower() == base:
+                        found = os.path.join(dirpath, fname)
+                        break
+                if found:
+                    break
+            if not found:
+                return f"READ_FILE: '{rel}' not found in the project."
+            abs_path = found
+            rel = os.path.relpath(abs_path, project_root).replace("\\", "/")
+        try:
+            with open(abs_path, encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            return f"READ_FILE failed for '{rel}': {exc}"
+        total = len(lines)
+        start = max(1, start)
+        end = total if end is None else min(end, total)
+        if start > total:
+            return (f"READ_FILE: '{rel}' has only {total} lines; "
+                    f"line {start} does not exist.")
+        capped = min(end, start + _READ_FILE_MAX_LINES - 1)
+        body = "".join(lines[start - 1:capped])
+        header = f"### {rel} (lines {start}-{capped} of {total})\n"
+        if capped < end:
+            header += (f"  [capped at {_READ_FILE_MAX_LINES} lines per call; "
+                       f"request {capped + 1}-{end} separately]\n")
+        return header + body
+
+    @staticmethod
     def _read_full_file(kb_context_builder, filename: str) -> str:
         """
         Read the full source of *filename* from the project.
 
-        Walks the project tree to find the file, returns its content capped at
-        300 lines.  Returns empty string if not found.
+        Walks the project tree to find the file. Returns empty string if not
+        found.
+
+        The header states EXACTLY what was included. It used to say
+        "(full source)" whatever it had actually read, and the cap was 300
+        lines. Measured 2026-09-10: `table.py` is 405 lines, so the model was
+        handed lines 1-300 under a label promising the whole file, plus a
+        "... (105 more lines)" marker telling it otherwise — and no action in
+        its vocabulary can read a line range (`KB_SEARCH` returns symbol
+        chunks, `RUN_CMD`'s allowlist has no file reader). It spent three
+        iterations asking for "lines 303-454", then "330-454", then "do not
+        truncate", ~28k uncached prompt tokens, and concluded having never
+        seen the second half of `build_table` — the exact function the task
+        was about.
+
+        `READ_FILE` now exists for the remainder, and the notice names it.
         """
         project_root = getattr(kb_context_builder, '_project_root', None)
         if not project_root:
@@ -1925,11 +2067,21 @@ class IntentAgent(Agent):
                     try:
                         with open(abs_path, encoding="utf-8", errors="ignore") as fh:
                             all_lines = fh.readlines()
-                        cap = 300
+                        total = len(all_lines)
+                        cap = _AUTOLOAD_MAX_LINES
                         content = "".join(all_lines[:cap])
-                        if len(all_lines) > cap:
-                            content += f"\n  ... ({len(all_lines) - cap} more lines)"
-                        return f"### {fname} (full source) — {rel_path}\n{content}"
+                        if total > cap:
+                            return (
+                                f"### {fname} — {rel_path} "
+                                f"(lines 1-{cap} of {total}; TRUNCATED)\n"
+                                f"{content}\n"
+                                f"  ... {total - cap} more lines NOT shown. To read "
+                                f"them, emit:  READ_FILE: {rel_path}:{cap + 1}-{total}\n"
+                                f"  (KB_SEARCH returns symbol chunks and can never "
+                                f"return the rest of this file.)"
+                            )
+                        return (f"### {fname} — {rel_path} "
+                                f"(complete, {total} lines)\n{content}")
                     except OSError:
                         pass
         return ""
