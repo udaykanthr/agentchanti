@@ -151,18 +151,128 @@ def source_inspecting_tests(tree: ast.AST) -> list[str]:
     return out
 
 
+# Reading a DOCUMENT's wording is the same defect as reading the source's,
+# one file over — and written blind it is worse, because the contract
+# predates the document and must guess both its words and its markup.
+#
+# Measured 2026-09-13, "create a 2 snake game in python include production
+# ready features". The contract's behaviour test launched the game, checked
+# the score file was created and recovered from corruption — and PASSED.
+# Its other test read README.md and made eleven wording assertions, one of
+# which was
+#
+#     self.assertRegex(readme, re.compile(r"python\s*(?:>=|3\.10|3\.1[0-9])"))
+#
+# over a README that says `Python **3.10 or newer**`. The Markdown bold sits
+# between the two words, so the regex cannot match text that meets the
+# requirement exactly, and a run whose every gate was green and whose ghost
+# reported 23/24 holding exited 1 on it. The other ten were luck: `"esc"`,
+# `"space"` and `r"\br\b"` hold for nearly any README that mentions keys.
+#
+# Judged on a read of a prose document, not on its mere mention:
+# `(root / "README.md").is_file()` is an existence check, harmless if thin,
+# and a task that asks for documentation may fairly have it. Scoped to
+# PROSE — `requirements.txt` is a manifest and a save-file is behaviour, and
+# reading either is a different question.
+_PROSE_EXTENSIONS = (".md", ".markdown", ".rst", ".adoc")
+_PROSE_STEMS = {"readme", "changelog", "contributing", "authors", "history",
+                "usage", "manual"}
+_READ_CALLS = {"read_text", "read_bytes", "read", "readlines", "open"}
+
+
+def _names_prose_doc(value: str) -> bool:
+    base = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not base or len(base) > 80:
+        return False
+    if base.endswith(_PROSE_EXTENSIONS):
+        return True
+    stem = base.split(".", 1)[0]
+    return stem in _PROSE_STEMS and (base == stem or base.endswith(".txt"))
+
+
+def _mentions_doc(node: ast.AST, doc_names: set[str]) -> bool:
+    for sub in ast.walk(node):
+        if (isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                and _names_prose_doc(sub.value)):
+            return True
+        if isinstance(sub, ast.Name) and sub.id in doc_names:
+            return True
+    return False
+
+
+def _reads_documentation(func: ast.AST) -> bool:
+    """Does this test open a prose document and look at what it says?"""
+    # Names bound to a document path, so `readme = root / "README.md"`
+    # followed by `readme.read_text()` is seen as the read it is. Two
+    # passes, because the binding may itself be built from another name.
+    doc_names: set[str] = set()
+    for _ in range(2):
+        for sub in ast.walk(func):
+            if isinstance(sub, ast.Assign) and _mentions_doc(sub.value,
+                                                             doc_names):
+                for target in sub.targets:
+                    if isinstance(target, ast.Name):
+                        doc_names.add(target.id)
+    for sub in ast.walk(func):
+        if not isinstance(sub, ast.Call):
+            continue
+        name = _call_name(sub)
+        if name not in _READ_CALLS:
+            continue
+        # The receiver of `.read_text()`, or the argument of `open(...)`.
+        if isinstance(sub.func, ast.Attribute) and _mentions_doc(
+                sub.func.value, doc_names):
+            return True
+        if any(_mentions_doc(arg, doc_names) for arg in sub.args):
+            return True
+    return False
+
+
+def documentation_reading_tests(tree: ast.AST) -> list[str]:
+    """Names of test functions that assert on a prose document's wording."""
+    return [node.name for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+            and _reads_documentation(node)]
+
+
+def documentation_grep_reason(src: str) -> Optional[str]:
+    """Why this contract judges documentation wording, or None.
+
+    Kept out of `weak_contract_reason` on purpose: that function also
+    judges a USER's surviving suite at verdict time, and a user who wrote
+    a README check wrote it against a README that already existed — the
+    blind guess that makes this a defect is specific to seeding.
+    """
+    if not src or not src.strip():
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    reading = documentation_reading_tests(tree)
+    if not reading:
+        return None
+    return (f"{', '.join(reading[:2])} asserts on the wording of a "
+            f"documentation file, which was written after this contract and "
+            f"can say the right thing in words or markup no guess anticipates")
+
+
 def _excluded_node_ids(tree: ast.AST) -> set[int]:
-    """Every node inside a source-inspecting test.
+    """Every node inside a source-inspecting or documentation-reading test.
 
     Excluded at FUNCTION granularity rather than per assertion: a test
     that parses the module is a source-inspection test, and its
     assertions are about text whether or not each one names the parse.
+    The same holds for a test that reads a README — its assertions are
+    about prose, and counting them as behaviour is how eleven wording
+    checks looked like a strong contract.
     """
     excluded: set[int] = set()
     for node in ast.walk(tree):
         if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name.startswith("test")
-                and _inspects_source(node)):
+                and (_inspects_source(node) or _reads_documentation(node))):
             for sub in ast.walk(node):
                 excluded.add(id(sub))
     return excluded
@@ -276,3 +386,29 @@ the state changes.
 Keep the same rules as before (no mocks, no stubs, no assigning to
 state, import inside each test) and output ONLY the Python file in one
 ``` fenced block."""
+
+
+DOCUMENTATION_NOTE = """
+
+Your contract ASSERTS ON DOCUMENTATION WORDING: {reason}.
+
+This contract is written before the documentation exists. Any check on
+what a README says is a guess at its exact words AND its markup — measured,
+`python\\s*3\\.10` failed a README reading `Python **3.10 or newer**`, which
+states exactly the requirement, because the bold markers sit between the
+words. That failed a run whose game worked.
+
+Rewrite it. Hard rules:
+
+  - Do NOT open, read or search README, CHANGELOG or any .md/.rst file.
+  - If the task asks for documentation, at most assert the file EXISTS and
+    is not empty. Never assert on its words, headings, or formatting.
+  - Spend the assertions on BEHAVIOUR instead: drive the program, read its
+    state and outputs back, and compare them to concrete values.
+  - Keep every behaviour test you already had, unchanged.
+
+The contract you wrote, to revise rather than start over:
+
+```python
+{contract}
+```"""

@@ -349,6 +349,24 @@ Matched **anywhere in the source, not line-anchored**: the measured contract imp
 
 Repaired rather than refused outright: a contract that asks a human usually checks the RIGHT behaviours and only reads them the wrong way, so the strong draft is worth recovering. Refused if the retry is still interactive — keeping it would guarantee a failed run over code that may be perfect, and no file is the honest outcome. Screened in the runnability repair path too, since a repair is free to introduce this defect even when the original did not. Rule 8 of the seeding prompt forbids it up front, because never generating one is cheaper than detecting and regenerating.
 
+### A Contract That Judges The README (seed_strength.py `documentation_grep_reason`)
+
+`source_inspecting_tests` refuses a contract that reads the program's own text, because it verifies vocabulary rather than behaviour. **Documentation was one file over and unguarded — and worse, because the contract is written before the README exists**, so it must guess both the words and the markup.
+
+Measured 2026-09-13, "create a 2 snake game in python include production ready features": every gate green, ghost 23/24 holding with 0 violated, the plan's suite passing, and exit 1. The seeded contract had two tests. One read `README.md` and made eleven wording assertions, including
+
+    self.assertRegex(readme, re.compile(r"python\s*(?:>=|3\.10|3\.1[0-9])"))
+
+over a README reading `- Python **3.10 or newer**`. The Markdown bold sits between the two words, so the regex cannot match a document that states the requirement exactly. The other ten were luck — `"esc"`, `"space"` and `r"\br\b"` hold for nearly any README that mentions keys.
+
+The finding one layer down mattered as much. With the README test excluded, the contract has **zero** substantive assertions: its "behaviour" test asserts an exit code, a marker file and a data file's existence, three times. The eleven wording checks were the whole of its measured strength, so `weak_contract_reason` had rated a liveness check as strong.
+
+Three parts. **Detection** reads a *read* of a prose document (`.md`/`.rst`/`.adoc`, or a README/CHANGELOG-style stem), through a receiver (`Path("README.md").read_text()`), an argument (`open("CHANGELOG.rst")`), or a name bound to either. Mere mention is not reading — `Path("README.md").is_file()` is an existence check a task asking for docs may fairly make — and prose is the scope: `requirements.txt` is a manifest and a save-file is behaviour. **Strength** excludes those tests at function granularity, exactly as for source inspection. **Seeding** repairs before strength is judged (otherwise one test draws two differently-worded complaints), with the draft *in the prompt* so "keep every behaviour test you had" refers to something the model can see; if every retry still reads docs it is kept with a WARNING, because refusing leaves nothing and most wording checks pass. Rule 9 of the prompt forbids it up front. The runnability repair refuses a candidate that *introduces* doc reads, but not one inheriting them — a contract kept with README checks must stay repairable when it crashes.
+
+`documentation_grep_reason` is deliberately **not** a branch of `weak_contract_reason`, which also judges a *user's* surviving suite at verdict time: a user's README check was written against a README that existed, and the blind guess that makes this a defect is specific to seeding. The strength exclusion does reach user suites, which is honest — wording checks were never behavioural evidence — and changes only the `shallow` claim, never `independent`.
+
+Replayed against the real contract: the README test is named and the behaviour test is not; substantive count 0. Against the prior code, the seeding path wrote the README-reading contract on one prompt, a docs-only contract was judged strong, and a green-running repair that added a README read was accepted; all three flip. Costs nothing unless it fires; when it does, one or two generation calls before the first step.
+
 ### An Empty Suite Is A Verdict In Neither Direction (evidence.py `empty_suite_reason`)
 
 `verify_passed()` already refuses to call an empty gate run a pass, and `_green_suites_contradicting` already refuses to let an empty suite overrule a failing gate. Both rest on one fact: **the exit code cannot distinguish "nothing was wrong" from "nothing was checked"** — most runners exit 0 on an empty collection (`--passWithNoTests` is an explicit request for it) while unittest on Python 3.12+ exits 5. `run_pre_existing_tests`, the layer of last resort, read the status first and so got it wrong in *both* directions.

@@ -160,6 +160,12 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    perfect, and leaves an application window open that looks hung. Assert
    on the program's own state and returned values instead.
 
+9. NEVER assert on documentation wording. Do not read README, CHANGELOG
+   or any .md/.rst file. It does not exist yet, and you cannot predict its
+   words or its markup: `Python **3.10 or newer**` states the requirement
+   exactly and still fails a regex for `python 3.10`. If the task asks for
+   documentation, assert at most that the file exists and is not empty.
+
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
 
@@ -431,6 +437,42 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                 "may be perfect; no file is the honest outcome",
                 _human, _REPAIR_ATTEMPTS)
             return None
+
+    # Documentation wording, repaired before strength is judged — a README
+    # test's assertions no longer count as substantive, so judging strength
+    # first would send a second, differently-worded complaint about the same
+    # test. Measured 2026-09-13: the behaviour test passed, the README test
+    # failed on Markdown bold between "Python" and "3.10", and a working
+    # snake game exited 1.
+    #
+    # Kept rather than refused if every retry still reads the docs: most
+    # wording checks pass by luck, the behaviour tests beside them are real
+    # evidence, and refusing would leave nothing. Said out loud instead.
+    from .seed_strength import DOCUMENTATION_NOTE, documentation_grep_reason
+    _docs = documentation_grep_reason(src)
+    if _docs:
+        log.info("[AcceptanceSeed] the contract asserts on documentation "
+                 "wording (%s) — asking again for one that checks behaviour",
+                 _docs)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=DOCUMENTATION_NOTE.format(
+                                  reason=_docs, contract=src.strip()))
+            if retry is None or mocking_reason(retry) \
+                    or interactive_reason(retry):
+                continue
+            _still = documentation_grep_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract leaves the "
+                         "documentation alone — using it")
+                src, _docs = retry, None
+                break
+            _docs = _still
+        if _docs:
+            log.warning("[AcceptanceSeed] the contract still asserts on "
+                        "documentation wording after %d attempt(s) (%s) — "
+                        "keeping it, but it can fail a correct README over "
+                        "phrasing or markup", _REPAIR_ATTEMPTS, _docs)
 
     # Strength, judged once and repaired once. Measured across three runs
     # of one prompt: 2 substantive tests, then 1 that asserted only that
@@ -802,6 +844,21 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                      "human (%s) — asking again", _attempt,
                      _REPAIR_ATTEMPTS, _human)
             rejected = _INTERACTIVE_NOTE.format(marker=_human)
+            continue
+        # Same reasoning for documentation wording — but only a repair that
+        # INTRODUCES it is refused. A contract kept with README checks after
+        # its seeding retries would otherwise become unrepairable, and a
+        # crash is the more urgent of the two defects.
+        from .seed_strength import documentation_grep_reason
+        _docs = documentation_grep_reason(candidate)
+        if _docs and not documentation_grep_reason(state[2]):
+            log.info("[AcceptanceSeed] runnability repair %d/%d started "
+                     "asserting on documentation wording (%s) — asking again",
+                     _attempt, _REPAIR_ATTEMPTS, _docs)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it added assertions "
+                "on documentation wording (%s). Do not read README or any "
+                ".md file — fix the crash, keep the behaviour checks." % _docs)
             continue
         # A crash is trivially "fixed" by asserting less. Rank the repair
         # the same way the weakness repair does, and refuse a trade of
