@@ -576,24 +576,56 @@ _ERRORS_RE = re.compile(r"errors=(\d+)")
 _NOT_READY_RE = re.compile(
     r"ModuleNotFoundError|No module named|ImportError|cannot import name")
 
+# An import error is only how a contract that IMPORTS the project reports a
+# missing project. One that reaches it through a SUBPROCESS reports the same
+# fact as an ordinary assertion about a return code, and the import
+# signature never fires. Measured 2026-09-12: a contract whose harness did
+# `runpy.run_path("main.py")` inside `subprocess.run(...)` was executed after
+# wave 1 — a CMD step, before any code-producing step had run — and reported
+# `FAILED (failures=1)` over a `FileNotFoundError` for a `main.py` no step
+# had written yet. Scoped to a missing PYTHON SOURCE file, because a
+# contract complaining that a module is absent is "not built yet" while one
+# complaining that a save-file or an export is absent has genuinely judged.
+_NOT_BUILT_RE = re.compile(
+    r"(?:FileNotFoundError|No such file or directory|can't open file)"
+    r"[^\n]*\.py")
+
+
+def _not_ready_reason(output: str):
+    """Short reason the contract could not reach the project yet, or None."""
+    found = _NOT_READY_RE.search(output or "")
+    if found:
+        return found.group(0)
+    found = _NOT_BUILT_RE.search(output or "")
+    return "a project source file does not exist yet" if found else None
+
+
 # One path -> repair attempts already spent. A contract that still cannot
 # run afterwards is left alone: the end-of-run path reports it as
 # inconclusive, which is the honest outcome and already implemented.
 _REPAIR_STATE: dict = {}
 
+# Paths that have already RUN and judged, so the per-wave check does not
+# spend a subprocess (and, for a graphical contract, a window) every wave
+# re-learning the same thing. Deliberately separate from `_REPAIR_STATE`:
+# one is a repair budget, the other is "no new information this wave", and
+# the measured defect was exactly a single variable answering both.
+_JUDGED: set = set()
+
 # The most recent `(ok, output)` this module observed for a contract, so the
-# end-of-run verdict does not pay for a second identical subprocess. The
-# final check runs immediately before `run_pre_existing_tests`, which would
-# otherwise execute the same file again — and a contract that plays a real
-# session is not cheap (4.4s in the measured run). Cleared whenever the file
-# on disk stops matching what was run, so a stale result can never be handed
-# to the verdict.
+# end-of-run verdict does not pay for a second identical subprocess. Only
+# the FINAL check records here. A per-wave run measures an unfinished tree
+# and has no business reaching the verdict — the saving is sound only
+# because the final check runs immediately before `run_pre_existing_tests`
+# with nothing in between, and a contract that plays a real session is not
+# cheap (4.4s in the measured run).
 _LAST_RUN: dict = {}
 
 
 def reset_contract_repairs() -> None:
     """Forget repair bookkeeping — for a second run in one process."""
     _REPAIR_STATE.clear()
+    _JUDGED.clear()
     _LAST_RUN.clear()
 
 
@@ -615,14 +647,15 @@ def _errors_reported(output: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def _run_contract(executor, root: str):
+def _run_contract(executor, root: str, record: bool = False):
     cmd = "python -m unittest " + SEED_BASENAME
     try:
         result = executor.run_command(cmd, timeout=180, cwd=root)
     except TypeError:
         # Executors that take no cwd — the caller is already rooted there.
         result = executor.run_command(cmd, timeout=180)
-    _LAST_RUN[os.path.join(root, SEED_BASENAME)] = result
+    if record:
+        _LAST_RUN[os.path.join(root, SEED_BASENAME)] = result
     return result
 
 
@@ -651,20 +684,29 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
     state = seed_state(path)
     if state is None:
         return None                       # absent, or not ours to touch
-    if _REPAIR_STATE.get(path, 0) >= max_repairs:
+    repairs_left = _REPAIR_STATE.get(path, 0) < max_repairs
+    if not final and (not repairs_left or path in _JUDGED):
         return None
+    # The FINAL check always runs it, whatever the mid-run bookkeeping says.
+    # That costs nothing net: `run_pre_existing_tests` needs a fresh result
+    # and would otherwise pay for this very subprocess itself. Measured
+    # 2026-09-12, this is the whole defect — a wave-1 run (before any
+    # code-producing step) retired the check, so the final one never
+    # executed, and its two-minute-old result was handed to the verdict as
+    # if it described the finished tree.
 
-    ok, out = _run_contract(executor, root)
+    ok, out = _run_contract(executor, root, record=final)
     if ok:
-        # It runs. Nothing more to check, and re-running it every wave
-        # would cost a subprocess (and, for a graphical project, a window)
-        # for no new information.
-        _REPAIR_STATE[path] = max_repairs
+        # It runs. Nothing more to check this wave, and re-running it every
+        # wave would cost a subprocess (and, for a graphical project, a
+        # window) for no new information.
+        _JUDGED.add(path)
         return None
-    if _NOT_READY_RE.search(out or ""):
+    if _not_ready_reason(out):
         if not final:
-            log.debug("[AcceptanceSeed] contract cannot import the project "
-                      "yet — deferring the runnability check")
+            log.debug("[AcceptanceSeed] contract cannot reach the project "
+                      "yet (%s) — deferring the runnability check",
+                      _not_ready_reason(out))
             return None
         # There is no later wave to defer to. Measured 2026-09-12: the
         # contract became importable only during the post-wave phases, so
@@ -672,18 +714,24 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
         # the first execution was the verdict itself — with no chance to
         # repair. "Not built yet" is a true statement mid-run and a
         # meaningless one here, so say what is actually wrong instead.
-        log.warning("[AcceptanceSeed] the contract still cannot import the "
+        log.warning("[AcceptanceSeed] the contract still cannot reach the "
                     "project at the end of the run — it can never have "
                     "judged anything:\n%s",
                     "\n".join((out or "").strip().splitlines()[-10:]))
-        _REPAIR_STATE[path] = max_repairs
+        _JUDGED.add(path)
         return None
     if _errors_reported(out) == 0:
         # It ran and judged. Whether it is RIGHT is the end-of-run
         # question, and a seeded contract may not convict the code anyway.
-        _REPAIR_STATE[path] = max_repairs
+        # This must NOT spend the repair budget: a mid-run disagreement is
+        # the least conclusive state there is, because the code is
+        # incomplete by construction, and retiring the check on it is what
+        # stopped the final one from ever looking.
+        _JUDGED.add(path)
         return None
 
+    if not repairs_left:
+        return None                       # ran, crashed, nothing left to try
     _REPAIR_STATE[path] = _REPAIR_STATE.get(path, 0) + 1
     tail = "\n".join((out or "").strip().splitlines()[-25:])
     log.warning("[AcceptanceSeed] the seeded contract CRASHES rather than "
@@ -788,7 +836,7 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                         exc)
             return None
 
-        ok_after, out_after = _run_contract(executor, root)
+        ok_after, out_after = _run_contract(executor, root, record=final)
         if ok_after or _errors_reported(out_after) == 0:
             from .evidence import _digest
             digest = _digest(path)

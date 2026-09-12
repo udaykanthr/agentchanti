@@ -101,7 +101,7 @@ class FinalCheckStopsDeferring(_Clean):
         self.assertIsNone(result)
         self.assertFalse(client.prompts, "still no LLM call")
         self.assertTrue(
-            any("cannot import the project at the end" in m
+            any("cannot reach the project at the end" in m
                 for m in caught.output),
             "the end-of-run failure was reported as a silent deferral")
 
