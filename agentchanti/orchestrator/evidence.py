@@ -346,7 +346,9 @@ def _was_seeded(root: str, rel: str) -> bool:
 
 
 def run_pre_existing_tests(executor, root: str,
-                           survivors: Iterable[str]) -> tuple[bool | None, str]:
+                           survivors: Iterable[str],
+                           prerun: "dict | None" = None,
+                           ) -> tuple[bool | None, str]:
     """Actually run the surviving pre-existing tests. ``(passed, detail)``.
 
     ``None`` means the question could not be answered — no survivors, no
@@ -369,12 +371,20 @@ def run_pre_existing_tests(executor, root: str,
     passed: list[str] = []
     ran = 0
     for rel in files:
-        cmd = "python -m unittest " + rel.replace("/", os.sep)
-        try:
-            ok, out = executor.run_command(cmd, timeout=300)
-        except Exception as exc:
-            _logger.debug("[Evidence] %s could not run: %s", rel, exc)
-            continue
+        # A result the caller already paid for. `verify_contract_runs` runs
+        # the seeded contract immediately before this, so without the reuse
+        # the same file — which may play a full session — is executed twice
+        # back to back for an identical answer.
+        cached = (prerun or {}).get(rel)
+        if cached is not None:
+            ok, out = cached
+        else:
+            cmd = "python -m unittest " + rel.replace("/", os.sep)
+            try:
+                ok, out = executor.run_command(cmd, timeout=300)
+            except Exception as exc:
+                _logger.debug("[Evidence] %s could not run: %s", rel, exc)
+                continue
         ran += 1
         # Asked BEFORE the exit code, because the exit code cannot answer
         # it. An empty collection exits 0 on most runners and 5 on

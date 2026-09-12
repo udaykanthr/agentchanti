@@ -2661,13 +2661,43 @@ def _main_impl():
     # added the claim rested on `tests_ran` — a flag about the pipeline's
     # OWN tests. Two measured runs reported them as passing while every
     # test in them errored.
+    # Last chance to catch a BROKEN instrument, after every post-wave phase
+    # has written what it is going to write. The per-wave checks defer while
+    # the contract cannot import the project, and measured 2026-09-12 the
+    # project only became importable during bulk-test/wiring/smoke — so all
+    # seven per-wave checks deferred, the check never ran once, and the
+    # contract's first execution was the verdict itself, too late to repair.
+    #
+    # Costs no LLM tokens unless the contract actually crashes: a pass, an
+    # assertion failure and an unimportable project all return before any
+    # generation. The one subprocess it spends is handed to the verdict
+    # below rather than paid for twice.
+    _contract_prerun: dict = {}
+    if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
+        try:
+            from .acceptance_seed import (SEED_BASENAME, last_contract_run,
+                                          verify_contract_runs)
+            _fixed = verify_contract_runs(
+                executor, os.getcwd(), llm_client, args.task,
+                identity_task=getattr(args, "_raw_task", None), final=True)
+            if _fixed:
+                _rel, _new_digest = _fixed
+                _pre_existing_tests[_rel] = _new_digest
+            _last = last_contract_run(os.getcwd())
+            if _last is not None:
+                _contract_prerun[SEED_BASENAME] = _last
+        except Exception as _vc_exc:       # never fail a run over this
+            log.warning("[AcceptanceSeed] final runnability check skipped "
+                        "(%s: %s)", type(_vc_exc).__name__, _vc_exc)
+
     from .evidence import (run_pre_existing_tests as _run_survivors,
                            surviving_pre_existing_tests as _survivors)
     _surv = _survivors(os.getcwd(), _pre_existing_tests)
     _surv_passed, _surv_detail = (None, "")
     if _surv:
         _surv_passed, _surv_detail = _run_survivors(executor, os.getcwd(),
-                                                    _surv)
+                                                    _surv,
+                                                    prerun=_contract_prerun)
         log.info("[Evidence] pre-existing suite(s) %s — %s",
                  {True: "PASSED", False: "FAILED"}.get(_surv_passed,
                                                        "could not be run"),

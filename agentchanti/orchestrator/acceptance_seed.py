@@ -581,10 +581,29 @@ _NOT_READY_RE = re.compile(
 # inconclusive, which is the honest outcome and already implemented.
 _REPAIR_STATE: dict = {}
 
+# The most recent `(ok, output)` this module observed for a contract, so the
+# end-of-run verdict does not pay for a second identical subprocess. The
+# final check runs immediately before `run_pre_existing_tests`, which would
+# otherwise execute the same file again — and a contract that plays a real
+# session is not cheap (4.4s in the measured run). Cleared whenever the file
+# on disk stops matching what was run, so a stale result can never be handed
+# to the verdict.
+_LAST_RUN: dict = {}
+
 
 def reset_contract_repairs() -> None:
     """Forget repair bookkeeping — for a second run in one process."""
     _REPAIR_STATE.clear()
+    _LAST_RUN.clear()
+
+
+def last_contract_run(root: str):
+    """``(ok, output)`` from the most recent contract execution, or None.
+
+    Only valid for the file as it currently sits on disk — every path that
+    rewrites or restores the contract invalidates it.
+    """
+    return _LAST_RUN.get(os.path.join(root, SEED_BASENAME))
 
 
 def _errors_reported(output: str) -> int:
@@ -599,15 +618,18 @@ def _errors_reported(output: str) -> int:
 def _run_contract(executor, root: str):
     cmd = "python -m unittest " + SEED_BASENAME
     try:
-        return executor.run_command(cmd, timeout=180, cwd=root)
+        result = executor.run_command(cmd, timeout=180, cwd=root)
     except TypeError:
         # Executors that take no cwd — the caller is already rooted there.
-        return executor.run_command(cmd, timeout=180)
+        result = executor.run_command(cmd, timeout=180)
+    _LAST_RUN[os.path.join(root, SEED_BASENAME)] = result
+    return result
 
 
 def verify_contract_runs(executor, root: str, llm_client, task: str,
                          identity_task: str = None,
-                         max_repairs: int = 1):
+                         max_repairs: int = 1,
+                         final: bool = False):
     """Execute the seeded contract; repair it once if it cannot run.
 
     Returns ``(relative path, new sha256)`` when the file was rewritten —
@@ -640,8 +662,21 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
         _REPAIR_STATE[path] = max_repairs
         return None
     if _NOT_READY_RE.search(out or ""):
-        log.debug("[AcceptanceSeed] contract cannot import the project yet "
-                  "— deferring the runnability check")
+        if not final:
+            log.debug("[AcceptanceSeed] contract cannot import the project "
+                      "yet — deferring the runnability check")
+            return None
+        # There is no later wave to defer to. Measured 2026-09-12: the
+        # contract became importable only during the post-wave phases, so
+        # all seven per-wave checks deferred, the check never ran once, and
+        # the first execution was the verdict itself — with no chance to
+        # repair. "Not built yet" is a true statement mid-run and a
+        # meaningless one here, so say what is actually wrong instead.
+        log.warning("[AcceptanceSeed] the contract still cannot import the "
+                    "project at the end of the run — it can never have "
+                    "judged anything:\n%s",
+                    "\n".join((out or "").strip().splitlines()[-10:]))
+        _REPAIR_STATE[path] = max_repairs
         return None
     if _errors_reported(out) == 0:
         # It ran and judged. Whether it is RIGHT is the end-of-run
@@ -777,6 +812,10 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                 fh.write(original)
         except OSError:
             pass
+        # `_LAST_RUN` now describes the REPAIRED file, which is no longer the
+        # one on disk. Handing that to the verdict would report a result for
+        # bytes nobody can read.
+        _LAST_RUN.pop(path, None)
         latest = "\n".join((out_after or "").strip().splitlines()[-25:])
         rejected = ("\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it still "
                     "crashed, with the error shown above. Fix that one, and "
