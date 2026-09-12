@@ -4,6 +4,7 @@ Pipeline execution — wave-based parallel/sequential step execution.
 
 import logging
 import re
+import sys
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -4352,6 +4353,31 @@ def _missing_js_packages(output: str) -> list[str]:
     return seen
 
 
+# Modules that were in the standard library and have since been REMOVED
+# (PEP 594 in 3.13, distutils/imp/asynchat/asyncore/smtpd in 3.12, lib2to3
+# in 3.13). `sys.stdlib_module_names` on a newer interpreter no longer lists
+# them, yet "No module named distutils" still means the same thing it always
+# did: code written for an older Python, never a package to fetch.
+#
+# Measured 2026-09-13: pip tried to build pygame 2.6.0 from source on Python
+# 3.13, the build backend died on `No module named 'distutils.msvccompiler'`,
+# and the env self-heal ran `pip install distutils`. It failed — but a name
+# that belongs to Python itself is exactly the name a squatter would register,
+# and the healer had no reason to believe PyPI's `distutils` is Python's.
+_REMOVED_STDLIB = frozenset({
+    "distutils", "imp", "asynchat", "asyncore", "smtpd",
+    "aifc", "audioop", "cgi", "cgitb", "chunk", "crypt", "imghdr",
+    "mailcap", "msilib", "nis", "nntplib", "ossaudiodev", "pipes",
+    "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib", "lib2to3",
+})
+
+
+def _is_stdlib_module(mod: str) -> bool:
+    """Is *mod* part of Python itself — now, or before it was removed?"""
+    names = getattr(sys, "stdlib_module_names", frozenset())
+    return mod in names or mod in _REMOVED_STDLIB
+
+
 def _missing_third_party_module(output: str, project_files) -> str | None:
     """Extract a missing-module name from test output — unless it is a
     project-local module (a sys.path/code problem; pip-installing a name
@@ -4361,6 +4387,8 @@ def _missing_third_party_module(output: str, project_files) -> str | None:
     if not m:
         return None
     mod = m.group(1).split(".")[0]
+    if _is_stdlib_module(mod):
+        return None
     from .api_grounding import local_top_levels_from_files
     if mod in local_top_levels_from_files(project_files):
         return None
