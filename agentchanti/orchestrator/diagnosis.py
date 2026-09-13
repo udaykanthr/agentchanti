@@ -8,6 +8,7 @@ import re
 
 from ..executor import Executor
 from ..cli_display import CLIDisplay, token_tracker, log
+from ..paths import strip_dot_slash
 from ..diff_display import show_diffs, _detect_hazards, HAZARD_BLOCK
 
 from .memory import FileMemory
@@ -163,7 +164,7 @@ def _pre_investigate(error_info: str, memory: FileMemory,
                 )
                 # Detect nested directory collision
                 for loc in disk_locations:
-                    parts = loc.replace('\\', '/').lstrip('./').split('/')
+                    parts = strip_dot_slash(loc.replace('\\', '/')).split('/')
                     if (len(parts) >= 3
                             and parts[0] == parts[1]
                             and parts[0] == module_parts[0]):
@@ -247,7 +248,7 @@ def _pre_investigate(error_info: str, memory: FileMemory,
             for fpath, _line in [tb_files[0], tb_files[-1]]:
                 for mem_path, content in memory.all_files().items():
                     if fpath.endswith(mem_path) or mem_path.endswith(
-                        fpath.lstrip('./')
+                        strip_dot_slash(fpath)
                     ):
                         # Extract import lines
                         imports = [

@@ -6,6 +6,93 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.0 — 2026-09-13
+
+Measured over ~32 runs of a two-root React + Express task and a series of
+Python game builds. Most of what changed is in the verification layer: the
+checks that decide whether a run may call itself verified. In nearly every
+incident the generated code was right and the harness was wrong.
+
+### Changed
+
+- **A failed acceptance check is retried instead of ending the run.**
+  `acceptance_cmds` used to run once, at the very end, so a plan that
+  never built what the contract requires failed on the last line, after
+  every gate had passed. It now gets bounded repair rounds
+  (`acceptance_repair_rounds`, default 3, `0` disables). They stop early
+  when a round changes nothing, and the last round escalates. The banner
+  says `verified after N repair round(s)` rather than claiming a
+  first-time pass. The write guard that makes this safe was not actually
+  wired in before, so a run could have rewritten its own acceptance
+  script. It is wired now.
+
+- **Interactive runs are asked for `acceptance_cmds` at plan time** when
+  `require_independent_evidence` could otherwise only be satisfied by a
+  contract the run writes itself. `--auto` warns instead of prompting, and
+  declining always continues.
+
+- **Exact version pins the task never asked for are relaxed.** An
+  unrequested `pygame==2.6.0` in the requirements spec or plan becomes
+  `pygame~=2.6`. The measured pin had no wheel for the venv's Python 3.13.
+  It cost 16 turns and an escalation, and the run finished by rebuilding
+  the venv on Python 3.11. Pins the user named, or asked for in general,
+  are kept.
+
+### Added
+
+- **The seeded acceptance contract is executed before it is trusted.**
+  Every earlier check on it was static, and every measured failure was
+  at runtime. It now runs after each wave and again just before the
+  verdict. A contract that crashes is repaired, with its own source in
+  the prompt. A failed assertion is never rewritten.
+
+- **`READ_FILE: <path>[:start-end]`** for the intent agent, and file
+  headers that state what was actually read. A 454-line file used to be
+  labelled `full source` after 300 lines.
+
+### Fixed
+
+- **Evidence verdicts.** Six ways a correct run could be failed or
+  wrongly verified:
+  - A contract result measured before the code existed was handed to the
+    final verdict.
+  - A test run that collected zero tests counted as a pass one way and a
+    failure the other (`tests/__init__.py` failed a run).
+  - A contract that opened a Tkinter window and waited for a person.
+  - A contract that grepped README wording
+    (`Python **3.10 or newer**` failed `python\s*3\.10`).
+  - A failing acceptance command reported as "no evidence".
+  - A configured acceptance command that never ran was reported as a
+    missing one.
+- **Multi-root projects** (frontend + backend). Five places answered a
+  per-directory question at the repo root:
+  - the whole backend was built inside `frontend/`;
+  - a CommonJS module was rewritten into ESM;
+  - dependencies were installed at the root;
+  - an install was skipped because the package existed in the *other*
+    project;
+  - a root-level Vite app was mistaken for a sub-project.
+- **Gates the agent could only pass by damaging the project** are now
+  refused:
+  - replacing `node` with a `node.cmd` shim;
+  - writing a phantom root `package.json`;
+  - aliasing `node_modules` with a junction;
+  - gates that ask plain Node to load `.jsx`.
+- **Leading dots in file paths.** `lstrip("./")` turned `.gitignore`
+  into `gitignore`, `.env` into `env`, and so on, across 16 sites. An
+  acceptance instrument under a dot-directory (e.g. `.ci/`) could be
+  overwritten despite being protected.
+- **Language detection** matched keywords inside words: "chan**gin**g"
+  detected Go, "**node**s" detected Node, "in**vite**" detected Vite.
+- **The env self-heal no longer installs standard-library names** from
+  PyPI (it ran `pip install distutils`).
+- **KB docs are scoped to the project's framework**, not just its
+  language. A Django doc no longer reaches a Pygame plan.
+- **Style checks use stylesheets the app actually loads.** A repair
+  loop had "fixed" missing CSS by writing into a file nothing imports.
+- **The acceptance repair loop would have raised `NameError`** the
+  first time it fired (caught by CI before release).
+
 ## 0.7.0 — 2026-08-18
 
 ### Fixed

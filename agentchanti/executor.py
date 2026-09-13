@@ -951,7 +951,8 @@ class Executor:
         grounded, not hallucinated — and editing a manifest is sometimes
         the entire task.
         """
-        _allowed_norm = {p.replace("\\", "/").lstrip("./")
+        from .paths import strip_dot_slash
+        _allowed_norm = {strip_dot_slash(p.replace("\\", "/"))
                          for p in (allow_protected or ())}
         written = []
         init_dirs: set[str] = set()
@@ -992,7 +993,7 @@ class Executor:
             # Guard: never overwrite dependency manifests / lock files
             basename = os.path.basename(filename)
             if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(filepath):
-                if _norm_filename.lstrip("./") in _allowed_norm:
+                if strip_dot_slash(_norm_filename) in _allowed_norm:
                     log.info(f"[Executor] Writing protected file {filepath} — "
                              f"content derived from exact-match edit of the "
                              f"current file")

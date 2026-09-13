@@ -631,6 +631,23 @@ class PlannerAgent(Agent):
                             language=language,
                             api_client=kb_context_builder._api_client,
                         )
+                        # Scope to the project's FRAMEWORK too, not just
+                        # its language. `language=` cannot separate these:
+                        # the Django docs are correctly tagged
+                        # `language: "python"` and a Pygame game is a Python
+                        # project, so every run of the Pac-Man benchmark
+                        # surfaced "Django Page Creation Pattern" here. The
+                        # per-step builder drops it a layer later, but this
+                        # list is what the IntentAgent picks `KB docs:` from
+                        # and what the force-include net scans — which is
+                        # how "Vitest React Testing Library Setup" reached a
+                        # Pygame plan. Same rule, same tokeniser, one
+                        # implementation.
+                        from ..kb import context_builder as _kb_cb
+                        _title_hits = _kb_cb.scope_docs_to_project(
+                            _title_hits,
+                            _kb_cb.task_vocabulary(_raw_task),
+                            where="pre-analysis")
                         _available_kb_titles = [
                             r.title for r in (_title_hits or []) if r.title
                         ]
@@ -656,6 +673,7 @@ class PlannerAgent(Agent):
 
             _full_semantic_context = "\n\n".join(_semantic_kb)
 
+            self._user_task = task
             task = intent_agent.analyze_intent(
                 task, search_agent=search_agent,
                 kb_context_builder=kb_context_builder,
@@ -665,6 +683,11 @@ class PlannerAgent(Agent):
                 subproject_cwd=subproject_cwd,
                 language=language,
             )
+            # Relaxed HERE because both readers of the spec — the planner
+            # and the acceptance-contract seeder — take it from this one
+            # attribute. See version_pins for the measured cost of a pin the
+            # user never asked for.
+            task = self._relax_pins(task, "requirements spec")
             self._enriched_task = task
             _logger.info("[PreAnalysis] Task intent enriched.")
 
@@ -1874,4 +1897,26 @@ Steps in the same wave can run in parallel. Each wave runs after the previous.
 - [ ] No install steps for already-installed packages
 - [ ] Config/tooling steps come BEFORE code that depends on them
 """) + _checklist_extras(language)
-        return self.llm_client.generate_response(prompt)
+        plan = self.llm_client.generate_response(prompt)
+        # A backstop for pins the planner invents on its own. The user's raw
+        # words decide what was requested — never the enriched task, which
+        # is model output and is exactly where the measured pin came from.
+        return self._relax_pins(plan, "plan",
+                                user_task=getattr(self, "_user_task", task))
+
+    def _relax_pins(self, text: str, where: str,
+                    user_task: str | None = None) -> str:
+        from ..orchestrator.version_pins import relax_unrequested_pins
+        if not isinstance(text, str):
+            return text
+        new, changes = relax_unrequested_pins(
+            text, user_task if user_task is not None
+            else getattr(self, "_user_task", ""))
+        if changes:
+            _logger.info(
+                "[VersionPins] relaxed %d exact pin(s) the task never asked "
+                "for in the %s: %s — a model's pin cannot know which "
+                "versions have binaries for this interpreter",
+                len(changes), where,
+                ", ".join(f"{a} -> {b}" for a, b in changes))
+        return new

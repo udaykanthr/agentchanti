@@ -63,8 +63,9 @@ _NOT_PROJECT_ROOTS = frozenset({
 
 
 def normalize_path(path: str) -> str:
-    """Collapse separators and strip a leading ``./``."""
-    return re.sub(r"[\\/]+", "/", (path or "").strip()).lstrip("./")
+    """Collapse separators and strip a leading ``./`` (never a leading dot)."""
+    from ..paths import norm_rel_path
+    return norm_rel_path(path)
 
 
 def strip_source_ext(path: str) -> str:

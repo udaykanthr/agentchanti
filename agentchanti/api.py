@@ -18,6 +18,7 @@ Example usage::
 from __future__ import annotations
 
 import logging
+from dataclasses import replace as _dc_replace
 import os
 import time
 from dataclasses import dataclass, field
@@ -643,6 +644,25 @@ def _run_task_impl(
                     pipeline_success = False
                     break
 
+        # Is the seeded contract an instrument or a bug? Validated only
+        # statically when written (it could not be executed — no code
+        # existed yet), while every measured failure of one has been a
+        # runtime crash. This is the first point it CAN be run. A no-op
+        # unless a contract this pipeline wrote is present, and kept here
+        # so the library path cannot silently diverge from cli.py the day
+        # seeding is wired into it — the reason `repair_failed_acceptance`
+        # lives in both.
+        try:
+            from .orchestrator.acceptance_seed import verify_contract_runs
+            _fixed = verify_contract_runs(executor, os.getcwd(), llm_client,
+                                          task)
+            if _fixed:
+                _rel, _new_digest = _fixed
+                _pre_existing_tests[_rel] = _new_digest
+        except Exception as _vc_exc:       # never fail a run over this
+            log.warning("[AcceptanceSeed] runnability check skipped "
+                        "(%s: %s)", type(_vc_exc).__name__, _vc_exc)
+
         if not pipeline_success:
             break
 
@@ -746,8 +766,25 @@ def _run_task_impl(
     from .orchestrator.evidence import run_acceptance_commands as _run_acc
     _acceptance_cmds = list(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
     _acceptance_passed = None
+    _acceptance_repaired = 0
     if pipeline_success and _acceptance_cmds:
         _acceptance_passed, _acc_failures = _run_acc(executor, _acceptance_cmds)
+        if _acceptance_passed is False:
+            # Same bounded repair the CLI path gets; the two must not
+            # diverge on what a failing acceptance check means.
+            from .orchestrator.evidence import (
+                repair_failed_acceptance as _repair_acc)
+            _acceptance_passed, _acceptance_repaired, _acc_failures = (
+                _repair_acc(
+                    executor=executor, cmds=_acceptance_cmds,
+                    failures=_acc_failures,
+                    llm_client=getattr(coder, "llm_client", None),
+                    memory=memory, task=task, language=language,
+                    max_rounds=getattr(cfg, "ACCEPTANCE_REPAIR_ROUNDS", 3),
+                    max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+                    escalation_client=getattr(coder, "escalation_client",
+                                              None),
+                    project_root=os.getcwd()))
         if _acceptance_passed is False:
             pipeline_success = False
             log.error("Pipeline failed: user acceptance command(s) did not "
@@ -757,6 +794,8 @@ def _run_task_impl(
         tests_ran=any(_is_test_file(f) for f in files_written),
         acceptance_passed=_acceptance_passed,
         acceptance_cmds=_acceptance_cmds)
+    if _acceptance_repaired:
+        _evidence = _dc_replace(_evidence, repaired=_acceptance_repaired)
     log.info(_evidence.log_line())
     if (pipeline_success and not _evidence.independent
             and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):

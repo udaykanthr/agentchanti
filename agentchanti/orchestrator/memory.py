@@ -198,7 +198,8 @@ class FileMemory:
         """
         from ..executor import Executor
 
-        _allowed = {p.replace("\\", "/").lstrip("./")
+        from ..paths import strip_dot_slash
+        _allowed = {strip_dot_slash(p.replace("\\", "/"))
                     for p in (allow_protected or ())}
         to_embed: list[tuple[str, str]] = []
         with self._lock:
@@ -212,7 +213,7 @@ class FileMemory:
                 basename = os.path.basename(fpath)
                 if (basename in Executor._PROTECTED_FILENAMES
                         and os.path.isfile(fpath)
-                        and fpath.lstrip("./") not in _allowed):
+                        and strip_dot_slash(fpath) not in _allowed):
                     log.warning(f"[FileMemory] Skipping protected file update: "
                                 f"{fpath} (already exists on disk)")
                     continue

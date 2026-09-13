@@ -4,6 +4,7 @@ Pipeline execution — wave-based parallel/sequential step execution.
 
 import logging
 import re
+import sys
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -166,6 +167,14 @@ def _is_test_file(file_path: str) -> bool:
     # Never treat non-source files (HTML, CSS, JSON, …) as test files even
     # when they live inside a __tests__ directory.
     if ext.lower() not in _SOURCE_EXTS:
+        return False
+    # A package marker is not a suite. `_TEST_DIR_RE` matches every .py
+    # under `tests/`, which swept `tests/__init__.py` in — and no runner
+    # collects it, so it can only ever report "ran 0 tests". Measured
+    # 2026-09-10: a 71-byte docstring-only `__init__.py` was recorded as
+    # a pre-existing evidence candidate, ran nothing, and its empty
+    # result failed a run whose every gate, suite and contract was green.
+    if basename == "__init__.py":
         return False
     return bool(_TEST_FILE_RE.search(basename) or _TEST_DIR_RE.search(file_path))
 
@@ -4290,8 +4299,43 @@ def _ensure_pytest_available(executor, cwd: str | None = None) -> None:
 # Vitest/Node resolution errors for uninstalled npm packages, e.g.
 #   Cannot find package '@testing-library/react' imported from ...
 #   Cannot find module 'axios'
+# Capture the WHOLE quoted specifier, then decide whether it names a
+# package. Matching a package-shaped prefix instead silently truncated
+# anything else into something installable: Node says `Cannot find
+# module '<absolute path>'` when a FILE is missing, and `[\w.-]+` stops
+# at the colon, so `C:\Users\...\run-tests.js` yielded the package
+# name "C" and the loop ran `npm install -D C`. Measured 2026-08-19
+# run 14. That is the supply-chain hazard `_missing_third_party_module`
+# already refuses on the Python side — a name that happens to exist on
+# the registry would be installed into the project — and single-letter
+# npm packages do exist.
 _JS_MISSING_PKG_RE = re.compile(
-    r"Cannot find (?:package|module) '((?:@[\w.-]+/)?[\w.-]+)")
+    r"Cannot find (?:package|module) '([^']+)'")
+
+# npm's own naming rules, tightened to what can appear in an import.
+_NPM_NAME_RE = re.compile(r"^(?:@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*$",
+                          re.IGNORECASE)
+
+
+def _npm_package_of(spec: str) -> str | None:
+    r"""The package *spec* refers to, or None when it is not a package.
+
+    A path is not a package: absolute (`/x`, `C:\x`), relative (`./x`,
+    `../x`), or carrying a separator that scoping cannot explain. A deep
+    import (`lodash/debounce`) resolves to its package (`lodash`), which
+    is what installing it would need.
+    """
+    spec = (spec or "").strip()
+    if not spec or spec[0] in "./~" or "\\" in spec:
+        return None
+    if re.match(r"^[A-Za-z]:", spec):      # Windows drive letter
+        return None
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        pkg = "/".join(parts[:2]) if len(parts) >= 2 else spec
+    else:
+        pkg = spec.split("/")[0]
+    return pkg if _NPM_NAME_RE.match(pkg) else None
 
 
 def _missing_js_packages(output: str) -> list[str]:
@@ -4303,10 +4347,35 @@ def _missing_js_packages(output: str) -> list[str]:
     """
     seen: list[str] = []
     for m in _JS_MISSING_PKG_RE.finditer(output):
-        pkg = m.group(1)
-        if pkg not in seen and not pkg.startswith("."):
+        pkg = _npm_package_of(m.group(1))
+        if pkg and pkg not in seen:
             seen.append(pkg)
     return seen
+
+
+# Modules that were in the standard library and have since been REMOVED
+# (PEP 594 in 3.13, distutils/imp/asynchat/asyncore/smtpd in 3.12, lib2to3
+# in 3.13). `sys.stdlib_module_names` on a newer interpreter no longer lists
+# them, yet "No module named distutils" still means the same thing it always
+# did: code written for an older Python, never a package to fetch.
+#
+# Measured 2026-09-13: pip tried to build pygame 2.6.0 from source on Python
+# 3.13, the build backend died on `No module named 'distutils.msvccompiler'`,
+# and the env self-heal ran `pip install distutils`. It failed — but a name
+# that belongs to Python itself is exactly the name a squatter would register,
+# and the healer had no reason to believe PyPI's `distutils` is Python's.
+_REMOVED_STDLIB = frozenset({
+    "distutils", "imp", "asynchat", "asyncore", "smtpd",
+    "aifc", "audioop", "cgi", "cgitb", "chunk", "crypt", "imghdr",
+    "mailcap", "msilib", "nis", "nntplib", "ossaudiodev", "pipes",
+    "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib", "lib2to3",
+})
+
+
+def _is_stdlib_module(mod: str) -> bool:
+    """Is *mod* part of Python itself — now, or before it was removed?"""
+    names = getattr(sys, "stdlib_module_names", frozenset())
+    return mod in names or mod in _REMOVED_STDLIB
 
 
 def _missing_third_party_module(output: str, project_files) -> str | None:
@@ -4318,6 +4387,8 @@ def _missing_third_party_module(output: str, project_files) -> str | None:
     if not m:
         return None
     mod = m.group(1).split(".")[0]
+    if _is_stdlib_module(mod):
+        return None
     from .api_grounding import local_top_levels_from_files
     if mod in local_top_levels_from_files(project_files):
         return None
@@ -4381,11 +4452,25 @@ def declared_gate_cwd(cmd: str, subproject_cwd: str | None) -> str | None:
     substitution this preflight exists to prevent. Every other caller ran
     the same command from the repo root and it passed.
 
-    The test mirrors `_gate_on_declared_verify`, which already refuses to
-    ADD a `cd {sub}` prefix to a command that has one, so the two cannot
-    disagree about what "self-locating" means.
+    The test SHARES `references_subproject` with `_declared_verify_cmd`,
+    which decides the mirror-image question — whether to ADD a `cd {sub}`
+    prefix — so the two cannot disagree about what "self-locating" means.
+    They did disagree while this checked only for a leading `cd `:
+    `npm --prefix frontend test -- --run && npm --prefix backend test`
+    names the sub-project without cd-ing to it, so it was launched with
+    cwd=frontend, where `--prefix frontend` means `frontend/frontend`.
+    Measured 2026-08-19: the gate died four times (0xFFFFF026) and
+    BulkTest logged "Plan-declared gate did not pass", demoting a correct
+    gate to the framework default — the substitution this preflight
+    exists to prevent. The identical command passed from the repo root
+    immediately before and after.
     """
-    if cmd and cmd.lstrip().lower().startswith("cd "):
+    if not cmd:
+        return subproject_cwd
+    if cmd.lstrip().lower().startswith("cd "):
+        return None
+    from .step_handlers import references_subproject
+    if references_subproject(cmd, subproject_cwd):
         return None
     return subproject_cwd
 
@@ -6026,7 +6111,8 @@ def _resolve_fix_scope_files(
         #    same-named files are exactly the ones the wiring check must
         #    see side by side.
         stored = memory.all_files()
-        p_norm = path.replace("\\", "/").lstrip("./")
+        from ..paths import strip_dot_slash
+        p_norm = strip_dot_slash(path.replace("\\", "/"))
         matches = [sp for sp in stored
                    if sp.replace("\\", "/") == p_norm
                    or sp.replace("\\", "/").endswith("/" + p_norm)]
@@ -6321,8 +6407,9 @@ def run_wiring_verification(
         # rather than filtered: the files on disk have already passed
         # their own step checks.
         _allowed = set(verification_context.keys())
+        from ..paths import strip_dot_slash
         _strays = [p for p in fix_files
-                   if p.replace("\\", "/").lstrip("./") not in _allowed]
+                   if strip_dot_slash(p.replace("\\", "/")) not in _allowed]
         if _strays:
             _logger.warning(
                 "[WiringVerification] Rejecting fix — it rewrites file(s) "

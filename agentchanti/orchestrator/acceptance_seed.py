@@ -153,6 +153,19 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    `restart`; you would be testing vocabulary, not behaviour. Build the
    objects and call the methods.
 
+8. NEVER require a human. No `input()`, no `tkinter` or any other GUI
+   prompt, no "press a key", no asking someone to look at the screen and
+   report what they saw. Nobody is watching this run: a contract that
+   waits for a person never finishes, fails the run over code that may be
+   perfect, and leaves an application window open that looks hung. Assert
+   on the program's own state and returned values instead.
+
+9. NEVER assert on documentation wording. Do not read README, CHANGELOG
+   or any .md/.rst file. It does not exist yet, and you cannot predict its
+   words or its markup: `Python **3.10 or newer**` states the requirement
+   exactly and still fails a regex for `python 3.10`. If the task asks for
+   documentation, assert at most that the file exists and is not empty.
+
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
 
@@ -183,6 +196,72 @@ def mocking_reason(src: str) -> str | None:
         if marker in src:
             return marker
     return None
+
+
+# A contract that needs a PERSON cannot pass an unattended run, whatever
+# the code does — the same category as a gate this platform's shell cannot
+# execute, which `unrunnable_gate_reason` already refuses at plan time. The
+# weakness, mocking and source-grep screens all ask whether the contract
+# CHECKS the right thing; none asked whether it can ever finish.
+#
+# Measured 2026-09-10, a 3D pinball run. The seeded contract opened a
+# Tkinter prompt window and asked a human to observe the game and type
+# scores in:
+#
+#     score_before = self.integer("Score before the final scoring hit")
+#     self.action("Press Esc in the game. Do not close it with the window
+#                  manager.")
+#     print("\nThe game is still open; press Esc in its window ...")
+#
+# The run had every gate green, a suite that passed and a game that
+# demonstrably worked — verified afterwards by screenshot, 1090 fps and a
+# full-power launch that cleared the lane — and still exited non-zero,
+# because nobody was there to answer. Worse, it is self-concealing: it
+# leaves a real game window parked on the desktop, which reads as a hung
+# application rather than as a contract waiting for input.
+#
+# Matched anywhere in the source, not line-anchored: the measured contract
+# imported tkinter lazily inside a method (`    import tkinter as tk`), so
+# an `^import` scan would have missed the one construct that mattered.
+_INTERACTIVE_MARKERS = (
+    "tkinter",
+    "input(",
+    "raw_input(",
+    "getpass",
+    "msvcrt.getch",
+    "sys.stdin.read",        # also covers .readline()
+    "PySimpleGUI",
+    "pyautogui",
+)
+
+
+def interactive_reason(src: str) -> str | None:
+    """Which human-in-the-loop construct makes this contract unattendable."""
+    for marker in _INTERACTIVE_MARKERS:
+        if marker in src:
+            return marker
+    return None
+
+
+_INTERACTIVE_NOTE = """
+
+Your contract CANNOT RUN UNATTENDED: it uses `{marker}`, which asks a
+person to look at something, type something, or press a key. This run has
+no operator. The contract will launch the application, wait forever for
+input nobody will give, and fail — over code that may be perfect — while
+leaving a window open that looks like a hung program.
+
+Rewrite it to assert the same behaviours PROGRAMMATICALLY. Hard rules:
+
+  - No `tkinter`, no `input()`, no `getpass`, no reading stdin, no
+    screenshot-and-ask. Nothing that waits for a human.
+  - Do NOT weaken what you check to achieve this. Drive the program's own
+    public API, read its state back, and assert on the values.
+  - If a behaviour is genuinely only observable on screen, assert on the
+    state that produces it (positions, scores, phase, returned values)
+    rather than asking someone to look.
+  - The test must terminate on its own, every time, with no keypress.
+"""
 
 
 def _substantive_count(src: str) -> int:
@@ -329,6 +408,72 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                     "no seeded independent check", _mock)
         return None
 
+    # Repaired rather than refused outright: a contract that asks a human
+    # usually checks the RIGHT behaviours and only reads them the wrong
+    # way, so the strong draft is worth recovering. Refused if the retry is
+    # still interactive — keeping it would guarantee a failed run.
+    _human = interactive_reason(src)
+    if _human:
+        log.info("[AcceptanceSeed] the contract needs a human (%s) — it can "
+                 "never pass an unattended run, asking again for one that "
+                 "asserts programmatically", _human)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=_INTERACTIVE_NOTE.format(marker=_human))
+            if retry is None or mocking_reason(retry):
+                continue
+            _still = interactive_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract runs "
+                         "unattended — using it")
+                src, _human = retry, None
+                break
+            _human = _still
+        if _human:
+            log.warning(
+                "[AcceptanceSeed] the contract still needs a human (%s) after "
+                "%d attempt(s) — refusing it. It would launch the app, wait "
+                "for input nobody will give, and fail the run over code that "
+                "may be perfect; no file is the honest outcome",
+                _human, _REPAIR_ATTEMPTS)
+            return None
+
+    # Documentation wording, repaired before strength is judged — a README
+    # test's assertions no longer count as substantive, so judging strength
+    # first would send a second, differently-worded complaint about the same
+    # test. Measured 2026-09-13: the behaviour test passed, the README test
+    # failed on Markdown bold between "Python" and "3.10", and a working
+    # snake game exited 1.
+    #
+    # Kept rather than refused if every retry still reads the docs: most
+    # wording checks pass by luck, the behaviour tests beside them are real
+    # evidence, and refusing would leave nothing. Said out loud instead.
+    from .seed_strength import DOCUMENTATION_NOTE, documentation_grep_reason
+    _docs = documentation_grep_reason(src)
+    if _docs:
+        log.info("[AcceptanceSeed] the contract asserts on documentation "
+                 "wording (%s) — asking again for one that checks behaviour",
+                 _docs)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=DOCUMENTATION_NOTE.format(
+                                  reason=_docs, contract=src.strip()))
+            if retry is None or mocking_reason(retry) \
+                    or interactive_reason(retry):
+                continue
+            _still = documentation_grep_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract leaves the "
+                         "documentation alone — using it")
+                src, _docs = retry, None
+                break
+            _docs = _still
+        if _docs:
+            log.warning("[AcceptanceSeed] the contract still asserts on "
+                        "documentation wording after %d attempt(s) (%s) — "
+                        "keeping it, but it can fail a correct README over "
+                        "phrasing or markup", _REPAIR_ATTEMPTS, _docs)
+
     # Strength, judged once and repaired once. Measured across three runs
     # of one prompt: 2 substantive tests, then 1 that asserted only that
     # the process had not exited — which passes over any program that
@@ -396,3 +541,395 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
              "ran — it counts as independent evidence for exactly as long "
              "as the run leaves it byte-identical", SEED_BASENAME)
     return path
+
+
+# ── Does the contract actually RUN? ──────────────────────────────────
+#
+# Everything above validates the contract STATICALLY: `_looks_like_a_suite`
+# compiles it, `mocking_reason` reads its imports, `weak_contract_reason`
+# walks its AST. Not one of those executes it, and every measured failure
+# of a seeded contract has been a RUNTIME failure:
+#
+#   `ambient_lights[0].getColor()[:3]`   TypeError — LVecBase4f has no slice
+#   `self.win.requestProperties(...)`    AttributeError — it is a
+#                                        GraphicsBuffer, not a window
+#
+# Both compile perfectly. The reason they cluster in framework
+# introspection is structural: the contract is written before the code
+# exists, so it cannot name the artifact's own API, and the only
+# vocabulary it can predict is the framework's — which is precisely the
+# most environment- and version-fragile code there is to write blind.
+#
+# The contract cannot be executed when it is written; there is nothing to
+# import yet. The first moment it CAN be is as soon as the code exists,
+# and that is where this runs — instead of at the very end, which is
+# where a broken contract used to surface, after the whole budget was
+# spent. Measured 2026-09-08: one such contract failed a step's own gate
+# and cost 30 turns, an escalation and 402k tokens over a game that
+# scored 18/18 against external probes.
+
+_UNRUNNABLE_NOTE = """
+
+IGNORE the instruction above to write a NEW contract. This is a REPAIR of
+one you have already written, and the code it tests now EXISTS.
+
+Here is your contract exactly as it stands:
+
+--- BEGIN CONTRACT ---
+{contract}
+--- END CONTRACT ---
+
+Executed against the project as it now stands, it CRASHED instead of
+judging it:
+
+{output}
+
+Return the COMPLETE corrected file. Hard constraints:
+
+  - Keep the same behaviours under test, and keep them just as strict.
+    Do NOT delete, weaken or skip an assertion to make the error go
+    away, and do NOT wrap anything in try/except or unittest.skip.
+  - Do NOT replace the contract with a test that calls `self.fail(...)`,
+    `self.skipTest(...)` or otherwise refuses to check anything. The
+    project exists and your contract already imports it successfully;
+    a contract that gives up is worse than the crashing one.
+  - The defect is in HOW the check inspects the program, not in WHAT it
+    checks.
+
+This kind of crash almost always comes from reaching into the
+FRAMEWORK's internals — objects whose API you had to guess, or that only
+exist when there is a real window or display. Prefer asserting on the
+program's OWN public API and observable state (its classes, methods and
+returned values) over the framework's internal objects. If a behaviour
+can only be observed through the framework, assert on something the
+program itself exposes instead.
+"""
+
+# unittest reports a crash as an ERROR and a judged disagreement as a
+# FAILURE. Only the first says the instrument is broken; a failure may
+# simply be code that is not finished yet, which at this point in the run
+# is the normal state of affairs.
+_FAILED_TAIL_RE = re.compile(r"FAILED \(([^)]*)\)")
+_ERRORS_RE = re.compile(r"errors=(\d+)")
+
+# The module under test does not exist yet — the contract is fine, the
+# code has just not been written. Not a defect, and not this function's
+# business; try again after the next wave.
+_NOT_READY_RE = re.compile(
+    r"ModuleNotFoundError|No module named|ImportError|cannot import name")
+
+# An import error is only how a contract that IMPORTS the project reports a
+# missing project. One that reaches it through a SUBPROCESS reports the same
+# fact as an ordinary assertion about a return code, and the import
+# signature never fires. Measured 2026-09-12: a contract whose harness did
+# `runpy.run_path("main.py")` inside `subprocess.run(...)` was executed after
+# wave 1 — a CMD step, before any code-producing step had run — and reported
+# `FAILED (failures=1)` over a `FileNotFoundError` for a `main.py` no step
+# had written yet. Scoped to a missing PYTHON SOURCE file, because a
+# contract complaining that a module is absent is "not built yet" while one
+# complaining that a save-file or an export is absent has genuinely judged.
+_NOT_BUILT_RE = re.compile(
+    r"(?:FileNotFoundError|No such file or directory|can't open file)"
+    r"[^\n]*\.py")
+
+
+def _not_ready_reason(output: str):
+    """Short reason the contract could not reach the project yet, or None."""
+    found = _NOT_READY_RE.search(output or "")
+    if found:
+        return found.group(0)
+    found = _NOT_BUILT_RE.search(output or "")
+    return "a project source file does not exist yet" if found else None
+
+
+# One path -> repair attempts already spent. A contract that still cannot
+# run afterwards is left alone: the end-of-run path reports it as
+# inconclusive, which is the honest outcome and already implemented.
+_REPAIR_STATE: dict = {}
+
+# Paths that have already RUN and judged, so the per-wave check does not
+# spend a subprocess (and, for a graphical contract, a window) every wave
+# re-learning the same thing. Deliberately separate from `_REPAIR_STATE`:
+# one is a repair budget, the other is "no new information this wave", and
+# the measured defect was exactly a single variable answering both.
+_JUDGED: set = set()
+
+# The most recent `(ok, output)` this module observed for a contract, so the
+# end-of-run verdict does not pay for a second identical subprocess. Only
+# the FINAL check records here. A per-wave run measures an unfinished tree
+# and has no business reaching the verdict — the saving is sound only
+# because the final check runs immediately before `run_pre_existing_tests`
+# with nothing in between, and a contract that plays a real session is not
+# cheap (4.4s in the measured run).
+_LAST_RUN: dict = {}
+
+
+def reset_contract_repairs() -> None:
+    """Forget repair bookkeeping — for a second run in one process."""
+    _REPAIR_STATE.clear()
+    _JUDGED.clear()
+    _LAST_RUN.clear()
+
+
+def last_contract_run(root: str):
+    """``(ok, output)`` from the most recent contract execution, or None.
+
+    Only valid for the file as it currently sits on disk — every path that
+    rewrites or restores the contract invalidates it.
+    """
+    return _LAST_RUN.get(os.path.join(root, SEED_BASENAME))
+
+
+def _errors_reported(output: str) -> int:
+    """How many tests CRASHED, as opposed to failing an assertion."""
+    tail = _FAILED_TAIL_RE.search(output or "")
+    if not tail:
+        return 0
+    found = _ERRORS_RE.search(tail.group(1))
+    return int(found.group(1)) if found else 0
+
+
+def _run_contract(executor, root: str, record: bool = False):
+    cmd = "python -m unittest " + SEED_BASENAME
+    try:
+        result = executor.run_command(cmd, timeout=180, cwd=root)
+    except TypeError:
+        # Executors that take no cwd — the caller is already rooted there.
+        result = executor.run_command(cmd, timeout=180)
+    if record:
+        _LAST_RUN[os.path.join(root, SEED_BASENAME)] = result
+    return result
+
+
+def verify_contract_runs(executor, root: str, llm_client, task: str,
+                         identity_task: str = None,
+                         max_repairs: int = 1,
+                         final: bool = False):
+    """Execute the seeded contract; repair it once if it cannot run.
+
+    Returns ``(relative path, new sha256)`` when the file was rewritten —
+    the caller MUST update its pre-existing-test snapshot with it, or the
+    repair would read as "the agent edited the contract" and forfeit the
+    very independence this is protecting.
+
+    Returns ``None`` whenever nothing was changed, including every case
+    where the honest answer is "not yet": no contract, not ours, the code
+    it imports does not exist, or the contract ran and merely disagreed
+    with the code. An assertion FAILURE is deliberately never repaired —
+    at this point in the run the code is usually incomplete, and rewriting
+    the instrument because it says so is exactly the cheat this module
+    exists to prevent.
+    """
+    if executor is None or llm_client is None:
+        return None
+    path = os.path.join(root, SEED_BASENAME)
+    state = seed_state(path)
+    if state is None:
+        return None                       # absent, or not ours to touch
+    repairs_left = _REPAIR_STATE.get(path, 0) < max_repairs
+    if not final and (not repairs_left or path in _JUDGED):
+        return None
+    # The FINAL check always runs it, whatever the mid-run bookkeeping says.
+    # That costs nothing net: `run_pre_existing_tests` needs a fresh result
+    # and would otherwise pay for this very subprocess itself. Measured
+    # 2026-09-12, this is the whole defect — a wave-1 run (before any
+    # code-producing step) retired the check, so the final one never
+    # executed, and its two-minute-old result was handed to the verdict as
+    # if it described the finished tree.
+
+    ok, out = _run_contract(executor, root, record=final)
+    if ok:
+        # It runs. Nothing more to check this wave, and re-running it every
+        # wave would cost a subprocess (and, for a graphical project, a
+        # window) for no new information.
+        _JUDGED.add(path)
+        return None
+    if _not_ready_reason(out):
+        if not final:
+            log.debug("[AcceptanceSeed] contract cannot reach the project "
+                      "yet (%s) — deferring the runnability check",
+                      _not_ready_reason(out))
+            return None
+        # There is no later wave to defer to. Measured 2026-09-12: the
+        # contract became importable only during the post-wave phases, so
+        # all seven per-wave checks deferred, the check never ran once, and
+        # the first execution was the verdict itself — with no chance to
+        # repair. "Not built yet" is a true statement mid-run and a
+        # meaningless one here, so say what is actually wrong instead.
+        log.warning("[AcceptanceSeed] the contract still cannot reach the "
+                    "project at the end of the run — it can never have "
+                    "judged anything:\n%s",
+                    "\n".join((out or "").strip().splitlines()[-10:]))
+        _JUDGED.add(path)
+        return None
+    if _errors_reported(out) == 0:
+        # It ran and judged. Whether it is RIGHT is the end-of-run
+        # question, and a seeded contract may not convict the code anyway.
+        # This must NOT spend the repair budget: a mid-run disagreement is
+        # the least conclusive state there is, because the code is
+        # incomplete by construction, and retiring the check on it is what
+        # stopped the final one from ever looking.
+        _JUDGED.add(path)
+        return None
+
+    if not repairs_left:
+        return None                       # ran, crashed, nothing left to try
+    _REPAIR_STATE[path] = _REPAIR_STATE.get(path, 0) + 1
+    tail = "\n".join((out or "").strip().splitlines()[-25:])
+    log.warning("[AcceptanceSeed] the seeded contract CRASHES rather than "
+                "judging the code — it is the instrument that is broken, "
+                "not necessarily the artifact. Repairing it now rather "
+                "than discovering this at the end of the run:\n%s", tail)
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            original = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not read the contract: %s", exc)
+        return None
+    original_strength = _substantive_count(state[2])
+
+    # Asked more than once, for the reason the weakness repair above
+    # already documents: an unusable RESPONSE is not the same as a repair
+    # that was judged and rejected, and must not spend the budget as if
+    # it were. Measured live 2026-09-09: the single attempt came back
+    # having burned all 16,384 output tokens on reasoning ("Response hit
+    # the output-token limit"), the contract stayed broken, and the run
+    # ended exactly as it would have without any of this.
+    identity = identity_task if (identity_task or "").strip() else task
+    latest = tail
+    # Why the PREVIOUS attempt was rejected. Sending an identical prompt
+    # twice asks a blind question: measured live 2026-09-09, both attempts
+    # came back weaker than the original (0 then 1 substantive assertion
+    # against 2) because nothing told the model that the first had been
+    # refused, or why. The still-crashing branch below already feeds its
+    # error back; every other rejection now does the same.
+    rejected = ""
+    for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+        # The contract itself goes in the prompt. Without it the model was
+        # being asked to fix a file it could not see, under a base prompt
+        # whose framing is "before any code exists" — and it did the only
+        # thing that framing allows: it regenerated from scratch, decided
+        # the task named no importable module, and returned a contract
+        # whose single test was `self.fail(...)`. Its own prior output is
+        # safe to show; the ARTIFACT is not, because a contract shaped by
+        # the code it judges is no longer independent of it.
+        candidate = _generate(
+            llm_client, task,
+            extra=_UNRUNNABLE_NOTE.format(output=latest,
+                                          contract=state[2].strip())
+                  + rejected)
+        if candidate is None:
+            log.info("[AcceptanceSeed] runnability repair %d/%d came back "
+                     "unusable — that is a bad response, not a verdict on "
+                     "the repair, so asking again", _attempt,
+                     _REPAIR_ATTEMPTS)
+            continue
+        _mock = mocking_reason(candidate)
+        if _mock:
+            log.info("[AcceptanceSeed] runnability repair %d/%d mocks the "
+                     "system under test (%s) — asking again", _attempt,
+                     _REPAIR_ATTEMPTS, _mock)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it mocked or "
+                "stubbed the system under test (%s). A contract that stubs "
+                "the code cannot be evidence about the code — drive the "
+                "real objects." % _mock)
+            continue
+        # A repair is free to introduce this defect even when the original
+        # did not, so the runnability path screens for it too.
+        _human = interactive_reason(candidate)
+        if _human:
+            log.info("[AcceptanceSeed] runnability repair %d/%d needs a "
+                     "human (%s) — asking again", _attempt,
+                     _REPAIR_ATTEMPTS, _human)
+            rejected = _INTERACTIVE_NOTE.format(marker=_human)
+            continue
+        # Same reasoning for documentation wording — but only a repair that
+        # INTRODUCES it is refused. A contract kept with README checks after
+        # its seeding retries would otherwise become unrepairable, and a
+        # crash is the more urgent of the two defects.
+        from .seed_strength import documentation_grep_reason
+        _docs = documentation_grep_reason(candidate)
+        if _docs and not documentation_grep_reason(state[2]):
+            log.info("[AcceptanceSeed] runnability repair %d/%d started "
+                     "asserting on documentation wording (%s) — asking again",
+                     _attempt, _REPAIR_ATTEMPTS, _docs)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it added assertions "
+                "on documentation wording (%s). Do not read README or any "
+                ".md file — fix the crash, keep the behaviour checks." % _docs)
+            continue
+        # A crash is trivially "fixed" by asserting less. Rank the repair
+        # the same way the weakness repair does, and refuse a trade of
+        # correctness for coverage.
+        if _substantive_count(candidate) < original_strength:
+            log.info("[AcceptanceSeed] runnability repair %d/%d is weaker "
+                     "than the original (%d substantive assertion(s) vs "
+                     "%d) — that trades a broken check for a shallow one, "
+                     "so asking again", _attempt, _REPAIR_ATTEMPTS,
+                     _substantive_count(candidate), original_strength)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it kept only %d "
+                "meaningful assertion(s) where the contract above has %d. "
+                "You removed checks instead of fixing the crash. Reproduce "
+                "EVERY assertion from the contract above, changing only the "
+                "expression that raised."
+                % (_substantive_count(candidate), original_strength))
+            continue
+
+        # Static checks passed, so prove it the only way that counts: run
+        # it. The write has to happen first — the contract is executed by
+        # its own name, from the project root, exactly as the end-of-run
+        # check will execute it.
+        if not candidate.endswith("\n"):
+            candidate += "\n"
+        body = "\n" + candidate
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_header(identity, body) + body)
+        except OSError as exc:
+            log.warning("[AcceptanceSeed] could not write the repair: %s",
+                        exc)
+            return None
+
+        ok_after, out_after = _run_contract(executor, root, record=final)
+        if ok_after or _errors_reported(out_after) == 0:
+            from .evidence import _digest
+            digest = _digest(path)
+            if digest is None:
+                return None
+            log.info("[AcceptanceSeed] the contract now runs (%s) — "
+                     "repaired before the run spent its budget proving a "
+                     "broken instrument right",
+                     "and passes" if ok_after else "and judges the code")
+            return SEED_BASENAME, digest
+
+        # Still crashing. Restore the original — two broken contracts are
+        # not better than one, and the original at least had whatever
+        # strength the seeding checks approved — then feed the NEW error
+        # back. Measured live 2026-09-09: a candidate that passed every
+        # static check and then crashed ended the repair outright, which
+        # threw away the most useful signal available (a fresh, specific
+        # error about the attempt just made) while attempts remained.
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(original)
+        except OSError:
+            pass
+        # `_LAST_RUN` now describes the REPAIRED file, which is no longer the
+        # one on disk. Handing that to the verdict would report a result for
+        # bytes nobody can read.
+        _LAST_RUN.pop(path, None)
+        latest = "\n".join((out_after or "").strip().splitlines()[-25:])
+        rejected = ("\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it still "
+                    "crashed, with the error shown above. Fix that one, and "
+                    "keep every assertion.")
+        log.info("[AcceptanceSeed] runnability repair %d/%d still crashes — "
+                 "restored the original and asking again with the new "
+                 "error:\n%s", _attempt, _REPAIR_ATTEMPTS, latest)
+
+    log.warning("[AcceptanceSeed] no usable repair after %d attempt(s) — "
+                "keeping the original contract; this run's seeded evidence "
+                "will be reported as inconclusive", _REPAIR_ATTEMPTS)
+    return None
