@@ -506,7 +506,8 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
 
     Must be called after **every** stage that can write source files —
-    each wave, the bulk-test fix round, and the smoke-test repair loop.
+    each wave, the bulk-test fix round, wiring verification (through
+    `_check_advisory_stage`), and the smoke-test repair loop.
     Skipping any of them lets that stage's edits ship unverified: the
     smoke test repaired a launch crash by changing ``Player.update()``'s
     signature, the already-green ``python -m unittest discover`` gate went
@@ -625,6 +626,47 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
             "[Monotonic] Rollback unavailable (%s) — regressing state left "
             "in place for inspection.", rb_msg)
     return False
+
+
+def _check_advisory_stage(snapshots, executor, stage: str,
+                          display=None) -> bool:
+    """Gate-check a stage whose edits the run never needed; True if it may pass.
+
+    Wiring verification is advisory by construction: when its fix FAILS the
+    pipeline only logs a warning, because the tree before it had already
+    passed every gate. Its edits were still source edits, though, and
+    nothing gate-checked them — `_enforce_monotonic_gates` listed every
+    other stage that writes source and not this one.
+
+    Measured 2026-09-13, a single-file pygame pinball run. Gate 2.1 passed
+    after wave 2. WiringVerification then applied an LLM fix to
+    `pinball.py` that made `PinballGame()` build a font before
+    `pygame.init()` (`pygame.error: font not initialized`). Nothing looked
+    until the smoke test's re-check, which blamed "smoke-test fixes" — the
+    smoke test had fixed nothing — rolled the tree back to the wave-2
+    snapshot, and failed the run. The rolled-back tree passed the gate,
+    launched, and passed its independent contract 3/3; the ghost said
+    `failed-but-clean`. The only thing wrong was the verdict.
+
+    So: run the ordinary monotonic check, attributed to the right stage.
+    If it rolls back, measure the tree it rolled back TO. Green means the
+    stage's work was discarded and nothing the run needed went with it, so
+    the run stands. Still red — a gate conflict (nothing was rolled back)
+    or a rollback that could not happen — fails exactly as before: a red
+    gate is never reported as success.
+    """
+    if _enforce_monotonic_gates(snapshots, executor, stage, display=display):
+        return True
+    from .wave_snapshots import get_gate_ledger
+    still_red = get_gate_ledger().recheck(executor)
+    if still_red:
+        return False
+    log.warning(
+        "[Monotonic] %s broke a previously-passing gate and was rolled back; "
+        "the tree before it passes every gate, so the run stands on that "
+        "state. %s is advisory — its edits were never needed for the run "
+        "to succeed.", stage, stage)
+    return True
 
 
 def _prompt_for_acceptance_cmds(cfg, auto: bool) -> list:
@@ -2495,6 +2537,13 @@ def _main_impl():
         )
         if not wv_ok:
             log.warning(f"[WiringVerification] Fix failed: {wv_err[:200]}")
+        # Its edits are source edits and must be gate-checked HERE, under
+        # its own name. Unchecked, a regression it introduced surfaced at the
+        # smoke test's re-check, was blamed on "smoke-test fixes", and failed
+        # a run whose rolled-back tree was green. See _check_advisory_stage.
+        if not _check_advisory_stage(snapshots, executor, "wiring fixes",
+                                     display=display):
+            pipeline_success = False
 
     # ── 13.7. Runtime smoke verification ──
     # Tests can pass while the app crashes at launch (GUI apps especially —
