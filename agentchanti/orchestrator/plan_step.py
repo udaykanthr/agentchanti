@@ -518,8 +518,14 @@ def _norm_target_path(path: str) -> str:
     ``main//templates//...`` and poison every downstream consumer (the
     Django probe derived template names like ``/main//base.html`` and
     failed verification against a working app).
+
+    Strips a leading ``./`` PREFIX only. ``lstrip("./")`` stripped every
+    leading dot, so ``target: .gitignore`` was recorded as ``gitignore``
+    and the ghost reported the planned file missing and the real one as an
+    unplanned write (measured 2026-09-13).
     """
-    return re.sub(r"[\\/]+", "/", path.strip()).lstrip("./")
+    from ..paths import norm_rel_path
+    return norm_rel_path(path)
 
 
 def parse_structured_plan(text: str) -> list[PlanStep]:

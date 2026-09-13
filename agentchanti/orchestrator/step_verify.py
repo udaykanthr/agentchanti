@@ -35,7 +35,8 @@ def _python_import_target(file_path: str) -> Optional[tuple[str, str]]:
     root ``.``) and src-layouts (``src/pkg/mod.py`` → ``pkg.mod``,
     root ``src``) from the same rule.
     """
-    norm = file_path.replace("\\", "/").lstrip("./")
+    from ..paths import strip_dot_slash
+    norm = strip_dot_slash(file_path.replace("\\", "/"))
     if not norm.endswith(".py"):
         return None
     parts = norm.split("/")

@@ -79,7 +79,8 @@ Reader = Callable[[str], Optional[str]]
 
 
 def _norm(path: str) -> str:
-    return posixpath.normpath(path.replace("\\", "/")).lstrip("./")
+    from ..paths import strip_dot_slash
+    return strip_dot_slash(posixpath.normpath(path.replace("\\", "/")))
 
 
 def _project_root_of(target: str, read: Reader) -> Optional[str]:

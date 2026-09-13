@@ -2135,8 +2135,9 @@ def _main_impl():
         # the plan asked for is planned however unusual it looks, which
         # is what keeps `phantom_root_manifest_reason` from refusing a
         # legitimate workspaces root.
+        from ..paths import strip_dot_slash
         memory._plan_declared_files = {
-            (_t or "").replace(chr(92), "/").lstrip("/").lstrip("./")
+            strip_dot_slash((_t or "").replace(chr(92), "/"))
             for _ps in plan_steps_parsed
             for _t in (getattr(_ps, "target_files", None) or [])
         }

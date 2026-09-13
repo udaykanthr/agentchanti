@@ -508,8 +508,13 @@ class AgentTools:
         """
         for p in paths or ():
             if p:
+                # A PREFIX strip. `lstrip("./")` stored `.ci/accept.py` as
+                # `ci/accept.py`, while `_acceptance_refusal` compares the
+                # dotted relpath — so a dot-directory instrument was never
+                # protected at all.
+                from .paths import strip_dot_slash
                 self._acceptance_files.add(
-                    str(p).replace("\\", "/").lstrip("./").strip("/"))
+                    strip_dot_slash(str(p).replace("\\", "/")).strip("/"))
 
     # ── Definitions ──
 

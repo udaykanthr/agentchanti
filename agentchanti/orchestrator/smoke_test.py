@@ -19,6 +19,7 @@ import os
 import re
 
 from ..cli_display import status_only as _status_only
+from ..paths import strip_dot_slash
 
 _logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def build_run_command(entry_path: str) -> str:
     relative imports.  Parent levels may be namespace packages (no
     ``__init__.py``); ``-m`` handles those fine.  Otherwise ``python path``.
     """
-    norm = entry_path.replace("\\", "/").lstrip("./")
+    norm = strip_dot_slash(entry_path.replace("\\", "/"))
     parts = norm.split("/")
     if len(parts) > 1 and os.path.isfile(
         os.path.join(*parts[:-1], "__init__.py")
@@ -203,7 +204,7 @@ def _files_from_traceback(output: str, memory_files: dict[str, str]) -> list[str
     for tb_path in _TB_FILE_RE.findall(output):
         tb_norm = tb_path.replace("\\", "/")
         for mem_path in memory_files:
-            mem_norm = mem_path.replace("\\", "/").lstrip("./")
+            mem_norm = strip_dot_slash(mem_path.replace("\\", "/"))
             if tb_norm.endswith(mem_norm) and mem_path not in matched:
                 matched.append(mem_path)
                 break
@@ -355,7 +356,7 @@ def _attempt_fix(
         # Only accept fixes for files the crash implicated
         fix_files = {
             p: c for p, c in (fix_files or {}).items()
-            if p.replace("\\", "/").lstrip("./") in allowed
+            if strip_dot_slash(p.replace("\\", "/")) in allowed
         }
         if not fix_files:
             _logger.warning(

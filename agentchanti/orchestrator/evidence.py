@@ -128,7 +128,8 @@ class Evidence:
 
 
 def _norm(path: str) -> str:
-    return os.path.normpath(path).replace("\\", "/").lstrip("./")
+    from ..paths import strip_dot_slash
+    return strip_dot_slash(os.path.normpath(path).replace("\\", "/"))
 
 
 def _digest(path: str) -> Optional[str]:

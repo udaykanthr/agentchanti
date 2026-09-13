@@ -6111,7 +6111,8 @@ def _resolve_fix_scope_files(
         #    same-named files are exactly the ones the wiring check must
         #    see side by side.
         stored = memory.all_files()
-        p_norm = path.replace("\\", "/").lstrip("./")
+        from ..paths import strip_dot_slash
+        p_norm = strip_dot_slash(path.replace("\\", "/"))
         matches = [sp for sp in stored
                    if sp.replace("\\", "/") == p_norm
                    or sp.replace("\\", "/").endswith("/" + p_norm)]
@@ -6406,8 +6407,9 @@ def run_wiring_verification(
         # rather than filtered: the files on disk have already passed
         # their own step checks.
         _allowed = set(verification_context.keys())
+        from ..paths import strip_dot_slash
         _strays = [p for p in fix_files
-                   if p.replace("\\", "/").lstrip("./") not in _allowed]
+                   if strip_dot_slash(p.replace("\\", "/")) not in _allowed]
         if _strays:
             _logger.warning(
                 "[WiringVerification] Rejecting fix — it rewrites file(s) "

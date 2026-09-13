@@ -75,12 +75,13 @@ from typing import Iterable, Optional
 # is the whole point — a second, naive comparison here would reproduce the
 # false-warning history that function exists to end.
 #
-# `plan_graph.normalize_path` is deliberately NOT used: its `lstrip("./")`
-# strips any leading dot, so `.agentchanti/log.txt` becomes
-# `agentchanti/log.txt` and `.env` becomes `env`. That is harmless for a
-# graph of planned modules, but this module stats real files and compares
-# against FileMemory keys (which keep their dots), so it needs a
-# normaliser that only collapses separators and a leading `./`.
+# This module keeps its own path normaliser because it stats real files
+# and compares against FileMemory keys, which keep their dots. The warning
+# that used to sit here — `plan_graph.normalize_path`'s `lstrip("./")`
+# turning `.env` into `env` — was right, and incomplete: the plan PARSER
+# used the same idiom, so a `target: .gitignore` reached this module
+# already stripped and no local care could recover it. Both now go through
+# `agentchanti.paths.strip_dot_slash` (measured 2026-09-13).
 from .plan_graph import _canonical_name, _export_satisfied, module_key
 
 _logger = logging.getLogger(__name__)

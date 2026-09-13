@@ -377,7 +377,8 @@ def local_top_levels_from_files(file_paths) -> set[str]:
     """
     tops: set[str] = set()
     for p in file_paths:
-        norm = p.replace("\\", "/").lstrip("./")
+        from ..paths import strip_dot_slash
+        norm = strip_dot_slash(p.replace("\\", "/"))
         first = norm.split("/")[0]
         if first.endswith(".py"):
             first = first[:-3]
