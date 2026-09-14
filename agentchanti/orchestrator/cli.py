@@ -2443,9 +2443,17 @@ def _main_impl():
         if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
             try:
                 from .acceptance_seed import verify_contract_runs
+                # Files later waves will write: a contract crashing because
+                # one of them is missing is ahead of the build, not broken.
+                _later = {i for _w in waves[wave_idx + 1:] for i in _w}
+                _pending_targets = [
+                    _t for _ps in (plan_steps_parsed or [])
+                    if getattr(_ps, "index", None) in _later
+                    for _t in (getattr(_ps, "target_files", None) or [])]
                 _fixed = verify_contract_runs(
                     executor, os.getcwd(), llm_client, args.task,
-                    identity_task=getattr(args, "_raw_task", None))
+                    identity_task=getattr(args, "_raw_task", None),
+                    pending_targets=_pending_targets)
                 if _fixed:
                     # The snapshot must learn the new bytes, or the repair
                     # reads downstream as "the agent edited the contract"

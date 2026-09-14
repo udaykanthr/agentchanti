@@ -642,6 +642,49 @@ def _not_ready_reason(output: str):
     return "a project source file does not exist yet" if found else None
 
 
+# The `.py` rule above is a guess at "not built yet"; the plan is the fact.
+# Measured 2026-09-15, a 12-step Snake run on 0.8.1: after wave 6 the
+# contract reported `FAILED (failures=3, errors=1)`, and the one error was
+#
+#     Path("README.md").stat().st_size
+#     FileNotFoundError: [WinError 2] ... cannot find the file specified: 'README.md'
+#
+# README.md was the declared target of step 5.2, which ran in wave 7. The
+# error was read as a broken instrument, two repair attempts spent 26k
+# tokens and blocked the run for three minutes, both were rejected — and
+# the unmodified contract passed 5/5 at the end. A missing file that a step
+# still to run declares as its target is code not written yet, whatever its
+# extension.
+_MISSING_FILE_LINE_RE = re.compile(
+    r"FileNotFoundError|No such file or directory|cannot find the "
+    r"(?:file|path) specified|can't open file", re.IGNORECASE)
+
+
+def _names_pending_target(output: str, pending_targets) -> str | None:
+    """A pending step's target named by a missing-file error, or None.
+
+    Judged per line, so a pending target mentioned in some unrelated
+    assertion message does not excuse a genuine crash elsewhere.
+    """
+    if not output or not pending_targets:
+        return None
+    from ..paths import strip_dot_slash
+    wanted = {strip_dot_slash(t.replace("\\", "/")).lower()
+              for t in pending_targets if t and t.strip()}
+    wanted.discard("")
+    for line in output.splitlines():
+        if not _MISSING_FILE_LINE_RE.search(line):
+            continue
+        norm = line.replace("\\\\", "/").replace("\\", "/").lower()
+        for target in wanted:
+            # A path is named when it ends a quoted or separated token:
+            # 'README.md', C:/proj/tests/test_game.py, tests/test_game.py
+            if re.search(r"(?:^|[\s'\"/:])" + re.escape(target) + r"(?=['\"\s]|$)",
+                         norm):
+                return target
+    return None
+
+
 # One path -> repair attempts already spent. A contract that still cannot
 # run afterwards is left alone: the end-of-run path reports it as
 # inconclusive, which is the honest outcome and already implemented.
@@ -704,8 +747,13 @@ def _run_contract(executor, root: str, record: bool = False):
 def verify_contract_runs(executor, root: str, llm_client, task: str,
                          identity_task: str = None,
                          max_repairs: int = 1,
-                         final: bool = False):
+                         final: bool = False,
+                         pending_targets=None):
     """Execute the seeded contract; repair it once if it cannot run.
+
+    *pending_targets* are the files declared by plan steps that have not run
+    yet. A crash on one of them missing is deferred like an import error —
+    the file is simply not written yet — rather than repaired.
 
     Returns ``(relative path, new sha256)`` when the file was rewritten —
     the caller MUST update its pre-existing-test snapshot with it, or the
@@ -744,6 +792,13 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
         # window) for no new information.
         _JUDGED.add(path)
         return None
+    if not final:
+        _pending = _names_pending_target(out, pending_targets)
+        if _pending:
+            log.debug("[AcceptanceSeed] contract needs %s, which a later step "
+                      "of the plan will write — deferring the runnability "
+                      "check", _pending)
+            return None
     if _not_ready_reason(out):
         if not final:
             log.debug("[AcceptanceSeed] contract cannot reach the project "
