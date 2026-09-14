@@ -6,6 +6,29 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.1 — 2026-09-15
+
+### Fixed
+
+- **A wiring-verification fix could fail a run that ended up correct.**
+  Wiring verification asks the model for a cross-file fix and applies it
+  to source files, but nothing re-ran the gates after it. Measured on
+  0.8.0 with a pygame pinball game: the wiring fix made the game create a
+  font before `pygame.init()` and broke a passing gate. The regression
+  was only noticed at the smoke test's re-check, which blamed
+  "smoke-test fixes" (the smoke test had changed nothing), rolled the
+  project back to its last green snapshot, and failed the run. The
+  rolled-back game passed every gate, launched, and passed its
+  independent acceptance contract.
+
+  Gates are now re-checked right after wiring verification, under its
+  own name, before the smoke test launches the app. If its fix breaks a
+  gate, the fix is rolled back. When the restored project passes every
+  gate, the run stands with a warning, since wiring verification was
+  never needed for the run to succeed (a failed wiring fix only ever
+  warned). If gates are still red after the rollback, the run fails as
+  before.
+
 ## 0.8.0 — 2026-09-13
 
 Measured over ~32 runs of a two-root React + Express task and a series of
