@@ -6,6 +6,53 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.2 — 2026-09-16
+
+Measured over a series of runs of one ordinary prompt ("create a 2 snake
+game in python include production ready features") and a 0.7.0-vs-0.8.2
+A/B of three paired runs. In every failure investigated, the generated game
+was correct and the harness was wrong.
+
+### Changed
+
+- **A contract the run wrote can no longer fail the run on its own.**
+  With `require_independent_evidence: true`, a run used to exit non-zero
+  whenever the only independent check was the acceptance contract the
+  pipeline wrote from the task, before any code existed, and that contract
+  did not pass. Four consecutive runs failed that way over working games,
+  each on a different contract mistake. Such a run now finishes, reported
+  clearly as **not independently verified**. Your own `acceptance_cmds`,
+  your own test files, a run with no evidence at all, and a contract the
+  agent edited still fail the run exactly as before. Applied in the CLI and
+  the library API alike.
+
+- **The contract-writing prompt is back to the 0.7.0 prompt.** It had grown
+  from 7 rules to 11 without improving results. The checks for each
+  mistake remain; their guidance is now sent only to a contract that makes
+  that mistake.
+
+### Fixed
+
+- **A combined gate could never pass on Windows.** When the pipeline joins
+  two `python -c` checks with `&&`, cmd.exe misread a `<` inside them as a
+  file redirect and reported `The system cannot find the path specified.`
+  on every attempt, while each check passed on its own. A correct step
+  ended the run. Each script in such a chain now runs without cmd.exe,
+  stopping at the first failure.
+- **Contract mistakes caught before any step runs**, with a targeted repair:
+  - looking for project files one folder above the project
+    (`Path(__file__).parents[1]`);
+  - sending signals Windows rejects (`send_signal(signal.SIGINT)`);
+  - finding the program's window through the Windows desktop instead of
+    testing the program (it could never match a venv's child process).
+  An existing contract with one of these mistakes is rewritten on rerun
+  when no other tests exist.
+- **No contract repairs for files later steps haven't written yet.** A
+  contract that needed `README.md` mid-run was "repaired" twice (26k tokens
+  and three minutes) before the step that writes it had run.
+- **`produces: installed pygame>=2.5,<3` is no longer read as two files**,
+  one of them named `<3`.
+
 ## 0.8.1 — 2026-09-15
 
 ### Fixed
