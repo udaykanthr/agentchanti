@@ -6,6 +6,26 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.3 — 2026-09-16
+
+### Fixed
+
+- **A `findstr` check that could never pass on Windows.** `findstr` splits a
+  quoted search string on spaces and matches any single word, so a gate
+  such as `findstr /x "snake_game 0.1.0"` fails even when the program
+  prints exactly that line — and hides the output it rejected, so the model
+  cannot see why. Measured on 0.8.2, one such gate consumed 79% of a
+  472k-token run before it failed. These gates are now recognised before
+  the step starts and run as `findstr /x /c:"..."`, the literal-phrase form.
+- **No more recovery turns on a gate already proven broken.** Once a gate is
+  marked stalled (it cannot measure the code), the step now stops. It used
+  to run a recovery loop and an escalation against the same gate — 20
+  wasted turns in the measured run.
+
+Tested live before release on the release-candidate build: the snake prompt
+passed 3 times and a second (pinball) prompt passed once, all verified by
+their seeded contract.
+
 ## 0.8.2 — 2026-09-16
 
 Measured over a series of runs of one ordinary prompt ("create a 2 snake

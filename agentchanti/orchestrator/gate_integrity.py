@@ -172,6 +172,45 @@ def posix_only_idiom_reason(cmd: str) -> str | None:
     return None
 
 
+# `findstr` reads a quoted search string that contains a space as SEVERAL
+# search strings, and matches a line against ANY of them; a literal phrase
+# needs `/c:"..."`. With `/x` (match the whole line) the gate becomes
+# unsatisfiable: it asks for a line equal to one single word.
+#
+# Measured 2026-09-16, step 10 of a Snake run:
+#
+#     set PYTHONPATH=src&&python -m snake_game --version | findstr /x "snake_game 0.1.0"
+#
+# The program printed exactly `snake_game 0.1.0`; the gate exited 1 with
+# EMPTY output, because findstr swallows every line that does not match —
+# so the model could not even see what it was failing. 25 turns across a
+# stall, a recovery and an escalation, 374k tokens (79% of the run), and
+# the four waves after it never ran. With `/c:` the same gate passes.
+_FINDSTR_PHRASE_RE = re.compile(
+    r'\bfindstr\b(?P<flags>(?:\s+/[A-Za-z]+)*)\s+"(?P<s>[^"]*\s[^"]*)"',
+    re.IGNORECASE)
+
+
+def findstr_phrase_reason(cmd: str) -> str | None:
+    """Why a `findstr` in *cmd* cannot match the phrase it was given, or None."""
+    if not cmd or os.name != 'nt':
+        return None
+    m = _FINDSTR_PHRASE_RE.search(cmd)
+    if not m:
+        return None
+    return (f"`findstr{m.group('flags')} \"{m.group('s')}\"` — findstr splits a "
+            f"quoted string on spaces and matches ANY of the words (with /x, "
+            f"a whole line equal to one word), so it cannot match that phrase "
+            f"and hides the output it rejected (use /c:\"...\" for a literal "
+            f"phrase)")
+
+
+def _findstr_literal_phrase(cmd: str) -> str:
+    """Rewrite `findstr [flags] "a b"` as `findstr [flags] /c:"a b"`."""
+    return _FINDSTR_PHRASE_RE.sub(
+        lambda m: f'findstr{m.group("flags")} /c:"{m.group("s")}"', cmd)
+
+
 def _to_cmd_dialect(cmd: str) -> str:
     """Rewrite POSIX-only idioms into their cmd.exe equivalents.
 
@@ -251,6 +290,10 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
         translated = _to_cmd_dialect(cmd)
         if translated and translated != cmd:
             variants.append(("posix-shell-idioms", translated))
+    if findstr_phrase_reason(cmd):
+        phrased = _findstr_literal_phrase(cmd)
+        if phrased and phrased != cmd:
+            variants.append(("findstr-literal-phrase", phrased))
     return variants
 
 

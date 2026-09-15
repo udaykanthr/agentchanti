@@ -2092,8 +2092,8 @@ def _posix_idiom_error(cmd: str) -> Optional[str]:
     what a given shell does with a given text, and is silent on POSIX
     where these idioms are correct.
     """
-    from .gate_integrity import posix_only_idiom_reason
-    return posix_only_idiom_reason(cmd)
+    from .gate_integrity import findstr_phrase_reason, posix_only_idiom_reason
+    return posix_only_idiom_reason(cmd) or findstr_phrase_reason(cmd)
 
 
 def _unescape_shell_quotes(payload: str) -> str:
