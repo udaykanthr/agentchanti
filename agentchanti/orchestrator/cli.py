@@ -2443,9 +2443,17 @@ def _main_impl():
         if getattr(cfg, "SEED_ACCEPTANCE_TESTS", True):
             try:
                 from .acceptance_seed import verify_contract_runs
+                # Files later waves will write: a contract crashing because
+                # one of them is missing is ahead of the build, not broken.
+                _later = {i for _w in waves[wave_idx + 1:] for i in _w}
+                _pending_targets = [
+                    _t for _ps in (plan_steps_parsed or [])
+                    if getattr(_ps, "index", None) in _later
+                    for _t in (getattr(_ps, "target_files", None) or [])]
                 _fixed = verify_contract_runs(
                     executor, os.getcwd(), llm_client, args.task,
-                    identity_task=getattr(args, "_raw_task", None))
+                    identity_task=getattr(args, "_raw_task", None),
+                    pending_targets=_pending_targets)
                 if _fixed:
                     # The snapshot must learn the new bytes, or the repair
                     # reads downstream as "the agent edited the contract"
@@ -2767,9 +2775,22 @@ def _main_impl():
 
     if (pipeline_success and not _evidence.independent
             and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
-        log.error("Pipeline failed: require_independent_evidence is set and "
-                  "nothing outside this run's own output verified it")
-        pipeline_success = False
+        from .evidence import seeded_contract_was_the_only_witness as _only_seed
+        _seeded_only = _only_seed(os.getcwd(), _pre_existing_tests,
+                                  _acceptance_cmds)
+        if _seeded_only:
+            log.warning(
+                "[Evidence] require_independent_evidence is set, but the only "
+                "instrument that could satisfy it was a contract this run "
+                "wrote before any code existed (%s), and it did not pass. A "
+                "seeded contract cannot fail a run on its own — reporting the "
+                "run as NOT independently verified rather than failed. Add "
+                "`acceptance_cmds` for a check the run cannot write.",
+                _seeded_only)
+        else:
+            log.error("Pipeline failed: require_independent_evidence is set "
+                      "and nothing outside this run's own output verified it")
+            pipeline_success = False
 
     if pipeline_success:
         display.finish(success=True, evidence=_evidence)

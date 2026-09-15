@@ -172,8 +172,10 @@ class StrengthNoLongerCountsWording(unittest.TestCase):
         """
         self.assertIsNone(weak_contract_reason(MEASURED))
 
-    def test_the_prompt_forbids_it_up_front(self):
-        self.assertIn("NEVER assert on documentation wording", _PROMPT)
+    def test_the_repair_note_forbids_it(self):
+        """Sent only to a contract that read the docs, not every prompt."""
+        from agentchanti.orchestrator.seed_strength import DOCUMENTATION_NOTE
+        self.assertIn("Do NOT open, read or search README", DOCUMENTATION_NOTE)
 
 
 class Seeding(unittest.TestCase):

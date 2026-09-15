@@ -1428,6 +1428,58 @@ class Executor:
         return argv
 
     @staticmethod
+    def _inline_script_chain(cmd: str) -> List[str] | None:
+        """Split `A && B && ...` of inline scripts into separate commands.
+
+        `_shell_free_argv` bypasses cmd.exe only for ONE inline script, and
+        the pipeline itself builds conjunctions: `_merged_gate` and
+        `carry_forward_strong_gates` join two good gates with `&&`. Measured
+        2026-09-16 (A/B round 3): the gate was
+
+            python -c "...assert 'pygame>=2.5,<3' in t..." && python -c "...'requires-python = \\">=3.10\\"' in text..."
+
+        Two inline scripts meant a 7-entry argv, so it went through cmd.exe,
+        whose quote tracking broke on `\\"` and read `<3` as input
+        redirection: `The system cannot find the path specified.` (44
+        chars) on every one of 20+ verifications, while the same first
+        script run on its own passed. gate_integrity then called the gate
+        STALLED, escalation failed, and a correct step ended the run.
+
+        Returns one command string per script, rebuilt with
+        `subprocess.list2cmdline` (the inverse of the Win32 parser, so each
+        re-splits to exactly the argv the chain's parse gave it), or None
+        unless EVERY segment is an inline-script invocation — any other
+        command in the chain keeps the shell, exactly as before. The caller
+        runs them in order and stops at the first failure, which is what
+        `&&` means.
+        """
+        if os.name != 'nt' or '&&' not in cmd:
+            return None
+        argv = Executor._win_split(cmd)
+        if not argv or '&&' not in argv:
+            return None
+        groups: list[list[str]] = [[]]
+        for tok in argv:
+            if tok == '&&':
+                groups.append([])
+            else:
+                groups[-1].append(tok)
+        if len(groups) < 2:
+            return None
+        for g in groups:
+            if len(g) != 3:
+                return None
+            exe = os.path.basename(g[0]).lower()
+            if exe.endswith('.exe'):
+                exe = exe[:-4]
+            if (exe not in Executor._INLINE_SCRIPT_INTERPRETERS
+                    or g[1] not in Executor._INLINE_SCRIPT_FLAGS):
+                return None
+        if not any(c in g[2] for g in groups for c in Executor._CMD_METACHARS):
+            return None
+        return [subprocess.list2cmdline(g) for g in groups]
+
+    @staticmethod
     def _env_path_key(run_env: dict) -> str:
         """The PATH key actually present in *run_env*.
 
@@ -1686,6 +1738,24 @@ class Executor:
             cmd = Executor._sanitize_unicode(cmd)
             log.info(f"[Executor] Running {'background ' if background else ''}command: {cmd}"
                      f"{f' (cwd={cwd})' if cwd else ''}")
+
+            # A chain of inline scripts must bypass cmd.exe one script at a
+            # time — see _inline_script_chain for the measured failure.
+            if not background:
+                chain = Executor._inline_script_chain(cmd)
+                if chain:
+                    log.debug(f"[Executor] {len(chain)} inline scripts joined "
+                              f"by && — running each outside cmd.exe, "
+                              f"stopping at the first failure")
+                    outputs: list[str] = []
+                    for segment in chain:
+                        ok, out = self._run_command_once(
+                            segment, env=env, timeout=timeout, cwd=cwd)
+                        if out:
+                            outputs.append(out)
+                        if not ok:
+                            return False, "\n".join(outputs)
+                    return True, "\n".join(outputs)
             # Fix bash-only constructs (source → .) so /bin/sh can run them
             if os.name != 'nt':
                 cmd = Executor._rewrite_for_posix_sh(cmd)

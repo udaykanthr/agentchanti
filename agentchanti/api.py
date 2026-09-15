@@ -799,9 +799,22 @@ def _run_task_impl(
     log.info(_evidence.log_line())
     if (pipeline_success and not _evidence.independent
             and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
-        log.error("Pipeline failed: require_independent_evidence is set and "
-                  "nothing outside this run's own output verified it")
-        pipeline_success = False
+        # Same rule as cli.py, so the two paths cannot diverge.
+        from .orchestrator.evidence import (
+            seeded_contract_was_the_only_witness as _only_seed)
+        _seeded_only = _only_seed(os.getcwd(), _pre_existing_tests,
+                                  _acceptance_cmds)
+        if _seeded_only:
+            log.warning(
+                "[Evidence] require_independent_evidence is set, but the only "
+                "instrument that could satisfy it was a contract this run "
+                "wrote before any code existed (%s), and it did not pass — "
+                "reporting the run as NOT independently verified rather than "
+                "failed.", _seeded_only)
+        else:
+            log.error("Pipeline failed: require_independent_evidence is set "
+                      "and nothing outside this run's own output verified it")
+            pipeline_success = False
 
     return TaskResult(
         success=pipeline_success,

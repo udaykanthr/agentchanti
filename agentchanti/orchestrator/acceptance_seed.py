@@ -55,6 +55,7 @@ declares something the plan's body does not.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
 import os
@@ -153,21 +154,18 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
    `restart`; you would be testing vocabulary, not behaviour. Build the
    objects and call the methods.
 
-8. NEVER require a human. No `input()`, no `tkinter` or any other GUI
-   prompt, no "press a key", no asking someone to look at the screen and
-   report what they saw. Nobody is watching this run: a contract that
-   waits for a person never finishes, fails the run over code that may be
-   perfect, and leaves an application window open that looks hung. Assert
-   on the program's own state and returned values instead.
-
-9. NEVER assert on documentation wording. Do not read README, CHANGELOG
-   or any .md/.rst file. It does not exist yet, and you cannot predict its
-   words or its markup: `Python **3.10 or newer**` states the requirement
-   exactly and still fails a regex for `python 3.10`. If the task asks for
-   documentation, assert at most that the file exists and is not empty.
-
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
+
+# The prompt above is deliberately the 0.7.0 prompt, verbatim. Between 0.8.0
+# and 2026-09-15 it grew from 7 rules / 2,132 chars to 11 rules / 4,143 chars
+# (no human, no README wording, where the file lives, the platform, no
+# climbing above __file__, no desktop inspection) — one rule per observed
+# failure — while the failure rate on the measured prompt did not improve,
+# and the contract after the Windows platform note walked the Win32 desktop
+# for the first time. Every one of those defects is now caught by a detector
+# that costs nothing unless it fires, and its guidance is sent only then, in
+# the repair note for the contract that actually made the mistake.
 
 
 # Rule 5 of the prompt says no mocks, and a suite that ignores it is not
@@ -233,6 +231,235 @@ _INTERACTIVE_MARKERS = (
     "PySimpleGUI",
     "pyautogui",
 )
+
+
+# The contract is written to the PROJECT ROOT and run from there, and the
+# prompt never said so. Measured 2026-09-15, a 7-step Snake run: every gate
+# green, smoke test launched, ghost 0 violated — and exit 1, because the
+# seeded contract began
+#
+#     PROJECT_ROOT = Path(__file__).resolve().parents[1]
+#
+# which is the conventional line for a file in `tests/`, and one directory
+# ABOVE the project for a file at the root. `snake_game.py` was reported
+# missing while it sat beside the contract, and the game was launched with
+# cwd outside the project, exiting 2. Both surfaced as assertion FAILURES,
+# which the runnability repair rightly never touches — so nothing caught it.
+#
+# Deterministic from the source alone: a file in the root that climbs from
+# `__file__` always leaves the project. Names bound to a `__file__`
+# expression are followed, so `HERE = Path(__file__).resolve()` then
+# `HERE.parents[1]` is seen too.
+def root_escape_reason(src: str) -> str | None:
+    """The construct that resolves a path above the project root, or None."""
+    if not src or "__file__" not in src:
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+
+    file_names: set[str] = set()
+
+    def _from_file(node) -> bool:
+        return any((isinstance(n, ast.Name) and
+                    (n.id == "__file__" or n.id in file_names))
+                   for n in ast.walk(node))
+
+    for _ in range(2):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _from_file(node.value):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        file_names.add(target.id)
+
+    def _is_dirname(call) -> bool:
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else (
+            func.id if isinstance(func, ast.Name) else "")
+        return name == "dirname"
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "parents"
+                and _from_file(node.value.value)):
+            idx = node.slice
+            if (isinstance(idx, ast.Constant) and isinstance(idx.value, int)
+                    and idx.value >= 1):
+                return f"parents[{idx.value}]"
+        if (isinstance(node, ast.Attribute) and node.attr == "parent"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "parent"
+                and _from_file(node.value.value)):
+            return ".parent.parent"
+        if (isinstance(node, ast.Call) and _is_dirname(node) and node.args
+                and isinstance(node.args[0], ast.Call)
+                and _is_dirname(node.args[0])
+                and _from_file(node.args[0])):
+            return "os.path.dirname(os.path.dirname(__file__))"
+    return None
+
+
+# The same run's contract carried a second defect under the first: once its
+# root was corrected, the KeyboardInterrupt test raised
+#
+#     process.send_signal(signal.SIGINT)
+#     ValueError: Unsupported signal: 2
+#
+# On Windows `Popen.send_signal` accepts only SIGTERM, CTRL_C_EVENT and
+# CTRL_BREAK_EVENT, and several POSIX names do not exist at all. The prompt
+# never said which OS the contract runs on, so the model wrote POSIX. A
+# construct the running platform rejects is an instrument that cannot
+# execute — `posix_only_idiom_reason`'s argument for gates, one layer over.
+_WIN_SEND_SIGNAL_OK = {"SIGTERM", "CTRL_C_EVENT", "CTRL_BREAK_EVENT"}
+_POSIX_ONLY_SIGNAL_ATTRS = {
+    "SIGKILL", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM",
+    "SIGCHLD", "SIGPIPE", "SIGSTOP", "SIGCONT", "SIGTSTP", "alarm",
+    "setitimer", "pause", "pthread_kill", "sigwait"}
+_POSIX_ONLY_OS_ATTRS = {"killpg", "setsid", "getpgid", "setpgrp", "fork"}
+
+
+def _platform_note(platform: str | None = None) -> str:
+    import sys
+    platform = platform or sys.platform
+    if platform != "win32":
+        return f"PLATFORM: {platform}."
+    return (
+        "PLATFORM: Windows. `subprocess.Popen.send_signal` accepts ONLY "
+        "`signal.SIGTERM`, `signal.CTRL_C_EVENT` and `signal.CTRL_BREAK_EVENT` "
+        "(sending `signal.SIGINT` raises ValueError); `signal.SIGKILL`, "
+        "`SIGHUP`, `SIGUSR1`, `signal.alarm`, `os.killpg`, `os.setsid` and "
+        "`preexec_fn=` do not exist here. To stop a program you launched, "
+        "call `process.terminate()` and then `process.wait()`.")
+
+
+def platform_signal_reason(src: str, platform: str | None = None) -> str | None:
+    """A process/signal construct the running platform rejects, or None."""
+    import sys
+    if (platform or sys.platform) != "win32" or not src:
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Attribute) and func.attr == "send_signal"
+                    and node.args and isinstance(node.args[0], ast.Attribute)
+                    and isinstance(node.args[0].value, ast.Name)
+                    and node.args[0].value.id == "signal"
+                    and node.args[0].attr not in _WIN_SEND_SIGNAL_OK):
+                return f"send_signal(signal.{node.args[0].attr})"
+            for kw in node.keywords:
+                if kw.arg == "preexec_fn":
+                    return "preexec_fn="
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "signal" and node.attr in _POSIX_ONLY_SIGNAL_ATTRS:
+                return f"signal.{node.attr}"
+            if node.value.id == "os" and node.attr in _POSIX_ONLY_OS_ATTRS:
+                return f"os.{node.attr}"
+    return None
+
+
+# Measured 2026-09-15, the next Snake run after the two fixes above: every
+# gate green, the smoke test launched the game — and the contract failed on
+# `snake_game.py did not open a visible pygame window within 8.0 seconds`.
+# It launched the game with `sys.executable`, then walked the desktop with
+# `ctypes.WinDLL("user32").EnumWindows` for a visible window owned by
+# `process.pid`, and meant to scrape its pixels through gdi32. Measured by
+# hand, the window existed and was titled 'Two Player Snake' — owned by pid
+# 22824 (`C:\\Python313\\python.exe`), whose parent was pid 13136, the
+# `venv\\Scripts\\python.exe` launcher stub `Popen` returned. A Windows venv
+# interpreter re-executes the base one, so the check could never match.
+#
+# That is one instance of a class: asserting on the DESKTOP rather than the
+# program — window enumeration, screen capture, GUI automation. It depends
+# on a logged-in session, on how the interpreter launches, on focus and DPI,
+# and none of it is behaviour the task describes. Blind-written framework
+# introspection was already the dominant runtime failure; OS introspection
+# is the same thing one layer further out.
+_DESKTOP_DLLS = {"user32", "gdi32", "dwmapi", "user32.dll", "gdi32.dll",
+                 "dwmapi.dll"}
+_DESKTOP_MODULES = {"win32gui", "win32ui", "win32api", "win32con",
+                    "pywinauto", "mss", "pyscreeze", "Xlib", "Quartz"}
+
+
+def desktop_introspection_reason(src: str) -> str | None:
+    """A construct that inspects the OS window system or screen, or None."""
+    if not src:
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _DESKTOP_MODULES or alias.name == "PIL.ImageGrab":
+                    return f"import {alias.name}"
+        if isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top in _DESKTOP_MODULES:
+                return f"from {node.module} import ..."
+            if node.module == "PIL" and any(a.name == "ImageGrab"
+                                            for a in node.names):
+                return "PIL.ImageGrab"
+        if isinstance(node, ast.Call) and node.args:
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else (
+                func.id if isinstance(func, ast.Name) else "")
+            first = node.args[0]
+            if (name in ("WinDLL", "CDLL", "OleDLL", "LoadLibrary")
+                    and isinstance(first, ast.Constant)
+                    and isinstance(first.value, str)
+                    and first.value.lower() in _DESKTOP_DLLS):
+                return f'ctypes.{name}("{first.value}")'
+        if (isinstance(node, ast.Attribute) and node.attr in ("user32", "gdi32")
+                and isinstance(node.value, (ast.Attribute, ast.Name))
+                and (getattr(node.value, "attr", None) == "windll"
+                     or getattr(node.value, "id", None) == "windll")):
+            return f"windll.{node.attr}"
+    return None
+
+
+def structural_defect_reason(src: str) -> str | None:
+    """Why this contract cannot judge THIS project on THIS machine, or None."""
+    escape = root_escape_reason(src)
+    if escape:
+        return f"it looks outside the project ({escape} on __file__)"
+    posix = platform_signal_reason(src)
+    if posix:
+        return f"it uses {posix}, which this platform rejects"
+    desktop = desktop_introspection_reason(src)
+    if desktop:
+        return (f"it inspects the desktop rather than the program ({desktop}) "
+                f"— window enumeration and screen capture depend on a "
+                f"logged-in session and on which process owns the window, and "
+                f"a Windows venv interpreter launches the real one as a child")
+    return None
+
+
+_STRUCTURAL_NOTE = """
+
+Your contract CANNOT JUDGE THIS PROJECT ON THIS MACHINE: {reason}.
+
+{platform}
+
+It is saved as `test_acceptance_contract.py` IN THE PROJECT ROOT and run
+from there, so the project root is `Path(__file__).resolve().parent`.
+Never inspect the desktop (window enumeration, screenshots, GUI
+automation): for a graphical program set `SDL_VIDEODRIVER=dummy` and
+assert on the program's own state instead. Fix ONLY that defect: keep
+every test and every assertion exactly as strict.
+
+The contract you wrote, to revise rather than start over:
+
+```python
+{contract}
+```"""
 
 
 def interactive_reason(src: str) -> str | None:
@@ -359,6 +586,15 @@ def _should_seed(task: str, root: str, path: str) -> bool:
                  "seeded — whoever changed it owns it now", SEED_BASENAME)
         return False
     if task_hash == _fingerprint(task):
+        # Same task, unedited, but structurally unable to judge this project:
+        # reusing it guarantees the same false verdict on every rerun of the
+        # prompt. Ours, untouched, and provably broken — so replace it.
+        _defect = structural_defect_reason(body)
+        if _defect:
+            log.info("[AcceptanceSeed] re-seeding: %s was seeded from this "
+                     "task but %s, so it can never judge it",
+                     SEED_BASENAME, _defect)
+            return True
         log.info("[AcceptanceSeed] skipped: %s was seeded from this same "
                  "task and still applies", SEED_BASENAME)
         return False
@@ -436,6 +672,38 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                 "for input nobody will give, and fail the run over code that "
                 "may be perfect; no file is the honest outcome",
                 _human, _REPAIR_ATTEMPTS)
+            return None
+
+    # Structurally unable to judge this project on this machine: a root that
+    # climbs out of the project, or a signal the platform rejects. Refused
+    # if every retry keeps it, for the interactive screen's reason — the
+    # affected tests fail over any code, so keeping it guarantees a false
+    # verdict.
+    _defect = structural_defect_reason(src)
+    if _defect:
+        log.info("[AcceptanceSeed] the contract cannot judge this project on "
+                 "this machine (%s) — asking again", _defect)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=_STRUCTURAL_NOTE.format(
+                                  reason=_defect, platform=_platform_note(),
+                                  contract=src.strip()))
+            if retry is None or mocking_reason(retry) \
+                    or interactive_reason(retry):
+                continue
+            _still = structural_defect_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract can judge "
+                         "this project — using it")
+                src, _defect = retry, None
+                break
+            _defect = _still
+        if _defect:
+            log.warning(
+                "[AcceptanceSeed] the contract still cannot judge this project "
+                "(%s) after %d attempt(s) — refusing it. The affected tests "
+                "would fail over any code; no file is the honest outcome",
+                _defect, _REPAIR_ATTEMPTS)
             return None
 
     # Documentation wording, repaired before strength is judged — a README
@@ -642,6 +910,49 @@ def _not_ready_reason(output: str):
     return "a project source file does not exist yet" if found else None
 
 
+# The `.py` rule above is a guess at "not built yet"; the plan is the fact.
+# Measured 2026-09-15, a 12-step Snake run on 0.8.1: after wave 6 the
+# contract reported `FAILED (failures=3, errors=1)`, and the one error was
+#
+#     Path("README.md").stat().st_size
+#     FileNotFoundError: [WinError 2] ... cannot find the file specified: 'README.md'
+#
+# README.md was the declared target of step 5.2, which ran in wave 7. The
+# error was read as a broken instrument, two repair attempts spent 26k
+# tokens and blocked the run for three minutes, both were rejected — and
+# the unmodified contract passed 5/5 at the end. A missing file that a step
+# still to run declares as its target is code not written yet, whatever its
+# extension.
+_MISSING_FILE_LINE_RE = re.compile(
+    r"FileNotFoundError|No such file or directory|cannot find the "
+    r"(?:file|path) specified|can't open file", re.IGNORECASE)
+
+
+def _names_pending_target(output: str, pending_targets) -> str | None:
+    """A pending step's target named by a missing-file error, or None.
+
+    Judged per line, so a pending target mentioned in some unrelated
+    assertion message does not excuse a genuine crash elsewhere.
+    """
+    if not output or not pending_targets:
+        return None
+    from ..paths import strip_dot_slash
+    wanted = {strip_dot_slash(t.replace("\\", "/")).lower()
+              for t in pending_targets if t and t.strip()}
+    wanted.discard("")
+    for line in output.splitlines():
+        if not _MISSING_FILE_LINE_RE.search(line):
+            continue
+        norm = line.replace("\\\\", "/").replace("\\", "/").lower()
+        for target in wanted:
+            # A path is named when it ends a quoted or separated token:
+            # 'README.md', C:/proj/tests/test_game.py, tests/test_game.py
+            if re.search(r"(?:^|[\s'\"/:])" + re.escape(target) + r"(?=['\"\s]|$)",
+                         norm):
+                return target
+    return None
+
+
 # One path -> repair attempts already spent. A contract that still cannot
 # run afterwards is left alone: the end-of-run path reports it as
 # inconclusive, which is the honest outcome and already implemented.
@@ -704,8 +1015,13 @@ def _run_contract(executor, root: str, record: bool = False):
 def verify_contract_runs(executor, root: str, llm_client, task: str,
                          identity_task: str = None,
                          max_repairs: int = 1,
-                         final: bool = False):
+                         final: bool = False,
+                         pending_targets=None):
     """Execute the seeded contract; repair it once if it cannot run.
+
+    *pending_targets* are the files declared by plan steps that have not run
+    yet. A crash on one of them missing is deferred like an import error —
+    the file is simply not written yet — rather than repaired.
 
     Returns ``(relative path, new sha256)`` when the file was rewritten —
     the caller MUST update its pre-existing-test snapshot with it, or the
@@ -744,6 +1060,13 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
         # window) for no new information.
         _JUDGED.add(path)
         return None
+    if not final:
+        _pending = _names_pending_target(out, pending_targets)
+        if _pending:
+            log.debug("[AcceptanceSeed] contract needs %s, which a later step "
+                      "of the plan will write — deferring the runnability "
+                      "check", _pending)
+            return None
     if _not_ready_reason(out):
         if not final:
             log.debug("[AcceptanceSeed] contract cannot reach the project "
@@ -859,6 +1182,18 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                 "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it added assertions "
                 "on documentation wording (%s). Do not read README or any "
                 ".md file — fix the crash, keep the behaviour checks." % _docs)
+            continue
+        # Refused whether introduced or inherited: unlike wording checks, a
+        # root outside the project or a signal this platform rejects is never
+        # right, and fixing it alongside the crash costs nothing extra.
+        _defect = structural_defect_reason(candidate)
+        if _defect:
+            log.info("[AcceptanceSeed] runnability repair %d/%d cannot judge "
+                     "this project (%s) — asking again", _attempt,
+                     _REPAIR_ATTEMPTS, _defect)
+            rejected = _STRUCTURAL_NOTE.format(reason=_defect,
+                                               platform=_platform_note(),
+                                               contract=candidate.strip())
             continue
         # A crash is trivially "fixed" by asserting less. Rank the repair
         # the same way the weakness repair does, and refuse a trade of
