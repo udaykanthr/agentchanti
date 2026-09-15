@@ -1121,6 +1121,24 @@ class TestDiagnosisLoopRecovery(unittest.TestCase):
         self.assertFalse(result)
         mock_rec.assert_not_called()
 
+    @patch("agentchanti.orchestrator.agent_loop.run_recovery_loop")
+    def test_a_stalled_gate_gets_no_recovery(self, mock_rec):
+        """Recovery is held to the same gate, proven not to measure the code.
+
+        Measured 2026-09-16: after STALLED and "NOT escalating", recovery ran
+        10 turns and escalated 10 more against a findstr gate no output
+        could pass — 20 of the step's 25 turns.
+        """
+        from agentchanti.orchestrator.agent_loop import GATE_STALLED_MARKER
+        from agentchanti.orchestrator.pipeline import _run_diagnosis_loop
+        kwargs = self._kwargs(self._cfg())
+        kwargs["llm_client"].supports_tools.return_value = True
+        result = _run_diagnosis_loop(
+            0, "step text",
+            f"{GATE_STALLED_MARKER} 4 identical failing verdicts", **kwargs)
+        self.assertFalse(result)
+        mock_rec.assert_not_called()
+
 
 class TestStepHandlerIntegration(unittest.TestCase):
     """The handlers delegate to the loop when the flag is on."""

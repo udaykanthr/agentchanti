@@ -3061,14 +3061,28 @@ def _run_diagnosis_loop(step_idx: int, step_text: str, error_info: str, *,
     # machinery: the model reads the real error, inspects the project
     # with tools, fixes the cause and completes the step in place.
     from .agent_loop import (
-        RECOVERY_FAILED_MARKER, agent_loop_enabled, build_step_tools,
-        run_recovery_loop, verify_cmd_for_language,
+        GATE_STALLED_MARKER, RECOVERY_FAILED_MARKER, agent_loop_enabled,
+        build_step_tools, run_recovery_loop, verify_cmd_for_language,
     )
     if agent_loop_enabled(cfg, llm_client):
         if RECOVERY_FAILED_MARKER in (error_info or ""):
             log.warning(
                 f"Task {step_idx+1}: Agent-loop recovery already attempted "
                 f"for this failure — not retrying.")
+            display.complete_step(step_idx, "failed")
+            return False
+        # The escalation wrapper already refuses to spend a stronger model
+        # on a gate proven not to measure the code. Recovery is held to the
+        # SAME plan-declared gate, so it cannot succeed either — and it
+        # escalates on its own. Measured 2026-09-16: after `[GateIntegrity]
+        # gate STALLED` and "NOT escalating", this path ran 10 recovery
+        # turns and 10 escalated ones against a findstr gate no output
+        # could pass: 20 of the step's 25 turns, most of 374k tokens.
+        if GATE_STALLED_MARKER in (error_info or ""):
+            log.warning(
+                f"Task {step_idx+1}: the step's gate was proven not to "
+                f"measure the code — skipping agent-loop recovery, which "
+                f"would be held to the same gate.")
             display.complete_step(step_idx, "failed")
             return False
         display.step_info(step_idx, "Agent loop: recovering from failure")
