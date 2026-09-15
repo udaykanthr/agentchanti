@@ -510,6 +510,21 @@ _STEP_RE = re.compile(
 )
 
 
+def _produced_paths(raw: str) -> list[str]:
+    """File entries of a `produces:` line, without prose or version specs.
+
+    `produces:` is free text, and planners describe environment state in
+    it. Measured 2026-09-15: `produces: installed pygame>=2.5,<3` split on
+    its comma into two "files", and the ghost reported
+    `violated-exists (step 2.1): <3 — planned target does not exist on disk`.
+    `<`, `>`, `|` and `"` cannot appear in a Windows path and only ever come
+    from a version specifier or prose, so such entries are dropped. Globs
+    (`app/src/*`) are kept — scaffold steps declare them.
+    """
+    return [f.strip() for f in (raw or "").split(",")
+            if f.strip() and not any(c in f for c in '<>|"')]
+
+
 def _norm_target_path(path: str) -> str:
     """Normalise a planner-emitted file path.
 
@@ -805,9 +820,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
             elif _bare_lower.startswith("produces:"):
                 raw = _bare[9:].strip()
                 if raw:
-                    current.target_files.extend(
-                        f.strip() for f in raw.split(",") if f.strip()
-                    )
+                    current.target_files.extend(_produced_paths(raw))
                 continue
             elif _bare_lower.startswith("verify:"):
                 raw = _bare[7:].strip().strip("`")
@@ -873,8 +886,7 @@ def parse_structured_plan(text: str) -> list[PlanStep]:
         elif line.lower().startswith("produces:"):
             raw = line[9:].strip()
             if raw:
-                produced = [f.strip() for f in raw.split(",") if f.strip()]
-                current.target_files.extend(produced)
+                current.target_files.extend(_produced_paths(raw))
 
         # KB docs declared by planner for reviewer context
         elif line.lower().startswith("kb_docs:"):

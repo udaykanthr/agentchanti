@@ -184,6 +184,14 @@ Rules, all of them load-bearing:
    OUTSIDE the project: every file you look for is "missing" and every
    script you launch fails to start, over code that may be perfect.
 
+11. NEVER inspect the desktop. No `ctypes` calls into user32/gdi32, no
+   `win32gui`, no window enumeration, no screenshots (`PIL.ImageGrab`,
+   `mss`), no GUI automation. A window's owner is often not the process you
+   launched (a venv's python.exe starts the real interpreter as a child),
+   and there may be no desktop session at all. For a graphical program, set
+   `SDL_VIDEODRIVER=dummy` and assert on the program's own state, or on
+   what its display surface reports, instead.
+
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
 
@@ -383,6 +391,68 @@ def platform_signal_reason(src: str, platform: str | None = None) -> str | None:
     return None
 
 
+# Measured 2026-09-15, the next Snake run after the two fixes above: every
+# gate green, the smoke test launched the game — and the contract failed on
+# `snake_game.py did not open a visible pygame window within 8.0 seconds`.
+# It launched the game with `sys.executable`, then walked the desktop with
+# `ctypes.WinDLL("user32").EnumWindows` for a visible window owned by
+# `process.pid`, and meant to scrape its pixels through gdi32. Measured by
+# hand, the window existed and was titled 'Two Player Snake' — owned by pid
+# 22824 (`C:\\Python313\\python.exe`), whose parent was pid 13136, the
+# `venv\\Scripts\\python.exe` launcher stub `Popen` returned. A Windows venv
+# interpreter re-executes the base one, so the check could never match.
+#
+# That is one instance of a class: asserting on the DESKTOP rather than the
+# program — window enumeration, screen capture, GUI automation. It depends
+# on a logged-in session, on how the interpreter launches, on focus and DPI,
+# and none of it is behaviour the task describes. Blind-written framework
+# introspection was already the dominant runtime failure; OS introspection
+# is the same thing one layer further out.
+_DESKTOP_DLLS = {"user32", "gdi32", "dwmapi", "user32.dll", "gdi32.dll",
+                 "dwmapi.dll"}
+_DESKTOP_MODULES = {"win32gui", "win32ui", "win32api", "win32con",
+                    "pywinauto", "mss", "pyscreeze", "Xlib", "Quartz"}
+
+
+def desktop_introspection_reason(src: str) -> str | None:
+    """A construct that inspects the OS window system or screen, or None."""
+    if not src:
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _DESKTOP_MODULES or alias.name == "PIL.ImageGrab":
+                    return f"import {alias.name}"
+        if isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top in _DESKTOP_MODULES:
+                return f"from {node.module} import ..."
+            if node.module == "PIL" and any(a.name == "ImageGrab"
+                                            for a in node.names):
+                return "PIL.ImageGrab"
+        if isinstance(node, ast.Call) and node.args:
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else (
+                func.id if isinstance(func, ast.Name) else "")
+            first = node.args[0]
+            if (name in ("WinDLL", "CDLL", "OleDLL", "LoadLibrary")
+                    and isinstance(first, ast.Constant)
+                    and isinstance(first.value, str)
+                    and first.value.lower() in _DESKTOP_DLLS):
+                return f'ctypes.{name}("{first.value}")'
+        if (isinstance(node, ast.Attribute) and node.attr in ("user32", "gdi32")
+                and isinstance(node.value, (ast.Attribute, ast.Name))
+                and (getattr(node.value, "attr", None) == "windll"
+                     or getattr(node.value, "id", None) == "windll")):
+            return f"windll.{node.attr}"
+    return None
+
+
 def structural_defect_reason(src: str) -> str | None:
     """Why this contract cannot judge THIS project on THIS machine, or None."""
     escape = root_escape_reason(src)
@@ -391,6 +461,12 @@ def structural_defect_reason(src: str) -> str | None:
     posix = platform_signal_reason(src)
     if posix:
         return f"it uses {posix}, which this platform rejects"
+    desktop = desktop_introspection_reason(src)
+    if desktop:
+        return (f"it inspects the desktop rather than the program ({desktop}) "
+                f"— window enumeration and screen capture depend on a "
+                f"logged-in session and on which process owns the window, and "
+                f"a Windows venv interpreter launches the real one as a child")
     return None
 
 
