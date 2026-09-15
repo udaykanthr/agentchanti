@@ -103,11 +103,11 @@ class InteractiveContractsAreRefused(unittest.TestCase):
             with self.subTest(src=src[:40]):
                 self.assertIsNone(interactive_reason(src))
 
-    def test_the_prompt_forbids_it_up_front(self):
-        """Cheaper to never generate one than to detect and regenerate."""
-        self.assertIn("NEVER require a human", _PROMPT)
-        self.assertIn("input()", _PROMPT)
-        self.assertIn("tkinter", _PROMPT)
+    def test_the_repair_note_forbids_it(self):
+        """Sent only to a contract that asked for a human, not every prompt."""
+        from agentchanti.orchestrator.acceptance_seed import _INTERACTIVE_NOTE
+        self.assertIn("input()", _INTERACTIVE_NOTE)
+        self.assertIn("tkinter", _INTERACTIVE_NOTE)
 
 
 if __name__ == "__main__":

@@ -2775,9 +2775,22 @@ def _main_impl():
 
     if (pipeline_success and not _evidence.independent
             and getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False)):
-        log.error("Pipeline failed: require_independent_evidence is set and "
-                  "nothing outside this run's own output verified it")
-        pipeline_success = False
+        from .evidence import seeded_contract_was_the_only_witness as _only_seed
+        _seeded_only = _only_seed(os.getcwd(), _pre_existing_tests,
+                                  _acceptance_cmds)
+        if _seeded_only:
+            log.warning(
+                "[Evidence] require_independent_evidence is set, but the only "
+                "instrument that could satisfy it was a contract this run "
+                "wrote before any code existed (%s), and it did not pass. A "
+                "seeded contract cannot fail a run on its own — reporting the "
+                "run as NOT independently verified rather than failed. Add "
+                "`acceptance_cmds` for a check the run cannot write.",
+                _seeded_only)
+        else:
+            log.error("Pipeline failed: require_independent_evidence is set "
+                      "and nothing outside this run's own output verified it")
+            pipeline_success = False
 
     if pipeline_success:
         display.finish(success=True, evidence=_evidence)

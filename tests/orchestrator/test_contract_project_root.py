@@ -16,6 +16,7 @@ were assertion FAILURES, which the runnability repair rightly never
 rewrites — so nothing caught it.
 """
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -23,7 +24,8 @@ import textwrap
 import pytest
 
 from agentchanti.orchestrator.acceptance_seed import (
-    SEED_BASENAME, _PROMPT, _header, _platform_note, _should_seed,
+    SEED_BASENAME, _PROMPT, _STRUCTURAL_NOTE, _header, _platform_note,
+    _should_seed,
     platform_signal_reason, root_escape_reason, seed_acceptance_tests,
     seed_state,
 )
@@ -84,10 +86,19 @@ class TestDetection:
         src = "import os\nfrom pathlib import Path\n" + line + "\n"
         assert root_escape_reason(src) is None
 
-    def test_the_prompt_says_where_the_file_lives(self):
-        assert "IN THE\nPROJECT ROOT" in _PROMPT
-        assert "Path(__file__).resolve().parent" in _PROMPT
-        assert "parents[1]" in _PROMPT
+    def test_the_repair_note_says_where_the_file_lives(self):
+        """Sent only to a contract that made the mistake, not every prompt."""
+        assert "IN THE PROJECT ROOT" in _STRUCTURAL_NOTE
+        assert "Path(__file__).resolve().parent" in _STRUCTURAL_NOTE
+        assert "{platform}" in _STRUCTURAL_NOTE
+
+    def test_the_seeding_prompt_is_the_070_prompt(self):
+        """Grown to 11 rules while the measured failure rate did not
+        improve; restored to 0.7.0's seven, guidance moved to repair notes."""
+        rules = re.findall(r"^\s*(\d+)\. ", _PROMPT, re.M)
+        assert rules == ["1", "2", "3", "4", "5", "6", "7"]
+        assert "{platform}" not in _PROMPT
+        assert len(_PROMPT) < 2300
 
 
 def test_the_difference_is_real(tmp_path):

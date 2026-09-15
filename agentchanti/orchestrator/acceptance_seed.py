@@ -123,18 +123,7 @@ TASK:
 {task}
 
 Write a single self-contained Python `unittest` file that checks ONLY the
-behaviour the task states explicitly.
-
-WHERE IT RUNS: this file is saved as `test_acceptance_contract.py` IN THE
-PROJECT ROOT — not in a `tests/` folder — and executed from the project
-root with `python -m unittest test_acceptance_contract`. The project root
-is therefore the current working directory, and also
-`Path(__file__).resolve().parent`. Refer to project files relative to that
-directory.
-
-{platform}
-
-Rules, all of them load-bearing:
+behaviour the task states explicitly. Rules, all of them load-bearing:
 
 1. Assert ONLY what the task says. Do not invent requirements, do not
    guess at internals, do not assume a file layout beyond what the task
@@ -165,35 +154,18 @@ Rules, all of them load-bearing:
    `restart`; you would be testing vocabulary, not behaviour. Build the
    objects and call the methods.
 
-8. NEVER require a human. No `input()`, no `tkinter` or any other GUI
-   prompt, no "press a key", no asking someone to look at the screen and
-   report what they saw. Nobody is watching this run: a contract that
-   waits for a person never finishes, fails the run over code that may be
-   perfect, and leaves an application window open that looks hung. Assert
-   on the program's own state and returned values instead.
-
-9. NEVER assert on documentation wording. Do not read README, CHANGELOG
-   or any .md/.rst file. It does not exist yet, and you cannot predict its
-   words or its markup: `Python **3.10 or newer**` states the requirement
-   exactly and still fails a regex for `python 3.10`. If the task asks for
-   documentation, assert at most that the file exists and is not empty.
-
-10. NEVER climb above this file's directory. No `Path(__file__).parents[1]`,
-   no `.parent.parent`, no `os.path.dirname(os.path.dirname(__file__))`.
-   This file already sits in the project root, so each of those points
-   OUTSIDE the project: every file you look for is "missing" and every
-   script you launch fails to start, over code that may be perfect.
-
-11. NEVER inspect the desktop. No `ctypes` calls into user32/gdi32, no
-   `win32gui`, no window enumeration, no screenshots (`PIL.ImageGrab`,
-   `mss`), no GUI automation. A window's owner is often not the process you
-   launched (a venv's python.exe starts the real interpreter as a child),
-   and there may be no desktop session at all. For a graphical program, set
-   `SDL_VIDEODRIVER=dummy` and assert on the program's own state, or on
-   what its display surface reports, instead.
-
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
+
+# The prompt above is deliberately the 0.7.0 prompt, verbatim. Between 0.8.0
+# and 2026-09-15 it grew from 7 rules / 2,132 chars to 11 rules / 4,143 chars
+# (no human, no README wording, where the file lives, the platform, no
+# climbing above __file__, no desktop inspection) — one rule per observed
+# failure — while the failure rate on the measured prompt did not improve,
+# and the contract after the Windows platform note walked the Win32 desktop
+# for the first time. Every one of those defects is now caught by a detector
+# that costs nothing unless it fires, and its guidance is sent only then, in
+# the repair note for the contract that actually made the mistake.
 
 
 # Rule 5 of the prompt says no mocks, and a suite that ignores it is not
@@ -478,8 +450,10 @@ Your contract CANNOT JUDGE THIS PROJECT ON THIS MACHINE: {reason}.
 
 It is saved as `test_acceptance_contract.py` IN THE PROJECT ROOT and run
 from there, so the project root is `Path(__file__).resolve().parent`.
-Fix ONLY that defect: keep every test and every assertion exactly as
-strict.
+Never inspect the desktop (window enumeration, screenshots, GUI
+automation): for a graphical program set `SDL_VIDEODRIVER=dummy` and
+assert on the program's own state instead. Fix ONLY that defect: keep
+every test and every assertion exactly as strict.
 
 The contract you wrote, to revise rather than start over:
 
@@ -530,7 +504,7 @@ def _substantive_count(src: str) -> int:
 
 def _generate(llm_client, task: str, extra: str = "") -> str | None:
     """One generation round: prompt, extract the fence, sanity-check it."""
-    prompt = _PROMPT.format(task=task.strip(), platform=_platform_note())
+    prompt = _PROMPT.format(task=task.strip())
     if extra:
         prompt += "\n\n" + extra
     try:

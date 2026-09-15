@@ -19,7 +19,7 @@ import textwrap
 import pytest
 
 from agentchanti.orchestrator.acceptance_seed import (
-    SEED_BASENAME, _PROMPT, _header, _should_seed,
+    SEED_BASENAME, _PROMPT, _STRUCTURAL_NOTE, _header, _should_seed,
     desktop_introspection_reason, seed_acceptance_tests, seed_state,
     structural_defect_reason,
 )
@@ -91,9 +91,11 @@ class TestDetection:
     def test_the_program_and_other_dlls_are_left_alone(self, src):
         assert desktop_introspection_reason(src) is None
 
-    def test_the_prompt_forbids_it(self):
-        assert "NEVER inspect the desktop" in _PROMPT
-        assert "SDL_VIDEODRIVER=dummy" in _PROMPT
+    def test_the_repair_note_says_what_to_do_instead(self):
+        """Sent only to a contract that made the mistake, not every prompt."""
+        assert "Never inspect the desktop" in _STRUCTURAL_NOTE
+        assert "SDL_VIDEODRIVER=dummy" in _STRUCTURAL_NOTE
+        assert "inspect the desktop" not in _PROMPT
 
 
 class TestSeeding:

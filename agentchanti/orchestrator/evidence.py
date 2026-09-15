@@ -346,6 +346,42 @@ def _was_seeded(root: str, rel: str) -> bool:
         return False
 
 
+def seeded_contract_was_the_only_witness(root: str,
+                                         snapshot: dict[str, str],
+                                         acceptance_cmds: Iterable[str] = (),
+                                         ) -> Optional[str]:
+    """The seeded contract(s), when they were the ONLY possible independent
+    evidence — else None.
+
+    `require_independent_evidence` turns "nothing independent verified
+    this" into a failed run. When the only instrument that could have
+    verified it is a contract this pipeline wrote, before any code existed,
+    that verdict is the model grading the model — the demotion rule above
+    already refuses to let such a contract convict the code, and failing the
+    run because it did not pass is the same conviction by another route.
+
+    Measured 2026-09-13..15 on one prompt: four consecutive runs exited 1
+    over working games, each on a different contract mistake — README
+    wording, `parents[1]` from a file in the project root, a Win32 window
+    lookup that could never match a venv child process, and the exact text
+    `>=2.5`/`<3.0` in requirements.txt. Every one was verified afterwards:
+    the code was right and the contract was wrong.
+
+    Strictly narrow, so the flag keeps its meaning everywhere else: any
+    user `acceptance_cmds`, any user-authored surviving suite, or a seeded
+    contract the agent MODIFIED (it no longer survives, so nothing is
+    returned) leaves the ordinary failure in place.
+    """
+    if any(c for c in (acceptance_cmds or ()) if str(c).strip()):
+        return None
+    survivors = surviving_pre_existing_tests(root, snapshot or {})
+    if not survivors:
+        return None
+    if not all(_was_seeded(root, rel) for rel in survivors):
+        return None
+    return ", ".join(survivors)
+
+
 def run_pre_existing_tests(executor, root: str,
                            survivors: Iterable[str],
                            prerun: "dict | None" = None,
