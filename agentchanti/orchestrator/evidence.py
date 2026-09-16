@@ -50,6 +50,7 @@ import hashlib
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -232,6 +233,9 @@ _INCONCLUSIVE_MARKERS = (
     ("KeyboardInterrupt", "the suite was interrupted"),
     ("ModuleNotFoundError: No module named 'unittest",
      "the test runner itself is unavailable"),
+    ("No module named pytest",
+     "pytest is not installed in this environment, so the suite could not "
+     "be collected — the instrument is missing, not the code wrong"),
     # A framework that permits one instance per process refuses the
     # second, and that refusal is a property of the framework, not of the
     # code under test. Measured 2026-08-18 09:54: a contract built a
@@ -382,6 +386,82 @@ def seeded_contract_was_the_only_witness(root: str,
     return ", ".join(survivors)
 
 
+def _runner_command(root: str, rel: str) -> str:
+    """The command that will actually COLLECT this file's tests.
+
+    Every survivor used to be run as ``python -m unittest`` whatever wrote
+    it, and unittest collects only ``TestCase`` subclasses. So a user's
+    pytest-style suite — bare ``def test_x()`` functions — collected zero
+    tests, `empty_suite_reason` correctly reported that it proved nothing,
+    the verdict fell through to self-authored, and
+    ``require_independent_evidence`` failed the run.
+
+    Measured 2026-09-16, benchmark task ``bugfix``: a seeded
+    ``test_calc.py`` of two module-level functions, a correct one-line fix,
+    the file left byte-identical, the pipeline's own ``pytest -q`` green
+    six times — and ``python -m unittest test_calc.py`` collected nothing,
+    so the run exited 1. The defect only ever reached a *user's* suite,
+    which is the strongest evidence class there is: a seeded contract is
+    written unittest-style and always collected fine.
+
+    The collection question is `ghost.needs_pytest_runner`, the same
+    object `tests-never-collected` asks, so the layer that reports a file
+    as uncollectable and the layer that runs it cannot disagree. Anything
+    unparseable, unreadable, or carrying a ``TestCase`` keeps unittest —
+    which needs nothing installed — so the default is unchanged and only
+    the files unittest cannot see move.
+    """
+    path = rel.replace("/", os.sep)
+    try:
+        from .ghost import needs_pytest_runner
+        with open(os.path.join(root, path), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception:
+        return "python -m unittest " + path
+    if needs_pytest_runner(text):
+        return "python -m pytest -q " + path
+    return "python -m unittest " + path
+
+
+_RUNNER_MISSING_RE = re.compile(r"No module named ['\"]?pytest")
+
+
+def _host_runner_fallback(executor, root: str, rel: str,
+                          original_out: str) -> tuple[bool, str]:
+    """Retry a pytest-style survivor with the interpreter running this run.
+
+    `Executor` prepends the project venv's bin directory to PATH, so bare
+    ``python`` is the project's interpreter — right for everything that
+    imports the project, and wrong when the venv has no pytest because no
+    plan step happened to install one. Measured 2026-09-16 on the retest of
+    benchmark task `bugfix`: the plan created ``venv/`` and never installed
+    pytest, so the correctly-chosen runner reported ``No module named
+    pytest`` and the user's suite still produced no verdict.
+
+    Only a **pass** is adopted. A failure here is discarded and the original
+    "runner missing" output stands, because this interpreter has the
+    project's dependencies only by accident — a ModuleNotFoundError for a
+    project requirement would otherwise convict the code of something that
+    is purely an environment difference, and this is the layer of last
+    resort. So the fallback can turn a lost verdict into evidence and can
+    never turn a working artifact into a failure.
+
+    Nothing is installed: an evidence check that mutates the environment it
+    is judging is the shape this module exists to refuse.
+    """
+    path = rel.replace("/", os.sep)
+    try:
+        ok, out = executor.run_command(
+            f'"{sys.executable}" -m pytest -q {path}', timeout=300)
+    except Exception as exc:
+        _logger.debug("[Evidence] host-runner fallback failed: %s", exc)
+        return False, original_out
+    if ok and not empty_suite_reason(out or ""):
+        return True, out
+    return False, original_out
+
+
 def run_pre_existing_tests(executor, root: str,
                            survivors: Iterable[str],
                            prerun: "dict | None" = None,
@@ -416,9 +496,13 @@ def run_pre_existing_tests(executor, root: str,
         if cached is not None:
             ok, out = cached
         else:
-            cmd = "python -m unittest " + rel.replace("/", os.sep)
+            cmd = _runner_command(root, rel)
             try:
                 ok, out = executor.run_command(cmd, timeout=300)
+                if (not ok and "pytest" in cmd
+                        and _RUNNER_MISSING_RE.search(out or "")):
+                    ok, out = _host_runner_fallback(
+                        executor, root, rel, out or "")
             except Exception as exc:
                 _logger.debug("[Evidence] %s could not run: %s", rel, exc)
                 continue

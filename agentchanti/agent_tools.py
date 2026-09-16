@@ -17,6 +17,7 @@ from typing import Optional
 
 from .cli_display import log
 from .llm.chat_types import Message, ToolCall, ToolDef
+from .paths import package_shadow_reason, superseded_scaffold_module
 
 
 def _protected_basenames() -> set[str]:
@@ -802,6 +803,22 @@ class AgentTools:
         if phantom is not None:
             log.warning("[AgentTools] refused phantom root manifest '%s'", rel)
             return phantom
+        shadow = package_shadow_reason(self.project_root, rel)
+        if shadow is not None:
+            log.warning("[AgentTools] refused shadowing module write '%s' "
+                        "(%s)", rel, shadow)
+            stem = rel.replace("\\", "/")[:-3]
+            return (
+                f"ERROR: refusing to write '{path}'. {shadow} — Python would "
+                f"have two claimants for the same module and test discovery "
+                f"breaks for everything under it "
+                f"(`ImportError: module incorrectly imported`)." + chr(10) +
+                f"Put the code inside the package instead, e.g. "
+                f"'{stem}/test_<name>.py'. If the plan names this path and "
+                f"the package is right, say so in your summary — that is a "
+                f"defect in the PLAN, not something to fix by re-creating "
+                f"the module.")
+
         shim = toolchain_shim(rel)
         if shim is not None:
             log.warning("[AgentTools] refused toolchain shim '%s' (would "
@@ -843,7 +860,27 @@ class AgentTools:
         if os.path.basename(rel_key) in _protected_basenames():
             self._created_manifests.add(rel_key)
         self._record(os.path.relpath(full, self.project_root), content)
-        return f"OK: wrote {len(content)} chars to {path}"
+
+        # Completing a package supersedes an empty scaffold module beside
+        # it; both claim the same name and discovery dies on the pair. Told
+        # to the model as well as the log, because it is a change to the
+        # tree it did not make and would otherwise discover as a surprise.
+        note = ""
+        stale = superseded_scaffold_module(self.project_root, rel_key)
+        if stale is not None:
+            try:
+                os.remove(os.path.join(self.project_root,
+                                       *stale.split("/")))
+                log.info("[AgentTools] removed superseded scaffold '%s' "
+                         "(the package '%s/' now owns the module name)",
+                         stale, stale[:-3])
+                note = (f" (also removed '{stale}', an empty scaffold the "
+                        f"package '{stale[:-3]}/' now supersedes — keeping "
+                        f"both breaks test discovery)")
+            except OSError as exc:
+                log.warning("[AgentTools] could not remove superseded "
+                            "'%s': %s", stale, exc)
+        return f"OK: wrote {len(content)} chars to {path}{note}"
 
     def _protected_overwrite_error(self, rel: str, full: str,
                                    path: str) -> "str | None":

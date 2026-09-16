@@ -379,6 +379,14 @@ def _missing_node_deps(root: str, text: str) -> list[str]:
             if not os.path.exists(os.path.join(nm, *d.split("/")))]
 
 
+# The module-name collision guard lives in `paths` because three
+# different seams write files and all three must answer it the same
+# way — the resolution `EMPTY_SUITE_RE` and `references_subproject`
+# already use. Re-exported here so this module's own callers and
+# tests keep importing it from the healer that first needed it.
+from ..paths import package_shadow_reason  # noqa: E402
+
+
 def _heal_missing_file(h: GhostHealer, exp) -> Optional[HealResult]:
     """Restore a file the plan promised, from the plan's own body.
 
@@ -394,10 +402,22 @@ def _heal_missing_file(h: GhostHealer, exp) -> Optional[HealResult]:
 
     A file the plan gave no body for is left missing and reported: there
     is nothing to restore it from, and a stub would only hide the gap.
+    Neither is a name a sibling package has taken — see
+    :func:`package_shadow_reason`, which refuses rather than repairs.
     """
     path = exp.subject
     if not h.allow_source_edits:
         return None
+
+    shadow = package_shadow_reason(h.ghost.root, path)
+    if shadow:
+        return HealResult(
+            exp.id, exp.kind,
+            f"NOT restoring {path} from the plan", ok=False,
+            detail=(f"{shadow} — the step promoted the module to a package, "
+                    f"and restoring the file would make both claim it and "
+                    f"break test discovery. If the plan should target the "
+                    f"package instead, fix the plan, not the tree"))
 
     body = h.ghost.plan_content.get(path)
     if body:

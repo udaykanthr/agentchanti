@@ -6,6 +6,33 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+### Fixed
+
+- **A seeded contract no longer samples the window before anything is drawn.**
+  A contract that waited for a pygame surface to exist and then read its
+  pixels in the next statement was measuring the blank buffer, not the
+  program — a fresh surface is one colour — so it failed a working game
+  roughly at random. The seeder now catches that ordering and repairs it.
+
+- **A pytest-style test file no longer loses the run its evidence.** Every
+  pre-existing test file was executed with `python -m unittest`, which
+  collects only `TestCase` subclasses — so a suite written as plain
+  `def test_x()` functions collected nothing, counted as proving nothing,
+  and (with `require_independent_evidence` set) failed the run over correct
+  code the project's own `pytest` had just passed. Each file is now run
+  with a runner that can collect it.
+- **A file is no longer written where a package already owns the name.**
+  When a step promotes `tests.py` into a `tests/` package — ordinary, and
+  idiomatic in Django — both claiming `core.tests` breaks test discovery
+  for the whole app (`ImportError: 'tests' module incorrectly imported`).
+  All three writers now refuse and say where the code belongs: the plan's
+  inline writes, the agent's own `write_file`, and Ghost Heal's restore of
+  a plan-declared file. And when a package grows up beside a framework's
+  own empty scaffold (`django-admin startapp` writes `tests.py`), the stub
+  is removed once the package exists — but only when it declares nothing,
+  so a module with real content in it is always kept and reported.
+
+
 ## 0.8.3 — 2026-09-16
 
 ### Fixed
