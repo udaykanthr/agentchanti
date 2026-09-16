@@ -6,6 +6,8 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.4 — 2026-09-16
+
 ### Fixed
 
 - **A seeded contract no longer samples the window before anything is drawn.**
@@ -31,6 +33,11 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
   own empty scaffold (`django-admin startapp` writes `tests.py`), the stub
   is removed once the package exists — but only when it declares nothing,
   so a module with real content in it is always kept and reported.
+
+Tested before release: the full benchmark sweep (8 tasks, ground truth 7/8,
+zero false greens) plus three clean-slate `--prompt-from-file` runs, the
+last of which passes on this exact tree and whose contract runs green three
+times by hand.
 
 
 ## 0.8.3 — 2026-09-16
