@@ -8,6 +8,10 @@ Each task is a dict:
                  task to count as succeeded (independent of what the
                  pipeline claims)
   language     — expected project language (informational)
+  timeout_s    — optional wall-clock cap for one run, overriding the
+                 harness default; set it from the task's MEASURED time
+                 with room for a slow day, because a run killed early is
+                 recorded as TIMEOUT and tells you nothing either way
 
 Tasks name their target files explicitly so ground-truth checks don't
 have to guess what the model called things.
@@ -217,6 +221,11 @@ TASKS = [
         # died on cross-file defaults (URL namespaces, {% load static %},
         # LOGIN_URL) — the case the plan_mode A/B actually decides.
         "id": "django-webapp",
+        # Measured 575.9s on its one healthy run against the harness's 600s
+        # default, then three consecutive no-verdict kills. Twenty steps of
+        # cross-file framework wiring is simply not a ten-minute task on a
+        # slow API day.
+        "timeout_s": 1500,
         "task": ("create a django application in a new folder named "
                  "spacious_site with a responsive spacious homepage at / "
                  "(header, large herobanner, price list component, large "
@@ -256,6 +265,9 @@ TASKS = [
         # from _PROBE, which lives in the repo and is never seeded into
         # the workdir.
         "id": "pacman-strict",
+        # Measured 538.1s and 451.2s — the same 600s margin problem, one
+        # bad afternoon away from being unmeasurable.
+        "timeout_s": 1200,
         "task": PACMAN_STRICT,
         "files": {},
         "success_cmds": [

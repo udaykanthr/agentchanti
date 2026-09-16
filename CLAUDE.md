@@ -88,6 +88,16 @@ That left one question open — why the first run's two signatures compared *equ
 
 A/B harness comparing `agent_loop` on vs off over the task set in `benchmarks/tasks.py`. Ground truth is per-task `success_cmds` run in the isolated workdir, independent of the pipeline's own claim. Run from repo root: `python benchmarks/run_ab.py --config <yaml-with-keys> [--tasks id1,id2] [--modes on,off] [--truststore]`. Results land in `benchmarks/results/*.json`. Not part of pytest — it spends real API tokens.
 
+A task may set `timeout_s` to override the harness's 600s default, and the
+two heavy ones do (1500s / 1200s). Measured 2026-09-16: `django-webapp`
+completed once in 575.9s against that 600s cap — a 4% margin — and then
+produced no verdict in three of the next four attempts, two of them killed
+before they had written a single file. A run the harness killed is now
+reported as **TIMEOUT rather than FAIL**, the distinction
+`verify_dt_invariance` already draws with its exit code 2: a refusal must
+never be recorded as a failure. With the cap raised the task passed ground
+truth for the first time, at 897.2s.
+
 `benchmarks/verify_dt_invariance.py <project-dir>` is an independent ground-truth check for generated tile-maze games: it drives the game at several timestep profiles and asserts no entity ever occupies a wall tile, catching games that only hold together at a fixed 1/60 dt. Exit codes are **0 PASS, 1 FAIL, 2 could-not-verify** — the third is deliberate, because generated projects share no vocabulary and a refusal must never be recorded as a failure.
 
 ### Plan Re-plan Gate Carry-Forward (plan_step.py)
@@ -319,6 +329,18 @@ Two halves of the repair request are load-bearing, and a live run found both mis
 
 Verified twice. Replaying all three measured incidents against their real artifacts: the two crashes request a repair carrying the actual traceback, and the assertion failure is correctly left alone. Then live, against a planted contract that compiles, imports the built project and raises `TypeError` — `runs=False, FAILED (errors=1)` before, `runs=True, OK` after, the header's task hash unchanged, still 2 substantive assertions, no `self.fail`, no `skipTest`, no `try/except`, and the repair touched only the crashing expression. The known hole is the third incident: a contract that runs and is simply *wrong* is still only caught at the end, where a seeded contract cannot convict the code anyway.
 
+**The first generation is asked more than once.** Every rejection in the
+seeder retries — mocking, interactive, structural, documentation, weakness
+— except the one generation that decides whether a contract exists at all.
+Measured 2026-09-16 on benchmark task `django-webapp`: the seeding call
+logged `completion=9679` after 2m43s and returned nothing usable, so
+`response was not a usable test module` ended it. The run then built a
+Django app that passed all four ground-truth checks — `manage.py check`,
+`manage.py test`, `/` -> 200, `/dashboard/` -> 302 — and exited 1 anyway,
+because with no contract there was nothing independent left to verify it.
+An unusable *response* is not a contract that was judged and refused, which
+is the reasoning the repair path directly above already carries.
+
 ### A Contract The Run Wrote Cannot Fail The Run (evidence.py `seeded_contract_was_the_only_witness`)
 
 The detectors above close one contract mistake each, and the next run found another. Measured 2026-09-13..15 on one prompt: four consecutive runs exited 1 over working games, each on a different mistake — README wording, `parents[1]` from the project root, a Win32 window lookup that could never match a venv child process, and the exact text `>=2.5`/`<3.0` in requirements.txt (the plan wrote `pygame~=2.6`, which satisfies it). Every one was verified by hand: the code was right. The failing mechanism was unchanged since 0.7.0; what made it fire was that `require_independent_evidence` turns "nothing independent verified this" into exit 1, and a seeded contract that did not pass was the only candidate — the model grading the model, which the demotion rule already refuses to let convict the code.
@@ -405,6 +427,20 @@ one colour. A fresh surface is uniformly black. Measured on that artifact
 with the contract's own code: **1** colour immediately, **364** after
 0.25s, 364 after 1.0s. The game was entirely correct, and policy B held so
 the run exited 0 — but the verdict was lost.
+
+**Repaired, never refused — which the first release of this check got
+wrong.** It was originally a branch of `structural_defect_reason`, whose
+retry-then-refuse rule is right for a root outside the project or a
+POSIX-only signal, because those tests fail over ANY code. Measured
+2026-09-16, minutes after 0.8.4 shipped: a snake run drafted a raced
+contract, the repair kept the race, the refusal left NO contract, and
+`require_independent_evidence` failed the run outright — turning "a
+contract that fails sometimes" into "no contract, fails always". A race is
+the `documentation_grep_reason` case instead: keep the imperfect
+instrument, say so in a WARNING, and let it fail only when the first frame
+is late. `reseed_defect_reason` keeps the wider question for the one place
+it still belongs — a stale raced contract is re-seeded rather than reused,
+because every rerun of the prompt would otherwise roll the same dice.
 
 `render_race_reason` reads the ordering, not the sleeping: between
 acquiring a surface the *program* owns and reading its pixels there must be

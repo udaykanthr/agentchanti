@@ -555,12 +555,18 @@ def structural_defect_reason(src: str) -> str | None:
                 f"— window enumeration and screen capture depend on a "
                 f"logged-in session and on which process owns the window, and "
                 f"a Windows venv interpreter launches the real one as a child")
-    race = render_race_reason(src)
-    if race:
-        return (f"{race} — a surface is blank until the program's next "
-                f"frame reaches it, so wait for a frame (or retry in a "
-                f"loop) before sampling, and keep the assertion as strict")
     return None
+
+
+def reseed_defect_reason(src: str) -> str | None:
+    """Why reusing this contract would repeat a false verdict, or None.
+
+    Wider than `structural_defect_reason` by exactly one case: a render
+    race is not grounds for REFUSING a contract, but it is grounds for
+    not reusing a stale one, because every rerun of the prompt in that
+    directory would roll the same dice again.
+    """
+    return structural_defect_reason(src) or render_race_reason(src)
 
 
 _STRUCTURAL_NOTE = """
@@ -575,6 +581,25 @@ Never inspect the desktop (window enumeration, screenshots, GUI
 automation): for a graphical program set `SDL_VIDEODRIVER=dummy` and
 assert on the program's own state instead. Fix ONLY that defect: keep
 every test and every assertion exactly as strict.
+
+The contract you wrote, to revise rather than start over:
+
+```python
+{contract}
+```"""
+
+
+_RENDER_RACE_NOTE = """
+
+Your contract SAMPLES THE WINDOW BEFORE THE PROGRAM HAS DRAWN: {reason}.
+
+A display surface exists the instant the program calls `set_mode`, and is
+blank until its next frame reaches it — so waiting for `get_surface()` to
+return non-None proves a window opened, not that anything was drawn.
+Between acquiring the surface and reading its pixels, let the program run:
+sleep briefly, or better, retry the read in a loop until it settles and
+fail if it never does. Fix ONLY that: keep every test and every assertion
+exactly as strict.
 
 The contract you wrote, to revise rather than start over:
 
@@ -710,7 +735,7 @@ def _should_seed(task: str, root: str, path: str) -> bool:
         # Same task, unedited, but structurally unable to judge this project:
         # reusing it guarantees the same false verdict on every rerun of the
         # prompt. Ours, untouched, and provably broken — so replace it.
-        _defect = structural_defect_reason(body)
+        _defect = reseed_defect_reason(body)
         if _defect:
             log.info("[AcceptanceSeed] re-seeding: %s was seeded from this "
                      "task but %s, so it can never judge it",
@@ -754,7 +779,30 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if not _should_seed(identity, root, path):
         return None
 
-    src = _generate(llm_client, task)
+    # Asked more than once, for the reason every repair path below already
+    # documents: a response that is not a usable test module is an unusable
+    # RESPONSE, not a contract that was judged and refused. Measured
+    # 2026-09-16 on benchmark task `django-webapp`:
+    #
+    #     22:54:08 [OpenAI] Streaming ~1426 est. tokens
+    #     22:56:51 [OpenAI] Streamed usage: prompt=1769 completion=9679
+    #     22:56:51 [AcceptanceSeed] response was not a usable test module
+    #
+    # 9,679 completion tokens over 2m43s spent on reasoning, and nothing
+    # came back. The run then built a Django app that passed all four
+    # ground-truth checks and still exited 1, because with no contract
+    # there was nothing independent left to verify it.
+    #
+    # This is the one generation the whole verdict rests on — every other
+    # rejection here retries, and this one, alone, did not.
+    src = None
+    for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+        src = _generate(llm_client, task)
+        if src is not None:
+            break
+        if _attempt < _REPAIR_ATTEMPTS:
+            log.info("[AcceptanceSeed] no usable contract from attempt %d/%d "
+                     "— asking again", _attempt, _REPAIR_ATTEMPTS)
     if src is None:
         return None
     _mock = mocking_reason(src)
@@ -826,6 +874,37 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
                 "would fail over any code; no file is the honest outcome",
                 _defect, _REPAIR_ATTEMPTS)
             return None
+
+    # A render race, repaired but never refused. Measured 2026-09-16, a
+    # snake run on 0.8.4 minutes after the screen shipped: the draft
+    # sampled before the first frame, the repair did too, and the refusal
+    # below left NO contract — so `require_independent_evidence` failed a
+    # run that would otherwise have had a contract failing only sometimes.
+    # Refusing is right for a root outside the project, whose tests fail
+    # over any code; a race is the documentation case instead, where
+    # keeping an imperfect instrument beats having none. Said out loud.
+    _race = render_race_reason(src)
+    if _race:
+        log.info("[AcceptanceSeed] the contract samples the window before "
+                 "the program has drawn (%s) — asking again", _race)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate(llm_client, task,
+                              extra=_RENDER_RACE_NOTE.format(
+                                  reason=_race, contract=src.strip()))
+            if retry is None or mocking_reason(retry)                     or interactive_reason(retry)                     or structural_defect_reason(retry):
+                continue
+            _still = render_race_reason(retry)
+            if _still is None:
+                log.info("[AcceptanceSeed] the repaired contract waits for a "
+                         "frame before sampling — using it")
+                src, _race = retry, None
+                break
+            _race = _still
+        if _race:
+            log.warning("[AcceptanceSeed] the contract still samples before "
+                        "the first frame after %d attempt(s) (%s) — keeping "
+                        "it, but it can fail a correct program whenever the "
+                        "first frame is late", _REPAIR_ATTEMPTS, _race)
 
     # Documentation wording, repaired before strength is judged — a README
     # test's assertions no longer count as substantive, so judging strength
@@ -1303,6 +1382,19 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                 "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: it added assertions "
                 "on documentation wording (%s). Do not read README or any "
                 ".md file — fix the crash, keep the behaviour checks." % _docs)
+            continue
+        # A render race is refused only when INTRODUCED, for the same
+        # reason as wording checks: a contract kept with one must stay
+        # repairable when it crashes.
+        _race = render_race_reason(candidate)
+        if _race and not render_race_reason(state[2]):
+            log.info("[AcceptanceSeed] runnability repair %d/%d started "
+                     "sampling before the first frame (%s) — asking again",
+                     _attempt, _REPAIR_ATTEMPTS, _race)
+            rejected = (
+                "\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED: %s. A surface is "
+                "blank until the program's next frame reaches it — wait for "
+                "a frame, or retry in a loop, before sampling." % _race)
             continue
         # Refused whether introduced or inherited: unlike wording checks, a
         # root outside the project or a signal this platform rejects is never

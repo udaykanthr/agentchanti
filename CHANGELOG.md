@@ -6,6 +6,29 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.5 — 2026-09-17
+
+### Fixed
+
+- **A run no longer fails because its acceptance contract was refused.**
+  0.8.4 added a check for a contract that samples a game window before the
+  first frame is drawn, and refused the contract when the repair did not fix
+  it — which left no contract at all, so a run with
+  `require_independent_evidence` set failed outright. The check now keeps the
+  contract and warns instead, the way the documentation-wording check already
+  did. Regression introduced in 0.8.4.
+- **A burned seeding response is retried.** If the model spends its output
+  budget on reasoning and returns nothing usable, the run used to proceed with
+  no independent check at all — measured on a Django build that passed every
+  ground-truth command and still exited 1. The first generation now gets the
+  same retries every other step of seeding already had.
+
+### Changed
+
+- **Benchmark tasks may set their own timeout**, and a run the harness killed
+  is reported as `TIMEOUT` rather than `FAIL` — it is not a verdict about the
+  pipeline either way.
+
 ## 0.8.4 — 2026-09-16
 
 ### Fixed
