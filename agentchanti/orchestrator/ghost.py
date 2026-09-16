@@ -1663,6 +1663,24 @@ def _python_test_counts(text: str) -> tuple[int, int]:
     return unittest_visible, pytest_only
 
 
+def needs_pytest_runner(text: str) -> bool:
+    """True when ``unittest`` would collect NOTHING from this module.
+
+    The same question `tests-never-collected` asks of a project's own
+    acceptance command, asked here of a single file so that whoever runs
+    it can pick a runner that will actually collect it. A module whose
+    tests are bare ``def test_x()`` functions is invisible to unittest
+    and complete to pytest; one with a ``TestCase`` runs under either.
+
+    ``False`` for an unparseable file, which is no opinion rather than a
+    recommendation — the caller's existing default stands.
+    """
+    visible, pytest_only = _python_test_counts(text)
+    if visible < 0:
+        return False
+    return visible == 0 and pytest_only > 0
+
+
 # ── Long runs that stop running ──────────────────────────────────────
 #
 # The blind spot this closes: a suite can satisfy "run >= 2000 frames and

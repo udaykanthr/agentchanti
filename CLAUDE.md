@@ -395,6 +395,31 @@ The seeding prompt never said **where** the contract lives or **what OS** runs i
 
 Both are decidable from the source before a step runs. `root_escape_reason` flags a path that climbs from `__file__` (`parents[k≥1]`, `.parent.parent`, nested `dirname(dirname(__file__))`, following names bound to a `__file__` expression); a file in the root that does this always leaves the project. `platform_signal_reason` flags, on Windows only, `send_signal` with anything but SIGTERM/CTRL_C_EVENT/CTRL_BREAK_EVENT, POSIX-only `signal.*`/`os.*` names and `preexec_fn=`. A third member arrived on the next run, with both of those fixes live: `snake_game.py did not open a visible pygame window within 8.0 seconds`. The contract launched the game with `sys.executable` and walked the desktop with `ctypes.WinDLL("user32").EnumWindows` for a visible window owned by `process.pid`. Measured by hand, the window existed (`'Two Player Snake'`) and was owned by pid 22824, `C:\Python313\python.exe` — whose parent was pid 13136, the `venv\Scripts\python.exe` launcher `Popen` returned, because a Windows venv interpreter re-executes the base one. `desktop_introspection_reason` flags asserting on the **desktop rather than the program** — `ctypes` into user32/gdi32/dwmapi, `win32gui`/`win32api`, `pywinauto`, `PIL.ImageGrab`, `mss` — on every platform, since it also needs a logged-in session and depends on focus and DPI; rule 11 of the prompt forbids it and points at `SDL_VIDEODRIVER=dummy` plus the program's own state. The same run's ghost reported `violated-exists: <3`, because `produces: installed pygame>=2.5,<3` was split on its comma into two "files"; `_produced_paths` drops entries containing `<>|"`, which no Windows path can hold.
 
+A fourth member is a **race**, not a wrong call, which is what makes it
+worse: it fails intermittently and reads as a real defect. Measured
+2026-09-16 in `test1`, a clean-slate pinball run on the fixed tree. The
+contract polled until `pygame.display.get_surface()` returned non-None —
+which happens the moment the game calls `set_mode`, before its first frame
+— and read the pixels back in the very next statement, requiring more than
+one colour. A fresh surface is uniformly black. Measured on that artifact
+with the contract's own code: **1** colour immediately, **364** after
+0.25s, 364 after 1.0s. The game was entirely correct, and policy B held so
+the run exited 0 — but the verdict was lost.
+
+`render_race_reason` reads the ordering, not the sleeping: between
+acquiring a surface the *program* owns and reading its pixels there must be
+something that lets that program run (a sleep, a frame wait, a join), or
+the read must sit in a loop that retries until it settles. Three bounds
+keep it off correct contracts. Only `get_surface` counts as acquisition —
+a contract that called `set_mode` itself owns the surface and may draw and
+read in the same breath. Loop bodies are **opaque**, because the
+`time.sleep(0.01)` inside a poll-for-the-surface loop is part of acquiring
+it and sits lexically between the two, which is precisely why this cannot
+be answered on line ranges. And a contract that never reads pixels is never
+accused — asserting `get_surface() is not None` and `get_size()` is a fair
+check of whether a window opened, which is a different question from
+whether anything was drawn.
+
 `structural_defect_reason` combines them and is screened at three seams: seeding (repair with the draft in the prompt; **refused** if every retry keeps it, since the affected tests fail over any code), the runnability repair (a candidate carrying one is rejected, introduced or inherited), and `_should_seed` — an unedited same-task contract with a structural defect is **re-seeded**, because otherwise every rerun of the prompt reuses it and repeats the false verdict. The prompt now states the location, the invocation and the platform, and rule 10 forbids climbing above `__file__`'s directory.
 
 ### A Contract That Judges The README (seed_strength.py `documentation_grep_reason`)
@@ -430,6 +455,42 @@ The genuine pass was then discarded anyway, because the inconclusive branch sat 
 `EMPTY_SUITE_RE` moved to `evidence.py` and `cli.py` imports it, so the monotonic-gate check and the evidence verdict cannot disagree about the same file — the resolution `references_subproject` already uses, and a test asserts they are one object.
 
 Worth noting what made the survivor set so thin: step 2's whole purpose was to add a regression test to `tests/test_pinball_game.py`, and touching it correctly forfeits it as independent evidence. For any bug-fix task whose plan must modify the existing suite, the survivor set shrinks *because* the run did its job — which leaves the seeded contract carrying the entire verdict, and it did.
+
+### A Runner That Cannot Collect It Is Not A Verdict (evidence.py `_runner_command`)
+
+The section above establishes that an empty collection is a verdict in
+neither direction. It did not ask **why** the collection was empty, and in
+the one case that matters the answer was the check's own doing:
+`run_pre_existing_tests` executed every survivor as `python -m unittest`,
+whatever framework wrote it. unittest collects only `TestCase` subclasses,
+so a user's pytest-style suite — bare `def test_x()` functions — collected
+nothing, `empty_suite_reason` correctly reported that it proved nothing,
+the verdict fell through to self-authored, and `require_independent_evidence`
+failed the run.
+
+Measured 2026-09-16 by the benchmark harness, task `bugfix`: a seeded
+`test_calc.py` of two module-level functions, a correct one-line fix
+(`add` returning `a - b` → `a + b`), the file left byte-identical, and the
+pipeline's own `python -m pytest -q` green **six times** — then, on the
+last line, `python -m unittest test_calc.py` collected zero tests and the
+run exited 1. Ground truth passes 2/2 when run properly.
+
+What makes this the worst place for the defect is *whose* instrument it
+discards. A seeded contract is written unittest-style and was always
+collected fine, so the bug was invisible for every greenfield run; it fires
+only on a **user's own suite**, which `evidence.py` ranks as the strongest
+evidence there is — "a suite the *user* wrote keeps every bit of its
+authority". The layer of last resort was silently unable to run the best
+instrument it had.
+
+The collection question is `ghost.needs_pytest_runner`, the same object
+behind the `tests-never-collected` finding, so the layer that *reports* a
+file as uncollectable and the layer that *runs* it cannot disagree about
+the same file — the resolution `EMPTY_SUITE_RE` and `references_subproject`
+already use. Anything unparseable, unreadable, or carrying a `TestCase`
+keeps unittest, which needs nothing installed, so only the files unittest
+cannot see move. A missing pytest joins `_INCONCLUSIVE_MARKERS`: an absent
+runner is the instrument being unavailable and must never convict the code.
 
 ### A Stylesheet Nothing Imports (orchestrator/style_coupling.py `reachable_stylesheets`)
 
@@ -508,6 +569,87 @@ Refusals are as important as repairs. Restoration is declined when the written f
 `PKG_PRESENT` is the one check that looks past the repo at the environment: for any manifest the plan targets (`requirements.txt`, `package.json`) every declared runtime dependency must be present in the environment the app will actually run in — the venv `Executor._venv_bin_dir()` resolves, or `node_modules`. Purely a filesystem comparison, no subprocess. It exists because a plan step wrote `python -m venv venv && python -m pip install pygame`, which creates a venv but never activates it, so pygame installed into the pipeline's interpreter instead; every gate passed (the game modules were headless and imported no pygame) and only `main.py` needed it, crashing at launch under the project venv. No venv / no `node_modules` resolves `UNKNOWN` — a project on the ambient interpreter must never be accused.
 
 Surfaces the disagreement classes the rest of the pipeline is blind to: `violated-*` (a step claimed done while a declared postcondition is false), `export-drift` (declared exports the code renamed that **no step imports** — one collapsed note rather than one finding each, since a contract with no consumer cannot break anything; the consumed case stays a `violated-exports` finding, because that is the `gate_integrity` shape), `planned-untouched` (target's bytes never changed), `unplanned-write` (a file no step declared), `plan-declares-no-targets` (no step declared any file, so nothing written could be reconciled at all), `no-checkable-claim` (a step whose expectations are all tautologies — the plan-level analogue of `gate_integrity`), `degenerate-long-run` (a long assertion loop that stops simulating partway and asserts a frozen state), `varied-input-ignored` (a loop varies an input the code it drives never reads), `unprogressed-long-run` (a long loop whose every assertion would hold if the object had frozen on iteration one), and `failed-but-clean` (run marked failed while everything declared holds). `failed-but-clean` tells a reader to suspect the harness before the model, so it is the one finding whose false positives are actively harmful, and it is fenced twice. A green **acceptance gate** is required — structural checks prove shape, never behaviour — and when the run halted partway that gate must belong to a step that *did not complete*, because a gate on step 2 is not evidence about step 6. Measured twice blaming the harness for the model: gates 2.1/3.1/4.1 green while step 5 failed having recorded no gate at all, and four green gates while step 6 failed `verify` three times. A gate's verdict also **expires**: `GATE_PASSED` records the hashes of the step's declared files the wave it first goes green, and re-resolves to `UNKNOWN` once any of them changes, since the first run's gate 3.1 was still reported green over a `game.py` that a later step had rewritten into a `TypeError` on every `advance()`. Disable with `ghost_shadow: false`.
+
+### A Name A Package Has Taken (paths.py `package_shadow_reason`)
+
+Ghost Heal's rule — *never invent content; freely restore content the plan
+already specified* — governs what may be written. It says nothing about
+whether the **path** is still free, and the two are not the same question.
+
+Measured 2026-09-16 by the benchmark harness, task `django-webapp`:
+
+    10:36:53  step 6.1 wrote  core/tests.py   (planner's body, 2558 chars)
+    10:37:03  the agent DELETED core/tests.py — it had built core/tests/
+              as a package (__init__.py, test_views.py, test_forms.py)
+    10:37:06  [GhostHeal] EXISTS (core/tests.py) — healed: restore from
+              the plan's own body (2558 chars)
+    10:37:06  [Ghost] 4 postcondition(s) ... repaired in flight
+
+`core/tests.py` and `core/tests/` are two claimants to the single module
+name `core.tests`. `manage.py test` died with `ImportError: 'tests' module
+incorrectly imported from ...core	ests. Expected ...core`, and the task
+was graded FAIL over an application that is otherwise **complete** — with
+that one restored file removed, its suite runs 10 tests OK, `/` returns
+200, `/dashboard/` returns 302 and `check` is clean.
+
+Promoting a module to a package is ordinary, and idiomatic in Django where
+`startapp` hands you `tests.py` and any real app outgrows it. Deleting the
+old file is not the step losing work; it is the step finishing the job —
+which is why this is a **refusal rather than a repair**, in the shape
+`_heal_plan_drift` already uses for a file that diverged in both
+directions. The healer's content was faithful to the plan throughout; every
+existing check passed it, because every existing check was about content.
+`__init__.py` is never in scope: it lives inside a package and names no
+module of its own.
+
+This is the second harness defect of the same family as `failed-but-clean`
+— a repair mechanism damaging a correct artifact and then reporting the
+damage as a repair. It went unnoticed because the run failed anyway, for
+the unrelated reason that its evidence was self-authored.
+
+**Guarding the healer alone was not enough, and the retest proved it
+within the hour.** With GhostHeal refusing, the same `ImportError` came
+back on the very next run of the same task by a different route: the plan
+declared `core/tests.py` as step 8.1's `target:` and `[PlanStep] Inline
+test code` wrote it, GhostHeal never involved, while another step had
+already built the package. *A guard is only as strong as the weakest thing
+that can establish its precondition* — the lesson `phantom_root_manifest_reason`
+records, re-learned here in one afternoon.
+
+So the check lives in `paths.py`, where all three writers reach it, and
+every seam refuses: `Executor.write_files` (the plan's inline CODE/TEST
+writes) skips and logs beside the node_modules and protected-manifest
+guards; `AgentTools.write_file` returns an ERROR naming the package and
+the right destination (`core/tests/test_<name>.py`), adding that a plan
+insisting on this path is *a defect in the PLAN*; and `_heal_missing_file`
+reports rather than restores. **Refuse-and-report rather than redirect**:
+where a file belongs is the plan's decision, and a writer silently moving
+it would make the plan's own `EXISTS` expectation read violated for a file
+that was quietly relocated — one wrong answer traded for a confusing one.
+Writing *into* the package is untouched, and so is any ordinary module.
+
+**A third direction needed the opposite remedy, and the retest found that
+too.** Measured on the next run of the same task: `manage.py startapp core`
+wrote `core/tests.py` at 13:27:55, the run built `core/tests/` at 13:28:56
+and 13:30:12, and nothing ever created a collision by writing the module —
+the package simply grew up beside a scaffold. Every write went exactly
+where it belonged, so a refusal would have blocked the correct behaviour;
+what was left over was `startapp`'s stub, `from django.test import TestCase`
+and a comment. All ten of the run's tests were right and in the right
+place, and deleting those 63 bytes turns `manage.py test` from the
+`ImportError` into `Found 10 test(s) ... OK`.
+
+`superseded_scaffold_module` removes it, bounded by what the file
+**declares** rather than by matching any framework's text: a module whose
+AST holds only imports, a docstring or `pass` defines no name, so nothing
+can be lost with it, and the package beside it now owns that name. One
+assignment, one class, one function — or a file that will not parse — and
+it is kept, because that is a real conflict for `package_shadow_reason` to
+report and a person to resolve. The agent reached this conclusion by itself
+in the first incident, deleting the module as it built the package; this
+only stops the outcome depending on whether it remembers to. It is told
+about the deletion in the `write_file` result, since a change to the tree
+it did not make would otherwise surface as a surprise.
 
 ### Key Subsystems
 

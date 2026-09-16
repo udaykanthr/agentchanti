@@ -425,6 +425,122 @@ def desktop_introspection_reason(src: str) -> str | None:
     return None
 
 
+# A surface exists the instant `set_mode` returns, and is blank until the
+# program's next frame reaches it. So these two questions have different
+# answers, and only the second one is about the artifact:
+#   * has the program opened a window?      `get_surface() is not None`
+#   * has the program DRAWN anything?       pixels, after a frame
+_PIXEL_READ_ATTRS = frozenset({
+    "tostring", "tobytes",                       # pygame.image.*
+    "get_at", "get_at_mapped", "get_buffer",     # Surface.*
+    "array2d", "array3d", "pixels2d", "pixels3d",           # surfarray
+    "array_red", "array_green", "array_blue", "array_alpha",
+})
+# Only `get_surface`: a contract that called `set_mode` itself owns the
+# surface and may draw on it and read it back in the same breath. The race
+# belongs to the observer of a surface some other thread is drawing.
+_SURFACE_ACQUIRE_ATTRS = frozenset({"get_surface"})
+# Anything that lets the program's loop make progress first.
+_SETTLE_ATTRS = frozenset({
+    "sleep",                                     # time.sleep
+    "wait", "delay", "tick", "tick_busy_loop",   # pygame.time.*
+    "join", "wait_for", "acquire",               # threads and events
+    "flip", "update",                            # presenting a frame
+})
+
+
+def _flat_stmts(body):
+    """Statements in order, descending through `try`/`with` but not loops.
+
+    A loop's body is deliberately opaque: the `time.sleep(0.01)` inside a
+    poll-for-the-surface loop is part of ACQUIRING the surface, not a wait
+    that stands between acquiring it and reading it.
+    """
+    for stmt in body:
+        if isinstance(stmt, (ast.Try, ast.With, ast.AsyncWith)):
+            inner = list(stmt.body)
+            inner += list(getattr(stmt, "orelse", []) or [])
+            inner += list(getattr(stmt, "finalbody", []) or [])
+            yield from _flat_stmts(inner)
+        else:
+            yield stmt
+
+
+def _calls_any(node, attrs) -> str | None:
+    """The first call in this subtree whose name is in *attrs*."""
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        func = sub.func
+        name = func.attr if isinstance(func, ast.Attribute) else (
+            func.id if isinstance(func, ast.Name) else "")
+        if name in attrs:
+            return name
+    return None
+
+
+def render_race_reason(src: str) -> str | None:
+    """Why this contract samples the window before anything is drawn, or None.
+
+    Measured 2026-09-16 in `test1`, a clean-slate pinball run on the fixed
+    tree. The seeded contract polled until `pygame.display.get_surface()`
+    returned non-None — which happens the moment the game calls
+    `set_mode`, before its first frame — and then, in the very next
+    statement, read the pixels back and required more than one colour:
+
+        rendered_pixels = pygame.image.tostring(surface, "RGB")
+        colors = {...}
+        self.assertGreater(len(colors), 1, "...must render visible content")
+
+    A fresh surface is uniformly black, so `len(colors) == 1` and the
+    contract failed a game that was entirely correct. Measured on that
+    artifact with the contract's own code: 1 colour immediately, **364**
+    after 0.25s, 364 after 1.0s.
+
+    This is the same family as everything else `structural_defect_reason`
+    screens — a contract written before the code exists, anchoring on the
+    only vocabulary it can predict, and getting the framework's timing
+    wrong — but it is the first one that is a RACE rather than a wrong
+    call, so it fails intermittently and reads as a real defect.
+
+    The rule is about ordering, not about sleeping: between acquiring a
+    surface the program owns and reading its pixels there must be
+    something that lets that program run — a sleep, a frame wait, a join
+    — or the read must sit in a loop that retries until it settles.
+    Reading a surface the contract drew on itself is untouched, and so is
+    any contract that never reads pixels at all.
+    """
+    if not src:
+        return None
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        stmts = list(_flat_stmts(fn.body))
+        acquired = None
+        for i, stmt in enumerate(stmts):
+            if _calls_any(stmt, _SURFACE_ACQUIRE_ATTRS):
+                acquired = i
+        if acquired is None:
+            continue
+        for j in range(acquired, len(stmts)):
+            read = _calls_any(stmts[j], _PIXEL_READ_ATTRS)
+            if read is None:
+                continue
+            if isinstance(stmts[j], (ast.For, ast.AsyncFor, ast.While)):
+                return None          # retried until it settles
+            if any(_calls_any(stmts[k], _SETTLE_ATTRS)
+                   for k in range(acquired + 1, j)):
+                return None          # something let the program run first
+            return (f"it reads the window's pixels ({read}) as soon as the "
+                    f"surface exists, which is before the program has drawn "
+                    f"its first frame")
+    return None
+
+
 def structural_defect_reason(src: str) -> str | None:
     """Why this contract cannot judge THIS project on THIS machine, or None."""
     escape = root_escape_reason(src)
@@ -439,6 +555,11 @@ def structural_defect_reason(src: str) -> str | None:
                 f"— window enumeration and screen capture depend on a "
                 f"logged-in session and on which process owns the window, and "
                 f"a Windows venv interpreter launches the real one as a child")
+    race = render_race_reason(src)
+    if race:
+        return (f"{race} — a surface is blank until the program's next "
+                f"frame reaches it, so wait for a frame (or retry in a "
+                f"loop) before sampling, and keep the assertion as strict")
     return None
 
 

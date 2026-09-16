@@ -951,7 +951,7 @@ class Executor:
         grounded, not hallucinated — and editing a manifest is sometimes
         the entire task.
         """
-        from .paths import strip_dot_slash
+        from .paths import package_shadow_reason, strip_dot_slash, superseded_scaffold_module
         _allowed_norm = {strip_dot_slash(p.replace("\\", "/"))
                          for p in (allow_protected or ())}
         written = []
@@ -990,6 +990,25 @@ class Executor:
                 )
                 continue
 
+            # Guard: a package already owns this module name.
+            # Writing `core/tests.py` beside an existing `core/tests/`
+            # gives Python two claimants for `core.tests` and breaks test
+            # discovery for the whole tree. Measured 2026-09-16: a plan
+            # declared `core/tests.py` as a step's target while another
+            # step had built the package, and `manage.py test` died with
+            # `ImportError: 'tests' module incorrectly imported` over an
+            # otherwise complete Django app. Refused and reported rather
+            # than redirected: where the file belongs is the plan's
+            # decision, not this writer's.
+            _shadow = package_shadow_reason(base_dir, filename)
+            if _shadow is not None:
+                log.warning(
+                    f"[Executor] Skipping {filepath}: {_shadow}. The tests "
+                    f"belong inside that package (e.g. "
+                    f"{filename[:-3]}/test_*.py) — writing this file would "
+                    f"break discovery for every module under it.")
+                continue
+
             # Guard: never overwrite dependency manifests / lock files
             basename = os.path.basename(filename)
             if basename in Executor._PROTECTED_FILENAMES and os.path.isfile(filepath):
@@ -1015,6 +1034,25 @@ class Executor:
                 f.write(content)
             log.info(f"Written: {filepath}")
             written.append(filepath)
+
+            # This write may have completed a package that supersedes an
+            # empty scaffold module beside it (`core/tests/` vs the
+            # `startapp` stub `core/tests.py`). Both claim `core.tests`,
+            # and discovery dies on the pair — while every write here went
+            # exactly where it belongs, so refusing is not the remedy.
+            # Only a module that DECLARES NOTHING is removed.
+            _stale = superseded_scaffold_module(base_dir, filename)
+            if _stale is not None:
+                try:
+                    os.remove(os.path.join(base_dir, *_stale.split("/")))
+                    log.info(
+                        f"[Executor] Removed {_stale}: the package "
+                        f"{_stale[:-3]}/ now owns that module name, and the "
+                        f"file declared nothing — both would break test "
+                        f"discovery for everything under it.")
+                except OSError as exc:
+                    log.warning(f"[Executor] Could not remove superseded "
+                                f"{_stale}: {exc}")
 
             # Track directories that contain .py files
             if filename.endswith(".py") and dirpath and dirpath != base_dir:
