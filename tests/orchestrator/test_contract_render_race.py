@@ -26,6 +26,7 @@ import textwrap
 
 from agentchanti.orchestrator.acceptance_seed import (
     render_race_reason,
+    reseed_defect_reason,
     structural_defect_reason,
 )
 
@@ -74,14 +75,22 @@ class TestTheMeasuredIncident:
         assert "time.sleep(0.01)" in MEASURED
         assert render_race_reason(MEASURED)
 
-    def test_it_reaches_the_structural_screen(self):
-        reason = structural_defect_reason(MEASURED)
-        assert reason and "blank until" in reason
+    def test_it_never_reaches_the_REFUSAL_path(self):
+        """Measured 2026-09-16, minutes after the screen first shipped.
 
-    def test_the_reason_says_what_to_do(self):
-        reason = structural_defect_reason(MEASURED)
-        assert "retry in a" in reason or "wait for a frame" in reason
-        assert "as strict" in reason, "a repair must not check less"
+        A snake run drafted a raced contract, the repair kept the race,
+        and `structural_defect_reason`'s refusal left NO contract — so
+        `require_independent_evidence` failed a run outright. Refusing is
+        right for a root outside the project, whose tests fail over any
+        code; a race fails only sometimes, so keeping an imperfect
+        instrument beats having none. The documentation screen already
+        draws this line.
+        """
+        assert structural_defect_reason(MEASURED) is None
+
+    def test_but_a_stale_raced_contract_is_still_re_seeded(self):
+        """Reusing one would roll the same dice on every rerun."""
+        assert reseed_defect_reason(MEASURED)
 
 
 def _fn(body: str) -> str:

@@ -38,7 +38,22 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.tasks import TASKS  # noqa: E402
 
+# Default wall-clock cap for one run. A task may raise it with its own
+# `timeout_s`, because one number cannot serve a 60-second bugfix and a
+# twenty-step Django build at once.
+#
+# Measured 2026-09-16: `django-webapp` completed in 575.9s against this
+# 600s cap — a 4% margin — and then produced NO verdict in three of the
+# next four attempts. Two died in planning having written no file at all;
+# one wrote a complete application and was killed mid-flight. A cap that
+# tight is not measuring the pipeline, it is measuring the API's latency
+# that afternoon, and three of the five defects fixed in 0.8.4 went
+# without live confirmation because this task could not finish.
 RUN_TIMEOUT_S = 600
+
+
+def _timeout_for(task: dict) -> int:
+    return int(task.get("timeout_s") or RUN_TIMEOUT_S)
 
 _TOKENS_RE = re.compile(r"Total tokens:\s*([\d,]+)")
 _LOOP_STATS_RE = re.compile(r"\[AgentLoop\] session: (.+)")
@@ -276,7 +291,7 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
                 cwd=workdir, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 stdin=subprocess.DEVNULL,
-                timeout=RUN_TIMEOUT_S,
+                timeout=_timeout_for(task),
                 env=child_env,
             )
             returncode = proc.returncode
@@ -284,7 +299,7 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
             stderr_tail = (proc.stderr or "")[-2000:]
         except subprocess.TimeoutExpired:
             timed_out = True
-            stdout_tail = "(timed out)"
+            stdout_tail = f"(timed out after {_timeout_for(task)}s)"
             stderr_tail = ""
 
         log_text = _read_run_log(workdir)
@@ -308,6 +323,14 @@ def run_one(task: dict, agent_loop: bool, base_config: str,
     wall_s = round(time.monotonic() - started, 1)
 
     # Ground truth: every success command must pass in the workdir.
+    #
+    # A run we KILLED is not a verdict about the pipeline. Its commands are
+    # judged anyway — a half-built tree is worth seeing — but the table
+    # reports TIMEOUT rather than FAIL, the same distinction
+    # `verify_dt_invariance` draws with its exit code 2: a refusal must
+    # never be recorded as a failure. Measured 2026-09-16, when three
+    # `django-webapp` runs in a row were recorded as FAIL having been shot
+    # mid-flight, two of them before they had written a single file.
     ground_truth = True
     check_outputs = []
     for cmd in task["success_cmds"]:
@@ -355,7 +378,7 @@ def _fmt(n) -> str:
 
 
 def print_table(results: list[dict]) -> None:
-    hdr = (f"{'task':<20} {'loop':<5} {'plan':<9} {'truth':<6} {'claim':<6} "
+    hdr = (f"{'task':<20} {'loop':<5} {'plan':<9} {'truth':<7} {'claim':<6} "
            f"{'evidence':<22} "
            f"{'total':>9} {'sent':>9} {'cached':>9} {'cch%':>5} "
            f"{'fullpr':>9} {'recv':>8} {'time_s':>7}  loop_stats")
@@ -366,9 +389,11 @@ def print_table(results: list[dict]) -> None:
         if plan == "(config default)":
             plan = "-"
         pct = r.get("cached_pct")
+        truth = ("TIMEOUT" if r.get("timed_out")
+                 else "PASS" if r["ground_truth"] else "FAIL")
         print(f"{r['task']:<20} {'on' if r['agent_loop'] else 'off':<5} "
               f"{plan:<9} "
-              f"{'PASS' if r['ground_truth'] else 'FAIL':<6} "
+              f"{truth:<7} "
               f"{str(r['pipeline_claim']):<6} "
               f"{str(r.get('evidence') or '-'):<22} "
               f"{_fmt(r['tokens']):>9} {_fmt(r.get('sent')):>9} "
