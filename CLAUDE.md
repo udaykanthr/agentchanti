@@ -540,6 +540,108 @@ Reachability is read from the three ways a project loads CSS: a JS/JSX `import`/
 
 The finding also had to change, not just the verdict. Telling a reader to write rules that already exist is the wrong instruction: when the missing names sit in an unreachable stylesheet, the message becomes *"These classes ARE defined — in `src/styles/global.css` — but nothing imports it … Fix the IMPORT, not the rules."* Adding rules to a file nothing imports is precisely what the repair loop did.
 
+### A Project The User Has Not Committed Yet (project_scanner.py `_is_gitignored`)
+
+The function was named for one question and implemented another: absent
+from `git ls-files` is **untracked**, not **ignored**. Those differ for
+exactly one case, and it is the most common state any project is ever in —
+files someone just created.
+
+Measured 2026-09-17. A user made a Next.js + TypeScript app in `my-app/` by
+hand, never committed it, and asked for a home page:
+
+    09:39:03 Project scan: 0 files detected, 0 source files collected
+    09:39:07 Creating git checkpoint branch...
+    --STEP 1.1 [CMD] ... in the blank `my-app` shell, replacing only the
+    empty directory structure
+    > rmdir /s /q my-app && npm create next-app@latest my-app -- --js
+
+Nineteen files deleted, and a TypeScript project replaced by a JavaScript
+scaffold. The scan ran **four seconds before** the run's own git
+checkpoint — the commit that made those files tracked, and the only reason
+they could be restored afterwards. The planner was handed a project
+containing an empty directory and reasonably concluded it was a scaffold in
+waiting.
+
+The intent agent had read `layout.tsx` moments earlier and knew the app was
+there. One subsystem knew while another asserted the opposite, and the
+empty scan is what reached the plan. The scan now asks git the question the
+name always promised: tracked files **plus** untracked-but-not-ignored ones
+(`git ls-files --others --exclude-standard`). Genuinely ignored paths stay
+hidden, and a directory with no git at all still falls back to the skip
+lists.
+
+### A Command That Destroys Work (executor.py, gate_safety.py `command_destructive_reason`)
+
+`gate_safety` has refused destructive `verify:` lines since a `taskkill /im
+python.exe` killed the pipeline mid-run, and its own header records the
+hole that left: *"An agent loop can still call run_command with anything,
+which is AgentTools sandboxing, not a gate check."* A plan CMD step is a
+third route, and it is the one that did the damage above — the same run
+also executed `taskkill /f /im node.exe`, killing every node process on the
+machine.
+
+The patterns were already written and already audited; they simply never
+ran against anything but gates. `Executor.run_command` is the one seam
+every route passes through, so the question is asked there, with one
+deliberate relaxation: a gate should never delete anything, but a build
+step legitimately clears `node_modules` or `dist`. A recursive delete is
+refused only when the path it names **holds work** — `_holds_work` walks it
+and ignores build output, so `rm -rf node_modules && npm install` stays
+ordinary while `rmdir /s /q my-app` does not. The refusal says what it
+means: *if a directory is in the way, the premise is probably wrong.*
+
+### A Contract For A Language The Seeder Could Not Read (acceptance_seed.py `_seed_js`)
+
+`require_independent_evidence` is satisfiable three ways — user
+`acceptance_cmds`, a pre-existing suite, or a seeded contract — and the
+seeder was Python-only end to end. So a JavaScript or TypeScript project
+could satisfy none of them, and every such run was doomed before it
+started. Measured 2026-09-17: a Next.js build whose every step ran, whose
+`npm run build` reported `Compiled successfully in 1337ms`, exited 1 on
+*"nothing outside this run's own output verified it"*.
+
+The contract is a **plain Node script**, not a vitest/jest suite: it is
+written before any code exists, so it cannot know which runner the project
+will end up with, and one needing an install nobody has run yet could never
+judge anything. `node acceptance.contract.test.mjs` works wherever a JS
+project works, and its exit status is the verdict. It is required to print
+`ACCEPTANCE: <n> checks passed`, because plain Node output has no
+"collected 0 tests" line for `empty_suite_reason` to read.
+
+**The sanity gate is deliberately shallow, after two attempts at being
+clever were both wrong about JavaScript.** Requiring two literal
+`assert.*(` calls refused three live contracts in a row, because the model
+wraps the assertion in a `check()` helper and calls it fourteen times — one
+literal call, thirteen real assertions. Balancing braces outside quotes was
+defeated by one ordinary line, a regex literal inside a template literal:
+``const p = href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}` ``.
+There is no JS parser here, so the gate asks only what separates a contract
+from prose or a stub — Node's assert is imported, it asserts at least once,
+it reports a count — and leaves judging to `verify_contract_runs`, which
+executes it per wave.
+
+`js_platform_defect_reason` is `platform_signal_reason` one language over.
+Measured on the first Node contract a live run ever seeded: fourteen good
+checks, and it reported `The production build must succeed` against a
+project that builds cleanly, because `spawnSync("npm", ...)` returns ENOENT
+on Windows where npm is a `.cmd` batch script. Windows only; the identical
+call is correct on POSIX. Repaired rather than refused, the
+`documentation_grep_reason` rule — an imperfect contract beats none, since
+a seeded contract can establish evidence but never convict.
+
+**What this path does NOT have is the Python ladder.** `mocking_reason`,
+`interactive_reason`, `structural_defect_reason`, `render_race_reason`,
+`documentation_grep_reason` and `weak_contract_reason` are `ast` analyses
+of Python source and cannot read JavaScript. The run says so in a WARNING
+rather than letting silence imply parity. Measured over six live runs on
+one prompt: three produced a working home page, two of those also earned
+independent evidence, and the third lost its verdict to a contract that
+searched for HTML tags in text its own helper had stripped of tags — a
+check no implementation could pass, which is exactly what a JS counterpart
+of `weak_contract_reason` would catch. The failure is bounded: the run
+exits 0 and reports itself unverified rather than failing correct work.
+
 ### Ghost Shadow (orchestrator/ghost.py)
 
 Read-only reconciliation of the plan's *declared postconditions* against the real tree — no LLM calls, no commands run, no verdict changed. `GhostPlan.build()` is called in `cli.py` once the plan is final (after blind-edit routing / dependency fixes / verify repair) and before the first step runs, so its file hashes are a true pre-run baseline. Steps' `target:`/`exports:`/`imports:`/`verify:` become interned `Expectation` nodes (`EXISTS`, `TOUCHED`, `PARSES`, `EXPORTS`, `IMPORT_EDGE`, `PKG_PRESENT`, `GATE_PASSED`) shared across the steps that declare them; verdicts are four-valued (`HOLDS`/`VIOLATED`/`UNKNOWN`/`INAPPLICABLE`) and fold over an append-only observation journal. Resolved per wave next to `_reconcile_plan_graph`, reported once at the end of the run under `[Ghost]`.

@@ -6,6 +6,33 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.8.6 — 2026-09-17
+
+### Fixed
+
+- **A project you have not committed yet is no longer invisible.** The scan
+  counted only files git already tracked, so an app created by hand and not
+  yet committed read as an empty directory — and a plan built on that
+  premise deleted it and scaffolded over the top. The scan now counts
+  untracked files too, and skips only what git actually ignores.
+- **A command that would destroy your work is refused.** The checks that
+  have long protected `verify:` lines from `rm -rf`, `rmdir /s` and
+  `taskkill` now apply to every command the pipeline runs, including a
+  plan's own steps. Clearing build output (`node_modules`, `dist`, `build`)
+  is still allowed — only deleting a directory that holds real files is
+  refused.
+
+### Added
+
+- **JavaScript and TypeScript projects can earn a verified result.** The
+  acceptance seeder was Python-only, so a JS/TS project with
+  `require_independent_evidence` set could never satisfy it however well the
+  run went. Such a project now gets its own Node contract
+  (`acceptance.contract.test.mjs`), written before the first step and run
+  with plain `node`. It is screened for shape and for commands that cannot
+  run on this platform; the deeper checks the Python contract gets do not
+  read JavaScript yet, and the run says so.
+
 ## 0.8.5 — 2026-09-17
 
 ### Fixed

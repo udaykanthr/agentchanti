@@ -60,6 +60,7 @@ import hashlib
 import logging
 import os
 import re
+import sys
 
 log = logging.getLogger("agentchanti")
 
@@ -72,14 +73,17 @@ SEED_BASENAME = "test_acceptance_contract.py"
 # generation is cheap next to the run it is supposed to judge.
 _REPAIR_ATTEMPTS = 2
 
-_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+_FENCE_RE = re.compile(
+    r"```(?:python|py|javascript|js|typescript|ts|mjs)?\s*\n(.*?)```",
+    re.DOTALL)
 
 # First line of a seeded file. A comment, so it costs the suite nothing,
 # and self-describing, so it survives a wiped .agentchanti directory —
 # the state that decides whether to re-seed must live with the artifact
 # it describes, not beside it.
 _HEADER_RE = re.compile(
-    r"^#\s*agentchanti:acceptance-seed\s+task=([0-9a-f]+)\s+body=([0-9a-f]+)\s*$"
+    r"^(?:#|//)\s*agentchanti:acceptance-seed\s+task=([0-9a-f]+)"
+    r"\s+body=([0-9a-f]+)\s*$"
 )
 
 
@@ -94,8 +98,9 @@ def _fingerprint(text: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _header(task: str, body: str) -> str:
-    return (f"# agentchanti:acceptance-seed task={_fingerprint(task)} "
+def _header(task: str, body: str, comment: str = "#") -> str:
+    """The stamp that makes a contract ours, in the file's comment syntax."""
+    return (f"{comment} agentchanti:acceptance-seed task={_fingerprint(task)} "
             f"body={_fingerprint(body)}\n")
 
 
@@ -156,6 +161,202 @@ behaviour the task states explicitly. Rules, all of them load-bearing:
 
 Output ONLY the Python file in one ``` fenced block. No commentary.
 """
+
+# The JavaScript/TypeScript counterpart.
+#
+# Deliberately a PLAIN NODE SCRIPT rather than a vitest/jest suite: the
+# contract is written before any code exists, so it cannot know which
+# runner the project will end up with, and a contract that needs an
+# install nobody has run yet is a contract that cannot judge anything.
+# `node file.mjs` works wherever a JS project works, and its exit status
+# is the whole verdict.
+#
+# The count it prints matters as much as the assertions. A script with no
+# assertions exits 0, and `empty_suite_reason` has no "collected 0 tests"
+# line to read in plain Node output — so the contract is required to say
+# how many checks it ran, and a contract claiming zero is refused.
+SEED_BASENAME_JS = "acceptance.contract.test.mjs"
+
+_JS_LANGUAGES = frozenset({
+    "javascript", "js", "typescript", "ts", "node", "jsx", "tsx",
+})
+
+_PROMPT_JS = """\
+You are writing the ACCEPTANCE TEST for a task, BEFORE any code exists.
+
+TASK:
+{task}
+
+Write ONE self-contained Node ES module that decides whether the finished
+project satisfies that task. It is saved as `acceptance.contract.test.mjs`
+IN THE PROJECT ROOT and run from there with `node
+acceptance.contract.test.mjs`, so the project root is the current working
+directory.
+
+RULES
+1. Use only Node's own standard library — `node:assert/strict`,
+   `node:fs`, `node:path`, `node:child_process`. No test framework, no
+   imports from npm: nothing is installed when you are writing this, and
+   the project may end up using any runner or none.
+2. Do not assume a file layout beyond what the task states. Discover what
+   you need (read `package.json`, look for the directory the task names)
+   rather than hardcoding a path the project may not use.
+3. Assert on BEHAVIOUR, not on source text. Running the build, starting
+   the app and requesting a page, checking rendered output — those are
+   behaviour. Grepping a component for the word "responsive" is
+   vocabulary, and passes a stub that mentions it.
+4. Never modify the project. Read, run, and assert; do not write files,
+   install packages, or edit anything.
+5. Never stub or mock the thing under test. A contract that replaces the
+   code with a fake proves nothing about the code.
+6. Every command you run must terminate on its own. Use
+   `execSync(..., {{timeout: ...}})` or kill what you start — a dev
+   server left running never returns, and the run hangs on your check.
+7. Make at least two assertions that could FAIL against a wrong
+   implementation. "The build exits 0" is one real check; "a file exists"
+   on its own is not enough.
+8. Print exactly one line before exiting cleanly:
+   `ACCEPTANCE: <n> checks passed`, where <n> is how many assertions you
+   actually made. Let a failed assertion throw — a non-zero exit is the
+   verdict.
+9. When you run `npm`, `npx`, `yarn` or `pnpm` through `child_process`,
+   pass `shell: true`. On Windows those are `.cmd` batch scripts, so
+   `spawnSync("npm", ...)` fails with ENOENT before the build is even
+   attempted — and your contract then reports the project as broken when
+   nothing is wrong with it. `execSync`/`exec` already use a shell.
+10. Every check must be able to PASS against a correct implementation.
+    Watch what you have done to a value before asserting on it: if you
+    strip the tags out of some HTML, assert on the TEXT that is left —
+    that it is non-empty, or contains a word you expect — and not on the
+    tags you just removed, which can never be found again. A check that
+    no implementation can satisfy is worse than no check at all.
+
+Output ONLY the JavaScript file in one ``` fenced block. No commentary.
+"""
+
+# `assert.ok(...)`, `assert.equal(...)`, `assert(...)`, `assert.match(...)`
+_JS_ASSERT_RE = re.compile(r"\bassert\s*(?:\.\w+\s*)?\(")
+
+# Node's assert, however it was reached. `node:assert`, `node:assert/strict`
+# and the bare `assert`/`assert/strict` specifiers are the same module, by
+# import or require — and a gate that accepts only the prefixed spelling is
+# an instrument the model cannot satisfy, which is the defect this whole
+# module exists to avoid. Measured 2026-09-17: a live run produced two
+# usable contracts and both were refused, one for writing `from "assert"`
+# and one for printing its count by concatenation rather than a literal.
+_JS_ASSERT_IMPORT_RE = re.compile(
+    r"""(?:from\s+|require\s*\(\s*)["'](?:node:)?assert(?:/strict)?["']""")
+
+# The contract must SAY how many checks it ran, because plain Node output
+# has no "collected 0 tests" line for `empty_suite_reason` to read. How it
+# builds that string is its own business — literal, concatenated or
+# interpolated — so only the marker is required here; the real guarantee
+# is the two static assertions above.
+_JS_SUMMARY_RE = re.compile(r"ACCEPTANCE:", re.IGNORECASE)
+
+
+# `spawnSync("npm", [...], {...})` and friends. `exec`/`execSync` run
+# through a shell already and are never the problem.
+_JS_SPAWN_TOOL_RE = re.compile(
+    r"\b(spawnSync|spawn|execFileSync|execFile)\s*\(\s*"
+    r"['\"](npm|npx|yarn|pnpm)(?:\.cmd)?['\"]")
+# How far past the call to look for its options object. No JS parser
+# here, so this is a window rather than a parse: long enough for the
+# argument array and an options literal, short enough not to borrow a
+# `shell: true` from an unrelated later call.
+_JS_OPTIONS_WINDOW = 400
+
+
+def js_platform_defect_reason(src: str,
+                              platform: str | None = None) -> str | None:
+    """Why this contract fails on THIS machine whatever the code does.
+
+    Measured 2026-09-17, the first Node contract a live run ever seeded.
+    It was a good contract — fourteen checks over the build, the rendered
+    `<title>`, the viewport meta tag and a `<header>` — and it reported
+    `The production build must succeed` against a project whose
+    `npm run build` prints `✓ Compiled successfully` when run by hand::
+
+        spawnSync("npm", ["run", "build"], {{cwd: appDirectory}})
+        -> status: null, error: ENOENT
+
+        spawnSync("npm", [...], {{shell: true}})
+        -> status: 0
+
+    On Windows `npm`, `npx`, `yarn` and `pnpm` are `.cmd` batch scripts,
+    which `spawn`/`execFile` cannot execute without a shell. The contract
+    then fails before the build is attempted and blames the project — the
+    JavaScript counterpart of `platform_signal_reason`, which refuses a
+    Python contract that sends POSIX-only signals.
+
+    Windows only: on POSIX the same call is correct, and flagging it
+    there would be inventing a defect.
+    """
+    if not src:
+        return None
+    if (platform or sys.platform) != "win32":
+        return None
+    for m in _JS_SPAWN_TOOL_RE.finditer(src):
+        window = src[m.start():m.start() + _JS_OPTIONS_WINDOW]
+        if "shell" not in window:
+            return (f"{m.group(1)}(\"{m.group(2)}\", ...) without "
+                    f"`shell: true`")
+    return None
+
+
+_JS_PLATFORM_NOTE = """
+
+YOUR PREVIOUS CONTRACT CANNOT RUN ITS OWN COMMANDS ON THIS MACHINE.
+
+It runs npm (or npx/yarn/pnpm) through `spawn`, `spawnSync`, `execFile`
+or `execFileSync` without `shell: true`. On Windows those tools are
+`.cmd` batch scripts, so the call fails with ENOENT before the command
+is attempted — and the contract then reports the project as broken when
+nothing is wrong with it.
+
+Pass `shell: true` in the options object of every such call (or use
+`execSync`, which already runs through a shell). Change nothing else:
+keep every check exactly as strict.
+"""
+
+
+def _looks_like_a_suite_js(src: str) -> bool:
+    """Cheap sanity gate for a Node contract — deliberately shallow.
+
+    Python's version can `compile()` the draft. There is no JavaScript
+    parser here, and the first two attempts at substituting for one were
+    both wrong about how JavaScript is actually written:
+
+    **Counting literal `assert.*(` calls.** Measured across three live
+    samples, the model wrapped the assertion in a helper every time ::
+
+        function check(condition, message) {{ checks += 1; assert.ok(...) }}
+
+    and then called `check(...)` fourteen times. One literal assert call,
+    thirteen real assertions — and a "must assert at least twice" rule
+    refused all three contracts, each of which checked the build, the
+    rendered `<title>`, the viewport meta tag and a `<header>`.
+
+    **Balancing braces outside quotes.** Defeated by one line of ordinary
+    code ::
+
+        const cssPath = href.startsWith('/') ? href : `/${{href.replace(/^\\.\\//, '')}}`;
+
+    — a regex literal inside a template literal. Comments and apostrophes
+    break it just as easily.
+
+    So this asks only what separates a contract from prose or a stub, and
+    leaves judging the contract to the thing that can actually judge it:
+    `verify_contract_runs` executes it per wave, which is the same answer
+    the Python path relies on for every runtime defect. A gate that cannot
+    be satisfied is the defect this module exists to prevent, and two of
+    these rules were exactly that.
+    """
+    if not src or not _JS_ASSERT_IMPORT_RE.search(src):
+        return False
+    if not _JS_ASSERT_RE.search(src):
+        return False          # imports assert and never asserts: a stub
+    return bool(_JS_SUMMARY_RE.search(src))
 
 # The prompt above is deliberately the 0.7.0 prompt, verbatim. Between 0.8.0
 # and 2026-09-15 it grew from 7 rules / 2,132 chars to 11 rules / 4,143 chars
@@ -706,8 +907,22 @@ def _should_seed(task: str, root: str, path: str) -> bool:
     because the whole point of the skip is that independent evidence we
     did not author already exists.
     """
-    others = [f for f in existing_test_files(root)
-              if os.path.normpath(f) != os.path.normpath(SEED_BASENAME)]
+    # "Someone else's" means exactly that: not the file being decided
+    # about, and not a contract this module wrote in EITHER dialect. The
+    # exclusion used to name the Python basename alone, so once a Node
+    # contract existed beside it the seeder treated its own work as
+    # independent evidence and never re-seeded, whatever the task said.
+    others = []
+    for rel in existing_test_files(root):
+        full = os.path.join(root, rel)
+        if os.path.normpath(full) == os.path.normpath(path):
+            continue
+        if os.path.normpath(rel) in (os.path.normpath(SEED_BASENAME),
+                                     os.path.normpath(SEED_BASENAME_JS)):
+            continue
+        if seed_state(full) is not None:
+            continue                     # ours, stamped, in some dialect
+        others.append(rel)
     if others:
         log.info("[AcceptanceSeed] skipped: %d test file(s) already predate "
                  "the run and are stronger evidence (%s)",
@@ -750,6 +965,114 @@ def _should_seed(task: str, root: str, path: str) -> bool:
     return True
 
 
+def _seed_js(task: str, root: str, llm_client,
+             identity_task: str | None = None) -> str | None:
+    """Seed the Node contract for a JavaScript or TypeScript project.
+
+    Measured 2026-09-17. A user asked a Next.js + TypeScript project for a
+    home page. Every step ran, `npm run build` reported `✓ Compiled
+    successfully in 1337ms`, and the run exited 1 on
+    `require_independent_evidence is set and nothing outside this run's
+    own output verified it` — because the seeder was Python-only, so of
+    the three things that can satisfy that flag, none could exist. The
+    pre-flight warning said so honestly at plan time; it did not make the
+    run any less doomed.
+
+    What this deliberately does NOT do yet is the whole Python ladder.
+    `mocking_reason`, `interactive_reason`, `structural_defect_reason`,
+    `render_race_reason`, `documentation_grep_reason` and
+    `weak_contract_reason` are all `ast` analyses of Python source, and
+    none of them can read JavaScript. A JS contract therefore gets the
+    sanity gate (`_looks_like_a_suite_js` — Node's assert, two or more
+    assertions, a reported count, balanced braces), the retry every
+    generation now gets, and nothing else. That is a weaker instrument
+    than the Python path, and it is said out loud in the log rather than
+    implied by silence, because a contract nobody screened can still be
+    wrong in all the ways this module has spent months cataloguing.
+    """
+    identity = identity_task if (identity_task or "").strip() else task
+    path = os.path.join(root, SEED_BASENAME_JS)
+    if not _should_seed(identity, root, path):
+        return None
+
+    src = None
+    for attempt in range(1, _REPAIR_ATTEMPTS + 1):
+        raw = _generate_js(llm_client, task)
+        if raw is not None:
+            src = raw
+            break
+        if attempt < _REPAIR_ATTEMPTS:
+            log.info("[AcceptanceSeed] no usable JS contract from attempt "
+                     "%d/%d — asking again", attempt, _REPAIR_ATTEMPTS)
+    if src is None:
+        log.warning("[AcceptanceSeed] no usable Node contract — this run has "
+                    "no independent check")
+        return None
+
+    # A contract that cannot run npm on this machine judges nothing, and
+    # blames the project while doing it. Repaired, not refused: keeping an
+    # imperfect contract beats having none, since a seeded contract can
+    # establish evidence but never convict.
+    defect = js_platform_defect_reason(src)
+    if defect:
+        log.info("[AcceptanceSeed] the contract cannot run its own commands "
+                 "on this platform (%s) — asking again", defect)
+        for attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate_js(llm_client, task, extra=_JS_PLATFORM_NOTE)
+            if retry is None:
+                continue
+            still = js_platform_defect_reason(retry)
+            if still is None:
+                log.info("[AcceptanceSeed] the repaired contract runs npm "
+                         "through a shell — using it")
+                src, defect = retry, None
+                break
+            defect = still
+        if defect:
+            log.warning("[AcceptanceSeed] the contract still spawns npm "
+                        "without a shell (%s) — keeping it, but on Windows "
+                        "it will report the build as failed whatever the "
+                        "code does", defect)
+
+    body = src.strip() + "\n"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body, comment="//"))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME_JS, exc)
+        return None
+
+    log.info("[AcceptanceSeed] wrote %s from the task text, before any step "
+             "ran — it counts as independent evidence for exactly as long as "
+             "the run leaves it untouched", SEED_BASENAME_JS)
+    log.warning("[AcceptanceSeed] a Node contract is screened only for shape, "
+                "not for the defects the Python path checks (mocking, "
+                "interactive prompts, source-grepping, weak assertions) — "
+                "those analyses read Python only")
+    return path
+
+
+def _generate_js(llm_client, task: str, extra: str = "") -> str | None:
+    """One JS generation round: prompt, extract the fence, sanity-check it."""
+    prompt = _PROMPT_JS.format(task=task.strip())
+    if extra:
+        prompt += "\n\n" + extra
+    try:
+        raw = llm_client.generate_response(prompt)
+    except Exception as exc:
+        log.warning("[AcceptanceSeed] generation failed: %s", exc)
+        return None
+    match = _FENCE_RE.search(raw or "")
+    src = (match.group(1) if match else (raw or "")).strip()
+    if not _looks_like_a_suite_js(src):
+        log.warning("[AcceptanceSeed] response was not a usable Node "
+                    "contract")
+        return None
+    return src
+
+
 def seed_acceptance_tests(task: str, root: str, llm_client,
                           language: str | None = None,
                           identity_task: str | None = None) -> str | None:
@@ -768,10 +1091,13 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     would re-seed every run and discard a contract that was fine.
     Defaults to *task* for callers that have only one of them.
     """
+    if not task or not task.strip():
+        return None
+    if language and language.lower() in _JS_LANGUAGES:
+        return _seed_js(task, root, llm_client,
+                        identity_task=identity_task)
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)
-        return None
-    if not task or not task.strip():
         return None
 
     identity = identity_task if (identity_task or "").strip() else task
