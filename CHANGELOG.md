@@ -6,6 +6,34 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.9.0 — 2026-09-17
+
+### Added
+
+- **Nothing you had before a run can be lost.** The project is copied before
+  anything reads or plans against it, and `agentchanti --restore` puts it
+  back. It needs no git — the previous safety net only worked in a
+  repository, and only from a point after the planning that could already
+  have gone wrong. Build output and dependency trees are skipped; a very
+  large tree is refused outright rather than half-copied, and says so.
+- **A built-in acceptance contract for JavaScript and TypeScript projects.**
+  Asking a model to write one before the code exists produced four contracts
+  in a row that failed correct projects, each in a new way. The contract is
+  now shipped with agentchanti, costs no tokens, and checks that the project
+  builds and emits a real page for its root route. It is still independent:
+  nothing in it is written by the run, and editing it withdraws it as
+  evidence.
+
+### Fixed
+
+- **A seeded JS contract can no longer depend on starting a server**, which
+  is the most environment-fragile thing to write blind and the cause of
+  three consecutive false failures. Contracts now read what the build left
+  behind.
+- **A JS contract that cannot fail on wrong behaviour is repaired.** Checks
+  that only assert a file exists, or restate a literal, no longer count as
+  verification.
+
 ## 0.8.6 — 2026-09-17
 
 ### Fixed

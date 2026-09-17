@@ -27,8 +27,10 @@ from agentchanti.orchestrator.acceptance_seed import (
     SEED_BASENAME_JS,
     _looks_like_a_suite_js,
     js_platform_defect_reason,
+    js_server_orchestration_reason,
     seed_acceptance_tests,
     seed_state,
+    weak_js_contract_reason,
 )
 from agentchanti.orchestrator.evidence import _runner_command
 
@@ -158,10 +160,11 @@ class TestSeeding:
         assert seed_state(path) is not None, "the run must recognise it as ours"
 
     def test_an_unusable_response_is_retried(self, tmp_path):
+        """The model-written path, which is now opt-in."""
+        from agentchanti.orchestrator.acceptance_seed import _seed_js
         client = _Client("I cannot help with that.", f"```js\n{GOOD}```")
 
-        path = seed_acceptance_tests("t", str(tmp_path), client,
-                                     language="typescript")
+        path = _seed_js("t", str(tmp_path), client, model_written=True)
 
         assert path is not None
         assert client.calls == 2
@@ -219,7 +222,8 @@ class TestReSeeding:
         again = seed_acceptance_tests("build a checkout page", str(tmp_path),
                                       client, language="typescript")
 
-        assert again is not None and client.calls == 1
+        assert again is not None
+        assert client.calls == 0, "the built-in contract costs no tokens"
 
     def test_an_edited_contract_is_left_alone(self, tmp_path):
         path = self._seed(tmp_path)
@@ -282,3 +286,78 @@ class TestItCanRunItsOwnCommands:
         src = (pathlib.Path(__file__).parent / "fixtures"
                / "js_contract_helper_style.mjs").read_text(encoding="utf-8")
         assert js_platform_defect_reason(src, platform="win32")
+
+
+class TestItDoesNotOrchestrateAServer:
+    """Measured 2026-09-17 across three consecutive live runs, each of
+    which failed a project that was correct:
+
+        spawnSync("npm", ...)                     ENOENT (npm is a .cmd)
+        "project root must contain package.json"  the app was in my-app/
+        "the development server did not serve the home page"
+
+    Different causes, one shape: the contract was orchestrating an
+    environment rather than judging an artifact. Every live sample
+    collected started a dev server.
+    """
+
+    @pytest.mark.parametrize("src,why", [
+        ('spawn("npm", ["run", "dev"], { shell: true })', "npm run dev"),
+        ('execSync("npx next start -p 3000")', "next start"),
+        ("server.listen(3000)", "listening on a socket"),
+        ('await fetch("http://localhost:3000/")', "fetching from localhost"),
+        ('const r = await fetch(`http://127.0.0.1:${port}/`)', "127.0.0.1"),
+    ])
+    def test_server_orchestration_is_flagged(self, src, why):
+        assert js_server_orchestration_reason(src), why
+
+    def test_a_build_only_contract_is_accepted(self):
+        src = ('const out = execSync("npm run build", '
+               '{ cwd: dir, shell: true, timeout: 300000 });\n'
+               'assert.ok(existsSync(".next/server/app/page.js"));\n')
+        assert js_server_orchestration_reason(src) is None
+
+    def test_the_real_dev_server_fixture(self):
+        import pathlib
+        src = (pathlib.Path(__file__).parent / "fixtures"
+               / "js_contract_dev_server.mjs").read_text(encoding="utf-8")
+        assert js_server_orchestration_reason(src)
+
+
+class TestItCanFailOnWrongBehaviour:
+    """`weak_contract_reason`'s counterpart — the gap 0.8.6 named."""
+
+    def test_existence_checks_alone_are_weak(self):
+        src = ('import assert from "node:assert";\n'
+               'assert.ok(existsSync("a"));\nassert.ok(existsSync("b"));\n')
+        assert weak_js_contract_reason(src)
+
+    def test_a_tautology_is_weak(self):
+        src = 'import assert from "node:assert";\nassert.ok(true);\n'
+        assert weak_js_contract_reason(src)
+
+    def test_one_real_check_is_not_enough(self):
+        """One is within reach of code written to satisfy exactly that one."""
+        src = ('assert.ok(existsSync("a"));\n'
+               'assert.ok(out.includes("compiled"));\n')
+        assert weak_js_contract_reason(src)
+
+    def test_two_discriminating_checks_pass(self):
+        src = ('assert.ok(html.includes("<header"));\n'
+               "assert.match(html, /<title>[^<]+<" + chr(92) + "/title>/);" + chr(10))
+        assert weak_js_contract_reason(src) is None
+
+    def test_the_helper_style_is_counted(self):
+        """Assertions are usually made through a check() helper."""
+        src = ('function check(c, m) { assert.ok(c, m); }\n'
+               'check(html.includes("<header"), "a");\n'
+               'check(/<title>/.test(html), "b");\n')
+        assert weak_js_contract_reason(src) is None
+
+    @pytest.mark.parametrize("name", ["js_contract_helper_style.mjs",
+                                      "js_contract_dev_server.mjs"])
+    def test_the_real_contracts_are_strong(self, name):
+        import pathlib
+        src = (pathlib.Path(__file__).parent / "fixtures"
+               / name).read_text(encoding="utf-8")
+        assert weak_js_contract_reason(src) is None

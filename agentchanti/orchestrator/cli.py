@@ -788,6 +788,9 @@ def _main_impl():
                          help="Generate HTML report after run (default: on)")
     parser.add_argument("--no-report", action="store_true",
                          help="Disable HTML report generation")
+    parser.add_argument("--restore", action="store_true",
+                         help="Restore the project from the snapshot taken "
+                              "before the last run, then exit")
     parser.add_argument("--generate-config", "--generate-yaml", action="store_true",
                          help="Generate a .agentchanti.yaml file with current settings and exit")
     parser.add_argument("--no-search", action="store_true",
@@ -795,6 +798,16 @@ def _main_impl():
     parser.add_argument("--no-kb", action="store_true",
                          help="Disable KB context injection (debugging)")
     args = parser.parse_args()
+
+    # Undo, before anything else runs. It needs no config, no provider and
+    # no API key: a user reaching for this has already had a bad run and
+    # must not be asked for credentials to get their files back.
+    if getattr(args, "restore", False):
+        from ..snapshot import restore_snapshot
+        ok, detail = restore_snapshot(".")
+        verb = "Restored" if ok else "Could not restore"
+        print("\n  " + verb + ": " + detail + "\n")
+        return
 
     # ── 0. Load config ──
     cfg = Config.load(args.config)
@@ -903,6 +916,18 @@ def _main_impl():
             reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
 
     # ── 3. Scan existing project ──
+    #
+    # The snapshot comes FIRST, before anything reads or plans against the
+    # project. Measured 2026-09-17: the scan below decided a user's
+    # uncommitted Next.js app was an empty directory, a plan deleted it,
+    # and the only reason nineteen files came back was that the git
+    # checkpoint 324 lines further down happened to apply — it is gated on
+    # the directory already being a repository. Guards decide what may
+    # happen; this decides what can be undone, and it must not depend on
+    # the premise the plan is about to be built on.
+    from ..snapshot import take_snapshot
+    take_snapshot(".")
+
     scan_result = scan_project(".")
     source_files = collect_source_files(".")
     log.info(f"Project scan: {scan_result['file_count']} files detected, "
