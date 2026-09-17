@@ -591,6 +591,34 @@ and ignores build output, so `rm -rf node_modules && npm install` stays
 ordinary while `rmdir /s /q my-app` does not. The refusal says what it
 means: *if a directory is in the way, the premise is probably wrong.*
 
+### An Undo That Does Not Depend On Git (snapshot.py)
+
+The two fixes above are guards: the scan no longer reports a real project
+as empty, and the executor refuses the command that deleted one. This is
+the backstop, and it exists because **neither guard is a guarantee**.
+
+The recovery that afternoon worked by luck. `create_checkpoint_branch` did
+auto-commit the user's files — but it is gated on the directory already
+being a git repository, and in `cli.py` it ran **324 lines after** the scan
+that formed the wrong premise. Run agentchanti in a plain folder, which is
+exactly what a new user does, and there was no snapshot at all.
+
+So `take_snapshot` runs *before* the scan, needs no git, and copies the
+project's own files while skipping build output and dependency trees.
+`agentchanti --restore` puts them back, and deliberately needs no config,
+provider or API key: someone reaching for it has already had a bad run and
+must not be asked for credentials to get their files back. Restore is
+**additive** — it never deletes what the run added, because an undo that
+destroys work is the behaviour this module exists to prevent.
+
+Bounds are refusals, not truncations: over 4,000 files or 200 MB it copies
+nothing and says which bound it hit, because a partial snapshot that looks
+complete is worse than none. Verified on the incident's own shape: the
+project deleted outright, then restored byte-for-byte, with `node_modules`
+correctly absent.
+
+Guards decide what is allowed to happen. This decides what can be undone.
+
 ### A Contract For A Language The Seeder Could Not Read (acceptance_seed.py `_seed_js`)
 
 `require_independent_evidence` is satisfiable three ways — user
@@ -629,6 +657,47 @@ on Windows where npm is a `.cmd` batch script. Windows only; the identical
 call is correct on POSIX. Repaired rather than refused, the
 `documentation_grep_reason` rule — an imperfect contract beats none, since
 a seeded contract can establish evidence but never convict.
+
+**Four more live runs, and the contract was wrong every time.** With the
+platform screen live, one Next.js task produced four model-written
+contracts and each failed a project that was correct: `spawnSync("npm")`
+ENOENT; `"project root must contain package.json"` when the app was in
+`my-app/`; `"the development server did not serve the home page"`; and a
+read of `.next/page.js` instead of the emitted `index.html`. Different
+causes, one shape — the contract was orchestrating an environment rather
+than judging an artifact, and **every live sample started a dev server**.
+
+Two screens came out of that. `js_server_orchestration_reason` refuses
+`npm run dev`, `next start`, `.listen(` and any fetch to localhost, asking
+instead for a contract that reads what the build left behind — the same
+trade `desktop_introspection_reason` made for Python, where a weaker check
+that is right about a correct project beats a stronger one that fails it.
+`weak_js_contract_reason` is `weak_contract_reason`'s counterpart: an
+assertion counts when it could separate two implementations, so
+`existsSync` alone and `assert.ok(true)` do not, and two are required.
+Both are permissive about syntax by design, having twice been wrong about
+JavaScript — `check(...)` helper calls count as assertion sites, because
+that is how every measured contract writes them.
+
+**And then the contract stopped being model-written at all.** Four fixes
+bought four new failure modes, which is the signal that the space of ways
+to observe a build wrongly is larger than a prompt can enumerate. The
+contract for a JS project is now written once, by people who can run it,
+and shipped: `contracts/js_build_contract.mjs`, installed by
+`_seed_js_builtin` for **zero tokens**. It is still independent in the
+sense that matters — nothing in it was authored by the model whose work it
+judges, and the hash check still withdraws it as evidence if the run edits
+it — and `model_written=True` keeps the generated path available.
+
+It is deliberately a floor, not a ceiling: it proves the project builds and
+emits a non-trivial page for its root route, and knows nothing about the
+task. Its own first draft manufactured a false pass, caught only by testing
+the negative case — a page rendering `null` PASSED, because Next's 8.5KB
+`_not-found.html` is larger than the 6.4KB `index.html` and the check
+graded "the largest emitted page". It now prefers the root route by name
+and excludes not-found pages. Verified: 7 checks pass on a working home
+page, and it fails with a precise reason on a `null` page and on a broken
+build.
 
 **What this path does NOT have is the Python ladder.** `mocking_reason`,
 `interactive_reason`, `structural_defect_reason`, `render_race_reason`,

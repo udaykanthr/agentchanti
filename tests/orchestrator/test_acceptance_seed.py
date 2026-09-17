@@ -78,9 +78,19 @@ def test_an_unusable_response_writes_nothing(tmp_path):
         assert not (tmp_path / SEED_BASENAME).exists()
 
 
-def test_a_non_python_project_is_skipped(tmp_path):
+def test_a_language_with_no_contract_is_skipped(tmp_path):
+    """Go has no seeder, so the honest answer is no file at all."""
     assert seed_acceptance_tests("Build an app.", str(tmp_path),
-                                 _client(GOOD), language="javascript") is None
+                                 _client(GOOD), language="go") is None
+
+
+def test_javascript_is_no_longer_skipped(tmp_path):
+    """It used to be, and that made `require_independent_evidence`
+    unsatisfiable for every JS/TS project however well the run went. A
+    Node contract is installed instead — see `test_acceptance_seed_js`."""
+    path = seed_acceptance_tests("Build an app.", str(tmp_path),
+                                 _client(GOOD), language="javascript")
+    assert path is not None and path.endswith(".mjs")
 
 
 def test_a_generation_failure_never_raises(tmp_path):

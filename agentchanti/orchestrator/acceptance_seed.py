@@ -198,20 +198,34 @@ RULES
    `node:fs`, `node:path`, `node:child_process`. No test framework, no
    imports from npm: nothing is installed when you are writing this, and
    the project may end up using any runner or none.
-2. Do not assume a file layout beyond what the task states. Discover what
-   you need (read `package.json`, look for the directory the task names)
-   rather than hardcoding a path the project may not use.
-3. Assert on BEHAVIOUR, not on source text. Running the build, starting
-   the app and requesting a page, checking rendered output — those are
-   behaviour. Grepping a component for the word "responsive" is
-   vocabulary, and passes a stub that mentions it.
+2. Do not assume a file layout beyond what the task states. In
+   particular the application often lives in a SUBDIRECTORY of the
+   directory you run in — `my-app/package.json`, not `package.json` —
+   so search for the nearest `package.json` that defines the scripts you
+   need (skipping `node_modules`) and work relative to the directory you
+   find. A contract that requires one in the root fails on every project
+   laid out that way, whatever the code does.
+3. Assert on BEHAVIOUR, not on source text. Running the build and
+   inspecting what it produced is behaviour. Grepping a component for the
+   word "responsive" is vocabulary, and passes a stub that mentions it.
 4. Never modify the project. Read, run, and assert; do not write files,
    install packages, or edit anything.
 5. Never stub or mock the thing under test. A contract that replaces the
    code with a fake proves nothing about the code.
-6. Every command you run must terminate on its own. Use
-   `execSync(..., {{timeout: ...}})` or kill what you start — a dev
-   server left running never returns, and the run hangs on your check.
+6. DO NOT START A SERVER. No `npm run dev`, no `next start`, no
+   `listen()`, no fetching `http://localhost`. Build the project and read
+   what the build wrote: whether it exited 0, whether it emitted an entry
+   for the route the task asks for, and what is in the HTML or assets it
+   produced. Every command you run must terminate on its own —
+   `execSync(..., {{timeout: ...}})`.
+
+   This is a deliberate trade. A live request proves more than a built
+   artifact, and orchestrating a server blind — picking a free port,
+   waiting for readiness, fetching, and killing the process — is the most
+   environment-fragile thing you could write, on a machine you have never
+   seen, before the code it drives exists. Measured: three contracts in a
+   row failed working projects this way. A slightly weaker check that is
+   right about a correct project beats a stronger one that fails it.
 7. Make at least two assertions that could FAIL against a wrong
    implementation. "The build exits 0" is one real check; "a file exists"
    on its own is not enough.
@@ -302,6 +316,170 @@ def js_platform_defect_reason(src: str,
             return (f"{m.group(1)}(\"{m.group(2)}\", ...) without "
                     f"`shell: true`")
     return None
+
+
+# Starting a server and fetching from it: the most environment-fragile
+# thing a contract can do, written blind, before the code exists.
+_JS_SERVER_RES = (
+    (re.compile(r"""['"`][^'"`]*\b(?:run\s+)?dev\b[^'"`]*['"`]"""),
+     "it starts a dev server (`npm run dev`)"),
+    (re.compile(r"""['"`][^'"`]*\bnext\s+start\b[^'"`]*['"`]"""),
+     "it starts the production server (`next start`)"),
+    (re.compile(r"""['"`][^'"`]*\bserve\b[^'"`]*['"`]"""),
+     "it starts a static server (`serve`)"),
+    (re.compile(r"\.listen\s*\("), "it listens on a socket"),
+    (re.compile(r"""['"`]https?://(?:localhost|127\.0\.0\.1)"""),
+     "it requests a URL from a server it has to start"),
+    (re.compile(r"\bfetch\s*\(\s*`?https?://"),
+     "it fetches over HTTP"),
+)
+
+
+def js_server_orchestration_reason(src: str) -> str | None:
+    """Why this contract has to run a server to decide anything, or None.
+
+    Measured 2026-09-17 across three consecutive live runs, each failing a
+    project that was correct:
+
+        spawnSync("npm", ...)         ENOENT — npm is a .cmd on Windows
+        "project root must contain package.json"  — the app was in my-app/
+        "the development server did not serve the home page"
+
+    Different causes, one shape: the contract was orchestrating an
+    environment rather than judging an artifact. Picking a free port,
+    waiting for readiness, fetching, and killing the process are four
+    things that must all go right on a machine the contract has never
+    seen, before the code it drives exists.
+
+    So a JS contract is narrowed to what the build leaves behind: the exit
+    status, the route entries, the emitted HTML and assets. That is
+    strictly weaker than a live request — and the Python path made the
+    same trade when `desktop_introspection_reason` stopped contracts
+    walking the window system in favour of the program's own state. A
+    weaker check that is right about a correct project beats a stronger
+    one that fails it.
+    """
+    if not src:
+        return None
+    for pattern, reason in _JS_SERVER_RES:
+        if pattern.search(src):
+            return reason
+    return None
+
+
+# What makes an assertion able to separate two implementations. A
+# comparison, a pattern match, a containment test — something whose
+# outcome depends on what the project actually produced.
+_JS_DISCRIMINATING_RE = re.compile(
+    r"(===|!==|==|!=|>=|<=|>|<"
+    r"|\.test\s*\(|\.includes\s*\(|\.match\s*\(|\.startsWith\s*\("
+    r"|\.endsWith\s*\(|\.some\s*\(|\.every\s*\(|\bassert\.(?:equal|strictEqual"
+    r"|deepEqual|deepStrictEqual|match)\s*\()"
+)
+# Existence alone is not behaviour: "a file is there" holds for a stub.
+_JS_EXISTENCE_ONLY_RE = re.compile(
+    r"^\s*(?:!\s*)?(?:fs\.)?(?:existsSync|statSync|accessSync)\s*\([^)]*\)\s*$")
+_JS_TAUTOLOGY_RE = re.compile(r"^\s*(?:true|1|!!\s*1)\s*$")
+
+# An assertion site: `assert.x(`, `assert(`, or a call to a one-word
+# helper. The helper form is how every measured contract writes them.
+_JS_ASSERT_SITE_RE = re.compile(
+    r"\b(?:assert(?:\.\w+)?|check|expectOk|ensure|must)\s*\(")
+
+
+def _js_first_argument(src: str, open_paren: int) -> str:
+    """Text of the first argument of the call whose `(` is at *open_paren*."""
+    depth, i, quote = 0, open_paren, None
+    start = open_paren + 1
+    while i < len(src):
+        ch = src[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return src[start:i]
+        elif ch == "," and depth == 1:
+            return src[start:i]
+        i += 1
+    return ""
+
+
+def weak_js_contract_reason(src: str) -> str | None:
+    """Why this Node contract could not fail on wrong behaviour, or None.
+
+    `weak_contract_reason`'s counterpart, and the gap named in 0.8.6's
+    release notes. An assertion counts when its subject can separate two
+    implementations: a comparison, a pattern match, a containment test.
+    It does not count when it merely asserts a file exists — which holds
+    for a stub — or when it asserts a literal.
+
+    Two are required, for the reason the Python version gives: one is
+    within reach of an implementation written to satisfy exactly that one.
+
+    Deliberately permissive about SYNTAX, having twice been wrong about
+    how JavaScript is written: assertions are usually made through a
+    `check(condition, message)` helper rather than by calling `assert`
+    directly, so helper calls count as assertion sites too. Over-counting
+    costs a warning that is not printed; under-counting would refuse a
+    good contract, which is the failure this module keeps relearning.
+    """
+    if not src:
+        return None
+    substantive = 0
+    for m in _JS_ASSERT_SITE_RE.finditer(src):
+        arg = _js_first_argument(src, m.end() - 1)
+        if not arg.strip():
+            continue
+        if _JS_TAUTOLOGY_RE.match(arg) or _JS_EXISTENCE_ONLY_RE.match(arg):
+            continue
+        if _JS_DISCRIMINATING_RE.search(arg) or "assert." in m.group(0):
+            substantive += 1
+    if substantive >= 2:
+        return None
+    return (f"only {substantive} of its assertions could fail on wrong "
+            f"behaviour — the rest check that something exists or restate "
+            f"a literal")
+
+
+_JS_WEAK_NOTE = """
+
+YOUR PREVIOUS CONTRACT CANNOT FAIL ON WRONG BEHAVIOUR: {reason}.
+
+A check earns its place when a wrong implementation would fail it.
+"The file exists" holds for an empty stub; "the build exited 0" holds for
+a project that renders nothing. Compare what the project PRODUCED against
+what the task asked for: the text of a rendered region, the route entries
+the build emitted, a value that a correct implementation computes and an
+incorrect one does not.
+
+Keep everything that already discriminates and strengthen the rest.
+"""
+
+
+_JS_SERVER_NOTE = """
+
+YOUR PREVIOUS CONTRACT HAS TO RUN A SERVER TO DECIDE ANYTHING: {reason}.
+
+Starting a server blind — choosing a port, waiting for readiness,
+fetching, killing the process — has to go right on a machine you have
+never seen, before the code exists. Three contracts in a row failed
+working projects that way.
+
+Decide from what the BUILD leaves behind instead: run the build with
+`execSync(..., {{timeout: ...}})`, assert it exited 0, and then read the
+output it wrote — the route entries it emitted, the generated HTML, the
+assets. Keep every check as strict as it was; change only how you observe
+the project.
+"""
 
 
 _JS_PLATFORM_NOTE = """
@@ -965,8 +1143,58 @@ def _should_seed(task: str, root: str, path: str) -> bool:
     return True
 
 
+BUILTIN_JS_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "contracts", "js_build_contract.mjs")
+
+
+def _seed_js_builtin(identity: str, path: str) -> str | None:
+    """Install the shipped Node contract. Returns the path, or None.
+
+    Four consecutive live runs on one Next.js task produced four
+    model-written contracts, and every one failed a project that was
+    correct: `spawnSync("npm")` ENOENT, a hardcoded root `package.json`,
+    a dev server that never came up, and reading `.next/page.js` instead
+    of the emitted HTML. The screens catch the first three. The fourth
+    showed the space of ways to observe a build wrongly is larger than a
+    prompt can enumerate — so the contract for a JS project is written
+    once, by people who can run it, and shipped.
+
+    It is still independent of the run in the sense that matters: nothing
+    in it was authored by the model whose work it judges, and the hash
+    check still withdraws it as evidence if the run edits it.
+
+    It is also deliberately SHALLOW, and the caller says so. It proves the
+    project builds and emits a non-trivial page for its root route, and it
+    knows nothing about the task — a floor, not a ceiling. Verified
+    against a real project: 7 checks pass on a working home page, and it
+    fails with a precise reason when the page renders `null` or the build
+    breaks.
+    """
+    try:
+        with open(BUILTIN_JS_CONTRACT, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] built-in Node contract unavailable: %s",
+                    exc)
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body, comment="//"))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME_JS, exc)
+        return None
+    log.info("[AcceptanceSeed] installed the built-in Node contract as %s — "
+             "it checks that the project builds and emits a real page, and "
+             "nothing about the task itself", SEED_BASENAME_JS)
+    return path
+
+
 def _seed_js(task: str, root: str, llm_client,
-             identity_task: str | None = None) -> str | None:
+             identity_task: str | None = None,
+             model_written: bool = False) -> str | None:
     """Seed the Node contract for a JavaScript or TypeScript project.
 
     Measured 2026-09-17. A user asked a Next.js + TypeScript project for a
@@ -995,6 +1223,9 @@ def _seed_js(task: str, root: str, llm_client,
     if not _should_seed(identity, root, path):
         return None
 
+    if not model_written:
+        return _seed_js_builtin(identity, path)
+
     src = None
     for attempt in range(1, _REPAIR_ATTEMPTS + 1):
         raw = _generate_js(llm_client, task)
@@ -1013,6 +1244,30 @@ def _seed_js(task: str, root: str, llm_client,
     # blames the project while doing it. Repaired, not refused: keeping an
     # imperfect contract beats having none, since a seeded contract can
     # establish evidence but never convict.
+    # Server orchestration first: it is the larger scope error, and a
+    # contract rewritten to read the build output usually drops the
+    # platform defect with it.
+    server = js_server_orchestration_reason(src)
+    if server:
+        log.info("[AcceptanceSeed] the contract has to run a server to "
+                 "decide anything (%s) — asking again", server)
+        for attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate_js(llm_client, task,
+                                 extra=_JS_SERVER_NOTE.format(reason=server))
+            if retry is None:
+                continue
+            still = js_server_orchestration_reason(retry)
+            if still is None:
+                log.info("[AcceptanceSeed] the repaired contract decides "
+                         "from the build output — using it")
+                src, server = retry, None
+                break
+            server = still
+        if server:
+            log.warning("[AcceptanceSeed] the contract still needs a running "
+                        "server (%s) — keeping it, but it will fail whenever "
+                        "the server does not come up in time", server)
+
     defect = js_platform_defect_reason(src)
     if defect:
         log.info("[AcceptanceSeed] the contract cannot run its own commands "
@@ -1034,6 +1289,32 @@ def _seed_js(task: str, root: str, llm_client,
                         "it will report the build as failed whatever the "
                         "code does", defect)
 
+    # Strength last, so it judges the contract that will actually be
+    # written rather than a draft two repairs will replace. Kept when the
+    # retry is still weak, for `weak_contract_reason`'s own reason: a
+    # shallow check that runs still catches a crashing artifact.
+    weak = weak_js_contract_reason(src)
+    if weak:
+        log.info("[AcceptanceSeed] the contract cannot fail on wrong "
+                 "behaviour (%s) — asking again", weak)
+        for _attempt in range(1, _REPAIR_ATTEMPTS + 1):
+            retry = _generate_js(llm_client, task,
+                                 extra=_JS_WEAK_NOTE.format(reason=weak))
+            if retry is None or js_server_orchestration_reason(retry) \
+                    or js_platform_defect_reason(retry):
+                continue
+            still = weak_js_contract_reason(retry)
+            if still is None:
+                log.info("[AcceptanceSeed] the repaired contract can fail on "
+                         "wrong behaviour — using it")
+                src, weak = retry, None
+                break
+            weak = still
+        if weak:
+            log.warning("[AcceptanceSeed] the contract is still shallow (%s) "
+                        "— keeping it, but it only shows the project builds, "
+                        "not that it does what was asked", weak)
+
     body = src.strip() + "\n"
     try:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
@@ -1047,10 +1328,10 @@ def _seed_js(task: str, root: str, llm_client,
     log.info("[AcceptanceSeed] wrote %s from the task text, before any step "
              "ran — it counts as independent evidence for exactly as long as "
              "the run leaves it untouched", SEED_BASENAME_JS)
-    log.warning("[AcceptanceSeed] a Node contract is screened only for shape, "
-                "not for the defects the Python path checks (mocking, "
-                "interactive prompts, source-grepping, weak assertions) — "
-                "those analyses read Python only")
+    log.warning("[AcceptanceSeed] a Node contract is screened for shape, "
+                "platform-runnable commands, server orchestration and weak "
+                "assertions — but not for mocking, interactive prompts or "
+                "source-grepping, whose analyses read Python only")
     return path
 
 
