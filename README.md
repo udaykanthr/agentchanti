@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <b>A multi-agent AI coding system with built-in RAG — local or cloud, CLI or API.</b><br>
-  Plans. Codes. Reviews. Tests. Understands your codebase.
+  <b>An AI coding agent that tells you when it did <i>not</i> verify your code.</b><br>
+  Plans, codes, reviews and tests — then says what actually checked the result, and what didn't.
 </p>
 
 <p align="center">
@@ -30,6 +30,57 @@ agentchanti --help
 
 Full installation options (venv, editable, convenience scripts) are [further down](#installation).
 
+---
+
+## The problem with "All tasks completed successfully"
+
+Every coding agent will tell you it finished. Almost none will tell you whether
+anything independent agreed.
+
+AgentChanti separates two questions that most tools collapse into one:
+
+| | |
+|---|---|
+| **Completed** | the plan ran, every step's own check passed |
+| **Verified** | something the agent did **not** write in this run agreed |
+
+When those answers differ, it says so on the last line rather than rounding up:
+
+```
+~  Tasks completed — but nothing independent verified them.
+   1 pre-existing test file(s) survived but none could be run
+```
+
+```
+✓  All tasks completed successfully!
+   Verified by pre-existing-tests.
+```
+
+Three rules make that claim mean something:
+
+- **A test the run wrote cannot prove the run worked.** Evidence counts only
+  from your own `acceptance_cmds`, a pre-existing test the run left
+  byte-identical, or a contract written before any code existed — and if the
+  agent edits that contract, it stops counting.
+- **A check the agent authored may never fail your code.** It can earn a green
+  verdict; it can't convict. Generated contracts have failed working programs
+  over README phrasing, a POSIX-only signal sent on Windows, and a race against
+  the first rendered frame — each verified afterwards by hand, and the code was
+  right every time.
+- **Nothing you had before the run can be lost.** The project is copied before
+  the agent reads a single file; `agentchanti --restore` puts it back. No git
+  required.
+
+Measured on an 8-task benchmark with external probes the agent never sees —
+ground truth 7/8, and **zero false greens**: not one run claimed success over an
+artifact that failed its checks.
+
+> Every claim above is an engineering log, not a slogan: `CLAUDE.md` records the
+> measured incident behind each one, including the ones where this tool was
+> wrong and how that was found.
+
+---
+
 ## Quick-Start Demo
 
 ![AgentChanti in action — Global KB registry + live agent pipeline](docs/demo.gif)
@@ -39,8 +90,6 @@ Full 7-minute walkthrough on YouTube — installation, configuration step-by-ste
 [![7-minute quick-start walkthrough](https://img.youtube.com/vi/DOUavSTMobI/0.jpg)](https://www.youtube.com/watch?v=DOUavSTMobI)
 
 ## What is AgentChanti?
-
-AgentChanti ships with a built-in RAG system. Before any agent writes code, it automatically retrieves the most relevant functions, classes, and docs from your codebase and injects them as context — so even a local 7B model running in Ollama understands your project structure and coding conventions. Teams can add internal docs, architecture decisions, and coding standards to the Global KB, and every agent on every run picks them up automatically.
 
 AgentChanti is a **command-line tool and Python library** that takes a plain English description of a coding task and autonomously builds the software for you using a team of specialized AI agents:
 
@@ -53,11 +102,43 @@ AgentChanti is a **command-line tool and Python library** that takes a plain Eng
 
 Supports local LLMs ([Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai)) and cloud providers (OpenAI, Google Gemini, Anthropic Claude).
 
-### Agent Loop (v0.3)
+It also ships with a built-in RAG system: before any agent writes code, the most
+relevant functions, classes and docs are retrieved from your codebase and
+injected as context — so even a local 7B model in Ollama understands your
+project's structure and conventions. Teams can add internal docs, ADRs and
+coding standards to the Global KB and every run picks them up. See
+[RAG Architecture](#rag-architecture).
+
+### Safety: an undo that does not depend on git
+
+The project is copied **before** the first agent reads anything, and
+`agentchanti --restore` puts it back:
+
+```bash
+agentchanti --restore     # needs no config, provider or API key
+```
+
+Restore is additive — it never deletes what the run added. Build output and
+dependency trees (`node_modules`, `.venv`, `.next`, `dist`) are skipped, and a
+tree past the size bounds is refused outright rather than half-copied, because
+a partial snapshot that looks complete is worse than none.
+
+This exists because guards are not guarantees. A run once read an uncommitted
+Next.js project as an empty directory and scaffolded over it; the scan and the
+destructive-command refusal that now prevent that are both in place, and this
+is the backstop for whatever they miss.
+
+### Agent Loop
 
 When the provider supports native tool calling (Ollama with llama3.1/qwen2.5-coder+, OpenAI, Anthropic), CODE and TEST steps run as a **bounded tool-calling loop**: the model reads files, edits, runs commands and tests, observes the real output, and self-corrects — capped at `agent_loop_max_turns` (default 8) so cost stays predictable. A step only counts as done once its verification command actually passes. Failed shell commands and failed steps get one bounded recovery loop instead of hard-failing the pipeline.
 
 This is on by default; set `agent_loop: false` in `.agentchanti.yaml` to use the classic generate→review→retry pipeline, which also remains the automatic fallback for models without tool support. A/B benchmarks (see `benchmarks/`) show parity on success rate with ~14% fewer tokens.
+
+Ground truth in those benchmarks is never the pipeline's own opinion: each task
+carries `success_cmds` that run in an isolated workdir, and the harness prints
+the pipeline's claim and the measured result as separate columns — because a
+tool grading its own homework is the failure mode this project is built
+around.
 
 ### Beyond the CLI — Use It as a Service
 
