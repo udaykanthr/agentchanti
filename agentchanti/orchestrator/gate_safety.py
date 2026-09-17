@@ -41,6 +41,7 @@ that direction is the right trade.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
@@ -236,3 +237,104 @@ def neutralize_destructive_gates(steps) -> list[tuple[str, str, str]]:
         step.verify_cmd = safe
         changed.append((getattr(step, "id", "?"), original, reason))
     return changed
+
+
+# ── The same judgement, applied to commands that are not gates ───────
+#
+# Everything above governs `verify:` lines, and this module's own header
+# records the known hole: "An agent loop can still call run_command with
+# anything, which is AgentTools sandboxing, not a gate check." A plan CMD
+# step is a third route, and it is the one that finally did the damage.
+#
+# Measured 2026-09-17. A user created a Next.js + TypeScript app in
+# `my-app/` by hand and asked for a home page. `scan_project` reported
+# `0 files detected` (it counted only files git had already committed, and
+# the run's own checkpoint came four seconds later), so the planner saw an
+# empty directory and wrote:
+#
+#     > rmdir /s /q my-app && npm create next-app@latest my-app -- --js
+#
+# Nineteen files gone, and a TypeScript project replaced by a JavaScript
+# scaffold. The run also executed `taskkill /f /im node.exe`, which this
+# module has refused for gates since the day a `taskkill /im python.exe`
+# killed the pipeline itself.
+#
+# The scan defect is fixed where it lives. This is the second line: a
+# wrong premise must not be able to delete a user's work, whichever
+# subsystem forms it.
+_DISPOSABLE_DIRS = frozenset({
+    "node_modules", "dist", "build", "out", ".next", ".nuxt", ".turbo",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    "venv", ".venv", "env", "target", "coverage", "htmlcov", ".cache",
+    ".parcel-cache", ".eggs", "bin", "obj", ".gradle", ".svelte-kit",
+})
+
+# The path operand of a recursive delete, per dialect.
+_REMOVAL_TARGET_RES = (
+    re.compile(r"\brm\s+(?:-[a-zA-Z]+\s+)*(?P<paths>.+)$", re.I),
+    re.compile(r"\b(?:rmdir|rd)\s+(?:/[a-zA-Z]+\s+)*(?P<paths>.+)$", re.I),
+    re.compile(r"\bRemove-Item\b(?P<paths>.+)$", re.I),
+)
+_FLAGLIKE_RE = re.compile(r"^[-/]")
+
+
+def removal_targets(segment: str) -> list[str]:
+    """Paths a recursive-delete segment names, flags and switches dropped."""
+    for pattern in _REMOVAL_TARGET_RES:
+        m = pattern.search(segment or "")
+        if not m:
+            continue
+        out = []
+        for tok in m.group("paths").split():
+            tok = tok.strip().strip('"').strip("'")
+            if not tok or _FLAGLIKE_RE.match(tok):
+                continue
+            out.append(tok.replace("\\", "/").rstrip("/"))
+        return out
+    return []
+
+
+def _holds_work(root: str, rel: str) -> bool:
+    """True when this path is a real directory holding non-disposable files.
+
+    A path that does not exist, an empty one, and one whose whole content
+    is build output are all safe to remove — `rm -rf node_modules &&
+    npm install` is ordinary, and refusing it would break real work. The
+    question is only whether something a person would miss is inside.
+    """
+    if not rel or rel in (".", "..", "/", "~"):
+        return True                     # deleting the root itself: never
+    base = os.path.basename(rel)
+    if base in _DISPOSABLE_DIRS:
+        return False
+    full = os.path.join(root or ".", *rel.split("/"))
+    if not os.path.isdir(full):
+        return False                    # nothing there to lose
+    for dirpath, dirnames, filenames in os.walk(full):
+        dirnames[:] = [d for d in dirnames if d not in _DISPOSABLE_DIRS
+                       and d != ".git"]
+        if filenames:
+            return True
+    return False
+
+
+def command_destructive_reason(cmd: str,
+                               cwd: str | None = None) -> Optional[str]:
+    """Why *cmd* must not be run at all, or None.
+
+    Reuses the gate patterns, with one deliberate relaxation: a gate
+    should never delete anything, but a build step legitimately clears
+    `node_modules` or `dist`. So a recursive delete is refused only when
+    the path it names actually holds work.
+    """
+    if not cmd:
+        return None
+    for segment, _sep in split_shell_segments(cmd):
+        reason = segment_destructive_reason(segment)
+        if reason is None:
+            continue
+        targets = removal_targets(segment)
+        if targets and not any(_holds_work(cwd or ".", t) for t in targets):
+            continue                    # clearing build output: allowed
+        return f"`{segment.strip()}` {reason}"
+    return None

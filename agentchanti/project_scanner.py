@@ -58,36 +58,75 @@ _MAX_LINES_PER_FILE = 100
 
 
 def _get_git_tracked_files(directory: str) -> set[str] | None:
-    """Return set of git-tracked file paths (relative, forward-slash).
+    """Files git considers part of the project — tracked AND untracked.
+
+    Two questions, and only their union describes a working tree: `git
+    ls-files` lists what is committed, and `git ls-files --others
+    --exclude-standard` lists what exists and is *not* ignored. A project
+    the user created this morning is entirely in the second set. See
+    :func:`_is_gitignored` for the run this cost.
 
     Returns None if not a git repo or git is unavailable, so callers
     can fall back to the hardcoded skip lists.
     """
-    try:
-        result = subprocess.run(
-            ["git", "ls-files"],
-            cwd=directory,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
+    visible: set[str] = set()
+    saw_git = False
+    for args in (["git", "ls-files"],
+                 ["git", "ls-files", "--others", "--exclude-standard"]):
+        try:
+            result = subprocess.run(
+                args, cwd=directory, capture_output=True, text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return None
-        tracked = set()
+        if result.returncode != 0:
+            continue
+        saw_git = True
         for line in result.stdout.splitlines():
             line = line.strip()
             if line:
-                tracked.add(line.replace("\\", "/"))
-        return tracked if tracked else None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                visible.add(line.replace("\\", "/"))
+    if not saw_git:
         return None
+    return visible if visible else None
 
 
-def _is_gitignored(rel_path: str, git_tracked: set[str] | None) -> bool:
-    """Check if a file should be excluded because it's not git-tracked."""
-    if git_tracked is None:
+def _is_gitignored(rel_path: str, visible: set[str] | None) -> bool:
+    """Check if a file is excluded by git — NOT merely absent from the index.
+
+    This function used to answer "is it tracked?" while being named, and
+    read, as "is it ignored?". Those differ for exactly one case, and it
+    is the most common state a project is ever in: **files the user has
+    created and not yet committed.**
+
+    Measured 2026-09-17. A user made a Next.js + TypeScript app in
+    `my-app/` by hand, never committed it, and asked for a home page. The
+    scan ran at 09:39:03 and reported `0 files detected`; the run's own
+    git checkpoint — which is what made those files tracked, and what
+    later allowed them to be recovered — ran at 09:39:07, four seconds
+    too late. The planner was handed a project containing an empty
+    `my-app/` directory and reasonably concluded it was a scaffold in
+    waiting:
+
+        --STEP 1.1 [CMD] Initialize a JavaScript Next.js App Router
+        project ... in the blank `my-app` shell, replacing only the empty
+        directory structure
+        > rmdir /s /q my-app && npm create next-app@latest my-app -- --js
+
+    Nineteen files were deleted and replaced with a JavaScript scaffold.
+    The intent agent had read `layout.tsx` moments earlier and knew the
+    app was there — one subsystem knew while another asserted the
+    opposite, and the empty scan is what reached the plan.
+
+    So the question asked here is now the one git actually answers:
+    tracked files PLUS untracked-but-not-ignored ones are the project.
+    Only genuinely ignored paths are skipped, which is what the name
+    always promised.
+    """
+    if visible is None:
         return False  # No git info available, rely on skip lists
-    return rel_path.replace("\\", "/") not in git_tracked
+    return rel_path.replace("\\", "/") not in visible
 
 
 def scan_project(directory: str = ".") -> dict:

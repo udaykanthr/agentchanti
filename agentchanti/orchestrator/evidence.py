@@ -386,6 +386,17 @@ def seeded_contract_was_the_only_witness(root: str,
     return ", ".join(survivors)
 
 
+# Extensions this module knows how to execute. Python has always been
+# here; `.mjs` arrived with the Node contract the seeder writes for a
+# JavaScript or TypeScript project, which is run as a plain script
+# because it is written before the project has chosen a test runner.
+_RUNNABLE_CONTRACT_EXTS = (".py", ".mjs", ".cjs", ".js")
+
+
+def _is_runnable_contract(rel: str) -> bool:
+    return bool(rel) and rel.endswith(_RUNNABLE_CONTRACT_EXTS)
+
+
 def _runner_command(root: str, rel: str) -> str:
     """The command that will actually COLLECT this file's tests.
 
@@ -412,6 +423,10 @@ def _runner_command(root: str, rel: str) -> str:
     the files unittest cannot see move.
     """
     path = rel.replace("/", os.sep)
+    if path.endswith((".mjs", ".cjs", ".js")):
+        # A Node contract is a script, not a suite: `node file.mjs` is the
+        # whole invocation and its exit status is the whole verdict.
+        return "node " + path
     try:
         from .ghost import needs_pytest_runner
         with open(os.path.join(root, path), "r",
@@ -480,7 +495,7 @@ def run_pre_existing_tests(executor, root: str,
     measured, in the one layer whose entire job is to check that
     something independent agreed.
     """
-    files = [f for f in (survivors or ()) if f.endswith(".py")]
+    files = [f for f in (survivors or ()) if _is_runnable_contract(f)]
     if not files or executor is None:
         return None, "no runnable pre-existing test file"
     failures: list[str] = []

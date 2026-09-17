@@ -1725,7 +1725,30 @@ class Executor:
 
         Returns (success, output); see :meth:`_run_command_once` for the
         command-rewriting behaviour.
+
+        Refuses outright a command that destroys work rather than building
+        it. `gate_safety` has judged this for `verify:` lines since a
+        `taskkill /im python.exe` killed the pipeline mid-run, and its own
+        header records the hole that left: nothing asked the same question
+        of a plan's CMD step, a recovery command, or an agent's
+        `run_command`. Measured 2026-09-17, a plan step ran `rmdir /s /q
+        my-app && npm create next-app@latest my-app` against a user's
+        hand-made TypeScript application — nineteen files — because the
+        project scan had reported the directory empty. Here is the one
+        seam every route passes through.
         """
+        from .orchestrator.gate_safety import command_destructive_reason
+        _danger = command_destructive_reason(cmd, cwd or os.getcwd())
+        if _danger is not None:
+            log.warning("[Executor] REFUSED destructive command: %s", _danger)
+            return False, (
+                f"ERROR: refused to run this command. {_danger}.\n"
+                f"This deletes work rather than building it. If a directory "
+                f"is in the way, the premise is probably wrong — check what "
+                f"is actually in it before replacing it, and prefer editing "
+                f"the project that is there to re-creating it. Clearing "
+                f"build output (node_modules, dist, build) is still allowed.")
+
         ok, out = self._run_command_once(
             cmd, env=env, timeout=timeout, background=background, cwd=cwd)
         if ok or background or not retry_on_crash:
