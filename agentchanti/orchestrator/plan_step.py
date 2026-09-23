@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import ast
+import os
 import posixpath
 import re
 import shutil
@@ -151,6 +152,62 @@ def plan_looks_truncated(plan_text: str,
             return True, (f"last step {last.id} has no body — its content "
                           f"block appears truncated")
     return False, ""
+
+
+_STEP_HEADER_RE = re.compile(r"^--STEP\s", re.MULTILINE)
+
+
+def truncated_plan_prefix(plan_text: str) -> Optional[str]:
+    """The complete head of a cut-off plan — everything before the last
+    ``--STEP`` header, which is the block the generation was cut inside.
+
+    Returns None when there is nothing worth keeping (fewer than two
+    complete steps), because a continuation is only cheaper than a re-plan
+    if it preserves real work.
+    """
+    text = (plan_text or "").rstrip()
+    heads = list(_STEP_HEADER_RE.finditer(text))
+    if len(heads) < 3:                    # keep >= 2 after dropping the last
+        return None
+    return text[:heads[-1].start()].rstrip()
+
+
+def plan_continuation_note(kept: list["PlanStep"]) -> str:
+    """Ask the planner to CONTINUE rather than start again.
+
+    A truncated plan was thrown away whole, so a planner that runs out of
+    room writes the same opening steps again and can run out at the same
+    place. Measured 2026-09-23, glm-5.3:cloud with the planner cap already
+    raised to 32,768: three generations in a row hit the cap (cut at step
+    1.6, then 2.3, then again), ~6 of a 13.5-minute run and ~98k received
+    tokens spent on plans that were discarded. Nothing was wrong with the
+    steps it had already written.
+    """
+    ids = ", ".join(s.id for s in kept if s.id)
+    last = kept[-1].id if kept and kept[-1].id else "the last step"
+    return (
+        f"\n\n[PLANNER CONTINUATION] Your previous plan was CUT OFF by the "
+        f"output limit. Steps {ids} are COMPLETE and are being kept exactly "
+        f"as you wrote them — do NOT repeat them and do NOT renumber them.\n"
+        f"Continue the plan from the step AFTER {last}. Emit ONLY the "
+        f"remaining steps, in the same `--STEP` format, and finish with the "
+        f"==END== marker. Keep every description to one or two lines: "
+        f"running out of room is what cut the plan off.")
+
+
+def merge_plan_continuation(prefix: str, continuation: str) -> str:
+    """Join a kept plan head to the steps a continuation call produced.
+
+    The continuation may re-emit the ``==PLAN==`` opener and a preamble;
+    only its ``--STEP`` blocks (and the closing marker) are wanted.
+    """
+    tail = continuation or ""
+    head = _STEP_HEADER_RE.search(tail)
+    if head:
+        tail = tail[head.start():]
+    elif "==END==" not in tail:
+        return prefix
+    return f"{prefix.rstrip()}\n\n{tail.strip()}"
 
 
 def plan_salvageable(steps: Optional[list["PlanStep"]]) -> bool:
@@ -2092,8 +2149,14 @@ def _posix_idiom_error(cmd: str) -> Optional[str]:
     what a given shell does with a given text, and is silent on POSIX
     where these idioms are correct.
     """
-    from .gate_integrity import findstr_phrase_reason, posix_only_idiom_reason
-    return posix_only_idiom_reason(cmd) or findstr_phrase_reason(cmd)
+    from .gate_integrity import (findstr_phrase_reason, missing_tool_reason,
+                                 posix_only_idiom_reason)
+    # `tsc <file>` is deliberately NOT here: measured against a real
+    # scaffold it passes for a page that needs nothing from tsconfig.json,
+    # so calling it unrunnable would refuse a gate that works. It is
+    # offered as a variant instead, and believed only if it passes.
+    return (posix_only_idiom_reason(cmd) or findstr_phrase_reason(cmd)
+            or missing_tool_reason(cmd))
 
 
 def _unescape_shell_quotes(payload: str) -> str:
@@ -2166,11 +2229,35 @@ def _interpreter_target_error(cmd: str) -> Optional[str]:
 
 def _placeholder_error(cmd: str) -> Optional[str]:
     match = _PLACEHOLDER_RE.search(_strip_quoted(cmd))
-    if not match:
+    if match:
+        return (f"the verify command still contains the placeholder "
+                f"`{match.group(0)}` — it is run verbatim, so the gate can "
+                f"never pass. Write the real path or command")
+    return _ellipsis_placeholder_error(cmd)
+
+
+# An ellipsis is the OTHER way a plan leaves a blank in a command, and the
+# angle-bracket pattern above cannot see it. Measured 2026-09-23,
+# glm-5.3:cloud — the whole gate was
+#
+#     cd my-app && ...
+#
+# which cmd.exe answers with "'...' is not recognized". Three identical
+# verdicts over three versions of the file, `gate STALLED`, escalation
+# correctly suppressed, and the run failed over an app whose contract
+# passes 7/7. A segment that is nothing but dots is never a command, on any
+# shell. Quoted spans are blanked first, so `python -c "x = ..."` — where
+# `...` is Python's Ellipsis and perfectly valid — is not accused.
+_ELLIPSIS_SEGMENT_RE = re.compile(r'(?:^|&&|\|\||[|;&])\s*(\.{3,}|…)\s*(?=$|&|\||;)')
+
+
+def _ellipsis_placeholder_error(cmd: str) -> Optional[str]:
+    if not _ELLIPSIS_SEGMENT_RE.search(_strip_quoted(cmd or "")):
         return None
-    return (f"the verify command still contains the placeholder "
-            f"`{match.group(0)}` — it is run verbatim, so the gate can never "
-            f"pass. Write the real path or command")
+    return ("the verify command contains `...` as a command of its own — a "
+            "blank the plan never filled in, which the shell runs verbatim "
+            "and rejects, so the gate can never pass whatever the step "
+            "writes. Write the real command")
 
 
 def _python_payload_error(payload: str) -> Optional[str]:
@@ -2364,7 +2451,16 @@ def repair_verify_commands(steps: list[PlanStep],
         "- Assert a concrete value the step produces, or run the step's "
         "test suite. `assert True` is not an assertion.\n"
         "- One line, runnable from the project root, no shell heredocs.\n"
-        "- Do not invent APIs the step does not export.\n"
+        "- Do not invent APIs the step does not export.\n")
+    if os.name == "nt":
+        # The measured repair answered a .tsx gate with `grep`, which this
+        # platform does not have — a replacement as unsatisfiable as the
+        # gate it replaced. Say what the shell is before it answers.
+        lines.append(
+            "- The gate runs under Windows cmd.exe. There is NO grep, sed, "
+            "awk, head, tail or cat — to check a file's content use "
+            "`node -e \"...\"` or `python -c \"...\"`.\n")
+    lines.append(
         "\nReply with one line per gate and nothing else:\n"
         "<step id>: <command>")
 
@@ -2385,9 +2481,16 @@ def repair_verify_commands(steps: list[PlanStep],
         if step is None or not cmd:
             continue
         # Never accept a replacement that has the same defect — that would
-        # burn the call and leave the gate toothless anyway.
+        # burn the call and leave the gate toothless anyway. A reply that
+        # merely picked the wrong dialect (grep on Windows) is translated
+        # rather than discarded, under the same rule the loop's turn-zero
+        # check uses: take the equivalent reading only if IT can run.
         if unrunnable_gate_reason(cmd):
-            continue
+            from .gate_integrity import platform_equivalent_variants
+            cmd = next((v for _r, v in platform_equivalent_variants(cmd)
+                        if not unrunnable_gate_reason(v)), "")
+            if not cmd:
+                continue
         if step.step_type == "CODE" and shallow_gate_reason(cmd):
             continue
         step.verify_cmd = cmd

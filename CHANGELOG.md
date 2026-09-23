@@ -6,6 +6,64 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.10.0 — 2026-09-23
+
+Thirteen live runs across three models on one Next.js prompt. Every run
+built a working application, and three were reported FAILED anyway — each
+by an acceptance check the plan itself had written, and none by anything
+wrong with the code. A fourth run hung for four hours.
+
+### Fixed
+
+- **A check naming a program you do not have is refused before it costs
+  anything.** A repaired check answered with `grep` on Windows, where there
+  is no grep: ten turns, an escalation, and then a resume that reloaded the
+  same check from the checkpoint and stalled again. Such a check is now
+  translated to `findstr` where that is faithful, and refused where it is
+  not. The repair is also told which shell it is writing for.
+- **A check left as `cd my-app && ...` is refused.** The placeholder check
+  only ever recognised `<angle brackets>`, so a literal ellipsis — a blank
+  the plan never filled in — ran verbatim and failed a working app.
+- **`tsc <file>` no longer fails a correct page.** Naming a file makes
+  TypeScript ignore `tsconfig.json`, dropping the JSX setting, the types
+  and the `@/*` aliases. The project-wide form is tried when the check
+  fails, and adopted only if it passes.
+- **A check reading `.next/server/app/page.html` is corrected.** Next names
+  prerendered HTML after the route — `/` is `index.html` — so that path is
+  never emitted, and no edit to the page could have satisfied it.
+- **A command that outlives its timeout can no longer hang the run.** A dev
+  server started with `start /b` survived the kill, kept the command's
+  output pipe open, and the pipeline waited on it for four hours. Commands
+  now run inside a job object so the whole tree is killed, the pipe is
+  abandoned rather than waited on, and the agent is refused a dev server
+  outright — a server never exits, so it could only ever return by timing
+  out.
+- **A nested git repository is no longer reported as an empty folder.**
+  `create-next-app` runs `git init` inside the app directory, and the scan
+  stopped at that boundary — telling the planner a 22-file app was BLANK,
+  the same premise that deleted a project in 0.8.6. Wave snapshots now also
+  say plainly that they cannot cover such a directory, and point at
+  `agentchanti --restore`, which can.
+- **A framework's route files are no longer "orphaned exports".** Nothing
+  imports `app/page.tsx` — the router loads it by path — so every Next.js
+  run spent an LLM call per wave trying to wire it in, and the only fix
+  available would have broken routing. Covers Next, SvelteKit, Nuxt, Astro,
+  Remix and Vite entry files.
+
+### Changed
+
+- **The planner has its own output ceiling** (32,768), because a plan cut
+  off is discarded and regenerated whole — so hitting the limit costs the
+  whole generation twice.
+- **A plan cut off is now continued, not rewritten.** The complete steps are
+  kept and the planner is asked only for the rest. Measured before this: a
+  model hit the ceiling three times in a row, spending six minutes of a
+  thirteen-minute run on plans that were thrown away.
+- **A model reply cut off mid-file is no longer kept in the conversation.**
+  It was being paid for again on every later turn — one measured step grew
+  from 6k to 35k prompt tokens that way, 45% of the run for one file. The
+  model is now told its reply was cut off and asked to call the tool.
+
 ## 0.9.0 — 2026-09-17
 
 ### Added

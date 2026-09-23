@@ -16,6 +16,7 @@ _DEFAULTS = {
     "model": "deepseek-coder-v2-lite-instruct",
     "context_window": 8192,
     "max_output_tokens": 16384,
+    "planner_max_output_tokens": 32768,
     "embedding_model": "nomic-embed-text",
     "embedding_provider": None,  # if set, overrides 'provider' for KB embeddings only
     "embedding_top_k": 5,
@@ -179,6 +180,17 @@ class Config:
                                    _DEFAULTS["context_window"], cast=int)
         self.MAX_OUTPUT_TOKENS = _get("MAX_OUTPUT_TOKENS", "max_output_tokens",
                                       _DEFAULTS["max_output_tokens"], cast=int)
+        # The planner gets its own, larger cap. A truncated plan is not
+        # partially usable — `[Plan] Plan looks truncated` throws it away
+        # and regenerates from scratch, so hitting the cap costs the whole
+        # generation twice. Measured 2026-09-22 on glm-5.3-flash: two of
+        # three runs hit 16,384 while planning and re-planned, 8 of a
+        # 17-minute run spent there. A cap is a ceiling, not a spend:
+        # raising it costs nothing on a plan that fits.
+        self.PLANNER_MAX_OUTPUT_TOKENS = max(
+            self.MAX_OUTPUT_TOKENS,
+            _get("PLANNER_MAX_OUTPUT_TOKENS", "planner_max_output_tokens",
+                 _DEFAULTS["planner_max_output_tokens"], cast=int))
         self.EMBEDDING_MODEL = _get("EMBEDDING_MODEL", "embedding_model",
                                     _DEFAULTS["embedding_model"])
         self.EMBEDDING_PROVIDER = _get("EMBEDDING_PROVIDER", "embedding_provider",
@@ -224,6 +236,21 @@ class Config:
             or yd.get("reasoning_effort")   # top-level fallback
             or _DEFAULTS["openai_reasoning_effort"]
         )
+
+        # Thinking for Ollama models that have a thinking mode. There was no
+        # reasoning control for Ollama at all — `reasoning_effort` reaches
+        # only OpenAI and LM Studio — so a thinking model ran with thinking
+        # on for every call. Unset keeps the model's own default; `false`
+        # sends `think: false`. See `OllamaClient.__init__` for the run
+        # that measured 88% of generate output as hidden thinking.
+        ollama_section = (yd.get("ollama", {})
+                          if isinstance(yd.get("ollama"), dict) else {})
+        _think = os.getenv("OLLAMA_THINK")
+        if _think is None:
+            _think = ollama_section.get("think")
+        if isinstance(_think, str):
+            _think = _think.strip().lower() in ("1", "true", "yes", "on")
+        self.OLLAMA_THINK = _think if isinstance(_think, bool) else None
 
         # Gemini
         gemini_section = yd.get("gemini", {}) if isinstance(yd.get("gemini"), dict) else {}
