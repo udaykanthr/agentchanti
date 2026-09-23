@@ -425,6 +425,80 @@ def detect_test_runner(directory: str | None = None) -> str | None:
     return None
 
 
+# A manifest that can only belong to one language. `package.json` is
+# deliberately absent: it is shared by JavaScript and TypeScript, which is
+# exactly the distinction the counts below have to make.
+_DECISIVE_MANIFESTS = {
+    "go.mod": "go", "go.sum": "go",
+    "cargo.toml": "rust",
+    "pyproject.toml": "python", "requirements.txt": "python",
+    "setup.py": "python", "manage.py": "python", "pipfile": "python",
+    "gemfile": "ruby", "composer.json": "php",
+    "pom.xml": "java", "build.gradle": "java", "build.gradle.kts": "kotlin",
+    "cargo.lock": "rust",
+}
+
+# Files every JS/TS project has regardless of which one it is, so they must
+# not vote: `next.config.js` in a TypeScript project is not evidence of
+# JavaScript, and `tailwind.config.js` says nothing at all.
+_JS_CONFIG_STEMS = {
+    "next.config", "tailwind.config", "postcss.config", "vite.config",
+    "jest.config", "vitest.config", "eslint.config", "babel.config",
+    "rollup.config", "webpack.config", "svelte.config", "nuxt.config",
+    "commitlint.config", "prettier.config",
+}
+
+
+def unambiguous_language(file_paths: list[str]) -> str | None:
+    """The project's language when the files answer it outright, else None.
+
+    `detect_language_llm` exists for the genuinely ambiguous case — a
+    `go.mod` sitting in a Django project — and asking a model costs an
+    output-token burst on EVERY run. Measured 2026-09-23 on a Next.js
+    project: 2,845 output tokens to answer "typescript" for a tree holding
+    `tsconfig.json`, `next-env.d.ts` and `.tsx` files, which is not a
+    question a model needs to be asked.
+
+    Returns None whenever the evidence disagrees with itself — two decisive
+    manifests, no source files, or no clear majority — so the LLM keeps
+    exactly the cases it was written for.
+    """
+    names = [os.path.basename(p or "").lower() for p in (file_paths or [])]
+    manifests = {_DECISIVE_MANIFESTS[n] for n in names
+                 if n in _DECISIVE_MANIFESTS}
+    if len(manifests) > 1:
+        return None                      # the case detect_language_llm owns
+
+    counts: dict[str, int] = {}
+    for path in (file_paths or []):
+        stem, ext = os.path.splitext(os.path.basename(path or ""))
+        lang = EXTENSION_MAP.get(ext.lower())
+        if not lang:
+            continue
+        if stem.lower() in _JS_CONFIG_STEMS:
+            continue
+        counts[lang] = counts.get(lang, 0) + 1
+
+    if manifests:
+        only = next(iter(manifests))
+        # A decisive manifest wins unless the source files say otherwise.
+        if not counts or max(counts, key=counts.get) == only:
+            return only
+        return None
+
+    if not counts:
+        return None
+    # TypeScript and JavaScript coexist by design (`.d.ts` beside `.js`),
+    # so a tsconfig plus any .ts/.tsx settles it rather than the count.
+    if "tsconfig.json" in names and counts.get("typescript"):
+        return "typescript"
+    total = sum(counts.values())
+    top = max(counts, key=counts.get)
+    if counts[top] >= 3 and counts[top] / total >= 0.9:
+        return top
+    return None
+
+
 def detect_language_llm(
     file_paths: list[str],
     task: str,

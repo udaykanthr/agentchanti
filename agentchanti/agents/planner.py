@@ -527,6 +527,33 @@ class PlannerAgent(Agent):
         # Only triggers when we have file paths to reason about.
         self._detected_language: str | None = None
         if source_files:
+            # Ask the files first. The LLM call exists for a tree whose
+            # evidence disagrees with itself; it costs an output burst on
+            # every run, and a `tsconfig.json` beside `.tsx` files is not a
+            # question worth asking (measured: 2,845 output tokens to be
+            # told "typescript").
+            try:
+                from ..language import unambiguous_language
+                _disk_lang = unambiguous_language(list(source_files.keys()))
+            except Exception:
+                _disk_lang = None
+            if _disk_lang:
+                if _disk_lang != language:
+                    _logger.info(
+                        "[PreAnalysis] language from the files: %s -> %s "
+                        "(no LLM call)", language, _disk_lang)
+                    self._detected_language = _disk_lang
+                    language = _disk_lang
+                else:
+                    _logger.debug(
+                        "[PreAnalysis] language %s confirmed by the files "
+                        "(no LLM call)", language)
+                source_files_langcheck = None
+            else:
+                source_files_langcheck = source_files
+        else:
+            source_files_langcheck = None
+        if source_files_langcheck:
             try:
                 from ..language import detect_language_llm
                 _llm_lang = detect_language_llm(
