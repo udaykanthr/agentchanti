@@ -526,6 +526,9 @@ class PlannerAgent(Agent):
         # corrected language can be used by the rest of the pipeline.
         # Only triggers when we have file paths to reason about.
         self._detected_language: str | None = None
+        # How it was decided, so the caller's log line cannot claim an LLM
+        # call that never happened.
+        self._language_source: str = "the LLM"
         if source_files:
             # Ask the files first. The LLM call exists for a tree whose
             # evidence disagrees with itself; it costs an output burst on
@@ -543,6 +546,7 @@ class PlannerAgent(Agent):
                         "[PreAnalysis] language from the files: %s -> %s "
                         "(no LLM call)", language, _disk_lang)
                     self._detected_language = _disk_lang
+                    self._language_source = "the project files"
                     language = _disk_lang
                 else:
                     _logger.debug(

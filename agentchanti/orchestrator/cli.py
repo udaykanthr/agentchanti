@@ -1410,7 +1410,8 @@ def _main_impl():
         _llm_detected = getattr(planner, '_detected_language', None)
         if _llm_detected and _llm_detected != language:
             log.info(
-                "Language corrected by LLM during pre-analysis: %s → %s (%s)",
+                "Language corrected during pre-analysis by %s: %s → %s (%s)",
+                getattr(planner, "_language_source", "the LLM"),
                 language, _llm_detected, get_language_name(_llm_detected),
             )
             language = _llm_detected
