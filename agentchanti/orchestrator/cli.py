@@ -1424,6 +1424,9 @@ def _main_impl():
         # weaken a gate it was never asked to touch. See
         # plan_step.carry_forward_strong_gates.
         _previous_plan_steps: list = []
+        # The complete head of a plan the output cap cut, kept so the next
+        # call only has to produce the rest (see plan_continuation_note).
+        _plan_prefix: str | None = None
 
         for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
             display.show_status(
@@ -1434,6 +1437,14 @@ def _main_impl():
                                        language=language,
                                        plan_mode=getattr(cfg, "PLAN_MODE",
                                                          "content"))
+                if _plan_prefix:
+                    from .plan_step import (merge_plan_continuation,
+                                            parse_structured_plan)
+                    plan = merge_plan_continuation(_plan_prefix, plan)
+                    _plan_prefix = None
+                    log.info("[Plan] Merged the continuation onto the %d "
+                             "step(s) kept from the cut-off plan",
+                             len(parse_structured_plan(plan) or []))
             except LLMError as exc:
                 # A model that spends its whole output budget on hidden
                 # reasoning returns nothing, every retry, deterministically
@@ -1504,6 +1515,7 @@ def _main_impl():
                 from_legacy_steps, parse_heuristic_plan, PlanStep,
                 reclassify_manifest_steps, plan_looks_truncated,
                 plan_salvageable, route_blind_edits,
+                truncated_plan_prefix, plan_continuation_note,
             )
             from .gate_safety import (
                 check_gate_safety, neutralize_destructive_gates,
@@ -1779,6 +1791,26 @@ def _main_impl():
                         "instead of re-planning",
                         len(plan_steps_parsed or []))
                 elif plan_attempt < MAX_PLAN_RETRIES:
+                    # Continue rather than start again, when there is a
+                    # complete head to continue from: a planner that ran out
+                    # of room rewrites the same opening steps and can run out
+                    # in the same place. Measured 2026-09-23 on glm-5.3:cloud
+                    # with the cap already at 32,768 — three generations in a
+                    # row hit it, ~98k received tokens discarded.
+                    _prefix = truncated_plan_prefix(plan)
+                    _kept = parse_structured_plan(_prefix) if _prefix else None
+                    if _kept and len(_kept) >= 2:
+                        log.warning(
+                            "[Plan] Plan looks truncated (%s) — keeping the "
+                            "%d complete step(s) and asking the planner to "
+                            "continue from step %s",
+                            _reason, len(_kept), _kept[-1].id)
+                        display.show_status(
+                            f"Plan was cut off — keeping {len(_kept)} step(s) "
+                            f"and requesting the rest...")
+                        _plan_prefix = _prefix
+                        planner_context += plan_continuation_note(_kept)
+                        continue
                     log.warning(
                         "[Plan] Plan looks truncated (%s) — re-planning for a "
                         "complete plan", _reason)

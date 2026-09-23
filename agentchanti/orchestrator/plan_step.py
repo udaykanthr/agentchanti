@@ -154,6 +154,62 @@ def plan_looks_truncated(plan_text: str,
     return False, ""
 
 
+_STEP_HEADER_RE = re.compile(r"^--STEP\s", re.MULTILINE)
+
+
+def truncated_plan_prefix(plan_text: str) -> Optional[str]:
+    """The complete head of a cut-off plan — everything before the last
+    ``--STEP`` header, which is the block the generation was cut inside.
+
+    Returns None when there is nothing worth keeping (fewer than two
+    complete steps), because a continuation is only cheaper than a re-plan
+    if it preserves real work.
+    """
+    text = (plan_text or "").rstrip()
+    heads = list(_STEP_HEADER_RE.finditer(text))
+    if len(heads) < 3:                    # keep >= 2 after dropping the last
+        return None
+    return text[:heads[-1].start()].rstrip()
+
+
+def plan_continuation_note(kept: list["PlanStep"]) -> str:
+    """Ask the planner to CONTINUE rather than start again.
+
+    A truncated plan was thrown away whole, so a planner that runs out of
+    room writes the same opening steps again and can run out at the same
+    place. Measured 2026-09-23, glm-5.3:cloud with the planner cap already
+    raised to 32,768: three generations in a row hit the cap (cut at step
+    1.6, then 2.3, then again), ~6 of a 13.5-minute run and ~98k received
+    tokens spent on plans that were discarded. Nothing was wrong with the
+    steps it had already written.
+    """
+    ids = ", ".join(s.id for s in kept if s.id)
+    last = kept[-1].id if kept and kept[-1].id else "the last step"
+    return (
+        f"\n\n[PLANNER CONTINUATION] Your previous plan was CUT OFF by the "
+        f"output limit. Steps {ids} are COMPLETE and are being kept exactly "
+        f"as you wrote them — do NOT repeat them and do NOT renumber them.\n"
+        f"Continue the plan from the step AFTER {last}. Emit ONLY the "
+        f"remaining steps, in the same `--STEP` format, and finish with the "
+        f"==END== marker. Keep every description to one or two lines: "
+        f"running out of room is what cut the plan off.")
+
+
+def merge_plan_continuation(prefix: str, continuation: str) -> str:
+    """Join a kept plan head to the steps a continuation call produced.
+
+    The continuation may re-emit the ``==PLAN==`` opener and a preamble;
+    only its ``--STEP`` blocks (and the closing marker) are wanted.
+    """
+    tail = continuation or ""
+    head = _STEP_HEADER_RE.search(tail)
+    if head:
+        tail = tail[head.start():]
+    elif "==END==" not in tail:
+        return prefix
+    return f"{prefix.rstrip()}\n\n{tail.strip()}"
+
+
 def plan_salvageable(steps: Optional[list["PlanStep"]]) -> bool:
     """True when a plan flagged truncated only by the missing ``==END==``
     marker is safe to run anyway.

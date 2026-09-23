@@ -1706,6 +1706,13 @@ kb_docs: <DocTitle1>, <DocTitle2>      ← CODE/TEST steps. Exact titles of KB d
 DO NOT include file contents anywhere in the plan. No content: blocks,
 no edit: blocks, no fenced source code — the executing agent writes the
 files. Every CODE/TEST step MUST carry a verify: line.
+
+BUDGET: the whole plan is generated under an output-token limit, and a
+plan cut off mid-step wastes the entire generation. Keep each description
+to ONE line naming what the file must do — not how it should look, which
+the executing agent decides from the requirements it is also given. Do
+not restate the requirements, do not list Tailwind classes or copy, and
+keep each verify: to one short command.
 """ if plan_mode == "intent" else """content:                               ← CODE/TEST steps. ALWAYS include complete file source here.
 ```<lang>                              ←   Fenced code block immediately after content:
 <complete file source>                 ←   Full file — not a snippet. Every line.
