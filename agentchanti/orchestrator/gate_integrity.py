@@ -426,6 +426,44 @@ def tsc_project_variant(cmd: str) -> str | None:
     return out if out != cmd else None
 
 
+# Next's prerendered HTML is named after the ROUTE, not the source file.
+# `app/page.tsx` serves `/`, which is emitted as `index.html`; `app/about/
+# page.tsx` is emitted as `about.html`. There is never a `page.html`.
+#
+# Measured 2026-09-23, kimi-k2.7-code::
+#
+#     verify: python -c "...Path('my-app/.next/server/app/page.html')
+#                        .read_text()... assert 'Start building today' in html"
+#
+# The step spent 8 turns and recovery 8 more against a FileNotFoundError no
+# edit to the page could fix, and the run was failed over an app whose
+# contract passes 7/7. The stall detector cannot help and is right not to:
+# a traceback counts as "reached the code", a category deliberately excluded
+# after a false positive suppressed real work.
+#
+# A variant rather than a refusal, like the tsc case: a gate naming a path
+# that happens to exist is fine, and this is believed only if it passes.
+_NEXT_PAGE_HTML_RE = re.compile(
+    r"(?P<pre>[\w./\\-]*\.next[/\\]server[/\\]app[/\\])"
+    r"(?P<route>(?:[\w.-]+[/\\])*)page\.html")
+
+
+def next_html_output_variant(cmd: str) -> str | None:
+    """*cmd* with `.next/server/app/**/page.html` renamed to the route's file."""
+    if not cmd or "page.html" not in cmd:
+        return None
+
+    def _sub(m: re.Match) -> str:
+        route = m.group("route").replace("\\", "/").strip("/")
+        sep = "\\" if "\\" in m.group("pre") else "/"
+        if not route:
+            return m.group("pre") + "index.html"
+        return m.group("pre") + route.replace("/", sep) + ".html"
+
+    out = _NEXT_PAGE_HTML_RE.sub(_sub, cmd)
+    return out if out != cmd else None
+
+
 def _to_cmd_dialect(cmd: str) -> str:
     """Rewrite POSIX-only idioms into their cmd.exe equivalents.
 
@@ -502,6 +540,11 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
         project = tsc_project_variant(cmd)
         if project and project != cmd:
             variants.append(("tsc-project-config", project))
+    # Also platform-independent: Next names prerendered HTML after the
+    # route, so `.next/server/app/page.html` is never emitted.
+    next_html = next_html_output_variant(cmd)
+    if next_html and next_html != cmd:
+        variants.append(("next-route-html", next_html))
     if not cmd or os.name != 'nt':
         return variants
     collapsed, changed = collapse_posix_escapes(cmd)
