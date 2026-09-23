@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import ast
+import os
 import posixpath
 import re
 import shutil
@@ -2092,8 +2093,14 @@ def _posix_idiom_error(cmd: str) -> Optional[str]:
     what a given shell does with a given text, and is silent on POSIX
     where these idioms are correct.
     """
-    from .gate_integrity import findstr_phrase_reason, posix_only_idiom_reason
-    return posix_only_idiom_reason(cmd) or findstr_phrase_reason(cmd)
+    from .gate_integrity import (findstr_phrase_reason, missing_tool_reason,
+                                 posix_only_idiom_reason)
+    # `tsc <file>` is deliberately NOT here: measured against a real
+    # scaffold it passes for a page that needs nothing from tsconfig.json,
+    # so calling it unrunnable would refuse a gate that works. It is
+    # offered as a variant instead, and believed only if it passes.
+    return (posix_only_idiom_reason(cmd) or findstr_phrase_reason(cmd)
+            or missing_tool_reason(cmd))
 
 
 def _unescape_shell_quotes(payload: str) -> str:
@@ -2166,11 +2173,35 @@ def _interpreter_target_error(cmd: str) -> Optional[str]:
 
 def _placeholder_error(cmd: str) -> Optional[str]:
     match = _PLACEHOLDER_RE.search(_strip_quoted(cmd))
-    if not match:
+    if match:
+        return (f"the verify command still contains the placeholder "
+                f"`{match.group(0)}` — it is run verbatim, so the gate can "
+                f"never pass. Write the real path or command")
+    return _ellipsis_placeholder_error(cmd)
+
+
+# An ellipsis is the OTHER way a plan leaves a blank in a command, and the
+# angle-bracket pattern above cannot see it. Measured 2026-09-23,
+# glm-5.3:cloud — the whole gate was
+#
+#     cd my-app && ...
+#
+# which cmd.exe answers with "'...' is not recognized". Three identical
+# verdicts over three versions of the file, `gate STALLED`, escalation
+# correctly suppressed, and the run failed over an app whose contract
+# passes 7/7. A segment that is nothing but dots is never a command, on any
+# shell. Quoted spans are blanked first, so `python -c "x = ..."` — where
+# `...` is Python's Ellipsis and perfectly valid — is not accused.
+_ELLIPSIS_SEGMENT_RE = re.compile(r'(?:^|&&|\|\||[|;&])\s*(\.{3,}|…)\s*(?=$|&|\||;)')
+
+
+def _ellipsis_placeholder_error(cmd: str) -> Optional[str]:
+    if not _ELLIPSIS_SEGMENT_RE.search(_strip_quoted(cmd or "")):
         return None
-    return (f"the verify command still contains the placeholder "
-            f"`{match.group(0)}` — it is run verbatim, so the gate can never "
-            f"pass. Write the real path or command")
+    return ("the verify command contains `...` as a command of its own — a "
+            "blank the plan never filled in, which the shell runs verbatim "
+            "and rejects, so the gate can never pass whatever the step "
+            "writes. Write the real command")
 
 
 def _python_payload_error(payload: str) -> Optional[str]:
@@ -2364,7 +2395,16 @@ def repair_verify_commands(steps: list[PlanStep],
         "- Assert a concrete value the step produces, or run the step's "
         "test suite. `assert True` is not an assertion.\n"
         "- One line, runnable from the project root, no shell heredocs.\n"
-        "- Do not invent APIs the step does not export.\n"
+        "- Do not invent APIs the step does not export.\n")
+    if os.name == "nt":
+        # The measured repair answered a .tsx gate with `grep`, which this
+        # platform does not have — a replacement as unsatisfiable as the
+        # gate it replaced. Say what the shell is before it answers.
+        lines.append(
+            "- The gate runs under Windows cmd.exe. There is NO grep, sed, "
+            "awk, head, tail or cat — to check a file's content use "
+            "`node -e \"...\"` or `python -c \"...\"`.\n")
+    lines.append(
         "\nReply with one line per gate and nothing else:\n"
         "<step id>: <command>")
 
@@ -2385,9 +2425,16 @@ def repair_verify_commands(steps: list[PlanStep],
         if step is None or not cmd:
             continue
         # Never accept a replacement that has the same defect — that would
-        # burn the call and leave the gate toothless anyway.
+        # burn the call and leave the gate toothless anyway. A reply that
+        # merely picked the wrong dialect (grep on Windows) is translated
+        # rather than discarded, under the same rule the loop's turn-zero
+        # check uses: take the equivalent reading only if IT can run.
         if unrunnable_gate_reason(cmd):
-            continue
+            from .gate_integrity import platform_equivalent_variants
+            cmd = next((v for _r, v in platform_equivalent_variants(cmd)
+                        if not unrunnable_gate_reason(v)), "")
+            if not cmd:
+                continue
         if step.step_type == "CODE" and shallow_gate_reason(cmd):
             continue
         step.verify_cmd = cmd

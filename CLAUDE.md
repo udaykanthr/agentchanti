@@ -54,6 +54,12 @@ Auto-detects project language by scanning file extensions (`detect_language()`) 
 
 `LLMClient` base class with provider implementations: `OllamaClient`, `LMStudioClient`, `OpenAIClient`, `GeminiClient`, `AnthropicClient`. All expose `generate_response(prompt) -> str` with retry and streaming support.
 
+`ollama.think` (config, unset by default) sends `think: false` on every
+Ollama call. It is an escape hatch, not a recommendation: measured on one
+model it moved reasoning out of the hidden channel and into the visible
+reply rather than removing it, and the run-to-run token spread was larger
+than its effect. Unset keeps the model's own default.
+
 Chat-native entry point: `chat(messages, tools=None) -> ChatResponse` (types in `llm/chat_types.py`: `Message`, `ToolDef`, `ToolCall`, `ChatResponse`). Ollama (`/api/chat`), OpenAI (`/chat/completions`) and Anthropic (Messages API) implement it natively with structured tool calling (`NATIVE_CHAT = True`); other providers fall back to flattening the conversation into a text prompt via `flatten_messages()`. Models that reject tools at runtime raise `ToolsNotSupportedError` and are downgraded to the text path for the session. Check availability with `client.supports_tools()`.
 
 ### Agent Tools (agent_tools.py)
@@ -618,6 +624,157 @@ project deleted outright, then restored byte-for-byte, with `node_modules`
 correctly absent.
 
 Guards decide what is allowed to happen. This decides what can be undone.
+
+### Four More Ways A Gate Cannot Be Satisfied (gate_integrity.py, plan_step.py)
+
+`unrunnable_gate_reason` already refuses a gate whose *shell* cannot run
+it. Three measured runs on 2026-09-22/23 added three more species, and
+each cost a run that had already produced a working application — the
+shipped acceptance contract passed 7/7 by hand on every one of them.
+
+**A program this machine does not have** (`missing_tool_reason`). A plan
+gated a component on `node -e "require('./my-app/components/Header.tsx')"`;
+`_node_jsx_error` rightly refused it, and the in-place repair answered with
+
+    grep -q "export.*function Header\|..." my-app/components/Header.tsx && ...
+
+There is no grep on Windows. The step spent 10 turns and an escalation over
+a `Header.tsx` the agent had already verified with its own `node -e` check,
+and the **auto-resume brought the identical gate back from the checkpoint
+and stalled again**. Deliberately a closed list of coreutils rather than
+"any first word `shutil.which` cannot find": a gate may name a tool a LATER
+step installs (a venv's pytest, a project's npx binary), and calling that
+unrunnable at plan time would be wrong. No step installs grep.
+`grep_to_findstr` offers the translation — several `/c:` strings are
+exactly BRE alternation, and findstr reads `+ ? { } ( )` as literals just
+as basic grep does — declining anything it cannot translate faithfully
+(`-E`, a `\s` class). Paths get backslashes, because findstr reads a `/`
+in an argument as a switch. `repair_verify_commands` also states the
+platform up front and translates a `grep` reply rather than discarding it.
+
+**An ellipsis** (`_ellipsis_placeholder_error`). `_PLACEHOLDER_RE` matched
+`<angle placeholders>` only, so glm-5.3's entire gate — `cd my-app && ...`
+— went through: three identical `'...' is not recognized` verdicts over
+three versions of the file, `gate STALLED`, escalation correctly
+suppressed, run failed. A segment that is nothing but dots is never a
+command on any shell. Quoted spans are blanked first, so `python -c "x =
+..."`, where `...` is Python's own `Ellipsis`, is not accused.
+
+**A `tsc` call that discards the project config** (`tsc_explicit_file_reason`,
+`tsc_project_variant`). Naming input files makes TypeScript ignore
+tsconfig.json, so the jsx setting, `types` and the `@/*` aliases all
+vanish: `cd my-app && npx tsc --noEmit --jsx react-jsx app/page.tsx`
+returned the identical 218-character error over two versions of a page
+that builds and passes its contract. This one is **a variant, not a
+refusal**, and the distinction was measured rather than reasoned: run
+against a real scaffold the file form exits 0 for a page that needs
+nothing from tsconfig.json, so refusing it up front would reject a gate
+that works. The project form is offered when the gate fails and adopted
+only if it passes — the believe-only-if-it-passes rule the dialect
+transforms already use, and it runs *before* the stall observation.
+
+**A file the build never emits** — pending. kimi's gate read
+`.next/server/app/page.html`, while Next emits the root route as
+`index.html`; 8 turns plus 8 more of recovery, over a working app. The
+stall detector cannot help here and is right not to: a `FileNotFoundError`
+traceback counts as "reached the code", a category deliberately excluded
+after a false positive suppressed real work.
+
+### A Turn Cut At The Output Cap Is Not A Done Claim (agent_loop.py)
+
+A plan cut off at the cap is thrown away and regenerated, so
+`PLANNER_MAX_OUTPUT_TOKENS` (32,768, never below `MAX_OUTPUT_TOKENS`)
+gives the planner its own ceiling: measured, two of three glm runs hit
+16,384 while planning and re-planned, one spending 8 of a 17-minute run
+there. A cap is a ceiling, not a spend — a plan that fits costs the same.
+
+A **loop turn** cut at the cap was worse, because it was kept. Measured on
+glm rewriting page.tsx::
+
+    prompt=6,097   completion=16,384  tool_calls=0
+    prompt=22,755  completion=16,384  tool_calls=0
+    prompt=35,077  completion=5,785   tool_calls=1   (write_file)
+
+Each truncated reply went back into the conversation whole and was paid
+for again on every later turn — ~130k tokens, 45% of the run, for one
+file. The loop now keeps a 400-character stub, says the reply was cut off
+before a tool call and asks for `write_file`, and does **not** read it as
+"the model believes it is done". Never on the final turn, where tools are
+withheld and the ordinary exit must run. Measured firing four times in one
+glm-5.3 run, on replies of 56,243 and 61,973 characters.
+
+### A Framework Route Is Not An Orphaned Export (dependency_check.py `framework_route_reason`)
+
+`find_gaps` flags a new file whose exports nothing imports, and already
+excludes the cases where that question is meaningless: test files, tool
+configs, Django app modules, `__main__` scripts, package initializers.
+Files a JS framework loads **by location** were missing, so every Next.js
+run reported `app/page.tsx exports [Home] but no other file imports it`
+and spent an LLM call per wave "fixing" it — 11.8k output tokens in one
+measured run, for a gap that cannot exist. The only fix available,
+importing the page into the layout, renders it outside the router; an
+earlier run's model said exactly that in its own reasoning.
+
+Two halves must both hold, as for Django: the path follows the
+framework's convention **and the nearest package.json to that file**
+depends on that framework — per file, because in a repo holding a Next app
+and a Vite app a `page.tsx` in the Vite app is an ordinary module. And the
+convention names FILES, never "anything under app/":
+`app/components/Hero.tsx` is not a route, and an unused one is a real gap.
+Covers Next (App and Pages routers, `middleware`), SvelteKit `+` files,
+Nuxt, Astro, Remix, and an entry loaded by `<script src>` in index.html —
+Vite's `src/main.tsx` is orphaned by the same false reading.
+
+### A Command That Outlives Its Timeout (executor.py, winjob.py, agent_tools.py)
+
+Measured 2026-09-22. An agent ran, to see its page render::
+
+    cd my-app && start /b npm run dev && timeout /t 6 /nobreak >nul && node -e "fetch('http://localhost:3000')..."
+
+The command timed out at 120s and was killed, but `next dev` survived —
+`taskkill /T` walks parent PIDs and the server's launcher had already
+exited. It still held the command's stdout pipe, and the executor then
+called `proc.stdout.close()`: on Windows that waits for the writer to
+exit, which a dev server never does. **The pipeline hung for four hours**,
+and hung again the same way on the next attempt.
+
+Three fixes, each independent. The close is skipped on Windows, because
+`communicate()`'s reader is a daemon thread and leaking one handle costs
+nothing while waiting costs the run. Every command now runs inside a
+**job object** (`winjob.contain`), which has no blind spot — every process
+created inside stays inside unless it explicitly breaks away — so a
+timeout terminates the whole tree and anything a command leaves running is
+reaped when agentchanti exits. And `dev_server_reason` refuses the command
+at the source: a server never exits, so `run_command` can only ever return
+it by timing out, and the model is told to run the build instead (a page
+that throws fails prerendering). `npm start` is deliberately allowed — a
+CLI project's start script runs and exits. Replayed as a test: the old
+code hangs for as long as the orphan lives, the new code returns in 4.6s
+and the orphan is gone.
+
+### A Nested Repository Is Still Part Of The Project (project_scanner.py, wave_snapshots.py)
+
+`git ls-files` lists files, with one exception: a nested repository.
+Committed it is a gitlink — one entry naming the directory — and
+untracked, `--others` reports it as `my-app/`. Either way git stops at the
+boundary and says nothing of the files inside.
+
+Measured 2026-09-21: `create-next-app` runs `git init` inside `my-app/`,
+the run's own snapshot repo at the parent then committed it as a gitlink,
+and the next run's scan reported **0 files detected** over a 22-file
+Next.js app. The planner was told the directory was BLANK and argued with
+that instruction through a whole plan before settling on `npm install`
+rather than a fresh scaffold — the premise that deleted `my-app` on
+2026-09-17. `_expand_nested_repos` walks into such an entry, recursing
+through the nested repo's own git when it has one.
+
+The snapshot half cannot be fixed the same way: git will not track files
+inside a nested repo, and removing or absorbing that `.git` would be
+editing the user's repository. So `nested_repos()` reports it instead —
+every wave commit held five root paths and a pointer, and a rollback could
+not have restored one line of the app, with nothing saying so. The
+pre-run copy (`agentchanti --restore`) does cover it, and the warning
+says exactly that.
 
 ### A Contract For A Language The Seeder Could Not Read (acceptance_seed.py `_seed_js`)
 

@@ -19,11 +19,23 @@ class OllamaClient(LLMClient):
     DEFAULT_READ_TIMEOUT = 900
 
     def __init__(self, base_url: str, model: str,
-                 read_timeout: int | None = None, **kwargs):
+                 read_timeout: int | None = None,
+                 think: bool | None = None, **kwargs):
         super().__init__(**kwargs)
         self.base_url = base_url
         self.model = model
         self.read_timeout = read_timeout or self.DEFAULT_READ_TIMEOUT
+        # `ollama.think` in the yaml. None leaves the model's own default.
+        #
+        # Measured 2026-09-21, glm-5.3-flash:cloud on a Next.js home page:
+        # 11 generate calls reported 110,885 tokens of `eval_count` and
+        # ~12,861 of visible text — 88% was hidden thinking, including
+        # 5,481 tokens to write a 222-token commit message. Thinking was
+        # only ever turned off as a one-shot RETRY after a response burned
+        # its whole budget, and a large `max_output_tokens` meant no call
+        # ever hit that limit, so the retry never fired. This makes it a
+        # setting instead of an accident.
+        self.think = think
         # One-shot: armed by _prepare_token_limit_retry after a reasoning
         # burn, consumed by the next generate call to disable thinking.
         self._retry_disable_think = False
@@ -42,6 +54,8 @@ class OllamaClient(LLMClient):
 
     def _apply_generate_options(self, payload: dict) -> None:
         """Fold per-request generation controls into *payload* (one-shot)."""
+        if self.think is not None:
+            payload["think"] = bool(self.think)
         if self._retry_disable_think:
             # Ollama ignores unknown fields on models without a thinking
             # mode, so this is safe to send unconditionally when armed.

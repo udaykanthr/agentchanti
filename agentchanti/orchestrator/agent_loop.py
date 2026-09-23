@@ -249,6 +249,11 @@ def loop_stats_summary() -> str | None:
 # stuck in analysis mode.
 _READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 
+# Stop reasons meaning "cut at the output cap": OpenAI/Ollama `length`,
+# Anthropic `max_tokens`, OpenAI Responses `max_output_tokens`. The same set
+# LLMClient._hit_token_limit reads.
+_TOKEN_LIMIT_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
 # Read-only intervention thresholds (consecutive inspection-only turns).
 # Lowered from 3/4 → 2/3: with the step's target files pre-loaded into the
 # opening message, the model rarely needs several read_file turns, so nudge
@@ -1377,6 +1382,39 @@ def run_agent_loop(
                     return _finish("verified-early", turn, (True, (
                         f"Step verified complete on turn {turn}: "
                         f"{verify_cmd} passes.")))
+            continue
+
+        # A reply cut at the output cap with no tool call is not a "done"
+        # claim — it is a model that ran out of room mid-sentence, usually
+        # while writing a file's content as prose instead of passing it to
+        # write_file. Measured 2026-09-22, glm-5.3-flash rewriting page.tsx:
+        #
+        #     prompt=6,097   completion=16,384  tool_calls=0
+        #     prompt=22,755  completion=16,384  tool_calls=0
+        #     prompt=35,077  completion=5,785   tool_calls=1   (write_file)
+        #
+        # Each truncated reply went back into the conversation whole, so it
+        # was paid for again as prompt on every later turn — ~130k tokens,
+        # 45% of the run, for one file. Keep a stub, not the reply, and say
+        # what to do instead. Not on the final turn, where tools are
+        # withheld and the ordinary exit must run.
+        if (not final_turn and (response.stop_reason or "").lower()
+                in _TOKEN_LIMIT_REASONS):
+            _logger.warning(
+                "[AgentLoop] step %d turn %d: reply hit the output-token cap "
+                "with no tool call (%d chars) — dropping it from the "
+                "conversation and asking for the tool call", step_idx + 1,
+                turn, len(response.text or ""))
+            messages.append(Message(role="assistant", content=(
+                (response.text or "").strip()[:400]
+                + "\n[... reply truncated at the output-token limit]")))
+            messages.append(Message(role="user", content=(
+                "Your reply was cut off at the output-token limit before "
+                "you called a tool, so nothing was written. Do not write "
+                "file contents or long reasoning in your reply. Call "
+                "write_file now with the complete file as its `content` "
+                "argument (or edit_file for a small change). "
+                f"{max_turns - turn} turn(s) remain.")))
             continue
 
         # Model stopped calling tools — it believes the step is done.

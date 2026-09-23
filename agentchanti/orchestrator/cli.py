@@ -878,7 +878,8 @@ def _main_impl():
         # every provider shares.
         llm_client = OllamaClient(
             base_url=cfg.OLLAMA_BASE_URL, model=model,
-            read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
+            read_timeout=cfg.LLM_READ_TIMEOUT,
+                think=cfg.OLLAMA_THINK, **llm_kwargs)
     elif provider == "openai":
         from ..llm.openai_client import OpenAIClient
         api_key = cfg.OPENAI_API_KEY
@@ -1049,33 +1050,41 @@ def _main_impl():
         """
         agent_model = cfg.get_agent_model(agent_name) or model
         agent_provider = cfg.get_agent_provider(agent_name) or provider
-        if agent_model == model and agent_provider == provider:
+        # The planner alone gets a larger ceiling — see
+        # PLANNER_MAX_OUTPUT_TOKENS — so it needs its own client even when
+        # its model is the run's.
+        cap = (cfg.PLANNER_MAX_OUTPUT_TOKENS if agent_name == "planner"
+               else cfg.MAX_OUTPUT_TOKENS)
+        kw = {**llm_kwargs, "max_output_tokens": cap}
+        if (agent_model == model and agent_provider == provider
+                and cap == cfg.MAX_OUTPUT_TOKENS):
             return llm_client  # reuse the main client — nothing overridden
         # Create a separate client with the agent-specific provider + model
         if agent_provider == "ollama":
             return OllamaClient(
                 base_url=cfg.OLLAMA_BASE_URL, model=agent_model,
-                read_timeout=cfg.LLM_READ_TIMEOUT, **llm_kwargs)
+                read_timeout=cfg.LLM_READ_TIMEOUT,
+                think=cfg.OLLAMA_THINK, **kw)
         elif agent_provider == "openai":
             from ..llm.openai_client import OpenAIClient
             return OpenAIClient(
                 base_url=cfg.OPENAI_BASE_URL, model=agent_model,
                 api_key=cfg.OPENAI_API_KEY,
-                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
+                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **kw)
         elif agent_provider == "gemini":
             from ..llm.gemini_client import GeminiClient
             return GeminiClient(
                 base_url=cfg.GEMINI_BASE_URL, model=agent_model,
-                api_key=cfg.GEMINI_API_KEY, **llm_kwargs)
+                api_key=cfg.GEMINI_API_KEY, **kw)
         elif agent_provider == "anthropic":
             from ..llm.anthropic_client import AnthropicClient
             return AnthropicClient(
                 base_url=cfg.ANTHROPIC_BASE_URL, model=agent_model,
-                api_key=cfg.ANTHROPIC_API_KEY, **llm_kwargs)
+                api_key=cfg.ANTHROPIC_API_KEY, **kw)
         else:
             return LMStudioClient(
                 base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model,
-                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
+                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **kw)
 
     # Custom prompt suffixes from config
     planner_suffix = cfg.PROMPT_SUFFIXES.get("planner_suffix", "")

@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 from typing import Dict, List, Tuple
+from . import winjob
 from .cli_display import log
 
 # Substituted for a failing command's empty output. A silent failure says
@@ -1886,6 +1887,10 @@ class Executor:
                 env=run_env,
                 cwd=cwd,
             )
+            # A job sees descendants taskkill /T cannot (`start /b`, a
+            # re-parented server). Background processes are left out: the
+            # pipeline tracks and stops those itself.
+            job = None if background else winjob.contain(proc)
 
             if background:
                 self._background_processes.append(proc)
@@ -1934,6 +1939,7 @@ class Executor:
             # makes the subsequent communicate() block indefinitely.  This
             # mirrors the cleanup() path which already does the right thing.
             if os.name == 'nt':
+                winjob.terminate(job)
                 try:
                     subprocess.run(
                         ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
@@ -1953,12 +1959,20 @@ class Executor:
             except subprocess.TimeoutExpired:
                 log.warning(
                     "[Executor] Process still holding stdout pipe after "
-                    "kill — closing pipes and abandoning collected output.")
-                try:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                except OSError:
-                    pass
+                    "kill — abandoning the pipe and its collected output.")
+                # NOT closed on Windows: communicate()'s reader thread is
+                # blocked in a synchronous ReadFile on this handle, and
+                # CloseHandle waits for that read to finish — i.e. for the
+                # surviving writer to exit. Measured 2026-09-22: a `next
+                # dev` started with `start /b` outlived the kill, and the
+                # close below hung the pipeline for four hours. The reader
+                # is a daemon thread; leaking one handle costs nothing.
+                if os.name != 'nt':
+                    try:
+                        if proc.stdout is not None:
+                            proc.stdout.close()
+                    except OSError:
+                        pass
                 stdout_bytes = b""
             output = Executor._decode_output(stdout_bytes)
             return False, f"Command timed out after {timeout} seconds.\n{output}".strip()

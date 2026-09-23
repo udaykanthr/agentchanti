@@ -200,6 +200,36 @@ _BARE_NPM_INSTALL_RE = re.compile(
     r"^\s*npm\s+(?:i|install|add)\s+(?!-)(?P<rest>\S.*)$", re.IGNORECASE)
 
 
+# A dev server never exits, so `run_command` can only ever return one by
+# timing out. Measured 2026-09-22 on a Next.js home-page step: five
+# attempts in a row — `npm run dev`, `npm run dev &`, `start /b npm run
+# dev && timeout /t 6 && node -e "fetch('http://localhost:3000')..."` —
+# each burned the full 120s timeout, and the `start /b` form left a `next
+# dev` holding the command's stdout pipe, which hung the pipeline for four
+# hours. The model wanted to see the page render; `npm run build` answers
+# that (a page that fails to render fails prerendering) and exits.
+_DEV_SERVER_RE = re.compile(
+    # `npm start` is deliberately absent: a CLI project's start script
+    # runs and exits, and refusing it would cost that project a turn.
+    r"(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|serve|preview)\b"
+    r"|\bnext\s+(?:dev|start)\b|\bvite(?:\s+(?:dev|preview|serve))?\s*(?:$|&|\|)"
+    r"|\bnodemon\b|\bmanage\.py\s+runserver\b|\bflask\s+run\b|\buvicorn\b)",
+    re.IGNORECASE)
+
+
+def dev_server_reason(command: str) -> str | None:
+    """Why *command* would start a server that never exits, or None."""
+    if not command or not _DEV_SERVER_RE.search(command):
+        return None
+    return (
+        f"ERROR: refusing to run '{command.strip()[:160]}'. It starts a "
+        f"server, which never exits: this tool would wait out its full "
+        f"timeout and return nothing, and a backgrounded server outlives "
+        f"the command. To check that the app works, run its build "
+        f"(`npm --prefix <app> run build` — a page that throws fails "
+        f"prerendering) or its test suite, and inspect the built output.")
+
+
 def rootless_npm_install_reason(command: str, project_root: str) -> str | None:
     """Why a bare `npm install <pkg>` here would create a phantom package.
 
@@ -1005,6 +1035,11 @@ class AgentTools:
             log.warning("[AgentTools] refused rootless npm install: %s",
                         command.strip()[:120])
             return rootless
+        server = dev_server_reason(command)
+        if server is not None:
+            log.warning("[AgentTools] refused dev server: %s",
+                        command.strip()[:120])
+            return server
         stripped_pipe = ""
         if os.name == "nt":
             _clean = _POSIX_OUTPUT_PIPE_RE.sub("", command).strip()

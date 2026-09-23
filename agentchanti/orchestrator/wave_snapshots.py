@@ -399,6 +399,40 @@ class ProjectSnapshots:
                          "can't be blocked by open handles: %s",
                          ", ".join(removed))
 
+    def nested_repos(self) -> list[str]:
+        """Subdirectories that are git repositories of their own.
+
+        `git add -A` records such a directory as a gitlink — a pointer to
+        another repository's commit — and none of its files. Measured
+        2026-09-21: `create-next-app` had run `git init` inside `my-app/`,
+        so every wave commit of a Next.js run held five root paths and a
+        pointer, and a rollback could not have restored one line of the
+        app. Nothing said so. Removing or absorbing the nested `.git`
+        would be editing the user's repository, so this only reports it.
+        """
+        found: list[str] = []
+        for cur, dirs, _files in os.walk(self.root):
+            depth = os.path.relpath(cur, self.root).count(os.sep)
+            dirs[:] = [d for d in dirs
+                       if d not in (".git", "node_modules", ".agentchanti",
+                                    "venv", ".venv", ".next")]
+            if cur != self.root and os.path.exists(os.path.join(cur, ".git")):
+                found.append(os.path.relpath(cur, self.root).replace("\\", "/"))
+                dirs[:] = []
+            elif depth >= 2:
+                dirs[:] = []
+        return sorted(found)
+
+    def _warn_nested_repos(self) -> None:
+        nested = self.nested_repos()
+        if nested:
+            _logger.warning(
+                "[Snapshots] %s %s its own git repository — git stores it as "
+                "a pointer, so wave snapshots and rollback do NOT cover its "
+                "files. The pre-run copy does: `agentchanti --restore`.",
+                ", ".join(f"{n}/" for n in nested),
+                "is" if len(nested) == 1 else "are each")
+
     def _head_sha(self) -> str | None:
         ok, out = self._git("rev-parse", "HEAD")
         return out.strip() if ok else None
@@ -425,6 +459,7 @@ class ProjectSnapshots:
             self._last_green_sha = self._last_sha
             _logger.info("[Snapshots] Resuming managed snapshot repo at %s",
                          self.root)
+            self._warn_nested_repos()
             return True
 
         ok, _ = self._git("rev-parse", "--is-inside-work-tree")
@@ -455,6 +490,7 @@ class ProjectSnapshots:
         self._commit("agentchanti: baseline (pre-run)")
         self._last_green_sha = self._last_sha
         _logger.info("[Snapshots] Initialised snapshot repo at %s", self.root)
+        self._warn_nested_repos()
         return True
 
     def _commit(self, message: str) -> str | None:

@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import threading
 from typing import List, Tuple
 
@@ -211,6 +212,220 @@ def _findstr_literal_phrase(cmd: str) -> str:
         lambda m: f'findstr{m.group("flags")} /c:"{m.group("s")}"', cmd)
 
 
+# A POSIX tool that simply is not installed. The idioms above are about
+# what a shell does with a construct; this is the plainer case of the
+# program a segment names not existing on this machine at all.
+#
+# Measured 2026-09-22, a Next.js run on Windows. The plan's gate asked
+# Node to `require()` a .tsx file, `_node_jsx_error` rightly refused it,
+# and the in-place repair replaced it with
+#
+#     grep -q "export.*function Header\|export const Header" my-app/components/Header.tsx
+#       && grep -q "lucide-react" my-app/components/Header.tsx && exit 0 || exit 1
+#
+# There is no grep on the machine (`'grep' is not recognized as an
+# internal or external command`). The step spent 10 turns and an
+# escalation over a Header.tsx the agent had verified with its own
+# `node -e` check, the run was called STALLED, and the auto-resume
+# brought the identical gate back from the checkpoint and stalled again.
+# The repair had swapped one unsatisfiable gate for another, because
+# nothing asked whether the program it named exists.
+#
+# Deliberately a closed list of coreutils rather than "any first word
+# `shutil.which` cannot find": a gate may name a tool a LATER step
+# installs (a venv's pytest, a project's npx binary), and calling that
+# unrunnable at plan time would be wrong. No step installs grep.
+_POSIX_TOOLS = frozenset((
+    "grep", "egrep", "fgrep", "sed", "awk", "head", "tail", "wc", "cat",
+    "test", "xargs", "cut", "tr", "uniq", "touch", "ls", "cp", "mv", "rm",
+    "which", "true", "false", "diff",
+))
+
+
+def _segments(cmd: str) -> List[str]:
+    """*cmd* split on `&&`, `||`, `|`, `&` and `;` outside quotes."""
+    segs: List[str] = []
+    buf: List[str] = []
+    quote = ""
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == "\\" and i + 1 < len(cmd):
+                buf.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            buf.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch in "&|;":
+            segs.append("".join(buf))
+            buf = []
+            if i + 1 < len(cmd) and cmd[i + 1] == ch:
+                i += 1
+        else:
+            buf.append(ch)
+        i += 1
+    segs.append("".join(buf))
+    return [s.strip() for s in segs if s.strip()]
+
+
+def missing_tool_reason(cmd: str) -> str | None:
+    """Why a POSIX tool *cmd* runs is not installed here, or None."""
+    if not cmd:
+        return None
+    for seg in _segments(cmd):
+        first = seg.lstrip("(@").split(None, 1)
+        if not first:
+            continue
+        tool = first[0].strip("\"'").lower()
+        if tool.endswith(".exe"):
+            tool = tool[:-4]
+        if tool in _POSIX_TOOLS and shutil.which(tool) is None:
+            return (f"`{tool}` is not installed on this machine, so the "
+                    f"shell rejects the command before the code is ever "
+                    f"consulted (check file content with `node -e` or "
+                    f"`python -c` instead)")
+    return None
+
+
+# `grep [-q] [-i] [-s] [-F] "a\|b" file` -> `findstr /r|/l [/i] /c:"a" /c:"b" file`.
+# findstr with several /c: strings matches a line against ANY of them,
+# which is exactly BRE alternation, and its regex dialect covers what
+# basic grep treats as special (`.`, `*`, `[]`, `^`, `$`) — in BRE the
+# characters `+ ? { } ( )` are literals, and findstr reads them the same
+# way. Anything outside that (-E, a backslash class like `\s`) is
+# declined rather than approximated.
+_GREP_CALL_RE = re.compile(
+    r'\bgrep(?P<flags>(?:\s+-[A-Za-z]+)*)\s+"(?P<pat>[^"]*)"\s+'
+    r'(?P<file>[^\s&|;<>]+)')
+
+
+def _grep_as_findstr(m: re.Match) -> str | None:
+    flags = "".join(f.lstrip("-") for f in m.group("flags").split())
+    if set(flags) - set("qisF"):
+        return None
+    fixed = "F" in flags
+    alts = [a for a in re.split(r"\\\\?\|", m.group("pat"))] if not fixed \
+        else [m.group("pat")]
+    if not alts or any(not a for a in alts):
+        return None
+    if not fixed and any(re.search(r"\\[A-Za-z0-9<>(){}+?]", a) for a in alts):
+        return None
+    parts = ["findstr", "/l" if fixed else "/r"]
+    if "i" in flags:
+        parts.append("/i")
+    parts.extend(f'/c:"{a}"' for a in alts)
+    # findstr reads a `/` anywhere in an argument as a switch, so
+    # `my-app/components/Header.tsx` answers "Cannot open Header.tsx".
+    parts.append(m.group("file").replace("/", "\\"))
+    out = " ".join(parts)
+    if "s" in flags:
+        out += " 2>nul"
+    if "q" in flags:
+        out += " >nul"
+    return out
+
+
+def grep_to_findstr(cmd: str) -> str | None:
+    """*cmd* with every `grep` rewritten for findstr, or None if any cannot be."""
+    if not cmd or "grep" not in cmd:
+        return None
+    failed = False
+
+    def _sub(m: re.Match) -> str:
+        nonlocal failed
+        rewritten = _grep_as_findstr(m)
+        if rewritten is None:
+            failed = True
+            return m.group(0)
+        return rewritten
+
+    out = _GREP_CALL_RE.sub(_sub, cmd)
+    if failed or out == cmd or re.search(r"\bgrep\b", out):
+        return None
+    return out
+
+
+# `tsc <file>` silently DISCARDS tsconfig.json. TypeScript documents it:
+# naming input files on the command line makes the compiler ignore the
+# project config entirely — so the JSX setting, `types`, `lib`, and the
+# `@/*` path aliases all vanish, and a correct file fails over errors it
+# could never fix.
+#
+# Measured 2026-09-23, kimi-k2.7-code on a Next.js page. The plan's gate:
+#
+#     cd my-app && npx tsc --noEmit --jsx react-jsx app/page.tsx
+#
+# returned the identical 218-character error over two versions of the file;
+# `observe_gate_verdict` called it STALLED and the run was failed, while the
+# page it rejected builds and passes the acceptance contract. The same
+# command without the file argument is the check the planner meant.
+#
+# Unlike `grep` this is not a missing program and every flag is valid — the
+# defect is one argument that changes which configuration is read. Bounded
+# by the two things that make it unanswerable: a tsconfig.json must exist
+# where the command runs (without one, explicit files are the only way to
+# invoke tsc), and `-p`/`--project` must be absent (that asks for the
+# project explicitly and is a deliberate combination).
+#
+# It is a VARIANT, not a structural refusal. Measured against a real
+# scaffold, the file form exits 0 for a page that needs nothing from
+# tsconfig.json — so a gate written this way may be perfectly serviceable,
+# and refusing it up front would reject a check that works. The project
+# form is offered when the gate fails and adopted only if it passes, the
+# same believe-only-if-it-passes rule as the dialect transforms.
+_TSC_CALL_RE = re.compile(
+    r"(?P<runner>\b(?:npx|pnpm\s+exec|yarn|bunx)\s+)?\btsc\b(?P<args>[^&|;]*)")
+_TS_FILE_RE = re.compile(r"(?<![\w./\\-])[\w./\\-]+\.(?:ts|tsx|mts|cts)\b")
+
+
+def _leading_cd(cmd: str) -> str:
+    """The directory a leading `cd X &&` moves into, or ''."""
+    m = re.match(r"^\s*cd\s+([^\s&|;]+)\s*&&", cmd or "")
+    return m.group(1).strip("\"'").replace("\\", "/") if m else ""
+
+
+def tsc_explicit_file_reason(cmd: str, root: str = ".") -> str | None:
+    """Why a `tsc <file>` gate cannot pass in a configured project, or None."""
+    if not cmd or "tsc" not in cmd:
+        return None
+    m = _TSC_CALL_RE.search(cmd)
+    if not m:
+        return None
+    args = m.group("args")
+    if re.search(r"(^|\s)(-p|--project)\b", args):
+        return None
+    files = _TS_FILE_RE.findall(args)
+    if not files:
+        return None
+    cfg = os.path.join(root, _leading_cd(cmd), "tsconfig.json")
+    if not os.path.isfile(cfg):
+        return None
+    return (f"the gate runs `tsc` on an explicit file ({files[0]}), which "
+            f"makes TypeScript IGNORE tsconfig.json — the project's jsx "
+            f"setting, types and path aliases are all dropped, so the file "
+            f"fails over errors no edit to it can fix. Run `tsc --noEmit` "
+            f"with no file argument, which compiles the project as "
+            f"configured")
+
+
+def tsc_project_variant(cmd: str) -> str | None:
+    """*cmd* with the explicit-file `tsc` call reduced to a project check."""
+    if not cmd or "tsc" not in cmd:
+        return None
+    m = _TSC_CALL_RE.search(cmd)
+    if not m or not _TS_FILE_RE.search(m.group("args")):
+        return None
+    runner = (m.group("runner") or "").strip()
+    replacement = f"{runner} tsc --noEmit".strip() if runner else "tsc --noEmit"
+    out = cmd[:m.start()] + replacement + cmd[m.end():]
+    return out if out != cmd else None
+
+
 def _to_cmd_dialect(cmd: str) -> str:
     """Rewrite POSIX-only idioms into their cmd.exe equivalents.
 
@@ -281,6 +496,12 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
     redundant = redundant_cd_path_variant(cmd)
     if redundant and redundant != cmd:
         variants.append(("redundant-cd-path", redundant))
+    # Also platform-independent: `tsc <file>` discards tsconfig.json under
+    # every shell, and the project-wide form is what the planner meant.
+    if tsc_explicit_file_reason(cmd):
+        project = tsc_project_variant(cmd)
+        if project and project != cmd:
+            variants.append(("tsc-project-config", project))
     if not cmd or os.name != 'nt':
         return variants
     collapsed, changed = collapse_posix_escapes(cmd)
@@ -294,6 +515,10 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
         phrased = _findstr_literal_phrase(cmd)
         if phrased and phrased != cmd:
             variants.append(("findstr-literal-phrase", phrased))
+    if missing_tool_reason(cmd) and shutil.which("findstr"):
+        translated = grep_to_findstr(cmd)
+        if translated and translated != cmd:
+            variants.append(("grep-to-findstr", translated))
     return variants
 
 

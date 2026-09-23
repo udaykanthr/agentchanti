@@ -176,6 +176,148 @@ def _is_django_app_module(file_path: str, known_files) -> bool:
         file_path, known_files)
 
 
+# Files a JS framework loads BY LOCATION — the file-system router — rather
+# than by import. The Django case above, one ecosystem over.
+#
+# Measured 2026-09-22, a Next.js home-page run on glm-5.3-flash:
+#
+#     [DepCheck] orphaned_export: File 'my-app/app/page.tsx' exports [Home]
+#                but no other file imports it.
+#
+# fired after each of two waves, and each time the LLM was asked to wire the
+# page into some parent: 5,772 + 6,019 output tokens for a gap that cannot
+# exist. The only "fix" available — importing page.tsx into layout.tsx —
+# renders the page outside the router. An earlier run's model said as much
+# in its own reasoning ("a false positive for Next.js App Router pages").
+#
+# Two halves must both hold, as for Django: the path follows the framework's
+# convention AND the nearest package.json depends on that framework. The
+# second half is read per file, not per repo — in a repo holding a Next app
+# and a Vite app, a `page.tsx` in the Vite app is an ordinary module. And the
+# first half names convention FILES, never "anything under app/":
+# `app/components/Hero.tsx` is not a route, and an unused one is a real gap.
+_NEXT_APP_FILES = frozenset({
+    "page", "layout", "loading", "error", "not-found", "global-error",
+    "template", "default", "route", "head", "opengraph-image",
+    "twitter-image", "icon", "apple-icon", "sitemap", "robots", "manifest",
+})
+_NEXT_ROOT_FILES = frozenset({"middleware", "instrumentation"})
+_ROUTED_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mdx",
+                ".svelte", ".vue", ".astro")
+_HTML_SCRIPT_RE = re.compile(
+    r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _read_project_file(rel: str, memory_files) -> str | None:
+    """*rel*'s text from this run's memory, else from disk, else None."""
+    for key in (rel, rel.replace("/", "\\")):
+        text = (memory_files or {}).get(key)
+        if text:
+            return text
+    try:
+        if os.path.isfile(rel):
+            with open(rel, encoding="utf-8") as fh:
+                return fh.read()
+    except OSError:
+        pass
+    return None
+
+
+def _nearest_package(path: str, memory_files) -> tuple[str, set[str]] | None:
+    """(directory, dependency names) of the package.json nearest *path*."""
+    d = os.path.dirname(path)
+    while True:
+        cand = f"{d}/package.json" if d else "package.json"
+        text = _read_project_file(cand, memory_files)
+        if text:
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                deps: set[str] = set()
+                for key in ("dependencies", "devDependencies",
+                            "peerDependencies"):
+                    if isinstance(data.get(key), dict):
+                        deps.update(data[key])
+                return d, deps
+        if not d:
+            return None
+        d = os.path.dirname(d)
+
+
+def _referenced_by_html(path: str, pkg_dir: str, memory_files) -> bool:
+    """True when an index.html loads *path* with `<script src=...>`.
+
+    Vite's `src/main.tsx` is the case: index.html loads it and no module
+    imports it, so it is "orphaned" by the same false reading.
+    """
+    for html_dir in {pkg_dir, os.path.dirname(path)}:
+        html_rel = f"{html_dir}/index.html" if html_dir else "index.html"
+        html = _read_project_file(html_rel, memory_files)
+        if not html:
+            continue
+        for src in _HTML_SCRIPT_RE.findall(html):
+            src = src.split("?")[0]
+            base = pkg_dir if src.startswith("/") else html_dir
+            ref = os.path.normpath(
+                os.path.join(base or ".", src.lstrip("/"))).replace("\\", "/")
+            if ref == os.path.normpath(path).replace("\\", "/"):
+                return True
+    return False
+
+
+def framework_route_reason(path: str, memory_files=None) -> str | None:
+    """Which framework loads *path* by location, or None.
+
+    None whenever either half cannot be established — no package.json, no
+    matching dependency, or a path the framework does not route — so an
+    ordinary module is judged exactly as before.
+    """
+    from ..paths import strip_dot_slash
+    p = strip_dot_slash((path or "").replace("\\", "/"))
+    if not p.lower().endswith(_ROUTED_EXTS):
+        return None
+    found = _nearest_package(p, memory_files)
+    if found is None:
+        return None
+    pkg_dir, deps = found
+    rel = p[len(pkg_dir) + 1:] if pkg_dir else p
+    parts = rel.split("/")
+    name = parts[-1]
+    stem = name.rsplit(".", 1)[0]
+    if parts[0] == "src" and len(parts) > 1:
+        parts = parts[1:]                  # src/app, src/pages, src/middleware
+
+    if "next" in deps:
+        if parts[0] == "app" and stem in _NEXT_APP_FILES:
+            return "Next.js App Router"
+        if parts[0] == "pages" and len(parts) > 1:
+            return "Next.js Pages Router"
+        if len(parts) == 1 and stem in _NEXT_ROOT_FILES:
+            return "Next.js"
+    if "@sveltejs/kit" in deps and name.startswith("+"):
+        return "SvelteKit"
+    if "nuxt" in deps and (parts[0] in ("pages", "layouts", "middleware",
+                                        "plugins")
+                           or parts[:2] == ["server", "api"]
+                           or rel in ("app.vue", "error.vue")):
+        return "Nuxt"
+    if "astro" in deps and parts[0] == "pages" and len(parts) > 1:
+        return "Astro"
+    if ((any(d.startswith("@remix-run/") for d in deps)
+         or "@react-router/dev" in deps)
+            and parts[0] == "app"
+            and (parts[1:2] == ["routes"]
+                 or (len(parts) == 2 and stem in ("root", "entry.client",
+                                                  "entry.server",
+                                                  "routes")))):
+        return "Remix / React Router"
+    if _referenced_by_html(p, pkg_dir, memory_files):
+        return "index.html <script>"
+    return None
+
+
 # ── Data structures ──────────────────────────────────────────────
 
 @dataclass
@@ -1202,6 +1344,12 @@ def find_gaps(
             continue
         nf_deps = after.file_deps.get(nf)
         if not nf_deps or not nf_deps.exports:
+            continue
+        _framework = framework_route_reason(nf, memory_files)
+        if _framework:
+            _logger.info(
+                "[DepCheck] Skipping orphaned_export for '%s': loaded by "
+                "location (%s), not imported by another file", nf, _framework)
             continue
 
         # Entry-point modules are executed, not imported — skip.

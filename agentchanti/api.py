@@ -149,7 +149,8 @@ def _run_task_impl(
 
     if provider == "ollama":
         llm_client = OllamaClient(
-            base_url=cfg.OLLAMA_BASE_URL, model=model, **llm_kwargs)
+            base_url=cfg.OLLAMA_BASE_URL, model=model,
+            think=cfg.OLLAMA_THINK, **llm_kwargs)
     elif provider == "openai":
         from .llm.openai_client import OpenAIClient
         api_key = cfg.OPENAI_API_KEY
@@ -184,21 +185,26 @@ def _run_task_impl(
     # Per-agent model helper
     def _make_llm(agent_name: str):
         agent_model = cfg.get_agent_model(agent_name) or model
-        if agent_model == model:
+        # Same planner ceiling as cli.py, so the two paths cannot diverge.
+        cap = (cfg.PLANNER_MAX_OUTPUT_TOKENS if agent_name == "planner"
+               else cfg.MAX_OUTPUT_TOKENS)
+        kw = {**llm_kwargs, "max_output_tokens": cap}
+        if agent_model == model and cap == cfg.MAX_OUTPUT_TOKENS:
             return llm_client
         if provider == "ollama":
             return OllamaClient(
-                base_url=cfg.OLLAMA_BASE_URL, model=agent_model, **llm_kwargs)
+                base_url=cfg.OLLAMA_BASE_URL, model=agent_model,
+                think=cfg.OLLAMA_THINK, **kw)
         elif provider == "openai":
             from .llm.openai_client import OpenAIClient
             return OpenAIClient(
                 base_url=cfg.OPENAI_BASE_URL, model=agent_model,
                 api_key=cfg.OPENAI_API_KEY,
-                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **llm_kwargs)
+                reasoning_effort=cfg.OPENAI_REASONING_EFFORT, **kw)
         else:
             return LMStudioClient(
                 base_url=cfg.LM_STUDIO_BASE_URL, model=agent_model,
-                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **llm_kwargs)
+                reasoning_effort=cfg.LM_STUDIO_REASONING_EFFORT, **kw)
 
     planner = PlannerAgent("Planner", "Senior Software Architect",
                            "Create a step-by-step plan for the coding task.",

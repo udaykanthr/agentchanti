@@ -89,7 +89,52 @@ def _get_git_tracked_files(directory: str) -> set[str] | None:
                 visible.add(line.replace("\\", "/"))
     if not saw_git:
         return None
+    visible = _expand_nested_repos(directory, visible)
     return visible if visible else None
+
+
+# Build output and dependency trees are never "the project" — the same
+# directories every scan already skips, needed here only for a nested
+# repository whose own ignore rules could not be asked.
+_NESTED_SKIP_DIRS = {".git", "node_modules", ".next", "dist", "build",
+                     "__pycache__", "venv", ".venv", ".turbo", "coverage"}
+
+
+def _expand_nested_repos(directory: str, visible: set[str]) -> set[str]:
+    """Replace every entry that is a DIRECTORY with the files inside it.
+
+    `git ls-files` lists files, with one exception: a nested repository.
+    Committed, it is a gitlink — a single entry naming the directory
+    (`160000 ... my-app`); untracked, `--others` reports it as `my-app/`.
+    Either way git stops at its boundary and says nothing of the files.
+
+    Measured 2026-09-21. `create-next-app` runs `git init` inside
+    `my-app/`, the run's own snapshot repo at the parent then committed
+    `my-app` as a gitlink, and the next run's scan reported `0 files
+    detected` over a 22-file Next.js app. The planner was told the
+    directory was BLANK and had to argue with that instruction for a
+    whole plan before settling on `npm install` rather than a fresh
+    scaffold — the premise that deleted `my-app` on 2026-09-17.
+    """
+    out: set[str] = set()
+    for rel in visible:
+        path = os.path.join(directory, rel.rstrip("/"))
+        if not os.path.isdir(path):
+            out.add(rel)
+            continue
+        prefix = rel.rstrip("/") + "/"
+        inner = None
+        if os.path.exists(os.path.join(path, ".git")):
+            inner = _get_git_tracked_files(path)
+        if inner is None:
+            inner = set()
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in _NESTED_SKIP_DIRS]
+                for name in files:
+                    inner.add(os.path.relpath(os.path.join(root, name),
+                                              path).replace("\\", "/"))
+        out.update(prefix + f for f in inner)
+    return out
 
 
 def _is_gitignored(rel_path: str, visible: set[str] | None) -> bool:
