@@ -1186,6 +1186,7 @@ def _seed_js_builtin(identity: str, path: str) -> str | None:
         log.warning("[AcceptanceSeed] could not write %s: %s",
                     SEED_BASENAME_JS, exc)
         return None
+    _remember_seed_bytes(path, _header(identity, body, comment="//") + body)
     log.info("[AcceptanceSeed] installed the built-in Node contract as %s — "
              "it checks that the project builds and emits a real page, and "
              "nothing about the task itself", SEED_BASENAME_JS)
@@ -1611,6 +1612,7 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     except OSError as exc:
         log.warning("[AcceptanceSeed] could not write %s: %s", path, exc)
         return None
+    _remember_seed_bytes(path, _header(identity, body) + body)
 
     log.info("[AcceptanceSeed] wrote %s from the task text, before any step "
              "ran — it counts as independent evidence for exactly as long "
@@ -1787,6 +1789,75 @@ def reset_contract_repairs() -> None:
     _REPAIR_STATE.clear()
     _JUDGED.clear()
     _LAST_RUN.clear()
+    _SEED_BYTES.clear()
+
+
+# The exact bytes this module last wrote, per path. The header carries a
+# hash, which can say "someone changed this" but cannot put it back.
+_SEED_BYTES: dict = {}
+
+
+def _remember_seed_bytes(path: str, text: str) -> None:
+    _SEED_BYTES[path] = text
+
+
+def restore_seeded_contract(root: str) -> "str | None":
+    """Put the contract back if anything in the run altered it.
+
+    The write guards cover `write_file`, `edit_file` and the plan's inline
+    writes. They cannot cover `run_command`, which is the documented hole
+    in `AgentTools` sandboxing — and the most innocent possible command
+    walked straight through it.
+
+    Measured 2026-09-24, gpt-6-astra::
+
+        run_command: python -m ruff check test_acceptance_contract.py --fix
+                     && python -m ruff format ...
+
+    `--fix` removed two unused imports and a blank line: five deletions in
+    a 194-line file. Nothing about what the contract asserts changed, and
+    that is beside the point — "byte-identical" is the only rule that
+    cannot be gamed, because any softer rule needs a model to judge which
+    edits are harmless, which is the thing being guarded against. The run
+    forfeited its own evidence and failed at 24:34 and 542k tokens over an
+    artifact whose own suite was green.
+
+    Restoring rather than refusing is what makes this route-proof: a
+    formatter, a shell redirect, `sed -i` or an editor all end the same
+    way. Returns a description when something was put back, else None.
+    """
+    restored = []
+    for base in (SEED_BASENAME, SEED_BASENAME_JS):
+        path = os.path.join(root, base)
+        wanted = _SEED_BYTES.get(path)
+        if wanted is None:
+            continue                      # not seeded by us this run
+        try:
+            if not os.path.isfile(path):
+                current = None
+            else:
+                with open(path, encoding="utf-8") as fh:
+                    current = fh.read()
+        except OSError:
+            continue
+        if current == wanted:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(wanted)
+        except OSError as exc:
+            log.warning("[AcceptanceSeed] could not restore %s: %s", base, exc)
+            continue
+        _LAST_RUN.pop(path, None)         # that result described other bytes
+        restored.append(base)
+        log.warning(
+            "[AcceptanceSeed] %s was %s during the run and has been restored "
+            "— it is independent evidence only while its bytes are the ones "
+            "written before any code existed. Change the PROJECT until it "
+            "passes; if it assumes a layout this run did not build, say so "
+            "rather than editing it.",
+            base, "deleted" if current is None else "modified")
+    return ", ".join(restored) if restored else None
 
 
 def last_contract_run(root: str):
@@ -1843,6 +1914,12 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
     the instrument because it says so is exactly the cheat this module
     exists to prevent.
     """
+    # Before anything else: put the contract back if the run altered it.
+    # This is the one seam every caller already passes through per wave and
+    # once at the end, and it covers routes no write guard can see — a
+    # formatter, a shell redirect, an editor (measured: `ruff check
+    # test_acceptance_contract.py --fix`).
+    restore_seeded_contract(root)
     if executor is None or llm_client is None:
         return None
     path = os.path.join(root, SEED_BASENAME)
@@ -2047,6 +2124,9 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
             log.warning("[AcceptanceSeed] could not write the repair: %s",
                         exc)
             return None
+        # A legitimate rewrite by this module: the restore must protect the
+        # repaired bytes from here on, not put the broken ones back.
+        _remember_seed_bytes(path, _header(identity, body) + body)
 
         ok_after, out_after = _run_contract(executor, root, record=final)
         if ok_after or _errors_reported(out_after) == 0:

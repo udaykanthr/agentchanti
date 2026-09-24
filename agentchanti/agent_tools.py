@@ -248,6 +248,49 @@ def dev_server_reason(command: str) -> str | None:
         f"prerendering) or its test suite, and inspect the built output.")
 
 
+# A command that names the seeded contract AND rewrites what it names.
+# The restore in acceptance_seed puts the bytes back whatever route
+# changed them; this exists so the model is TOLD, on the turn it happens,
+# instead of watching an edit silently revert.
+#
+# Measured 2026-09-24, gpt-6-astra:
+#
+#     python -m ruff check test_acceptance_contract.py --fix && ...
+#
+# removed two unused imports and a blank line - five deletions - and the
+# run forfeited its own evidence and failed.
+_MUTATING_TOKENS = ("--fix", "--write", "-w", "--in-place", "-i",
+                    "format", "black", "isort", "autoflake", "autopep8",
+                    "yapf", ">", ">>", "tee", "mv", "cp", "rm", "del")
+
+
+def contract_mutating_command(project_root: str, command: str) -> str | None:
+    """Why *command* would rewrite the seeded contract, or None."""
+    if not command:
+        return None
+    from .orchestrator.acceptance_seed import (SEED_BASENAME,
+                                               SEED_BASENAME_JS)
+    named = next((b for b in (SEED_BASENAME, SEED_BASENAME_JS)
+                  if b in command), None)
+    if named is None:
+        return None
+    if not os.path.isfile(os.path.join(project_root, named)):
+        return None
+    low = command.lower()
+    if not any(t in low.split() or t in low for t in _MUTATING_TOKENS):
+        return None                       # reading or running it is fine
+    return (
+        f"ERROR: refusing to run '{command.strip()[:160]}'. It would rewrite "
+        f"'{named}', the acceptance contract seeded from the task text "
+        f"before any code existed — the only check in this run that the run "
+        f"did not author. It counts as evidence for exactly as long as its "
+        f"bytes are unchanged, and a formatter's edit costs that just as "
+        f"surely as a rewritten assertion.\n"
+        f"Exclude it from the tool (ruff: `extend-exclude`), or run the "
+        f"tool on the project's own files. If the contract assumes a layout "
+        f"you did not build, say so in your summary.")
+
+
 def rootless_npm_install_reason(command: str, project_root: str) -> str | None:
     """Why a bare `npm install <pkg>` here would create a phantom package.
 
@@ -1143,6 +1186,11 @@ class AgentTools:
             log.warning("[AgentTools] refused rootless npm install: %s",
                         command.strip()[:120])
             return rootless
+        contract_cmd = contract_mutating_command(self.project_root, command)
+        if contract_cmd is not None:
+            log.warning("[AgentTools] refused command that would rewrite the "
+                        "seeded contract: %s", command.strip()[:120])
+            return contract_cmd
         server = dev_server_reason(command)
         if server is not None:
             log.warning("[AgentTools] refused dev server: %s",
