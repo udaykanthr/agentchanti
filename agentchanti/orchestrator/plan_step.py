@@ -2082,7 +2082,8 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     if not cmd:
         return None
     for structural in (_interpreter_target_error, _placeholder_error,
-                       _posix_idiom_error, _node_jsx_error):
+                       _posix_idiom_error, _node_jsx_error,
+                       _tomllib_text_mode_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2137,6 +2138,42 @@ def _node_jsx_error(cmd):
                 "transform-aware runner. Assert against the file's text, "
                 "or run the project's test runner (vitest/jest), which "
                 "transforms JSX before importing it")
+    return None
+
+
+# `tomllib.load` / `tomli.load` require a file opened in BINARY mode and
+# raise TypeError on a text handle, whatever the file contains. So a gate
+# written this way fails over every project, which is the structural bar.
+#
+# Measured 2026-09-24, gpt-oss:20b-cloud::
+#
+#     python -c "import tomllib; data=tomllib.load(open('pyproject.toml')); ..."
+#
+# raises `TypeError: File must be opened in binary mode, e.g. use
+# open('foo.toml', 'rb')`. The agent answered it by writing a `tomllib.py`
+# shim into the project root, which then replaced the real module for
+# pytest as well — 69 turns, two escalations, 374k tokens, and a failed
+# run over a `pyproject.toml` that was correct throughout.
+#
+# `load(...)` only: `tomllib.loads()` takes a string and is fine, and a
+# handle already opened 'rb' is exactly right.
+_TOMLLIB_TEXT_LOAD_RE = re.compile(
+    r"\b(?:tomllib|tomli)\.load\s*\(\s*open\s*\((?P<args>[^()]*)\)")
+
+
+def _tomllib_text_mode_error(cmd: str) -> Optional[str]:
+    """A `tomllib.load(open(...))` without binary mode."""
+    if not cmd:
+        return None
+    for m in _TOMLLIB_TEXT_LOAD_RE.finditer(cmd):
+        args = m.group("args")
+        if re.search(r"['\"][rwa]?b[+]?['\"]", args):
+            continue                      # 'rb' — correct
+        return ("the gate calls `tomllib.load(open(...))` on a TEXT handle, "
+                "which raises `TypeError: File must be opened in binary "
+                "mode` for every project, whatever the file contains. Open "
+                "it with `open(path, 'rb')`, or use `tomllib.loads(...)` on "
+                "the file's text")
     return None
 
 
