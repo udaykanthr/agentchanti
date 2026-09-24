@@ -17,7 +17,25 @@ from typing import Optional
 
 from .cli_display import log
 from .llm.chat_types import Message, ToolCall, ToolDef
-from .paths import package_shadow_reason, superseded_scaffold_module
+from .paths import (package_shadow_reason, seeded_contract_reason,
+                    superseded_scaffold_module)
+
+
+def _seeded_contract_refusal(root: str, rel: str, path: str) -> "str | None":
+    """Refuse a write or edit to the contract this run seeded."""
+    reason = seeded_contract_reason(root, rel)
+    if reason is None:
+        return None
+    log.warning("[AgentTools] refused write to the seeded contract '%s'", rel)
+    return (
+        f"ERROR: refusing to modify '{path}'. {reason} — it was written "
+        f"from the task text before any code existed, which is exactly what "
+        f"makes it independent. Editing it turns this run's evidence into "
+        f"something the run wrote itself, which is worth less than no "
+        f"evidence at all.\n"
+        f"Read it as often as you like and change the PROJECT until it "
+        f"passes. If the contract assumes a layout you did not build, say "
+        f"so in your summary — do not rewrite the check.")
 
 
 def _protected_basenames() -> set[str]:
@@ -893,6 +911,9 @@ class AgentTools:
         if phantom is not None:
             log.warning("[AgentTools] refused phantom root manifest '%s'", rel)
             return phantom
+        seeded = _seeded_contract_refusal(self.project_root, rel, path)
+        if seeded is not None:
+            return seeded
         shadow = package_shadow_reason(self.project_root, rel)
         if shadow is not None:
             log.warning("[AgentTools] refused shadowing module write '%s' "
@@ -1046,6 +1067,9 @@ class AgentTools:
                 f"gate cannot be satisfied because a tool lacks a "
                 f"capability, that is a defect in the GATE — say so in your "
                 f"summary rather than altering the tool.")
+        seeded = _seeded_contract_refusal(self.project_root, rel, path)
+        if seeded is not None:
+            return seeded
         stdlib = stdlib_shadow(rel)
         if stdlib is not None:
             log.warning("[AgentTools] refused edit of stdlib shadow '%s'",

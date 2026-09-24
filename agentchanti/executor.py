@@ -952,7 +952,8 @@ class Executor:
         grounded, not hallucinated — and editing a manifest is sometimes
         the entire task.
         """
-        from .paths import package_shadow_reason, strip_dot_slash, superseded_scaffold_module
+        from .paths import (package_shadow_reason, seeded_contract_reason,
+                            strip_dot_slash, superseded_scaffold_module)
         _allowed_norm = {strip_dot_slash(p.replace("\\", "/"))
                          for p in (allow_protected or ())}
         written = []
@@ -1001,6 +1002,21 @@ class Executor:
             # otherwise complete Django app. Refused and reported rather
             # than redirected: where the file belongs is the plan's
             # decision, not this writer's.
+            # A plan may declare the seeded contract as a step's target -
+            # the same route that re-created the package-shadow collision
+            # after the healer was guarded. The contract is independent
+            # only while the run leaves it alone, so this writer refuses it
+            # too (measured 2026-09-24: a run rewrote it 52 -> 394 lines
+            # and lost its own evidence).
+            _seeded = seeded_contract_reason(base_dir, filename)
+            if _seeded is not None:
+                log.warning(
+                    f"[Executor] Skipping {filepath}: {_seeded}. Change the "
+                    f"project until the contract passes; if it assumes a "
+                    f"layout this plan did not build, that is a defect in "
+                    f"the PLAN.")
+                continue
+
             _shadow = package_shadow_reason(base_dir, filename)
             if _shadow is not None:
                 log.warning(

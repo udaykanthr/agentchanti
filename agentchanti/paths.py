@@ -46,6 +46,56 @@ def norm_rel_path(path: str) -> str:
     return strip_dot_slash(re.sub(r"[\\/]+", "/", (path or "").strip()))
 
 
+# A contract this pipeline seeded says so in its first line, and that is
+# what makes it recognisable to a writer that has no other context.
+_SEED_STAMP = "agentchanti:acceptance-seed"
+
+
+def seeded_contract_reason(root: str, path: str) -> "str | None":
+    """Why *path* is this run's own acceptance contract, or None.
+
+    The seeded contract "counts as independent evidence for exactly as long
+    as the run leaves it byte-identical" — and until now that was *detected*
+    rather than *prevented*, while a user's `acceptance_cmds` script was
+    genuinely read-only to the agent. The strongest instrument a greenfield
+    run has was the one thing nothing stopped the agent editing.
+
+    Measured 2026-09-24, gpt-6-astra on "implement a 2d snake game". The
+    run planned a packaged project under `src/snake_game/` with a release
+    step, and the contract — written before any code existed — did not match
+    that layout, so the agent improved the CONTRACT: 52 lines to 394, `342
+    insertions(+), 52 deletions(-)`. Every other check was healthy (ghost 64
+    hold, 0 violated, 0 disagreements), and the run failed on the last line
+    with "no test survived that the agent did not write or rewrite". A
+    stronger model makes this MORE likely, not less: it is the one that
+    builds a layout the blind contract did not anticipate.
+
+    Judged on the seed stamp in the file's first line, so a user's own suite
+    is never protected by accident and a file this module did not write is
+    never ours to refuse.
+    """
+    import os
+
+    rel = norm_rel_path(path)
+    if not rel or "/" in rel:
+        return None                      # the seeder only writes at the root
+    if not (rel.endswith(".py") or rel.endswith(".mjs")):
+        return None
+    full = os.path.join(root or ".", rel)
+    try:
+        if not os.path.isfile(full):
+            return None
+        with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if _SEED_STAMP not in first:
+        return None
+    return (f"'{rel}' is the acceptance contract this run seeded before any "
+            f"code existed, and it is the only check here that the run did "
+            f"not author")
+
+
 def package_shadow_reason(root: str, path: str) -> "str | None":
     """Why writing ``path`` would collide with a package, or None.
 
