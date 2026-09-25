@@ -2056,6 +2056,80 @@ def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
     return issues
 
 
+# A bare test-discovery command: no path, so it collects the whole
+# directory tree it is run from.
+_BARE_UNITTEST_RE = re.compile(
+    r"^\s*(?:[\w./\\-]*python[\w.]*\s+-m\s+)?unittest(?:\s+-[qvbfk]+)*\s*$",
+    re.IGNORECASE)
+_BARE_PYTEST_RE = re.compile(
+    r"^\s*(?:[\w./\\-]*python[\w.]*\s+-m\s+)?pytest"
+    r"(?:\s+(?:-[qvxs]+|--no-header|--quiet|--tb=\S+))*\s*$",
+    re.IGNORECASE)
+
+
+def scope_suite_gate_to_step(step: "PlanStep") -> Optional[str]:
+    """A step's gate scoped to the tests that step writes, or None.
+
+    A gate is a measurement of THIS step. A bare `python -m unittest -q`
+    measures the whole directory — including every other step's tests and,
+    at the project root, the seeded acceptance contract, which the step
+    neither wrote nor may edit.
+
+    Measured 2026-09-25, gpt-5.6-terra. Step 11 ("create unit tests
+    covering initial state, movement, ... and restart") was gated on
+    `python -m unittest -q`. Its own eight tests passed; the contract has
+    one failing assertion, so the gate could not go green whatever the step
+    wrote. It spent 10 turns, its recovery spent 10 more — 20 of the run's
+    39 turns and ~190k of its 270k tokens — and the run failed. The
+    comparable run the night before, whose plan happened not to write that
+    gate, cost 78k.
+
+    Scoped only when the step declares test targets of its own, so a plan
+    that deliberately gates on the whole suite (a release step, say) is
+    untouched. Files sharing one directory become `discover -s <dir>`,
+    which is how unittest is meant to be pointed at a package; otherwise
+    the files are named individually.
+    """
+    from ..paths import norm_rel_path
+    cmd = (step.verify_cmd or "").strip()
+    if not cmd:
+        return None
+    is_unittest = bool(_BARE_UNITTEST_RE.match(cmd))
+    is_pytest = bool(_BARE_PYTEST_RE.match(cmd))
+    if not (is_unittest or is_pytest):
+        return None
+    tests = [norm_rel_path(t) for t in (step.target_files or [])
+             if t and _is_test_path(norm_rel_path(t))]
+    if not tests:
+        return None                      # nothing of its own to scope to
+    dirs = {posixpath.dirname(t) for t in tests}
+    if len(dirs) == 1 and dirs != {""}:
+        where = dirs.pop()
+        if is_unittest:
+            return f"python -m unittest discover -s {where} -q"
+        return f"python -m pytest -q {where}"
+    if is_unittest:
+        return "python -m unittest " + " ".join(sorted(tests))
+    return "python -m pytest -q " + " ".join(sorted(tests))
+
+
+def _is_test_path(rel: str) -> bool:
+    base = posixpath.basename(rel or "")
+    return (base.startswith("test_") or base.endswith("_test.py")) and \
+        base.endswith(".py")
+
+
+def scope_suite_gates(steps: list["PlanStep"]) -> list[tuple[str, str, str]]:
+    """Scope every bare-discovery gate in *steps*. Returns what changed."""
+    changed: list[tuple[str, str, str]] = []
+    for step in steps or ():
+        scoped = scope_suite_gate_to_step(step)
+        if scoped and scoped != (step.verify_cmd or "").strip():
+            changed.append((step.id, step.verify_cmd, scoped))
+            step.verify_cmd = scoped
+    return changed
+
+
 def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     """Explain why *cmd* can never run at all, or None.
 

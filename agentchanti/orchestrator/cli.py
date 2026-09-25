@@ -1204,7 +1204,10 @@ def _main_impl():
         # past it. Measured: a resume brought back, verbatim, the gate
         # that had already burned the run which wrote the checkpoint.
         from .gate_safety import neutralize_destructive_gates
-        from .plan_step import unrunnable_gate_reason
+        from .plan_step import scope_suite_gates, unrunnable_gate_reason
+        for _sid, _was, _now in scope_suite_gates(plan_steps_parsed):
+            log.info("[Plan] restored step %s: scoped its suite gate to the "
+                     "tests it writes — `%s` -> `%s`", _sid, _was, _now)
         for _sid, _was, _why in neutralize_destructive_gates(
                 plan_steps_parsed):
             log.warning(
@@ -1517,6 +1520,7 @@ def _main_impl():
                 reclassify_manifest_steps, plan_looks_truncated,
                 plan_salvageable, route_blind_edits,
                 truncated_plan_prefix, plan_continuation_note,
+                scope_suite_gates,
             )
             from .gate_safety import (
                 check_gate_safety, neutralize_destructive_gates,
@@ -1732,6 +1736,17 @@ def _main_impl():
                             "[GateSafety] step %s: dropped the destructive "
                             "tail of its verify: %s — was `%s`",
                             _sid, _why, _was)
+
+                    # A step's gate measures THAT step. A bare `unittest -q`
+                    # collects the whole directory, including the seeded
+                    # contract the step may not edit — measured at 20 of a
+                    # run's 39 turns on a step whose own tests all passed.
+                    for _sid, _was, _now in scope_suite_gates(
+                            plan_steps_parsed):
+                        log.info(
+                            "[Plan] step %s: scoped its suite gate to the "
+                            "tests it writes — `%s` -> `%s`",
+                            _sid, _was, _now)
 
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
