@@ -2532,10 +2532,17 @@ def _main_impl():
                     _t for _ps in (plan_steps_parsed or [])
                     if getattr(_ps, "index", None) in _later
                     for _t in (getattr(_ps, "target_files", None) or [])]
+                # The plan's own vocabulary: every symbol some step says it
+                # will export. A contract waiting on a name no step ever
+                # declared is not waiting, it is wrong.
+                _declared_exports = {
+                    _sym for _ps in (plan_steps_parsed or [])
+                    for _sym in (getattr(_ps, "exports", None) or [])}
                 _fixed = verify_contract_runs(
                     executor, os.getcwd(), llm_client, args.task,
                     identity_task=getattr(args, "_raw_task", None),
-                    pending_targets=_pending_targets)
+                    pending_targets=_pending_targets,
+                    declared_exports=_declared_exports)
                 if _fixed:
                     # The snapshot must learn the new bytes, or the repair
                     # reads downstream as "the agent edited the contract"
@@ -2819,7 +2826,10 @@ def _main_impl():
                                           verify_contract_runs)
             _fixed = verify_contract_runs(
                 executor, os.getcwd(), llm_client, args.task,
-                identity_task=getattr(args, "_raw_task", None), final=True)
+                identity_task=getattr(args, "_raw_task", None), final=True,
+                declared_exports={
+                    _sym for _ps in (plan_steps_parsed or [])
+                    for _sym in (getattr(_ps, "exports", None) or [])})
             if _fixed:
                 _rel, _new_digest = _fixed
                 _pre_existing_tests[_rel] = _new_digest

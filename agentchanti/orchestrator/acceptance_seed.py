@@ -1710,12 +1710,49 @@ _NOT_BUILT_RE = re.compile(
     r"[^\n]*\.py")
 
 
-def _not_ready_reason(output: str):
-    """Short reason the contract could not reach the project yet, or None."""
-    found = _NOT_READY_RE.search(output or "")
+# "No module named x" and "cannot import name X from x" are not the same
+# fact, and treating them alike cost a whole run. The first says the module
+# is not built yet; the second says the module is RIGHT THERE and the name
+# inside it is different.
+_MODULE_MISSING_RE = re.compile(r"ModuleNotFoundError|No module named")
+_MISSING_NAME_RE = re.compile(r"cannot import name ['\"](\w+)['\"]")
+
+
+def _not_ready_reason(output: str, declared_exports=None):
+    """Short reason the contract could not reach the project yet, or None.
+
+    *declared_exports* is every symbol the plan promises some step will
+    export — the plan's own vocabulary, the same fact `pending_targets`
+    supplies for files. Measured 2026-09-25, gpt-5.6-terra: the contract
+    guessed the class would be `Game`, the code named it `SnakeGame`, and
+
+        ImportError: cannot import name 'Game' from 'snake_game.game'
+
+    was read as "not built yet" four times and then reported, at the end of
+    the run, as "the contract still cannot reach the project". The module
+    imported fine every time. The repair path — which exists precisely for
+    a contract that crashes, and which can see both the contract and the
+    traceback — never ran, because the deferral sat in front of it.
+
+    So a missing NAME defers only while the plan still promises that name.
+    A name no step ever declared is the contract's own invention, and
+    inventing an API is a crash to repair, not a reason to wait.
+    """
+    out = output or ""
+    found = _MODULE_MISSING_RE.search(out)
     if found:
-        return found.group(0)
-    found = _NOT_BUILT_RE.search(output or "")
+        return found.group(0)            # the module itself is absent
+    names = _MISSING_NAME_RE.findall(out)
+    if names:
+        if declared_exports is None:
+            return "cannot import name"  # no plan facts — old behaviour
+        promised = [n for n in names if n in declared_exports]
+        if promised:
+            return f"cannot import name {promised[0]!r}, which a step declares"
+        return None                      # the plan never promised this name
+    if "ImportError" in out:
+        return "ImportError"
+    found = _NOT_BUILT_RE.search(out)
     return "a project source file does not exist yet" if found else None
 
 
@@ -1894,7 +1931,8 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                          identity_task: str = None,
                          max_repairs: int = 1,
                          final: bool = False,
-                         pending_targets=None):
+                         pending_targets=None,
+                         declared_exports=None):
     """Execute the seeded contract; repair it once if it cannot run.
 
     *pending_targets* are the files declared by plan steps that have not run
@@ -1951,11 +1989,11 @@ def verify_contract_runs(executor, root: str, llm_client, task: str,
                       "of the plan will write — deferring the runnability "
                       "check", _pending)
             return None
-    if _not_ready_reason(out):
+    if _not_ready_reason(out, declared_exports):
         if not final:
             log.debug("[AcceptanceSeed] contract cannot reach the project "
                       "yet (%s) — deferring the runnability check",
-                      _not_ready_reason(out))
+                      _not_ready_reason(out, declared_exports))
             return None
         # There is no later wave to defer to. Measured 2026-09-12: the
         # contract became importable only during the post-wave phases, so
