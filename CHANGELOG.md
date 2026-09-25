@@ -6,6 +6,49 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.10.1 — 2026-09-25
+
+Six more live runs, six more failures over applications that worked. Three
+were checks no code could satisfy; two were the run destroying the only
+evidence it had; one was a question the project files already answered.
+
+### Fixed
+
+- **A check that greps a file with forward slashes now finds it.** `findstr`
+  reads a `/` anywhere in an argument as a switch, so a path like
+  `my-app/components/NavBar.tsx` was never opened — four component steps
+  stalled over four correct components. The gap is worth stating: the
+  `grep`→`findstr` translation had converted separators since the day it was
+  written, and nothing covered a `findstr` the planner wrote itself.
+- **A check that reads `pyproject.toml` the wrong way is refused up front.**
+  `tomllib.load` needs a file opened `'rb'` and raises against any project,
+  whatever the file contains.
+- **The agent can no longer replace the standard library.** Answering that
+  check, one run wrote a `tomllib.py` into the project root — Python searches
+  the project directory first, so it replaced the real module for everything,
+  including the test runner. Writes and edits to a top-level file named after
+  a standard-library module are refused; the list is narrow, because `types.py`
+  and `queue.py` are names a project may legitimately own.
+- **A run can no longer rewrite the check that judges it.** The contract
+  seeded from your task text, before any code exists, is the only verification
+  a greenfield run does not author. One run grew it from 52 lines to 394 to
+  match a layout it had chosen, and failed on the last line having discarded
+  its own evidence — over an application whose own suite passed 350 tests.
+  Writes, edits and plan-declared targets are refused, and the bytes are
+  restored if anything changes them by another route: a formatter run through
+  a shell command (`ruff --fix` removing two unused imports) cost a later run
+  exactly the same way. Reading is always allowed, and the refusal says what
+  to do instead — change the project, and if the contract assumes a layout you
+  did not build, say so.
+
+### Changed
+
+- **The project's own files decide its language**, instead of an LLM call on
+  every run. A tree holding `tsconfig.json`, `next-env.d.ts` and `.tsx` files
+  is not a question worth asking a model — it cost about 2,800 output tokens
+  per run. The model is still asked when the evidence disagrees with itself,
+  such as a `go.mod` inside a Django project.
+
 ## 0.10.0 — 2026-09-23
 
 Thirteen live runs across three models on one Next.js prompt. Every run
