@@ -394,7 +394,8 @@ def _run_task_impl(
     if _llm_detected and _llm_detected != language:
         import logging as _lg
         _lg.getLogger(__name__).info(
-            "Language corrected by LLM during pre-analysis: %s → %s",
+            "Language corrected during pre-analysis by %s: %s → %s",
+            getattr(planner, "_language_source", "the LLM"),
             language, _llm_detected,
         )
         language = _llm_detected

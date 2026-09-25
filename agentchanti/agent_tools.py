@@ -17,7 +17,25 @@ from typing import Optional
 
 from .cli_display import log
 from .llm.chat_types import Message, ToolCall, ToolDef
-from .paths import package_shadow_reason, superseded_scaffold_module
+from .paths import (package_shadow_reason, seeded_contract_reason,
+                    superseded_scaffold_module)
+
+
+def _seeded_contract_refusal(root: str, rel: str, path: str) -> "str | None":
+    """Refuse a write or edit to the contract this run seeded."""
+    reason = seeded_contract_reason(root, rel)
+    if reason is None:
+        return None
+    log.warning("[AgentTools] refused write to the seeded contract '%s'", rel)
+    return (
+        f"ERROR: refusing to modify '{path}'. {reason} — it was written "
+        f"from the task text before any code existed, which is exactly what "
+        f"makes it independent. Editing it turns this run's evidence into "
+        f"something the run wrote itself, which is worth less than no "
+        f"evidence at all.\n"
+        f"Read it as often as you like and change the PROJECT until it "
+        f"passes. If the contract assumes a layout you did not build, say "
+        f"so in your summary — do not rewrite the check.")
 
 
 def _protected_basenames() -> set[str]:
@@ -228,6 +246,49 @@ def dev_server_reason(command: str) -> str | None:
         f"the command. To check that the app works, run its build "
         f"(`npm --prefix <app> run build` — a page that throws fails "
         f"prerendering) or its test suite, and inspect the built output.")
+
+
+# A command that names the seeded contract AND rewrites what it names.
+# The restore in acceptance_seed puts the bytes back whatever route
+# changed them; this exists so the model is TOLD, on the turn it happens,
+# instead of watching an edit silently revert.
+#
+# Measured 2026-09-24, gpt-6-astra:
+#
+#     python -m ruff check test_acceptance_contract.py --fix && ...
+#
+# removed two unused imports and a blank line - five deletions - and the
+# run forfeited its own evidence and failed.
+_MUTATING_TOKENS = ("--fix", "--write", "-w", "--in-place", "-i",
+                    "format", "black", "isort", "autoflake", "autopep8",
+                    "yapf", ">", ">>", "tee", "mv", "cp", "rm", "del")
+
+
+def contract_mutating_command(project_root: str, command: str) -> str | None:
+    """Why *command* would rewrite the seeded contract, or None."""
+    if not command:
+        return None
+    from .orchestrator.acceptance_seed import (SEED_BASENAME,
+                                               SEED_BASENAME_JS)
+    named = next((b for b in (SEED_BASENAME, SEED_BASENAME_JS)
+                  if b in command), None)
+    if named is None:
+        return None
+    if not os.path.isfile(os.path.join(project_root, named)):
+        return None
+    low = command.lower()
+    if not any(t in low.split() or t in low for t in _MUTATING_TOKENS):
+        return None                       # reading or running it is fine
+    return (
+        f"ERROR: refusing to run '{command.strip()[:160]}'. It would rewrite "
+        f"'{named}', the acceptance contract seeded from the task text "
+        f"before any code existed — the only check in this run that the run "
+        f"did not author. It counts as evidence for exactly as long as its "
+        f"bytes are unchanged, and a formatter's edit costs that just as "
+        f"surely as a rewritten assertion.\n"
+        f"Exclude it from the tool (ruff: `extend-exclude`), or run the "
+        f"tool on the project's own files. If the contract assumes a layout "
+        f"you did not build, say so in your summary.")
 
 
 def rootless_npm_install_reason(command: str, project_root: str) -> str | None:
@@ -461,6 +522,66 @@ def fabricated_dependency_link(command: str) -> Optional[str]:
         if name in _DEP_DIR_NAMES:
             return name
     return None
+
+
+def stdlib_shadow(rel_path: str) -> Optional[str]:
+    """The standard-library module *rel_path* would shadow, if any.
+
+    `shadowed_dist` guards an installed distribution and `toolchain_shim`
+    guards an executable; the standard library sat between them, unguarded
+    — and it is the easiest of the three to replace, because Python puts
+    the script's own directory first on `sys.path`.
+
+    Measured 2026-09-24, gpt-oss:20b-cloud on "implement a 2d snake game".
+    The plan gated a step on::
+
+        python -c "import tomllib; data=tomllib.load(open('pyproject.toml')); ..."
+
+    which raises `TypeError: File must be opened in binary mode` against
+    ANY project — `tomllib.load` requires `'rb'`. The agent answered it by
+    writing a 1,955-byte `tomllib.py` into the project root, headed
+    "Compatibility shim for the standard library tomllib" and justified by
+    an invented claim that the environment's tomllib was "a very old stub".
+    That file then replaced the real module for everything run from the
+    project, pytest included; the seeded contract ended with 8 errors and
+    the run failed after 69 turns and 374k tokens over a correct
+    `pyproject.toml`.
+
+    Only a NEW TOP-LEVEL module can shadow, so the first path component is
+    what counts: `tomllib.py` and `tomllib/` shadow, `src/tomllib.py` does
+    not. `__init__.py` names no module of its own. A module the project
+    legitimately owns as a package directory is still refused at the top
+    level, because that is exactly where the shadowing happens.
+    """
+    parts = re.split(r"[\\/]+", (rel_path or "").strip("\\/"))
+    if not parts or not parts[0]:
+        return None
+    head = parts[0]
+    if len(parts) == 1:
+        if not head.endswith(".py") or head == "__init__.py":
+            return None
+        head = head[:-3]
+    name = head.lower()
+    if name in _STDLIB_NEVER_SHADOW:
+        return name
+    return None
+
+
+# Deliberately not `sys.stdlib_module_names` wholesale: that set includes
+# names a project may legitimately own (`types`, `copy`, `queue`, `parser`
+# as a domain word), and refusing those would block ordinary work. These
+# are modules whose replacement breaks the interpreter or the test runner
+# itself, which is the damage this guard exists to prevent.
+_STDLIB_NEVER_SHADOW = frozenset({
+    "tomllib", "json", "logging", "os", "sys", "re", "io", "abc", "ast",
+    "pathlib", "subprocess", "threading", "asyncio", "typing", "enum",
+    "dataclasses", "functools", "itertools", "collections", "importlib",
+    "inspect", "traceback", "warnings", "unittest", "sqlite3", "socket",
+    "ssl", "hashlib", "base64", "pickle", "random", "math", "time",
+    "datetime", "shutil", "tempfile", "glob", "csv", "configparser",
+    "argparse", "contextlib", "operator", "string", "textwrap", "codecs",
+    "encodings", "site", "sysconfig", "zipfile", "tarfile", "struct",
+})
 
 
 def shadowed_dist(rel_path: str, failed: set[str]) -> Optional[str]:
@@ -833,6 +954,9 @@ class AgentTools:
         if phantom is not None:
             log.warning("[AgentTools] refused phantom root manifest '%s'", rel)
             return phantom
+        seeded = _seeded_contract_refusal(self.project_root, rel, path)
+        if seeded is not None:
+            return seeded
         shadow = package_shadow_reason(self.project_root, rel)
         if shadow is not None:
             log.warning("[AgentTools] refused shadowing module write '%s' "
@@ -862,6 +986,21 @@ class AgentTools:
                 f"capability (Node cannot parse JSX, for instance), that is "
                 f"a defect in the GATE. Say so in your summary; do not "
                 f"replace the tool.")
+        stdlib = stdlib_shadow(rel)
+        if stdlib is not None:
+            log.warning("[AgentTools] refused stdlib shadow '%s' (would "
+                        "shadow the standard library '%s')", rel, stdlib)
+            return (
+                f"ERROR: refusing to write '{path}'. Python searches the "
+                f"project directory BEFORE the standard library, so this "
+                f"file would replace '{stdlib}' for every command the run "
+                f"makes — the test runner and the interpreter's own "
+                f"machinery included.\n"
+                f"If a check fails because a standard-library call is used "
+                f"wrongly (tomllib.load needs a file opened 'rb', for "
+                f"instance), that is a defect in the CHECK or in the code "
+                f"calling it. Fix the caller, or say so in your summary — "
+                f"do not replace the module.")
         dist = shadowed_dist(rel, self._failed_installs)
         if dist is not None:
             log.warning(f"[AgentTools] refused shadow write '{rel}' "
@@ -971,6 +1110,18 @@ class AgentTools:
                 f"gate cannot be satisfied because a tool lacks a "
                 f"capability, that is a defect in the GATE — say so in your "
                 f"summary rather than altering the tool.")
+        seeded = _seeded_contract_refusal(self.project_root, rel, path)
+        if seeded is not None:
+            return seeded
+        stdlib = stdlib_shadow(rel)
+        if stdlib is not None:
+            log.warning("[AgentTools] refused edit of stdlib shadow '%s'",
+                        rel)
+            return (
+                f"ERROR: refusing to edit '{path}'. It shadows the standard "
+                f"library '{stdlib}' for everything run from this "
+                f"directory. Fix the code that calls '{stdlib}' instead, or "
+                f"say in your summary that the check is wrong.")
         if not os.path.isfile(full):
             return f"ERROR: file not found: {path}"
         with open(full, "r", encoding="utf-8", errors="replace") as f:
@@ -1035,6 +1186,11 @@ class AgentTools:
             log.warning("[AgentTools] refused rootless npm install: %s",
                         command.strip()[:120])
             return rootless
+        contract_cmd = contract_mutating_command(self.project_root, command)
+        if contract_cmd is not None:
+            log.warning("[AgentTools] refused command that would rewrite the "
+                        "seeded contract: %s", command.strip()[:120])
+            return contract_cmd
         server = dev_server_reason(command)
         if server is not None:
             log.warning("[AgentTools] refused dev server: %s",

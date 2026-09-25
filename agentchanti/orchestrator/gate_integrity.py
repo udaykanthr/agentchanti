@@ -330,6 +330,42 @@ def _grep_as_findstr(m: re.Match) -> str | None:
     return out
 
 
+# The same `/`-is-a-switch rule, for a findstr the PLANNER wrote. The
+# translation above converts separators, which is why it passes its tests —
+# but nothing covered a gate that arrives as findstr already.
+#
+# Measured 2026-09-23, gpt-oss:20b-cloud:
+#
+#     findstr /c:"export default function NavBar" my-app/components/NavBar.tsx
+#
+# answers `FINDSTR: Cannot open NavBar.tsx` and exits 1 over a file
+# containing exactly that line. Four component steps stalled this way — 30
+# loop turns, an escalation, 136k tokens — and every one of the four
+# components was correct. With backslashes the identical command prints the
+# match and exits 0.
+#
+# A variant, not a refusal: a relative path with no directory (`findstr
+# /c:"x" page.tsx`) is unaffected, and a gate that passes is never touched.
+_FINDSTR_FILE_RE = re.compile(
+    r'(?<=\s)(?P<file>(?:[\w.~-]+/)+[\w.-]+)(?=\s|$|&|\||>)')
+
+
+def findstr_path_variant(cmd: str) -> str | None:
+    """*cmd* with forward slashes in a findstr's file arguments backslashed."""
+    if not cmd or not re.search(r"\bfindstr\b", cmd, re.IGNORECASE):
+        return None
+    out = []
+    changed = False
+    for seg in re.split(r"(&&|\|\||[|;&])", cmd):
+        if re.search(r"\bfindstr\b", seg, re.IGNORECASE):
+            rewritten = _FINDSTR_FILE_RE.sub(
+                lambda m: m.group("file").replace("/", "\\"), seg)
+            changed = changed or rewritten != seg
+            seg = rewritten
+        out.append(seg)
+    return "".join(out) if changed else None
+
+
 def grep_to_findstr(cmd: str) -> str | None:
     """*cmd* with every `grep` rewritten for findstr, or None if any cannot be."""
     if not cmd or "grep" not in cmd:
@@ -562,6 +598,9 @@ def platform_equivalent_variants(cmd: str) -> List[Tuple[str, str]]:
         translated = grep_to_findstr(cmd)
         if translated and translated != cmd:
             variants.append(("grep-to-findstr", translated))
+    slashed = findstr_path_variant(cmd)
+    if slashed and slashed != cmd:
+        variants.append(("findstr-path-separator", slashed))
     return variants
 
 

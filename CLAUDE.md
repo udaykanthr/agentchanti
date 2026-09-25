@@ -673,12 +673,30 @@ that works. The project form is offered when the gate fails and adopted
 only if it passes — the believe-only-if-it-passes rule the dialect
 transforms already use, and it runs *before* the stall observation.
 
-**A file the build never emits** — pending. kimi's gate read
-`.next/server/app/page.html`, while Next emits the root route as
-`index.html`; 8 turns plus 8 more of recovery, over a working app. The
-stall detector cannot help here and is right not to: a `FileNotFoundError`
-traceback counts as "reached the code", a category deliberately excluded
-after a false positive suppressed real work.
+**A file the build never emits** (`next_html_output_variant`). kimi's gate
+read `.next/server/app/page.html`, while Next names prerendered HTML after
+the ROUTE — `app/page.tsx` serves `/` and is emitted as `index.html`,
+`app/about/page.tsx` as `about.html`. 8 turns plus 8 more of recovery, over
+a working app. The stall detector cannot help here and is right not to: a
+`FileNotFoundError` traceback counts as "reached the code", a category
+deliberately excluded after a false positive suppressed real work. A
+variant, believed only if it passes; replayed against the real build, the
+original exits 1 and the variant exits 0.
+
+**A path findstr never sees** (`findstr_path_variant`). findstr reads a `/`
+anywhere in an argument as a switch, so a forward-slash path is never
+opened. Measured 2026-09-23, gpt-oss:20b-cloud:
+
+    findstr /c:"export default function NavBar" my-app/components/NavBar.tsx
+
+answers `FINDSTR: Cannot open NavBar.tsx` and exits 1 over a file holding
+exactly that line; with backslashes it prints the match and exits 0. Four
+component steps stalled this way — 30 loop turns, an escalation, 136k
+tokens — and all four components were correct. The gap is instructive:
+`grep_to_findstr` had converted separators since the day it was written,
+which is why its tests passed, and **nothing covered a findstr the planner
+wrote itself**. A translation is not a guard; the guard has to sit where
+the command arrives.
 
 ### A Turn Cut At The Output Cap Is Not A Done Claim (agent_loop.py)
 
