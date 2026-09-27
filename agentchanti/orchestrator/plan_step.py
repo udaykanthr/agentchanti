@@ -1839,6 +1839,57 @@ def shell_level_assertion(cmd: str) -> bool:
     return bool(cmd) and bool(_SHELL_TEETH_RE.search(cmd))
 
 
+# A gate comparing a manifest's SCRIPT TEXT against a literal, e.g.
+#   node -e "const p=require('./package.json');
+#            if(p.scripts.test!=='node --test')process.exit(1)"
+_MANIFEST_SCRIPT_RE = re.compile(
+    r"""(?:scripts\s*(?:\.\s*(?P<dot>[\w-]+)|\[\s*['"](?P<idx>[\w-]+)['"]\s*\]))"""
+    r"""\s*(?:!==?|===?)\s*['"]""")
+
+
+def _manifest_script_gate_reason(cmd: str) -> Optional[str]:
+    """A gate asserting HOW a script is spelled, not that anything works.
+
+    Measured 2026-09-27 on the `todo-node` benchmark case, twice in three
+    runs::
+
+        node -e "const p=require('./package.json');
+                 if(p.scripts.test!=='node --test')process.exit(1)"
+
+    The project's script was `node --test test/todoManager.test.js` —
+    functionally the same suite, and arguably better, since it names what
+    to run. The gate stayed red over a correct artifact while the
+    project's own suite was green, which `_enforce_monotonic_gates`
+    reported as a GATE CONFLICT and the run failed. Both artifacts passed
+    an external 11-step behavioural probe; the ghost said
+    `failed-but-clean` over 13 holding postconditions.
+
+    This is exactly what `shallow_gate_reason` exists to catch, one step
+    further out: the gate cannot fail on wrong BEHAVIOUR, only on a
+    different spelling of a correct command. There are many correct ways
+    to write a test script and the task named none of them.
+
+    Asserting a manifest's content is not itself the defect — a gate
+    checking a dependency pin in requirements.txt is a real check. Only
+    `scripts.<name>` compared against a string literal is flagged, because
+    that string is an implementation detail rather than a postcondition.
+    """
+    if not cmd or "scripts" not in cmd:
+        return None
+    match = _MANIFEST_SCRIPT_RE.search(cmd)
+    if not match:
+        return None
+    name = match.group("dot") or match.group("idx") or "test"
+    return (f"the verify command asserts that package.json's "
+            f"`scripts.{name}` is spelled EXACTLY as some literal. Many "
+            f"correct spellings run the same thing (`node --test` vs "
+            f"`node --test test/x.test.js`), so this fails on a correct "
+            f"project and cannot fail on a broken one. Assert that the "
+            f"script WORKS instead — run `npm run {name}` and check its "
+            f"exit status, or assert the behaviour it is supposed to "
+            f"produce")
+
+
 def shallow_gate_reason(cmd: str) -> Optional[str]:
     """Explain why *cmd* cannot detect a behavioural defect, or None.
 
@@ -1858,6 +1909,9 @@ def shallow_gate_reason(cmd: str) -> Optional[str]:
     """
     if not cmd or not cmd.strip():
         return None
+    manifest = _manifest_script_gate_reason(cmd)
+    if manifest:
+        return manifest
     if _TEST_RUNNER_RE.search(cmd):
         return None
     if shell_level_assertion(cmd):
@@ -2056,6 +2110,80 @@ def check_gate_consistency(steps: list[PlanStep]) -> list[tuple[str, str]]:
     return issues
 
 
+# A bare test-discovery command: no path, so it collects the whole
+# directory tree it is run from.
+_BARE_UNITTEST_RE = re.compile(
+    r"^\s*(?:[\w./\\-]*python[\w.]*\s+-m\s+)?unittest(?:\s+-[qvbfk]+)*\s*$",
+    re.IGNORECASE)
+_BARE_PYTEST_RE = re.compile(
+    r"^\s*(?:[\w./\\-]*python[\w.]*\s+-m\s+)?pytest"
+    r"(?:\s+(?:-[qvxs]+|--no-header|--quiet|--tb=\S+))*\s*$",
+    re.IGNORECASE)
+
+
+def scope_suite_gate_to_step(step: "PlanStep") -> Optional[str]:
+    """A step's gate scoped to the tests that step writes, or None.
+
+    A gate is a measurement of THIS step. A bare `python -m unittest -q`
+    measures the whole directory — including every other step's tests and,
+    at the project root, the seeded acceptance contract, which the step
+    neither wrote nor may edit.
+
+    Measured 2026-09-25, gpt-5.6-terra. Step 11 ("create unit tests
+    covering initial state, movement, ... and restart") was gated on
+    `python -m unittest -q`. Its own eight tests passed; the contract has
+    one failing assertion, so the gate could not go green whatever the step
+    wrote. It spent 10 turns, its recovery spent 10 more — 20 of the run's
+    39 turns and ~190k of its 270k tokens — and the run failed. The
+    comparable run the night before, whose plan happened not to write that
+    gate, cost 78k.
+
+    Scoped only when the step declares test targets of its own, so a plan
+    that deliberately gates on the whole suite (a release step, say) is
+    untouched. Files sharing one directory become `discover -s <dir>`,
+    which is how unittest is meant to be pointed at a package; otherwise
+    the files are named individually.
+    """
+    from ..paths import norm_rel_path
+    cmd = (step.verify_cmd or "").strip()
+    if not cmd:
+        return None
+    is_unittest = bool(_BARE_UNITTEST_RE.match(cmd))
+    is_pytest = bool(_BARE_PYTEST_RE.match(cmd))
+    if not (is_unittest or is_pytest):
+        return None
+    tests = [norm_rel_path(t) for t in (step.target_files or [])
+             if t and _is_test_path(norm_rel_path(t))]
+    if not tests:
+        return None                      # nothing of its own to scope to
+    dirs = {posixpath.dirname(t) for t in tests}
+    if len(dirs) == 1 and dirs != {""}:
+        where = dirs.pop()
+        if is_unittest:
+            return f"python -m unittest discover -s {where} -q"
+        return f"python -m pytest -q {where}"
+    if is_unittest:
+        return "python -m unittest " + " ".join(sorted(tests))
+    return "python -m pytest -q " + " ".join(sorted(tests))
+
+
+def _is_test_path(rel: str) -> bool:
+    base = posixpath.basename(rel or "")
+    return (base.startswith("test_") or base.endswith("_test.py")) and \
+        base.endswith(".py")
+
+
+def scope_suite_gates(steps: list["PlanStep"]) -> list[tuple[str, str, str]]:
+    """Scope every bare-discovery gate in *steps*. Returns what changed."""
+    changed: list[tuple[str, str, str]] = []
+    for step in steps or ():
+        scoped = scope_suite_gate_to_step(step)
+        if scoped and scoped != (step.verify_cmd or "").strip():
+            changed.append((step.id, step.verify_cmd, scoped))
+            step.verify_cmd = scoped
+    return changed
+
+
 def unrunnable_gate_reason(cmd: str) -> Optional[str]:
     """Explain why *cmd* can never run at all, or None.
 
@@ -2083,7 +2211,7 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         return None
     for structural in (_interpreter_target_error, _placeholder_error,
                        _posix_idiom_error, _node_jsx_error,
-                       _tomllib_text_mode_error):
+                       _tomllib_text_mode_error, _always_fails_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2295,6 +2423,143 @@ def _ellipsis_placeholder_error(cmd: str) -> Optional[str]:
             "blank the plan never filled in, which the shell runs verbatim "
             "and rejects, so the gate can never pass whatever the step "
             "writes. Write the real command")
+
+
+def _split_top_level(text: str, operators: tuple) -> list:
+    """Split on *operators* that are not inside quotes or parentheses."""
+    parts, buf, depth, quote, i = [], [], 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in '"\'':
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0:
+            for op in operators:
+                if text.startswith(op, i):
+                    parts.append("".join(buf))
+                    buf = []
+                    i += len(op)
+                    break
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts]
+
+
+def _strip_group(text: str) -> str:
+    """Remove redundant outer parentheses.
+
+    The leading `(` must be the one the trailing `)` closes: in
+    `(A) || (B)` they are two different groups, and stripping them
+    produced the nonsense `A) || (B` and a missed detection.
+    """
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth, quote, matched = 0, None, True
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in '"\'':
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(text) - 1:
+                    matched = False
+                    break
+        if not matched or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
+_EXIT_NONZERO_RE = re.compile(
+    r"^exit\s*(?:/b\s*)?(-?\d+)\s*$", re.IGNORECASE)
+
+
+def _always_fails(cmd: str, depth: int = 0) -> bool:
+    """True when *cmd* exits non-zero whatever the artifact contains.
+
+    Decided from the shell's own operator semantics, which is why it is a
+    proof rather than a guess:
+
+      `A || B`  succeeds if either does  -> always fails iff BOTH do
+      `A && B`  runs B only if A won     -> always fails iff B does
+                (A losing already yields a non-zero status)
+      `A &  B`  sequential               -> the status is B's
+      `exit /b N` / `exit N`, N != 0     -> always fails
+
+    Anything this cannot prove returns False, so an ordinary gate is never
+    accused. Splitting on `||` before `&&` is sound under cmd.exe's equal
+    precedence and left association: if every `||` alternative always
+    fails, so does any grouping of them.
+    """
+    cmd = _strip_group(cmd)
+    if not cmd or depth > 12:
+        return False
+    alts = _split_top_level(cmd, ("||",))
+    if len(alts) > 1:
+        return all(_always_fails(a, depth + 1) for a in alts if a)
+    conj = _split_top_level(cmd, ("&&",))
+    if len(conj) > 1:
+        return _always_fails(conj[-1], depth + 1)
+    seq = [s for s in _split_top_level(cmd, ("&",)) if s]
+    if len(seq) > 1:
+        return _always_fails(seq[-1], depth + 1)
+    match = _EXIT_NONZERO_RE.match(_strip_group(cmd))
+    # `exit /b 0` is a SUCCESS path and the whole point of the advice this
+    # check gives, so the status has to be read, not just matched.
+    return bool(match) and match.group(1).lstrip("-") not in ("0", "")
+
+
+def _always_fails_error(cmd: str) -> Optional[str]:
+    """A gate whose exit status is non-zero however the code behaves.
+
+    The other structural branches catch a gate the shell cannot RUN. This
+    one runs perfectly and still cannot pass, which no existing check could
+    see. Measured 2026-09-25 on the pre-scaffolded Next.js case, twice in
+    three runs::
+
+        findstr /c:"Create Next App" app\\layout.tsx >nul && exit /b 1
+
+    The intent is "fail if the boilerplate is still there". But when the
+    text is absent - the CORRECT outcome - findstr exits 1, `&&` skips the
+    `exit`, and findstr's own 1 becomes the gate's status. Right code and
+    wrong code both fail. `observe_gate_verdict` caught it behaviourally
+    after 8 and 9 identical verdicts, having spent the turns to get there;
+    the shape is decidable before a token is spent.
+
+    The fix a planner needs is stated, because "assert a concrete value" is
+    not the advice for a command that is inverted.
+    """
+    if not cmd or not _always_fails(cmd):
+        return None
+    return ("the verify command exits non-zero whatever the code does — "
+            "every branch ends in a failure, so correct output fails it "
+            "exactly as wrong output does. A `<search> && exit /b 1` check "
+            "for forbidden text is the usual cause: when the text is "
+            "ABSENT the search itself exits 1, which becomes the gate's "
+            "status. Add an explicit success path (`... && exit /b 1 || "
+            "exit /b 0`), or assert what the code SHOULD contain instead")
 
 
 def _python_payload_error(payload: str) -> Optional[str]:

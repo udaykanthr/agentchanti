@@ -841,7 +841,15 @@ def _main_impl():
     # Handle prompt-from-file
     if args.prompt_from_file:
         try:
-            with open(args.prompt_from_file, "r", encoding="utf-8") as f:
+            # utf-8-sig, because a prompt file written by Notepad,
+            # PowerShell's `-Encoding utf8` or most Windows editors starts
+            # with a UTF-8 BOM. Read as plain utf-8 it survives as U+FEFF,
+            # which `.strip()` does NOT remove (it is not whitespace), so
+            # the task the planner reads begins with an invisible
+            # character and the acceptance seed's task fingerprint changes
+            # for two identical prompts. Measured 2026-09-27:
+            # `Task: ﻿Build a tiny thing in Python.`
+            with open(args.prompt_from_file, "r", encoding="utf-8-sig") as f:
                 args.task = f.read().strip()
         except Exception as e:
             print(f"\n  [ERROR] Could not read prompt file: {e}\n")
@@ -1204,7 +1212,10 @@ def _main_impl():
         # past it. Measured: a resume brought back, verbatim, the gate
         # that had already burned the run which wrote the checkpoint.
         from .gate_safety import neutralize_destructive_gates
-        from .plan_step import unrunnable_gate_reason
+        from .plan_step import scope_suite_gates, unrunnable_gate_reason
+        for _sid, _was, _now in scope_suite_gates(plan_steps_parsed):
+            log.info("[Plan] restored step %s: scoped its suite gate to the "
+                     "tests it writes — `%s` -> `%s`", _sid, _was, _now)
         for _sid, _was, _why in neutralize_destructive_gates(
                 plan_steps_parsed):
             log.warning(
@@ -1517,6 +1528,7 @@ def _main_impl():
                 reclassify_manifest_steps, plan_looks_truncated,
                 plan_salvageable, route_blind_edits,
                 truncated_plan_prefix, plan_continuation_note,
+                scope_suite_gates,
             )
             from .gate_safety import (
                 check_gate_safety, neutralize_destructive_gates,
@@ -1732,6 +1744,17 @@ def _main_impl():
                             "[GateSafety] step %s: dropped the destructive "
                             "tail of its verify: %s — was `%s`",
                             _sid, _why, _was)
+
+                    # A step's gate measures THAT step. A bare `unittest -q`
+                    # collects the whole directory, including the seeded
+                    # contract the step may not edit — measured at 20 of a
+                    # run's 39 turns on a step whose own tests all passed.
+                    for _sid, _was, _now in scope_suite_gates(
+                            plan_steps_parsed):
+                        log.info(
+                            "[Plan] step %s: scoped its suite gate to the "
+                            "tests it writes — `%s` -> `%s`",
+                            _sid, _was, _now)
 
                     raw_steps = steps_as_text_list(plan_steps_parsed)
                 else:
@@ -2085,7 +2108,7 @@ def _main_impl():
     # The agent-loop attempt journal is keyed by step index, so a second
     # run in the same process (library API, tests) would otherwise show a
     # step the previous run's attempts as if they were its own.
-    from .agent_loop import reset_attempt_journal
+    from .agent_loop import gate_proven_not_measuring, reset_attempt_journal
     reset_attempt_journal()
 
     # Graph of what the plan promises to build. Nodes start as `planned`
@@ -2273,6 +2296,14 @@ def _main_impl():
                          allow_source_edits=getattr(
                              cfg, "GHOST_HEAL_SOURCE_EDITS", True))
 
+    # Steps whose gate was PROVEN not to measure the artifact. Kept so the
+    # run can say so at the end: the work stands, but nothing in the plan
+    # confirmed it, which is a weaker claim than an ordinary green step.
+    # Declared here rather than below show_status(""), which
+    # test_cli_display_status pins to within 600 characters of the wave
+    # loop so a planning message cannot stay stuck on the status panel.
+    gate_defect_steps: list[tuple[int, str]] = []
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
@@ -2443,6 +2474,23 @@ def _main_impl():
             # Handle failures
             for idx, error_info in failed_steps:
                 step_text = steps[idx]
+                # A gate proven not to measure the artifact is not evidence
+                # about the artifact in EITHER direction, so its red verdict
+                # cannot be the thing that fails the run. The step's work is
+                # still judged by every later gate, the ghost's declared
+                # postconditions and the independent evidence check.
+                if gate_proven_not_measuring(error_info):
+                    log.warning(
+                        "[GateIntegrity] step %d: its gate was proven not to "
+                        "measure the artifact, so its failure says nothing "
+                        "about the code — continuing, and the step's work is "
+                        "left to the ghost's postconditions and the evidence "
+                        "check to confirm. FIX THE PLAN'S verify: LINE.",
+                        idx + 1)
+                    gate_defect_steps.append((idx, error_info))
+                    display.complete_step(idx, "done")
+                    step_results[idx] = "done"
+                    continue
                 _ps = next((s for s in plan_steps_parsed if s.index == idx), None) if plan_steps_parsed else None
                 fixed = _run_diagnosis_loop(
                     idx, step_text, error_info,
@@ -2517,10 +2565,17 @@ def _main_impl():
                     _t for _ps in (plan_steps_parsed or [])
                     if getattr(_ps, "index", None) in _later
                     for _t in (getattr(_ps, "target_files", None) or [])]
+                # The plan's own vocabulary: every symbol some step says it
+                # will export. A contract waiting on a name no step ever
+                # declared is not waiting, it is wrong.
+                _declared_exports = {
+                    _sym for _ps in (plan_steps_parsed or [])
+                    for _sym in (getattr(_ps, "exports", None) or [])}
                 _fixed = verify_contract_runs(
                     executor, os.getcwd(), llm_client, args.task,
                     identity_task=getattr(args, "_raw_task", None),
-                    pending_targets=_pending_targets)
+                    pending_targets=_pending_targets,
+                    declared_exports=_declared_exports)
                 if _fixed:
                     # The snapshot must learn the new bytes, or the repair
                     # reads downstream as "the agent edited the contract"
@@ -2804,7 +2859,10 @@ def _main_impl():
                                           verify_contract_runs)
             _fixed = verify_contract_runs(
                 executor, os.getcwd(), llm_client, args.task,
-                identity_task=getattr(args, "_raw_task", None), final=True)
+                identity_task=getattr(args, "_raw_task", None), final=True,
+                declared_exports={
+                    _sym for _ps in (plan_steps_parsed or [])
+                    for _sym in (getattr(_ps, "exports", None) or [])})
             if _fixed:
                 _rel, _new_digest = _fixed
                 _pre_existing_tests[_rel] = _new_digest
@@ -2858,6 +2916,15 @@ def _main_impl():
             log.error("Pipeline failed: require_independent_evidence is set "
                       "and nothing outside this run's own output verified it")
             pipeline_success = False
+
+    if gate_defect_steps:
+        log.warning(
+            "[GateIntegrity] %d step(s) finished with a gate that was proven "
+            "not to measure the artifact: %s. Their work was NOT confirmed by "
+            "the plan — only by the ghost's postconditions and whatever "
+            "independent evidence this run has. Fix those verify: lines.",
+            len(gate_defect_steps),
+            ", ".join(str(i + 1) for i, _ in gate_defect_steps))
 
     if pipeline_success:
         display.finish(success=True, evidence=_evidence)

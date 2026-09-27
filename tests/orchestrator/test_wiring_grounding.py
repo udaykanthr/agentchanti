@@ -50,7 +50,15 @@ class _Coder:
         self.llm_client = _LLM()
 
 
-SRC = "import json\nprint(json.loads('{}'))\n"
+# These tests are about the grounding probe and the scope guard, both of
+# which only exist on the ESCALATION path. Since the code graph now
+# answers a clean project without an LLM call, the fixture has to carry a
+# real wiring suspect — a project import that resolves to nothing — or
+# the model is never consulted and there is no prompt to assert on. The
+# premise is stated here rather than assumed.
+SRC = ("import json\n"
+       "from .helpers import missing_thing\n"
+       "print(json.loads('{}'))\n")
 
 
 def _run(coder, memory, tmp_path):

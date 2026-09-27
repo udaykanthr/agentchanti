@@ -1033,6 +1033,173 @@ only stops the outcome depending on whether it remembers to. It is told
 about the deletion in the `write_file` result, since a change to the tree
 it did not make would otherwise surface as a surprise.
 
+### A Gate That Runs Fine And Still Cannot Pass (plan_step.py `_always_fails_error`, agent_loop.py `gate_proven_not_measuring`)
+
+Every structural branch of `unrunnable_gate_reason` catches a gate the
+*shell* cannot execute. This one executes perfectly and is **logically
+inverted**, which no existing check could see. Measured 2026-09-25 on a
+pre-scaffolded Next.js task, twice in three runs:
+
+    findstr /c:"Create Next App" app\layout.tsx >nul && exit /b 1
+
+The intent is "fail if the boilerplate is still there". But when the text
+is ABSENT — the correct outcome — findstr exits 1, `&&` skips the `exit`,
+and findstr's own 1 becomes the gate's status. Correct output fails
+exactly as wrong output does.
+
+`_always_fails_error` decides it from the shell's own operator semantics,
+which makes it a proof rather than a heuristic: `A || B` always fails iff
+BOTH do, `A && B` iff B does (A losing already yields non-zero), `A & B`
+iff B does, and `exit /b N` (N≠0) always does. Anything unprovable returns
+None, so an ordinary gate is never accused. Splitting on `||` before `&&`
+is sound under cmd.exe's equal precedence and left association. Audited
+over **19,526 unique gates from 1,335 logs: 2 flagged, and both are the
+incident.**
+
+The verdict half is what decides an exit code. `observe_gate_verdict`
+trips only on repeated byte-identical failing verdicts across distinct
+artifact digests where the failure never reached the code — a proof that
+the gate's answer does not depend on what the step wrote. A failing
+measurement from an instrument known not to be measuring is not evidence
+of failure, so it can no longer fail a run: the step is marked done, the
+pipeline continues, and the work is left to the ghost's postconditions and
+the independent evidence check, with a warning naming the `verify:` lines
+to fix. Both measured runs logged `Evidence: independent` on the line
+immediately above `Pipeline failed`.
+
+A step refused **before turn 1** carries the same marker and is
+deliberately excluded (`GATE_UNSTARTED_NOTE`): the gate is defective there
+too, but nothing was built, so there is no artifact to stand on.
+
+### A Spelling Is Not A Behaviour (plan_step.py `_manifest_script_gate_reason`)
+
+`shallow_gate_reason` asks whether a gate can fail on wrong behaviour.
+This is the same question one step out. Measured 2026-09-27 on the
+`todo-node` benchmark case, twice in three runs:
+
+    node -e "const p=require('./package.json');
+             if(p.scripts.test!=='node --test')process.exit(1)"
+
+The project's script was `node --test test/todoManager.test.js` — the same
+suite, named explicitly, and arguably better. The gate stayed red over a
+correct artifact while the project's own suite was green, which
+`_enforce_monotonic_gates` reported as a GATE CONFLICT and the run failed.
+The ghost said `failed-but-clean` over 13 holding postconditions, and an
+external 11-step behavioural probe passed both artifacts. The identical
+task in Python passed 3/3, which is what made the gate — rather than the
+model or the language — the suspect.
+
+There are many correct spellings of a test script and the task named none
+of them, so the gate can only fail on a *different spelling of a correct
+command*. Only `scripts.<name>` compared against a string literal is
+flagged: a gate checking a dependency pin in requirements.txt is a real
+check, and one asserting a script merely *exists* is untouched.
+
+Deliberately **not** changed: `_enforce_monotonic_gates` still refuses to
+report success while a gate is red. Its own comment says so outright, and
+the fix for a wrong gate is the gate.
+
+### Where A Page's Content Lives (contracts/js_build_contract.mjs)
+
+Two defects in the shipped JS contract, both of which failed correct work
+because the check was shaped around the one framework in front of it.
+
+**Rendering strategy is not a defect.** The contract graded the emitted
+HTML — over 500 bytes, carrying an h1/main/header/section. Next
+prerenders, so its output holds the copy; a Vite or CRA app emits
+`<div id="root"></div>` and renders in the browser. Measured 2026-09-25
+across three runs that each produced a working responsive home page: 463
+bytes failed "too small to be a page", 637 bytes failed "no content
+regions", and 762 bytes PASSED **only because the model happened to add a
+`<noscript>` fallback** — markup that renders exactly when JavaScript does
+not. The verdict was uncorrelated with whether the app worked. It now
+judges the page when the page is server-rendered, and the **bundle's copy**
+(literal strings of three or more words, never minified identifiers) when
+the page is a shell. A shell loading nothing, or a bundle with no human
+text, still fails.
+
+**A CLI is not a broken web app.** `_seed_js_builtin` installs this
+contract for ANY JavaScript project, and it checks "the project builds and
+emits a real page". Measured 2026-09-27 on `todo-node`: a command-line
+todo manager has no build and no page, so the contract could never pass,
+all three runs reported `self-authored` where the identical task in Python
+reported `independent`, and the artifacts passed an external 11-step
+behavioural probe. A web build is now a build script **AND** a web signal
+— a framework or bundler dependency, or an index.html to build from —
+because a build script alone is not one: the measured project declared
+`"build": "node -e \"console.log('No build step required for the CLI')\""`
+purely to have one. Anything else is judged against a thin CLI/library
+floor: an entry point exists (from `bin`, `main`, or index.js), it parses
+under `node --check`, and it is a program rather than a stub.
+`node --check` runs nothing, so a CLI with side effects is never executed
+by its own acceptance check. No package.json at all is a legitimate shape
+for `node index.js` and is judged the same way.
+
+Verified on nine real artifacts: five working CLIs pass, the one that
+never wrote index.js still fails, three Vite apps are unchanged, an empty
+directory still fails, and the original `null`-page false pass — a root
+page rendering nothing beside a larger `_not-found.html` — still fails.
+
+### The Code Graph Answers Wiring First (orchestrator/wiring_graph.py)
+
+`run_wiring_verification` makes one LLM call per run asking whether the
+files are wired together. Profiled 2026-09-26 over three pre-scaffolded
+Next.js runs: **6,719 prompt tokens per run — 20.7% of the entire run** —
+answering `No wiring issues found` every time. Across every real run on
+the machine it fired 3 times in 10.
+
+Three of the four things its own docstring says it checks are decidable
+from the import/export graph the pipeline already builds: broken imports,
+default-vs-named export mismatches (`FileDeps.has_default_export`), and
+the router mount `_detect_router_mount_missing` already answers. Only
+wrong prop shapes genuinely needs a model on untyped code; on TypeScript
+`tsc --noEmit` settles even that for nothing.
+
+So the model becomes the escalation rather than the first resort. A clean
+graph skips the call; a dirty one still makes it, with **named findings**
+instead of a pile of files. That second half matters as much as the
+tokens: "here are 4 files, find problems" is the prompt shape that
+produced a rewrite calling `json.laods` and the CommonJS→ESM rewrite that
+turned a green gate red. A model asked to find problems in correct code
+will find some.
+
+The **refusal to judge** is load-bearing. A graph that cannot see the
+project is not a clean graph, and reporting one as the other is the
+mistake `empty_suite_reason` exists to prevent. No files, a language with
+no patterns, or an import resolving to no candidate path all set
+`can_judge=False` and fall through to the full check. Existence is checked
+on **disk as well as in memory**, because memory holds only what the run
+touched and a correct import of an untouched file would otherwise read as
+broken.
+
+Python relative imports are dotted **module** paths, not `./` paths. Read
+as paths, `from .models import X` resolves to `.models.py`, so every
+ordinary Python package would have been reported broken and the model sent
+to rewrite correct code — the exact false positive this gate exists to
+avoid. Caught by its own tests before it shipped.
+
+Measured after the change: the gate fired 3/3 on React (wiring 3 calls →
+**zero**), and never runs on the snake shape at all, because
+`should_run_wiring_verification` already skips it when bulk tests pass. So
+the saving is real but scoped to projects without a test suite. Total run
+cost is **not** claimed as improved: step-execution varies ±165% run to
+run on plan shape, which swamps a 20% effect at n=3.
+
+### A BOM Is Not Part Of The Task (cli.py `--prompt-from-file`)
+
+The prompt file was opened with `encoding="utf-8"`, so a UTF-8 BOM
+survives as `U+FEFF` — and `str.strip()` does not remove it, because it is
+not whitespace. Every file written by Notepad, most Windows editors, or
+PowerShell's `-Encoding utf8` starts with one. Measured 2026-09-27:
+`Task: ﻿Build a tiny thing in Python.`
+
+Not cosmetic: the task text is what the planner and intent agent read, and
+it is hashed into the acceptance seed's **task fingerprint**, so the same
+prompt saved by two different editors produces two different fingerprints
+and a seeded contract is re-seeded when it should have been reused. Read
+as `utf-8-sig`, which strips a BOM when present and is byte-identical
+otherwise.
+
 ### Key Subsystems
 
 - **Config** (`config.py`): Priority resolution: CLI args > env vars > `.agentchanti.yaml` > defaults

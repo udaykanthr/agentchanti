@@ -6304,6 +6304,36 @@ def run_wiring_verification(
         len(verification_context), list(verification_context.keys()),
     )
 
+    # ── 2b. Ask the code graph first ──────────────────────────────────────
+    # Three of the four things this check looks for are decidable from the
+    # import/export graph the pipeline already builds, and the LLM call
+    # cost 20.7% of a measured run to answer "no issues found". So the
+    # model becomes the escalation: skipped when the graph is clean, and
+    # given NAMED findings when it is not. `can_judge` False means the
+    # graph could not see enough — that is not clean, and falls through.
+    from .wiring_graph import findings_block, wiring_suspects
+    _wreport = wiring_suspects(
+        verification_context, language=language,
+        project_root=project_root or _os.getcwd(),
+        router_mismatch=_detect_router_mount_missing(memory),
+    )
+    if _wreport.clean:
+        _logger.info(
+            "[WiringVerification] code graph is clean (%s) — no LLM call",
+            _wreport.summary())
+        return True, ""
+    if _wreport.can_judge:
+        _logger.info(
+            "[WiringVerification] code graph found %d suspect(s) (%s) — "
+            "escalating to the model with named findings",
+            len(_wreport.suspects), _wreport.summary())
+        for _s in _wreport.suspects:
+            _logger.info("[WiringVerification]   %s", _s)
+    else:
+        _logger.info(
+            "[WiringVerification] code graph cannot judge (%s) — running the "
+            "full check", _wreport.summary())
+
     # ── 3. Build verification prompt ──────────────────────────────────────
     lang_tag = language or "code"
     context_block = "\n\n".join(
@@ -6353,6 +6383,7 @@ def run_wiring_verification(
         "that no URLconf in scope defines under that exact name; mind "
         "`app_name` namespacing\n"
         "  • Any other wiring issue that prevents the UI from rendering\n\n"
+        f"{findings_block(_wreport.suspects)}"
         f"Files in scope:\n{context_block}\n\n"
         "RESPONSE FORMAT:\n"
         "  • If NO issues exist, respond with exactly: NO_ISSUES_FOUND\n"

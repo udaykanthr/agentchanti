@@ -661,8 +661,11 @@ def _run_task_impl(
         # lives in both.
         try:
             from .orchestrator.acceptance_seed import verify_contract_runs
-            _fixed = verify_contract_runs(executor, os.getcwd(), llm_client,
-                                          task)
+            _fixed = verify_contract_runs(
+                executor, os.getcwd(), llm_client, task,
+                declared_exports={
+                    _sym for _ps in (plan_steps or [])
+                    for _sym in (getattr(_ps, "exports", None) or [])})
             if _fixed:
                 _rel, _new_digest = _fixed
                 _pre_existing_tests[_rel] = _new_digest
