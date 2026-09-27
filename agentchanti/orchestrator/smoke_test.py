@@ -101,6 +101,47 @@ def _is_headless_failure(output: str) -> bool:
     return any(sig.lower() in low for sig in _HEADLESS_SIGNATURES)
 
 
+# A program that dispatches on its arguments is a CLI, and a CLI started
+# with NO arguments is supposed to refuse: argparse exits 2, a hand-rolled
+# dispatcher exits 1, and both are correct behaviour rather than a crash.
+_CLI_DISPATCH_RE = re.compile(
+    r"\bimport\s+argparse\b|\bargparse\.ArgumentParser\b|\bsys\.argv\b"
+    r"|\bimport\s+click\b|\bimport\s+typer\b|\badd_subparsers\b",
+    re.IGNORECASE)
+
+
+def _is_cli_awaiting_arguments(output: str, entry: str,
+                               memory_files: dict[str, str]) -> bool:
+    """True when the 'crash' is a CLI correctly refusing an empty command.
+
+    Measured 2026-09-27 on a replayed todo-manager plan, 3 runs of 3: the
+    smoke test launched `python main.py` with no arguments, the CLI exited
+    1 exactly as the task required ("exit code 1 for an unknown command"),
+    and the smoke test called it a crash and **rewrote main.py three
+    times** trying to fix it. All three artifacts passed an external
+    11-step behavioural probe; the ghost said `failed-but-clean`.
+
+    That is the same shape as the recorded incident where a smoke "fix"
+    turned a graphical game into a silent headless one - the repair loop's
+    only tool is an edit, so it edits, whether or not anything is wrong.
+
+    A traceback is the discriminator, not the output text: the measured
+    launch printed NOTHING, so a usage-message regex would have missed it
+    entirely. An unhandled exception is still a crash and still repaired;
+    a quiet non-zero exit from a program that reads argv is not.
+    """
+    if "Traceback (most recent call last)" in (output or ""):
+        return False
+    src = (memory_files or {}).get(entry)
+    if src is None:
+        try:
+            with open(entry, "r", encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            return False
+    return bool(_CLI_DISPATCH_RE.search(src or ""))
+
+
 def _launch(executor, cmd: str) -> tuple[bool, str]:
     """Launch *cmd* in the background and classify the result.
 
@@ -895,6 +936,13 @@ def run_smoke_verification(
         if _is_headless_failure(out):
             _logger.info(
                 "[SmokeTest] No display available — skipping runtime check")
+            return True, ""
+        if _is_cli_awaiting_arguments(out, entry, memory_files):
+            _logger.info(
+                "[SmokeTest] `%s` reads its arguments and exited without a "
+                "traceback — that is a CLI refusing an empty command line, "
+                "not a crash. Skipping the runtime check rather than "
+                "editing working code.", entry)
             return True, ""
 
         _logger.warning(
