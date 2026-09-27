@@ -144,6 +144,36 @@ ESCALATION_ATTEMPT_LABEL = "escalation (stronger model)"
 # stronger model cannot satisfy an instrument that ignores the code, and
 # sending it in spends a second full turn budget to learn that again.
 GATE_STALLED_MARKER = "[gate-stalled]"
+# A step refused before turn 1 carries the stall marker too, and the two
+# cases mean opposite things to the run's verdict: one says the work
+# happened and the instrument cannot see it, the other says no work
+# happened at all.
+GATE_UNSTARTED_NOTE = "the step was never started"
+
+
+def gate_proven_not_measuring(error_info: str) -> bool:
+    """True when a gate was proven not to measure an artifact THE STEP BUILT.
+
+    `observe_gate_verdict` trips only on repeated byte-identical failing
+    verdicts across distinct artifact digests, where the failure never
+    reached the code — a proof that the gate's answer is independent of
+    what the step wrote. A failing measurement from an instrument known
+    not to be measuring is not evidence of failure, so it must not be the
+    thing that fails a run.
+
+    Measured 2026-09-25 on the pre-scaffolded Next.js case: two of three
+    runs exited 1 over home pages that build, serve 200 and have had every
+    line of Next's starter copy removed — the exact property their gates
+    were written to assert, and could not express (`findstr ... && exit
+    /b 1` exits 1 when the text is absent). Both logged `Evidence:
+    independent` on the line above `Pipeline failed`.
+
+    A step that never started is deliberately excluded: there the gate is
+    also defective, but nothing was built, so there is no artifact to
+    stand on.
+    """
+    info = error_info or ""
+    return GATE_STALLED_MARKER in info and GATE_UNSTARTED_NOTE not in info
 
 
 def record_attempt(step_idx: int, label: str, outcome: str,
@@ -885,7 +915,7 @@ def run_agent_loop(
                     step_idx + 1, _unrunnable, verify_cmd)
                 return _finish_unstarted(
                     step_idx, attempt_label, _recovery,
-                    f"{GATE_STALLED_MARKER} the step was never started: its "
+                    f"{GATE_STALLED_MARKER} {GATE_UNSTARTED_NOTE}: its "
                     f"verify command cannot run on this platform, so no "
                     f"edit could change the verdict. {_unrunnable}\n"
                     f"Gate: {verify_cmd}")

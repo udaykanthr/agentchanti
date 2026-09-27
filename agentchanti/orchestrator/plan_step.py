@@ -2157,7 +2157,7 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         return None
     for structural in (_interpreter_target_error, _placeholder_error,
                        _posix_idiom_error, _node_jsx_error,
-                       _tomllib_text_mode_error):
+                       _tomllib_text_mode_error, _always_fails_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2369,6 +2369,143 @@ def _ellipsis_placeholder_error(cmd: str) -> Optional[str]:
             "blank the plan never filled in, which the shell runs verbatim "
             "and rejects, so the gate can never pass whatever the step "
             "writes. Write the real command")
+
+
+def _split_top_level(text: str, operators: tuple) -> list:
+    """Split on *operators* that are not inside quotes or parentheses."""
+    parts, buf, depth, quote, i = [], [], 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in '"\'':
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0:
+            for op in operators:
+                if text.startswith(op, i):
+                    parts.append("".join(buf))
+                    buf = []
+                    i += len(op)
+                    break
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts]
+
+
+def _strip_group(text: str) -> str:
+    """Remove redundant outer parentheses.
+
+    The leading `(` must be the one the trailing `)` closes: in
+    `(A) || (B)` they are two different groups, and stripping them
+    produced the nonsense `A) || (B` and a missed detection.
+    """
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth, quote, matched = 0, None, True
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in '"\'':
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(text) - 1:
+                    matched = False
+                    break
+        if not matched or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
+_EXIT_NONZERO_RE = re.compile(
+    r"^exit\s*(?:/b\s*)?(-?\d+)\s*$", re.IGNORECASE)
+
+
+def _always_fails(cmd: str, depth: int = 0) -> bool:
+    """True when *cmd* exits non-zero whatever the artifact contains.
+
+    Decided from the shell's own operator semantics, which is why it is a
+    proof rather than a guess:
+
+      `A || B`  succeeds if either does  -> always fails iff BOTH do
+      `A && B`  runs B only if A won     -> always fails iff B does
+                (A losing already yields a non-zero status)
+      `A &  B`  sequential               -> the status is B's
+      `exit /b N` / `exit N`, N != 0     -> always fails
+
+    Anything this cannot prove returns False, so an ordinary gate is never
+    accused. Splitting on `||` before `&&` is sound under cmd.exe's equal
+    precedence and left association: if every `||` alternative always
+    fails, so does any grouping of them.
+    """
+    cmd = _strip_group(cmd)
+    if not cmd or depth > 12:
+        return False
+    alts = _split_top_level(cmd, ("||",))
+    if len(alts) > 1:
+        return all(_always_fails(a, depth + 1) for a in alts if a)
+    conj = _split_top_level(cmd, ("&&",))
+    if len(conj) > 1:
+        return _always_fails(conj[-1], depth + 1)
+    seq = [s for s in _split_top_level(cmd, ("&",)) if s]
+    if len(seq) > 1:
+        return _always_fails(seq[-1], depth + 1)
+    match = _EXIT_NONZERO_RE.match(_strip_group(cmd))
+    # `exit /b 0` is a SUCCESS path and the whole point of the advice this
+    # check gives, so the status has to be read, not just matched.
+    return bool(match) and match.group(1).lstrip("-") not in ("0", "")
+
+
+def _always_fails_error(cmd: str) -> Optional[str]:
+    """A gate whose exit status is non-zero however the code behaves.
+
+    The other structural branches catch a gate the shell cannot RUN. This
+    one runs perfectly and still cannot pass, which no existing check could
+    see. Measured 2026-09-25 on the pre-scaffolded Next.js case, twice in
+    three runs::
+
+        findstr /c:"Create Next App" app\\layout.tsx >nul && exit /b 1
+
+    The intent is "fail if the boilerplate is still there". But when the
+    text is absent - the CORRECT outcome - findstr exits 1, `&&` skips the
+    `exit`, and findstr's own 1 becomes the gate's status. Right code and
+    wrong code both fail. `observe_gate_verdict` caught it behaviourally
+    after 8 and 9 identical verdicts, having spent the turns to get there;
+    the shape is decidable before a token is spent.
+
+    The fix a planner needs is stated, because "assert a concrete value" is
+    not the advice for a command that is inverted.
+    """
+    if not cmd or not _always_fails(cmd):
+        return None
+    return ("the verify command exits non-zero whatever the code does — "
+            "every branch ends in a failure, so correct output fails it "
+            "exactly as wrong output does. A `<search> && exit /b 1` check "
+            "for forbidden text is the usual cause: when the text is "
+            "ABSENT the search itself exits 1, which becomes the gate's "
+            "status. Add an explicit success path (`... && exit /b 1 || "
+            "exit /b 0`), or assert what the code SHOULD contain instead")
 
 
 def _python_payload_error(payload: str) -> Optional[str]:
