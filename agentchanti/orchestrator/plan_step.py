@@ -2211,7 +2211,8 @@ def unrunnable_gate_reason(cmd: str) -> Optional[str]:
         return None
     for structural in (_interpreter_target_error, _placeholder_error,
                        _posix_idiom_error, _node_jsx_error,
-                       _tomllib_text_mode_error, _always_fails_error):
+                       _tomllib_text_mode_error, _always_fails_error,
+                       _shell_pseudo_var_error):
         reason = structural(cmd)
         if reason:
             return reason
@@ -2423,6 +2424,78 @@ def _ellipsis_placeholder_error(cmd: str) -> Optional[str]:
             "blank the plan never filled in, which the shell runs verbatim "
             "and rejects, so the gate can never pass whatever the step "
             "writes. Write the real command")
+
+
+# `CD` and `ERRORLEVEL` are cmd.exe DYNAMIC variables: `%CD%` expands on a
+# command line, but neither is ever written into the environment block a
+# child process receives unless something explicitly exports it. Read
+# through a program's environment API they are simply absent.
+_SHELL_PSEUDO_VAR_RE = re.compile(
+    r"""(?:process\.env\s*(?:\.\s*(?P<jsdot>CD|ERRORLEVEL)\b"""
+    r"""|\[\s*['"](?P<jsidx>CD|ERRORLEVEL)['"]\s*\])"""
+    r"""|os\.environ\s*\[\s*['"](?P<pyidx>CD|ERRORLEVEL)['"]\s*\]"""
+    r"""|os\.environ\.get\s*\(\s*['"](?P<pyget>CD|ERRORLEVEL)['"]"""
+    r"""|os\.getenv\s*\(\s*['"](?P<pygetenv>CD|ERRORLEVEL)['"])""")
+
+_PSEUDO_VAR_FIX = {
+    "CD": "the current directory — use `process.cwd()` in Node or "
+          "`os.getcwd()` in Python, captured BEFORE any chdir",
+    "ERRORLEVEL": "the previous command's exit status — check the status "
+                  "the call itself returns instead",
+}
+
+
+def _shell_pseudo_var_error(cmd: str) -> Optional[str]:
+    """A gate reading a shell pseudo-variable out of the environment.
+
+    Measured 2026-09-27 on the `todo-node` case, the last wrong verdict in
+    29 probed artifacts. The gate wanted the directory it was launched
+    from, so that it could chdir to a temp directory and still require the
+    module under test::
+
+        process.chdir(d);
+        const s = require(path.resolve(process.env.CD, 'todoStore.js'));
+
+    `%CD%` works on a cmd.exe command line, so it reads as if it should.
+    But cmd never puts CD in a child's environment block, agentchanti is
+    launched from Python rather than from cmd, and `_shell_free_argv`
+    deliberately bypasses cmd for a single inline script — so
+    `process.env.CD` is `undefined` and `path.resolve(undefined, ...)`
+    throws `ERR_INVALID_ARG_TYPE` before the gate can test anything.
+
+    Structurally unsatisfiable, which is the bar the other branches meet:
+    the gate fails identically whatever the step writes. Verified by
+    running the gate's own expression with CD removed from the
+    environment (exit 1, TypeError) and with `process.cwd()` in its place
+    (exit 0).
+
+    The step spent 10 turns, its recovery spent 10 more, and the run
+    ended at 167k tokens over an artifact that passes an external 11-step
+    behavioural probe.
+    """
+    if not cmd:
+        return None
+    match = _SHELL_PSEUDO_VAR_RE.search(cmd)
+    if not match:
+        return None
+    name = next(g for g in match.groups() if g)
+    # A command that EXPORTS the name first is not reading a pseudo
+    # variable — it is reading one it just created, and that works.
+    # `set "CD=%CD%" && node -e "...process.env.CD..."` is exactly the
+    # repair the agent reached for in the measured incident, and it is
+    # correct through cmd.exe. Refusing it would be a false positive on a
+    # gate that passes.
+    if re.search(rf"""(?:^|[&|;(]\s*)\s*(?:set\s+["']?|export\s+)"""
+                 rf"""{name}\s*=|(?:^|[&|;]\s*)\s*{name}=\S""",
+                 cmd, re.IGNORECASE):
+        return None
+    return (f"the verify command reads `{name}` out of the process "
+            f"environment, and it is not there: `{name}` is a cmd.exe "
+            f"dynamic variable that expands on a command line but is never "
+            f"placed in a child's environment block — and an inline script "
+            f"is run without cmd.exe at all. The read yields "
+            f"undefined/None and the gate fails whatever the step writes. "
+            f"You want {_PSEUDO_VAR_FIX[name]}")
 
 
 def _split_top_level(text: str, operators: tuple) -> list:
