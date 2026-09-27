@@ -1839,6 +1839,57 @@ def shell_level_assertion(cmd: str) -> bool:
     return bool(cmd) and bool(_SHELL_TEETH_RE.search(cmd))
 
 
+# A gate comparing a manifest's SCRIPT TEXT against a literal, e.g.
+#   node -e "const p=require('./package.json');
+#            if(p.scripts.test!=='node --test')process.exit(1)"
+_MANIFEST_SCRIPT_RE = re.compile(
+    r"""(?:scripts\s*(?:\.\s*(?P<dot>[\w-]+)|\[\s*['"](?P<idx>[\w-]+)['"]\s*\]))"""
+    r"""\s*(?:!==?|===?)\s*['"]""")
+
+
+def _manifest_script_gate_reason(cmd: str) -> Optional[str]:
+    """A gate asserting HOW a script is spelled, not that anything works.
+
+    Measured 2026-09-27 on the `todo-node` benchmark case, twice in three
+    runs::
+
+        node -e "const p=require('./package.json');
+                 if(p.scripts.test!=='node --test')process.exit(1)"
+
+    The project's script was `node --test test/todoManager.test.js` —
+    functionally the same suite, and arguably better, since it names what
+    to run. The gate stayed red over a correct artifact while the
+    project's own suite was green, which `_enforce_monotonic_gates`
+    reported as a GATE CONFLICT and the run failed. Both artifacts passed
+    an external 11-step behavioural probe; the ghost said
+    `failed-but-clean` over 13 holding postconditions.
+
+    This is exactly what `shallow_gate_reason` exists to catch, one step
+    further out: the gate cannot fail on wrong BEHAVIOUR, only on a
+    different spelling of a correct command. There are many correct ways
+    to write a test script and the task named none of them.
+
+    Asserting a manifest's content is not itself the defect — a gate
+    checking a dependency pin in requirements.txt is a real check. Only
+    `scripts.<name>` compared against a string literal is flagged, because
+    that string is an implementation detail rather than a postcondition.
+    """
+    if not cmd or "scripts" not in cmd:
+        return None
+    match = _MANIFEST_SCRIPT_RE.search(cmd)
+    if not match:
+        return None
+    name = match.group("dot") or match.group("idx") or "test"
+    return (f"the verify command asserts that package.json's "
+            f"`scripts.{name}` is spelled EXACTLY as some literal. Many "
+            f"correct spellings run the same thing (`node --test` vs "
+            f"`node --test test/x.test.js`), so this fails on a correct "
+            f"project and cannot fail on a broken one. Assert that the "
+            f"script WORKS instead — run `npm run {name}` and check its "
+            f"exit status, or assert the behaviour it is supposed to "
+            f"produce")
+
+
 def shallow_gate_reason(cmd: str) -> Optional[str]:
     """Explain why *cmd* cannot detect a behavioural defect, or None.
 
@@ -1858,6 +1909,9 @@ def shallow_gate_reason(cmd: str) -> Optional[str]:
     """
     if not cmd or not cmd.strip():
         return None
+    manifest = _manifest_script_gate_reason(cmd)
+    if manifest:
+        return manifest
     if _TEST_RUNNER_RE.search(cmd):
         return None
     if shell_level_assertion(cmd):

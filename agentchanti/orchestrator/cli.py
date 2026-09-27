@@ -841,7 +841,15 @@ def _main_impl():
     # Handle prompt-from-file
     if args.prompt_from_file:
         try:
-            with open(args.prompt_from_file, "r", encoding="utf-8") as f:
+            # utf-8-sig, because a prompt file written by Notepad,
+            # PowerShell's `-Encoding utf8` or most Windows editors starts
+            # with a UTF-8 BOM. Read as plain utf-8 it survives as U+FEFF,
+            # which `.strip()` does NOT remove (it is not whitespace), so
+            # the task the planner reads begins with an invisible
+            # character and the acceptance seed's task fingerprint changes
+            # for two identical prompts. Measured 2026-09-27:
+            # `Task: ﻿Build a tiny thing in Python.`
+            with open(args.prompt_from_file, "r", encoding="utf-8-sig") as f:
                 args.task = f.read().strip()
         except Exception as e:
             print(f"\n  [ERROR] Could not read prompt file: {e}\n")
