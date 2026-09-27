@@ -134,10 +134,13 @@ const rootFirst = [
   ...html.filter((f) => ROOT_NAMES.includes(path.basename(f).toLowerCase())),
   ...html.filter((f) => !ROOT_NAMES.includes(path.basename(f).toLowerCase())),
 ];
+let renderedFile = "";
 const rendered = (() => {
   for (const f of rootFirst) {
     try {
-      return fs.readFileSync(f, "utf8");
+      const body = fs.readFileSync(f, "utf8");
+      renderedFile = f;
+      return body;
     } catch {
       // unreadable: try the next candidate
     }
@@ -145,13 +148,7 @@ const rendered = (() => {
   return "";
 })();
 
-check(rendered.length > 500,
-      `the largest emitted page is ${rendered.length} bytes — too small to be a page`);
 check(/<body[\s>]/i.test(rendered), "the emitted page has no <body>");
-check(
-  /<(h1|main|header|section|article|nav)[\s>]/i.test(rendered),
-  "the emitted page has no content regions (h1/main/header/section/article/nav)",
-);
 
 const text = rendered
   .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -159,7 +156,70 @@ const text = rendered
   .replace(/<[^>]+>/g, " ")
   .replace(/\s+/g, " ")
   .trim();
-check(text.length > 50,
-      `the emitted page renders only ${text.length} characters of text`);
+
+// ── 4b. Where the page's content LIVES depends on the rendering strategy,
+//      and grading only the emitted HTML judged that choice rather than the
+//      app. Next prerenders, so its HTML carries the copy; a Vite/CRA SPA
+//      emits `<div id="root"></div>` and renders in the browser.
+//
+//      Measured 2026-09-25 across three runs that each produced a working
+//      responsive home page: 463 bytes failed "too small to be a page",
+//      637 bytes failed "no content regions", and the third PASSED only
+//      because the model happened to add a <noscript> fallback — markup
+//      that renders exactly when JavaScript does NOT. The verdict was
+//      uncorrelated with whether the app worked.
+//
+//      So: if the page renders server-side, judge the page. If it is a
+//      shell that loads a bundle, judge that bundle's copy. A shell that
+//      loads nothing, or a bundle with no human text in it, still fails.
+function bundleCopy(htmlFile, htmlText) {
+  if (!htmlFile) return 0;
+  const base = path.dirname(htmlFile);
+  const srcs = [...htmlText.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)]
+    .map((m) => m[1])
+    .filter((s) => !/^https?:/i.test(s));
+  let total = 0;
+  for (const src of srcs) {
+    const candidates = [
+      path.join(base, src.replace(/^\//, "")),
+      path.join(base, src),
+      path.join(app.dir, src.replace(/^\//, "")),
+    ];
+    for (const cand of candidates) {
+      let body;
+      try {
+        body = fs.readFileSync(cand, "utf8");
+      } catch {
+        continue;
+      }
+      // Literal strings of three or more words: headings, copy, labels —
+      // never minified identifiers.
+      for (const m of body.matchAll(/["'`]([^"'`<>{}\\]{12,200})["'`]/g)) {
+        if (m[1].trim().split(/\s+/).length >= 3) total += m[1].length;
+      }
+      break;
+    }
+  }
+  return total;
+}
+
+const serverRendered =
+  text.length > 50 &&
+  /<(h1|main|header|section|article|nav)[\s>]/i.test(rendered);
+
+if (serverRendered) {
+  check(rendered.length > 500,
+        `the largest emitted page is ${rendered.length} bytes — too small to be a page`);
+  check(text.length > 50,
+        `the emitted page renders only ${text.length} characters of text`);
+} else {
+  const copy = bundleCopy(renderedFile, rendered);
+  check(
+    copy > 200,
+    `the emitted page is a shell (${text.length} chars of text, no content ` +
+    `regions) and the scripts it loads carry only ${copy} characters of ` +
+    `copy — so nothing renders it either server-side or client-side`,
+  );
+}
 
 console.log(`ACCEPTANCE: ${checks} checks passed (app: ${path.relative(ROOT, app.dir) || "."})`);
