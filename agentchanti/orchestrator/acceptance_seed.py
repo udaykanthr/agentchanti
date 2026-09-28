@@ -1148,6 +1148,65 @@ BUILTIN_JS_CONTRACT = os.path.join(
     "contracts", "js_build_contract.mjs")
 
 
+BUILTIN_GO_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "contracts", "go_build_contract.py")
+
+_GO_LANGUAGES = frozenset({"go", "golang"})
+
+
+def _seed_go_builtin(identity: str, path: str) -> str | None:
+    """Install the shipped Go contract. Returns the path, or None.
+
+    `require_independent_evidence` is satisfiable three ways, and until
+    now the seeder could write a contract only for Python and JavaScript
+    — so a greenfield Go build had none of the three however well it
+    went. Measured 2026-09-28: a containerised Go run produced a todo
+    manager that passes an external 11-step behavioural probe, and exited
+    1 on the last line with "nothing outside this run's own output
+    verified it". The same defect was recorded for JavaScript before
+    `_seed_js_builtin` existed; this is its third instance, and the
+    general shape is that evidence seeding is per language and every new
+    language starts with none.
+
+    Shipped rather than generated, for the reason `_seed_js_builtin`
+    documents: four consecutive model-written JS contracts each failed a
+    correct project, in four different ways.
+
+    Written in PYTHON rather than Go on purpose. A Go file would be part
+    of the module under test — collected by `go test ./...`, built by
+    `go build ./...`, and able to break the very compilation it is meant
+    to measure. Python is already present wherever agentchanti runs, so
+    the contract observes the artifact from outside it.
+
+    A floor, not a ceiling: the module builds, a runnable command comes
+    out of it, and that command does not panic on startup. Verified
+    against four real trees — a working todo manager passes all five
+    checks, and a module that does not compile, one that panics, and an
+    empty stub each fail.
+    """
+    try:
+        with open(BUILTIN_GO_CONTRACT, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] built-in Go contract unavailable: %s",
+                    exc)
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME, exc)
+        return None
+    _remember_seed_bytes(path, _header(identity, body) + body)
+    log.info("[AcceptanceSeed] installed the built-in Go contract as %s — it "
+             "checks that the module builds and produces a command that "
+             "starts, and nothing about the task itself", SEED_BASENAME)
+    return path
+
+
 def _seed_js_builtin(identity: str, path: str) -> str | None:
     """Install the shipped Node contract. Returns the path, or None.
 
@@ -1378,6 +1437,12 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if language and language.lower() in _JS_LANGUAGES:
         return _seed_js(task, root, llm_client,
                         identity_task=identity_task)
+    if language and language.lower() in _GO_LANGUAGES:
+        identity = identity_task if (identity_task or "").strip() else task
+        path = os.path.join(root, SEED_BASENAME)
+        if not _should_seed(identity, root, path):
+            return None
+        return _seed_go_builtin(identity, path)
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)
         return None
