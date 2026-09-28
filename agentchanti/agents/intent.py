@@ -565,6 +565,18 @@ def _run_cmd(cmd: str, cwd: str | None = None) -> str:
         return f"(command failed: {exc})"
 
 
+def _evidence_block(accumulated_context: str) -> str:
+    """The investigation evidence, always appended LAST.
+
+    Kept as a module-level helper so both branches of `_build_prompt`
+    append it identically: the invariant instructions must be a byte-exact
+    prefix in every iteration, and a second copy of this string is exactly
+    how that stops being true.
+    """
+    if not accumulated_context:
+        return ""
+    return f"Evidence gathered so far:\n{accumulated_context}\n\n"
+
 class IntentAgent(Agent):
     """
     Analyzes the raw user prompt and gathers necessary context before planning.
@@ -1734,8 +1746,17 @@ class IntentAgent(Agent):
             f"User Prompt:\n{raw_task}\n\n"
         )
 
-        if accumulated_context:
-            prompt += f"Evidence gathered so far:\n{accumulated_context}\n\n"
+        # The evidence is appended LAST, after the static instructions, and
+        # that ordering is the whole point. It grows every iteration, so
+        # putting it here — ahead of ~2,582 tokens of invariant text — left
+        # successive calls sharing a common prefix of 155 characters (~38
+        # tokens). OpenAI's automatic prompt cache needs 1,024 tokens of
+        # shared prefix, so the intent loop cached nothing at all: measured
+        # 2026-09-26, 0% across every profiled run while it was the largest
+        # single phase at 27–33% of a run.
+        #
+        # Instructions-then-evidence is also the more conventional order,
+        # and leaves the evidence closest to the question being asked.
 
         if conclude:
             prompt += (
@@ -1749,7 +1770,7 @@ class IntentAgent(Agent):
                 "    NOT MODIFY. The user wants an explanation, not code edits.\n\n"
                 + self._spec_all_formats()
             )
-            return prompt
+            return prompt + _evidence_block(accumulated_context)
 
         prompt += (
             "── STEP 1: Classify the task ──────────────────────────────────────\n"
@@ -1868,7 +1889,7 @@ class IntentAgent(Agent):
             "          FIND_USAGES: SnakeBoard\n\n"
             + self._spec_all_formats()
         )
-        return prompt
+        return prompt + _evidence_block(accumulated_context)
 
     @staticmethod
     def _normalize_kb_topics(spec: str) -> str:
