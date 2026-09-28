@@ -182,9 +182,10 @@ class TestSeeding:
         assert path and path.endswith(".py")
 
     def test_an_unknown_language_is_still_skipped(self, tmp_path):
+        """Go was the example here until it gained a built-in contract."""
         client = _Client(f"```js\n{GOOD}```")
         assert seed_acceptance_tests("t", str(tmp_path), client,
-                                     language="go") is None
+                                     language="rust") is None
 
 
 class TestItIsRunnable:

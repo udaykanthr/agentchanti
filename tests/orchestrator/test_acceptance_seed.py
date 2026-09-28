@@ -79,9 +79,15 @@ def test_an_unusable_response_writes_nothing(tmp_path):
 
 
 def test_a_language_with_no_contract_is_skipped(tmp_path):
-    """Go has no seeder, so the honest answer is no file at all."""
+    """A language with no seeder writes nothing, which is the honest answer.
+
+    This used to say "go", which now HAS a built-in contract. Rust is the
+    current example; when Rust gains one, move this to the next language
+    rather than deleting the case — the rule it pins is that seeding is
+    per-language and an unsupported one must produce no file at all.
+    """
     assert seed_acceptance_tests("Build an app.", str(tmp_path),
-                                 _client(GOOD), language="go") is None
+                                 _client(GOOD), language="rust") is None
 
 
 def test_javascript_is_no_longer_skipped(tmp_path):
