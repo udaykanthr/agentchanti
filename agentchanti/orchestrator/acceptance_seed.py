@@ -1148,6 +1148,35 @@ BUILTIN_JS_CONTRACT = os.path.join(
     "contracts", "js_build_contract.mjs")
 
 
+def seedable_language(language: str | None) -> bool:
+    """Whether :func:`seed_acceptance_tests` can write a contract for it.
+
+    One source of truth, because the caller that warns "nothing can
+    satisfy `require_independent_evidence` in this run" has to agree with
+    the seeder about which languages it serves. `cli.py` hardcoded
+    ``("python", "py")`` and had already drifted twice — once when
+    JavaScript gained `_seed_js`, again when Go gained
+    `_seed_go_builtin`. A stale answer here tells a user their run cannot
+    succeed when it can, or names the wrong reason when it cannot.
+
+    ``None`` counts as seedable: language detection has not run or could
+    not decide, and the Python path is the default the seeder falls back
+    to. Claiming the flag is unsatisfiable on a guess would be worse than
+    saying nothing.
+    """
+    if not language:
+        return True
+    lang = language.lower()
+    return (lang in ("python", "py")
+            or lang in _JS_LANGUAGES
+            or lang in _GO_LANGUAGES)
+
+
+def seedable_languages_note() -> str:
+    """The supported set, for messages that have to name it."""
+    return "Python, JavaScript/TypeScript and Go"
+
+
 BUILTIN_GO_CONTRACT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "contracts", "go_build_contract.py")

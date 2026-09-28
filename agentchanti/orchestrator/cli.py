@@ -2192,9 +2192,15 @@ def _main_impl():
     # step runs, and saying so now is the whole point. Independent evidence
     # is exactly three things — user `acceptance_cmds`, a pre-existing test
     # file the run leaves alone, or a contract the seeder wrote — and the
-    # seeder is Python-only (`SEED_BASENAME` is a .py, `evidence` filters
-    # `.py`, `seed_strength` is an AST analysis). A greenfield JavaScript
-    # build therefore has none of the three, no matter how well it goes.
+    # seeder serves only some languages, so a greenfield build in any
+    # other has none of the three, no matter how well it goes.
+    #
+    # Which languages those are is asked of the seeder rather than
+    # restated here. This line said `("python", "py")` and had already
+    # drifted twice — past `_seed_js` and then `_seed_go_builtin` — so a
+    # JavaScript or Go run whose seeding failed would have been told the
+    # seeder "does not support" it and "Python only", both false, sending
+    # the reader after the wrong thing.
     #
     # Measured 2026-08-19: a run executed all 20 steps, passed every gate,
     # built clean and ran its suite green, then failed on the last line
@@ -2206,7 +2212,9 @@ def _main_impl():
     # resume from the checkpoint.
     if getattr(cfg, "REQUIRE_INDEPENDENT_EVIDENCE", False):
         _have_acc = bool(getattr(cfg, "ACCEPTANCE_CMDS", []) or [])
-        _seedable = not language or language.lower() in ("python", "py")
+        from .acceptance_seed import (seedable_language,
+                                      seedable_languages_note)
+        _seedable = seedable_language(language)
         # A pre-existing file this pipeline SEEDED is not a user's suite.
         # Counting it here would report the strong case ("someone else's
         # tests are present") for the weak one ("we wrote our own check").
@@ -2218,11 +2226,12 @@ def _main_impl():
                 "[Evidence] require_independent_evidence is set, but nothing "
                 "can satisfy it in this run: no `acceptance_cmds` are "
                 "configured, no pre-existing test file was found, and the "
-                "acceptance seeder does not support %s (Python only). The "
-                "run will do its work and then exit non-zero regardless of "
-                "the result. Add `acceptance_cmds:` to .agentchanti.yaml — "
-                "a command the agent cannot edit — or unset "
-                "`require_independent_evidence`.", language)
+                "acceptance seeder does not support %s (it writes a contract "
+                "for %s). The run will do its work and then exit non-zero "
+                "regardless of the result. Add `acceptance_cmds:` to "
+                ".agentchanti.yaml — a command the agent cannot edit — or "
+                "unset `require_independent_evidence`.",
+                language, seedable_languages_note())
         elif not _have_acc and not _user_tests:
             # Satisfiable, but only by a contract this pipeline generates.
             # That is the weakest form the flag admits: the check is a
