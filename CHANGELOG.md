@@ -6,6 +6,105 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.11.0 — 2026-09-30
+
+Benchmarked against an independent probe across five task shapes and three
+languages, 35 artifacts in all. Every artifact the pipeline produced worked;
+every defect this release fixes was in the layer that judges them. Four
+separate runs failed over applications that were correct, one rewrote three
+working programs to fix a bug that did not exist, and a whole language could
+not earn a verdict at all.
+
+### Added
+
+- **Go projects can earn independent evidence.** `require_independent_evidence`
+  is satisfiable three ways, and the seeder could write a contract only for
+  Python and JavaScript — so a greenfield Go build had none of the three
+  however well it went. Measured: a Go todo manager that passes an external
+  11-step behavioural probe exited 1 on the last line with "nothing outside
+  this run's own output verified it". The contract is shipped rather than
+  generated (zero tokens) and written in Python rather than Go on purpose: a
+  Go file would be part of the module under test, collected by
+  `go test ./...` and able to break the compilation it is meant to measure.
+  A floor, not a ceiling — the module builds, a runnable command comes out,
+  and it starts without panicking.
+
+### Fixed
+
+- **A gate that runs perfectly and can never pass is refused before a token
+  is spent.** `findstr /c:"Create Next App" app\layout.tsx >nul && exit /b 1`
+  reads as "fail if the boilerplate is still there", but when the text is
+  absent — the correct outcome — findstr exits 1, `&&` skips the `exit`, and
+  that 1 becomes the gate's status. Decided from the shell's own operator
+  semantics, so it is a proof rather than a heuristic: audited over 19,526
+  real gates, 2 flagged, and both are the incident.
+- **A gate proven not to measure the artifact can no longer fail the run.**
+  When a gate returns byte-identical failing verdicts across distinct
+  versions of the code, its answer does not depend on what the step wrote. A
+  failing measurement from an instrument known not to be measuring is not
+  evidence of failure. Both measured runs logged `Evidence: independent` on
+  the line immediately above `Pipeline failed`.
+- **A CLI refusing an empty command line is not a crashed app.** The smoke
+  test launched `python main.py` with no arguments, the CLI exited 1 exactly
+  as its task required, and the smoke test called it a crash and rewrote
+  `main.py` three times. The discriminator is a traceback, not the output
+  text — the measured launch printed nothing at all. Fixing it also cut that
+  case's tokens 29%, which is the three repair calls no longer spent on a
+  non-bug.
+- **A gate cannot read `%CD%` out of the process environment.** `CD` is a
+  cmd.exe dynamic variable: it expands on a command line and is never placed
+  in a child's environment block, and an inline script runs without cmd.exe
+  at all. `path.resolve(undefined, …)` threw before the gate could test
+  anything — 167k tokens over an artifact that passes its probe. A command
+  that exports the name first is deliberately still allowed.
+- **Where a page's content lives is a rendering choice, not a defect.** The
+  shipped JS contract graded the emitted HTML, so a Vite or CRA app serving
+  `<div id="root"></div>` failed while Next passed. Measured across three
+  working home pages: 463 bytes failed "too small", 637 failed "no content
+  regions", and 762 passed only because the model happened to add a
+  `<noscript>` fallback — markup that renders exactly when JavaScript does
+  not.
+- **A CLI is not a broken web app.** That same contract was installed into a
+  command-line project and asked whether it "builds and emits a real page".
+  A web build now needs a build script *and* a web signal, because the
+  measured project declared `"build": "node -e \"console.log('No build step
+  required')\""` purely to have one.
+- **A gate asserting how a script is spelled cannot fail on behaviour.** A
+  gate requiring `scripts.test === 'node --test'` stayed red over a project
+  whose script was `node --test test/todoManager.test.js` — the same suite,
+  named explicitly.
+- **A step's gate measures that step.** A bare `python -m unittest -q`
+  collects the whole directory, including the seeded contract the step may
+  not edit: 20 of a run's 39 turns against a contract it was never allowed
+  to fix.
+- **A missing name is not a missing module.** `cannot import name 'Game'` is
+  true of a missing module and false of a missing name; the plan's
+  `exports:` says which.
+- **A UTF-8 BOM is not part of the task.** Every prompt file written by
+  Notepad, most Windows editors, or PowerShell's `-Encoding utf8` starts with
+  one, and `str.strip()` does not remove it. It reached the planner and the
+  acceptance seed's task fingerprint.
+- **The evidence pre-flight asks the seeder which languages it serves**
+  rather than restating them, a list that had already drifted past both
+  JavaScript and Go.
+
+### Performance
+
+- **The code graph answers the wiring question before an LLM is paid.**
+  Profiled at 6,719 prompt tokens per run — 20.7% of an entire run —
+  answering "No wiring issues found" every time. Three of the four things it
+  checks are decidable from the import/export graph the pipeline already
+  builds. A clean graph skips the call; a dirty one still makes it, with
+  named findings instead of a pile of files. The refusal to judge is
+  load-bearing: a graph that cannot see the project is not a clean graph.
+- **The intent loop's invariant instructions come before its evidence.** The
+  evidence grows every iteration and sat ahead of ~2,582 tokens of fixed
+  text, leaving successive prompts sharing 38 tokens against a 1,024-token
+  cache minimum; now ~2,621. No saving is claimed: measured directly against
+  the API with a fresh prefix, `chat/completions` and `/v1/responses` both
+  write the cache on every call and never read it back, so the prompt is
+  merely eligible.
+
 ## 0.10.1 — 2026-09-25
 
 Six more live runs, six more failures over applications that worked. Three
