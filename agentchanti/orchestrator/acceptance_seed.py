@@ -1169,12 +1169,13 @@ def seedable_language(language: str | None) -> bool:
     lang = language.lower()
     return (lang in ("python", "py")
             or lang in _JS_LANGUAGES
-            or lang in _GO_LANGUAGES)
+            or lang in _GO_LANGUAGES
+            or lang in _RUST_LANGUAGES)
 
 
 def seedable_languages_note() -> str:
     """The supported set, for messages that have to name it."""
-    return "Python, JavaScript/TypeScript and Go"
+    return "Python, JavaScript/TypeScript, Go and Rust"
 
 
 BUILTIN_GO_CONTRACT = os.path.join(
@@ -1182,6 +1183,59 @@ BUILTIN_GO_CONTRACT = os.path.join(
     "contracts", "go_build_contract.py")
 
 _GO_LANGUAGES = frozenset({"go", "golang"})
+
+BUILTIN_RUST_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "contracts", "rust_build_contract.py")
+
+_RUST_LANGUAGES = frozenset({"rust", "rs"})
+
+
+def _seed_rust_builtin(identity: str, path: str) -> str | None:
+    """Install the shipped Rust contract. Returns the path, or None.
+
+    The fourth instance of one structural gap: evidence seeding is per
+    language, and every new language starts with none. Python, then
+    JavaScript, then Go, now Rust.
+
+    Shipped rather than generated for the reason `_seed_js_builtin`
+    records, and written in Python rather than Rust more strongly than for
+    Go: a Rust file placed in the crate is *compiled* — by `cargo build`
+    in `src/`, by `cargo test` in `tests/` — so a contract written in Rust
+    can break the very compilation it exists to measure, and a compile
+    error in the instrument would be reported as a defect in the artifact.
+
+    A floor, not a ceiling: the crate declares itself, it builds, a
+    runnable command comes out, that command starts without panicking, and
+    there is more than a stub's worth of source.
+
+    Two refusals are carried over deliberately. A non-zero exit is not a
+    crash — only a Rust panic is — because a CLI with no arguments is
+    supposed to refuse. And a build that could not reach crates.io
+    **skips**: Rust fetches a registry on every clean build where Go's
+    stdlib JSON needed nothing, so an unreachable registry is the
+    instrument being unavailable, never the code being wrong.
+    """
+    try:
+        with open(BUILTIN_RUST_CONTRACT, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] built-in Rust contract unavailable: %s",
+                    exc)
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME, exc)
+        return None
+    _remember_seed_bytes(path, _header(identity, body) + body)
+    log.info("[AcceptanceSeed] installed the built-in Rust contract as %s — "
+             "it checks that the crate builds and produces a command that "
+             "starts, and nothing about the task itself", SEED_BASENAME)
+    return path
 
 
 def _seed_go_builtin(identity: str, path: str) -> str | None:
@@ -1466,11 +1520,13 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if language and language.lower() in _JS_LANGUAGES:
         return _seed_js(task, root, llm_client,
                         identity_task=identity_task)
-    if language and language.lower() in _GO_LANGUAGES:
+    if language and language.lower() in (_GO_LANGUAGES | _RUST_LANGUAGES):
         identity = identity_task if (identity_task or "").strip() else task
         path = os.path.join(root, SEED_BASENAME)
         if not _should_seed(identity, root, path):
             return None
+        if language.lower() in _RUST_LANGUAGES:
+            return _seed_rust_builtin(identity, path)
         return _seed_go_builtin(identity, path)
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)
