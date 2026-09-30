@@ -430,7 +430,19 @@ def _suite_kind(root: Path):
         return "go"
     if (root / "package.json").is_file():
         return "node"
-    if (root / "main.py").is_file() or any(root.glob("*.py")):
+    # C source with no build file at all — the project is broken, but it is
+    # still a C project, and answering "python" here reports the wrong
+    # instrument as unavailable instead of the real defect.
+    if any(root.rglob("*.c")) or any(root.rglob("*.cpp")):
+        return "c"
+    # The seeded acceptance contract is a .py the HARNESS wrote, not the
+    # project's own code, so it cannot make a project Python. Measured
+    # 2026-09-30: a C artifact with no Makefile held exactly one .py —
+    # `test_acceptance_contract.py` — and was reported as
+    # `G2=UNKNOWN pytest unavailable`, which says nothing true about it.
+    own = [p for p in root.glob("*.py")
+           if p.name != "test_acceptance_contract.py"]
+    if (root / "main.py").is_file() or own:
         return "python"
     return None
 
