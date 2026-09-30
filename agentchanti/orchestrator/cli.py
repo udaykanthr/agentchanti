@@ -2313,6 +2313,38 @@ def _main_impl():
     # loop so a planning message cannot stay stuck on the status panel.
     gate_defect_steps: list[tuple[int, str]] = []
 
+    def _gate_defect_continue(idx: int, error_info: str) -> bool:
+        """Record a step whose gate cannot measure it, and treat it as done.
+
+        Shared by BOTH failure paths, because there are two and the first
+        release of this guarded only one. `_main_impl` reaches
+        `_run_diagnosis_loop` from the sequential path and from the wave
+        path, and only the wave path was intercepted — so a stalled gate
+        on the sequential path still failed the step and halted the run.
+
+        Measured 2026-09-30, a C benchmark run: the plan's gate carried
+        Makefile escaping into a shell (`d=$$(mktemp -d)`, where `$$` is
+        the PID), `GateIntegrity` correctly reported "gate STALLED — 3
+        identical failing verdicts over 2 different versions of the code",
+        recovery was correctly skipped — and the pipeline stopped at step
+        3 of 5 anyway, with 37 of 43 postconditions never evaluated. The
+        same shape as `phantom_root_manifest_reason`: a guard is only as
+        strong as the weakest path that reaches the thing it guards.
+        """
+        if not gate_proven_not_measuring(error_info):
+            return False
+        log.warning(
+            "[GateIntegrity] step %d: its gate was proven not to "
+            "measure the artifact, so its failure says nothing "
+            "about the code — continuing, and the step's work is "
+            "left to the ghost's postconditions and the evidence "
+            "check to confirm. FIX THE PLAN'S verify: LINE.",
+            idx + 1)
+        gate_defect_steps.append((idx, error_info))
+        display.complete_step(idx, "done")
+        step_results[idx] = "done"
+        return True
+
     # Clear any lingering planning/analysis status message before execution
     # starts. Without this, "Requesting steps from planner...", "Analysing
     # project...", etc. stay pinned to the STATUS panel for the entire run
@@ -2390,6 +2422,18 @@ def _main_impl():
                     log.error(f"Budget exceeded (${token_tracker.total_cost:.4f}). Halting.")
                     pipeline_success = False
                     break
+            elif _gate_defect_continue(idx, error_info):
+                # A gate proven not to measure the artifact is not evidence
+                # in EITHER direction, so its red verdict cannot halt the
+                # run. Same rule as the wave path below, same helper, so
+                # the two cannot drift apart again.
+                ds = {"elapsed": time.monotonic() - display.start_time,
+                      "steps": display.steps}
+                save_checkpoint(checkpoint_file, args.task, steps, idx,
+                                memory.as_dict(), step_results, language,
+                                display_state=ds,
+                                plan_steps=plan_steps_parsed,
+                                project_context=project_context)
             else:
                 # Diagnosis loop
                 fixed = _run_diagnosis_loop(
@@ -2488,17 +2532,7 @@ def _main_impl():
                 # cannot be the thing that fails the run. The step's work is
                 # still judged by every later gate, the ghost's declared
                 # postconditions and the independent evidence check.
-                if gate_proven_not_measuring(error_info):
-                    log.warning(
-                        "[GateIntegrity] step %d: its gate was proven not to "
-                        "measure the artifact, so its failure says nothing "
-                        "about the code — continuing, and the step's work is "
-                        "left to the ghost's postconditions and the evidence "
-                        "check to confirm. FIX THE PLAN'S verify: LINE.",
-                        idx + 1)
-                    gate_defect_steps.append((idx, error_info))
-                    display.complete_step(idx, "done")
-                    step_results[idx] = "done"
+                if _gate_defect_continue(idx, error_info):
                     continue
                 _ps = next((s for s in plan_steps_parsed if s.index == idx), None) if plan_steps_parsed else None
                 fixed = _run_diagnosis_loop(
