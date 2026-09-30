@@ -106,6 +106,36 @@ truth for the first time, at 897.2s.
 
 `benchmarks/verify_dt_invariance.py <project-dir>` is an independent ground-truth check for generated tile-maze games: it drives the game at several timestep profiles and asserts no entity ever occupies a wall tile, catching games that only hold together at a fixed 1/60 dt. Exit codes are **0 PASS, 1 FAIL, 2 could-not-verify** — the third is deliberate, because generated projects share no vocabulary and a refusal must never be recorded as a failure.
 
+`benchmarks/verify_todo_cli.py <project-dir>` is the same idea for the
+todo-CLI task, and **one probe for every language** — Python, JavaScript,
+Go, Rust, Java, C/C++. That is the point: a per-language probe confounds
+task with language, so nothing could say whether a difference came from
+the language or the job. It asserts behaviour rather than startup: each of
+eleven steps is a fresh process, so state that does not persist to disk
+fails, and a wrong exit code on an out-of-range index fails. Everything
+runs in a copy, so an existing `todos.json` cannot pre-seed the result.
+Two gates are reported separately and only the first decides the exit
+code — G1 is the contract neither agent wrote, G2 is the project's own
+suite, recorded rather than trusted, the same demotion `evidence.py`
+applies to a seeded contract.
+
+Every refusal in it was a **measured false verdict**, which is why
+`verify_todo_cli_selftest.py` exists and runs first: a probe that has
+never passed a correct program and never failed a broken one is not
+evidence. A build gets its own timeout, because two correct Maven projects
+were reported `FAIL — timed out` against a cap meant for a `todo add milk`
+invocation, and they build in 36s and 38s. A `todo` wrapper the project
+ships outranks the per-language guess, because one artifact's build copies
+its dependencies rather than shading them, so `java -jar` could never run
+it and an entirely correct project failed 11/11. `mvn -q` was suppressing
+the very `Tests run:` lines the check parses, so a project with **zero
+tests** exited 0 with no output and was graded PASS — the
+`empty_suite_reason` mistake, committed by the instrument grading
+agentchanti for it; a green exit now requires evidence that something ran,
+in Go and Node too. And C source with no Makefile is a definite FAIL
+rather than undecidable, because the task states the project MUST build
+with a single `make`.
+
 ### Plan Re-plan Gate Carry-Forward (plan_step.py)
 
 A weak `verify:` sends the plan back to the planner, but a re-plan regenerates *every* step — and a planner asked to strengthen step 4's gate has no reason to preserve the strength of step 3's. `repair_verify_commands` exists to avoid the re-plan entirely by rewriting only the offending line; `carry_forward_strong_gates` covers what happens when that repair yields nothing and the re-plan runs anyway.
