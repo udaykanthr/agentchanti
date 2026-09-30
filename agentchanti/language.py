@@ -146,6 +146,29 @@ _TASK_KEYWORDS = {
     "ruby":       ["ruby", "rails", "sinatra", "rspec", "bundler"],
     "csharp":     ["c#", "csharp", "dotnet", ".net", "asp.net"],
     "cpp":        ["c++", "cpp", "cmake"],
+    # C is phrases, never a bare "c", and it comes AFTER csharp and cpp.
+    #
+    # Both halves are load-bearing. `detect_language_from_task` outranks
+    # `detect_language()` — the function that reads the files actually on
+    # disk — so a false positive here picks the wrong baseline command and
+    # the wrong contract for a project sitting right there. That is exactly
+    # what `gin` inside "chan-gin-g" cost a Pygame run.
+    #
+    # Surveyed 2026-09-30 over fifteen realistic prompts: whole-token `c`
+    # correctly matched the four genuine C tasks and also matched "vitamin
+    # c", "plan c" and "option c" — three false positives, far worse than
+    # the single one the whole-token fix was accepted with. Every phrase
+    # below is unambiguous in a coding task.
+    #
+    # Ordering settles the overlap rather than the patterns: "in c" matches
+    # "in c++" too, because the boundary rule treats `+` as a boundary, so
+    # cpp and csharp are consulted first and win on their own keywords.
+    # `tests/test_language_c.py` pins that, since insertion order is the
+    # only thing keeping it true.
+    "c":          ["c99", "c11", "c17", "c23", "ansi c", "gcc", "clang",
+                   "in c", "c program", "c code", "c source", "c library",
+                   "c compiler", "c header", "written in c", "pure c",
+                   "plain c", "c standard library", "libc"],
 }
 
 _LANGUAGE_NAMES = {

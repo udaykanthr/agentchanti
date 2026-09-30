@@ -87,7 +87,7 @@ def test_a_language_with_no_contract_is_skipped(tmp_path):
     is per-language and an unsupported one must produce no file at all.
     """
     assert seed_acceptance_tests("Build an app.", str(tmp_path),
-                                 _client(GOOD), language="cpp") is None
+                                 _client(GOOD), language="ruby") is None
 
 
 def test_javascript_is_no_longer_skipped(tmp_path):
