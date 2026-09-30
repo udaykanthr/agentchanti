@@ -522,6 +522,150 @@ class JavaBackend(LanguageBackend):
         return ["pom.xml", "build.gradle", "build.gradle.kts"]
 
 
+class CBackend(LanguageBackend):
+    """C, where there is no default test runner to name.
+
+    Every other backend here names a framework the ecosystem agrees on:
+    pytest, jest, `go test`, `cargo test`, Surefire. C has none — Unity,
+    CMocka, Criterion and Check all exist and none is standard, and each
+    would need an install this project cannot assume.
+
+    So the runner is the project's own `make test` target, which is the
+    same answer `verify_cmd_for_language` gives for C and the same reason:
+    a declared target is the one thing that says what "the tests pass"
+    means here. That keeps the generated suite runnable with nothing
+    installed, which is what a dependency-free language should cost.
+
+    Before this existed, `get_backend("c")` fell through to the Python
+    backend, so the TesterAgent was told to write pytest for a C project
+    and `TEST_FRAMEWORKS` handed it `python -m pytest`.
+    """
+
+    language = "c"
+    display_name = "C"
+    _source_ext = ".c"
+    _compiler = "cc"
+
+    def get_test_framework(self, test_runner=None) -> dict:
+        return {
+            "command": "make test",
+            "dir": "tests",
+            "ext": self._source_ext,
+            "prefix": "test_",
+            "config_note": (
+                "There is no standard C test framework, so do NOT add one. "
+                "Write a plain program with a `main` that exercises the code "
+                "and returns non-zero on the first failure, and add a `test` "
+                "target to the Makefile that builds and runs it. "
+                "`make test` must be the whole command."
+            ),
+        }
+
+    def get_coder_rules(self) -> str:
+        return (
+            "- Check every allocation and every return value that can fail.\n"
+            "- Free what you allocate; a leak in a long-running loop is a "
+            "defect.\n"
+            "- Use `snprintf` over `sprintf` and bound every copy into a "
+            "fixed buffer.\n"
+            "- Include the header that declares what you use: `SIZE_MAX` "
+            "needs <stdint.h>, not <limits.h>.\n"
+        )
+
+    def get_test_rules(self, test_runner=None, env_info=None) -> str:
+        return (
+            "- The suite is a program, not a framework: a `main` that runs "
+            "the checks and returns non-zero on the first failure.\n"
+            "- Add a `test` target to the Makefile that builds AND runs it, "
+            "so `make test` is the entire command.\n"
+            "- Print a line naming what passed. A runner that prints nothing "
+            "cannot be distinguished from one that collected no tests.\n"
+            "- Do not add a third-party test framework; it would need an "
+            "install the build cannot assume.\n"
+            "- Exercise the behaviour through the same entry points a user "
+            "does, not through copies of the implementation.\n"
+        )
+
+    def extract_imports(self, content: str) -> list[str]:
+        """Both forms of include; the quoted ones are the project's own."""
+        return [m.group(1) for m in
+                re.finditer(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]',
+                            content, re.MULTILINE)]
+
+    def extract_exports(self, content: str) -> list[str]:
+        """Function and type definitions at file scope.
+
+        Deliberately not a parser — there is none here — so this reads the
+        shapes that occur: a definition whose line starts at column 0 and
+        whose body opens on the same line, plus typedefs. A declaration
+        ending in `;` is not a definition and is excluded.
+        """
+        exports = []
+        # A `static` function has INTERNAL linkage and is not an export.
+        # Listing one would make `find_gaps` report it as an export nothing
+        # imports — forever, since nothing outside the file can import it.
+        # The return type may carry `::`, `<...>`, `&` and `,` — that is
+        # most of C++ (`std::string`, `std::map<int, int>`, `const T&`) and
+        # costs C nothing, since C has none of them. Without this the C++
+        # backend returned no exports at all for an ordinary function.
+        for m in re.finditer(
+                r"^(?!\s*static\b)[A-Za-z_][\w \t*:<>&,]*?\b(\w+)\s*"
+                r"\([^;]*?\)\s*(?:const\s*)?\{",
+                content, re.MULTILINE):
+            exports.append(m.group(1))
+        # Two typedef shapes. The common one has a braced body containing
+        # its own semicolons, which is why it needs its own pattern rather
+        # than a `[^;]` scan. Nested braces are not handled, and a struct
+        # field list rarely has them.
+        #   typedef struct { int x; } Task;   -> Task
+        #   typedef unsigned long handle_t;   -> handle_t
+        for m in re.finditer(r"^\s*typedef\s+(?:struct|union|enum)\b[^{;]*"
+                             r"\{[^{}]*\}\s*(\w+)\s*;", content,
+                             re.MULTILINE | re.DOTALL):
+            exports.append(m.group(1))
+        for m in re.finditer(r"^\s*typedef\s+[^;{}]*?\b(\w+)\s*;",
+                             content, re.MULTILINE):
+            exports.append(m.group(1))
+        return [e for e in exports if e not in ("if", "for", "while",
+                                                "switch", "return", "sizeof")]
+
+    def get_config_candidates(self) -> list[str]:
+        return ["Makefile", "makefile", "GNUmakefile", "CMakeLists.txt"]
+
+    def get_config_fix_prompt(self, test_cmd: str) -> str:
+        return (
+            f"Fix the C build configuration so `{test_cmd}` runs the tests. "
+            "The Makefile must declare a `test` target that builds and runs "
+            "the test program. Do not introduce a third-party test "
+            "framework.\n"
+            "Return corrected files using #### [FILE]: format."
+        )
+
+
+class CppBackend(CBackend):
+    """C++, which shares every reason C has for not naming a framework.
+
+    GoogleTest and Catch2 are more established than C's options, and both
+    still need fetching — so the same `make test` answer holds, and the
+    only differences are the extension and the compiler.
+    """
+
+    language = "cpp"
+    display_name = "C++"
+    _source_ext = ".cpp"
+    _compiler = "g++"
+
+    def get_coder_rules(self) -> str:
+        return (
+            "- Prefer the standard library's containers and strings to raw "
+            "arrays and manual allocation.\n"
+            "- Use RAII; if you write `new`, justify why a smart pointer or "
+            "a value will not do.\n"
+            "- Include what you use: <string>, <vector>, <fstream> are not "
+            "transitively guaranteed.\n"
+        )
+
+
 class RubyBackend(LanguageBackend):
     language = "ruby"
     display_name = "Ruby"
@@ -716,7 +860,7 @@ class KotlinBackend(LanguageBackend):
 
 _BUILTIN_BACKENDS: list[type[LanguageBackend]] = [
     PythonBackend, JavaScriptBackend, TypeScriptBackend,
-    GoBackend, RustBackend, JavaBackend, RubyBackend,
+    GoBackend, RustBackend, JavaBackend, CBackend, CppBackend, RubyBackend,
     CSharpBackend, PHPBackend, SwiftBackend, KotlinBackend,
 ]
 

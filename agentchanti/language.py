@@ -129,6 +129,45 @@ TEST_FRAMEWORKS = {
         "prefix": "",
         "suffix": "_spec",
     },
+    # C and C++ name no framework, because neither ecosystem has a standard
+    # one: Unity, CMocka, Criterion, Check, GoogleTest and Catch2 all exist
+    # and every one of them needs an install this project cannot assume. So
+    # the runner is the project's own `make test` target, which is also
+    # what `verify_cmd_for_language` answers for C and for the same reason
+    # — a declared target is the one thing that says what "the tests pass"
+    # means here.
+    #
+    # These MUST match CBackend/CppBackend. `get_test_framework` prefers
+    # the backend, but `test_analyzer` reads this dict directly, so a C
+    # project got `python -m pytest` from one reader and nothing from the
+    # other. tests/test_language_c.py pins that the two agree for every
+    # language, which is an invariant the other seven already satisfied.
+    "c": {
+        "command": "make test",
+        "dir": "tests",
+        "ext": ".c",
+        "prefix": "test_",
+        "config_note": (
+            "There is no standard C test framework, so do NOT add one. "
+            "Write a plain program with a `main` that exercises the code "
+            "and returns non-zero on the first failure, and add a `test` "
+            "target to the Makefile that builds and runs it. "
+            "`make test` must be the whole command."
+        ),
+    },
+    "cpp": {
+        "command": "make test",
+        "dir": "tests",
+        "ext": ".cpp",
+        "prefix": "test_",
+        "config_note": (
+            "There is no standard C++ test framework available without an "
+            "install, so do NOT add one. Write a plain program with a "
+            "`main` that exercises the code and returns non-zero on the "
+            "first failure, and add a `test` target to the Makefile that "
+            "builds and runs it. `make test` must be the whole command."
+        ),
+    },
 }
 
 
