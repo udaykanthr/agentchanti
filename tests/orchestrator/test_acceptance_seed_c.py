@@ -557,3 +557,93 @@ class TestWhichCommandGetsRun:
         assert self.mod._program_kind(tmp_path / "b") == "binary"
         assert self.mod._program_kind(tmp_path / "s") == "script"
         assert self.mod._program_kind(tmp_path / "t") is None
+
+
+class TestALibraryIsNotACommand:
+    """A C project with no `main` is a library, and demanding an
+    executable of it would fail a perfectly good one.
+
+    The Rust contract draws this line with `src/main.rs`; C has no such
+    marker, so the source is what says it.
+    """
+
+    def _declares_main(self, project):
+        mod = _contract()
+        cls = mod.CBuildContract
+        cls.project = project
+        return cls("test_it_produces_an_executable")._declares_a_main()
+
+    @pytest.mark.parametrize("body", [
+        "int main(void) { return 0; }",
+        "int main(int argc, char **argv) { return 0; }",
+        "void main() {}",
+        "  int  main ( void ) { return 0; }",
+    ])
+    def test_a_program_is_recognised(self, tmp_path, body):
+        (tmp_path / "main.c").write_text(body)
+        assert self._declares_main(tmp_path) is True
+
+    def test_a_library_has_no_main(self, tmp_path):
+        (tmp_path / "todo.c").write_text(
+            "int todo_add(const char *t) { return 0; }\n")
+        (tmp_path / "todo.h").write_text("int todo_add(const char *t);\n")
+        assert self._declares_main(tmp_path) is False
+
+    def test_a_main_in_a_test_directory_does_not_count(self, tmp_path):
+        """A test harness often has its own main; that does not make the
+        project a command."""
+        (tmp_path / "todo.c").write_text("int todo_add(void) { return 0; }\n")
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "run.c").write_text("int main(void) { return 0; }\n")
+        assert self._declares_main(tmp_path) is False
+
+    def test_a_call_to_main_is_not_a_definition(self, tmp_path):
+        """`return main(argc, argv);` mid-line is a call, not a definition
+        — only a line that STARTS with the return type declares one."""
+        (tmp_path / "todo.c").write_text(
+            "int wrapper(int a, char **b) { return main(a, b); }\n")
+        assert self._declares_main(tmp_path) is False
+
+
+class TestTheLibrarySkipActuallyHappens:
+    """Testing `_declares_a_main` is not testing what it guards.
+
+    A mutation run said so: deleting the `if not self._declares_a_main()`
+    branch left every test green, because they all called the helper
+    directly and none ran the check it protects. This runs the real test
+    method with the build stubbed out, so no compiler is needed.
+    """
+
+    def _run(self, project):
+        import unittest
+
+        mod = _contract()
+        mod.ROOT = project
+        cls = mod.CBuildContract
+        # The build is not what is under test here, and stubbing it keeps
+        # this runnable on a machine with no toolchain (CI included).
+        cls._build = lambda self: (0, "")
+        cls.label = "make"
+        suite = unittest.TestSuite()
+        suite.addTest(cls("test_it_produces_an_executable"))
+        result = unittest.TestResult()
+        suite.run(result)
+        return result
+
+    def test_a_library_skips_rather_than_fails(self, tmp_path):
+        (tmp_path / "Makefile").write_text("lib:\n\tar rcs libtodo.a todo.o\n")
+        (tmp_path / "todo.c").write_text("int todo_add(void){return 0;}\n")
+        result = self._run(tmp_path)
+        assert result.failures == [], result.failures
+        assert len(result.skipped) == 1
+        assert "library, not a command" in result.skipped[0][1]
+
+    def test_a_program_that_built_nothing_still_fails(self, tmp_path):
+        """The other half: the skip must not swallow a real miss."""
+        (tmp_path / "Makefile").write_text("todo:\n\t@echo nothing\n")
+        (tmp_path / "main.c").write_text("int main(void){return 0;}\n")
+        result = self._run(tmp_path)
+        assert result.skipped == [], result.skipped
+        assert len(result.failures) == 1
+        assert "no executable" in result.failures[0][1]

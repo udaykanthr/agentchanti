@@ -418,10 +418,40 @@ class CBuildContract(unittest.TestCase):
         self.assertEqual(code, 0,
                          f"the {self.label} build failed:\n{out[-1500:]}")
 
+    def _declares_a_main(self):
+        """Whether any non-test source defines `main`.
+
+        A C project with no `main` is a library, and demanding an
+        executable of it would fail a perfectly good one. The Rust
+        contract draws the same line with `src/main.rs`; C has no such
+        marker, so the source is what says it.
+
+        Read as text rather than parsed: there is no C parser here, and
+        the alternative — assuming every project is a program — is the
+        failure this exists to prevent. `int main(` in a comment is a
+        false positive that costs nothing, since it only means the
+        executable checks run and then find one.
+        """
+        for path in self.project.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in SOURCE_EXT:
+                continue
+            if set(path.parts) & (SKIP | _TEST_DIRS):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if re.search(r"(?m)^\s*(?:int|void)\s+main\s*\(", text):
+                return True
+        return False
+
     def test_it_produces_an_executable(self):
         code, _out = self._build()
         if code != 0:
             self.skipTest("the project does not build, already reported")
+        if not self._declares_a_main():
+            self.skipTest("no source defines main() — this project is a "
+                          "library, not a command")
         self.assertTrue(
             self._commands(),
             f"the {self.label} build succeeded but there is no executable "
