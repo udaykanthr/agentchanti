@@ -239,7 +239,7 @@ Not addressed: the agent reaching for `winget` / Build Tools at all, and rebuild
 
 ### Unsatisfiable Evidence Policy (cli.py)
 
-`require_independent_evidence: true` can be decided **before the first step runs**. Independent evidence is exactly three things — user `acceptance_cmds`, a pre-existing test file the run leaves byte-identical, or a contract the seeder wrote — and the seeder is Python-only end to end (`SEED_BASENAME` is a `.py`, `evidence` filters `.py`, `seed_strength` is an `ast` analysis). A greenfield JavaScript build therefore has none of the three no matter how well it goes.
+`require_independent_evidence: true` can be decided **before the first step runs**. Independent evidence is exactly three things — user `acceptance_cmds`, a pre-existing test file the run leaves byte-identical, or a contract the seeder wrote — and the seeder was, when this was measured, Python-only end to end (`SEED_BASENAME` is a `.py`, `evidence` filters `.py`, `seed_strength` is an `ast` analysis). A greenfield JavaScript build therefore had none of the three no matter how well it went. The served set has since grown five times — JavaScript, Go, Rust, Java, C/C++ — and `seedable_language()` is the single source of truth the pre-flight now asks, precisely so this warning cannot go stale again.
 
 Measured 2026-08-19: a run executed all 20 steps, passed every gate, built clean and ran its own suite green, then exited non-zero on the last line with *"nothing outside this run's own output verified it"* — 691k tokens to reach a verdict that was already fixed at startup, phrased so it reads as the model's failure. The condition is now checked once the language, the config and the pre-existing snapshot are all known, and says what would satisfy it. Warned rather than refused: the artifacts are still worth having, and `acceptance_cmds` can be added and the run resumed from its checkpoint.
 
@@ -1139,6 +1139,97 @@ Verified on nine real artifacts: five working CLIs pass, the one that
 never wrote index.js still fails, three Vite apps are unchanged, an empty
 directory still fails, and the original `null`-page false pass — a root
 page rendering nothing beside a larger `_not-found.html` — still fails.
+
+### A Language With No Manifest (contracts/c_build_contract.py, language.py)
+
+The sixth instance of one structural gap: evidence seeding is per
+language, and every new language starts with none. Python, then
+JavaScript, then Go, then Rust, then Java, now C and C++. Until this
+existed a greenfield C build could satisfy
+`require_independent_evidence` no way at all, however well it went.
+
+C is the first of the six with **no manifest**. Go has `go.mod`, Rust
+`Cargo.toml`, Java `pom.xml`, and each of those contracts opens by asking
+the manifest what the project is. C's nearest equivalent is a build
+system, which says *how to build* and never *what the project is*. Three
+consequences, each of which is a check:
+
+**A project with no build system is skipped, not judged.** Inventing the
+build is how a missing `-lm` gets reported as a defect in the code. One
+translation unit is the exception, because `cc main.c -o a` is the only
+reading there is; at two, the link order, the include paths and the
+libraries are the build system's decisions.
+
+**The binary's name is asked, never guessed.** A Makefile emits whatever
+its author chose, so the contract reads the tree. CMake's own `cmTC_*`
+probe binaries are excluded — they compile and run fine and are not the
+project.
+
+**A crash is a signal.** Rust prints `thread panicked`, Java `Exception in
+thread "main"`, Go `goroutine 1 [running]`; C prints nothing and dies on
+SIGSEGV or SIGABRT. `_died_on_a_signal` reads a negative returncode on
+POSIX and an NTSTATUS on Windows. The refusal every sibling carries
+matters more here: **a non-zero exit is not a crash**, because a CLI with
+no arguments is supposed to refuse.
+
+Two defects were found by *running* the contract rather than reasoning
+about it, and both failed a correct project.
+
+**The execute bit is not evidence.** `_executables` trusted
+`os.access(X_OK)`. On a Windows bind mount every file reports mode 777, so
+`Makefile`, `main.c` and `store.h` were all "executable" — and `Makefile`
+sorts before `todo`, so the crash check ran the **Makefile**, got an
+exec-format error, and read that as "did not crash". A segfaulting program
+passed. The same holds on any FAT, exFAT or CIFS mount and on a checkout
+made with an odd umask. `_looks_like_a_program` reads ELF, PE and Mach-O
+magic, or a `#!` line, which needs no cooperation from the filesystem. The
+extension exclusions stay and now earn their place on exactly one input: a
+`.so` genuinely **is** an ELF image, so magic bytes alone would admit it.
+
+**An incremental build is not a missing one.** The first cut required an
+executable *new since before the build*. `make` is incremental, so a
+project whose binary is already up to date rebuilds nothing and was
+reported as "the build succeeded but left no new executable" — the normal
+case, not an edge one, since agentchanti runs the build itself during the
+run. Measured on the first live C benchmark: a working todo manager, and
+the run's own contract reported `FAILED (failures=1, skipped=1)`. Existence
+after a *successful* build is the right test, sound because
+`test_the_project_builds` runs first and everything downstream skips when
+it fails.
+
+**C was also absent from task detection**, which would have defeated the
+whole feature. `_TASK_KEYWORDS` had a `cpp` entry and no `c` one, so
+`detect_language_from_task("Build a todo manager in C")` returned None —
+and in an empty greenfield directory `detect_language()` returns None too,
+which the seeder treats as "fall back to Python". A C task would have been
+handed a **Python** contract. Measured live before the fix, the run
+recovered only by spending an LLM call on `[LangDetect] LLM identified
+language: c`.
+
+C is matched by **phrases, never a bare `c`**, and declared **after**
+`csharp` and `cpp`. Both halves are load-bearing. Task detection outranks
+`detect_language()`, the function that reads the files actually on disk, so
+a false positive picks the wrong language for a project sitting right there
+— what `gin` inside "chan*gin*g" cost a Pygame run. Surveyed over fifteen
+realistic prompts, a whole-token bare `c` matched the four genuine C tasks
+and also "vitamin c", "plan c" and "option c". Ordering settles the
+overlap, since `in c` matches `in c++` as well (the boundary rule treats
+`+` as a boundary), and a test pins the ordering because insertion order is
+the only thing keeping it true.
+
+Validated by 16 mutants of the contract's own logic, all caught. Two of
+those mutants only became catchable once the tests were written properly:
+the stub threshold had **no unit coverage** (replacing 400 with -1 left
+every test green, so it was validated by container fixtures alone), and the
+source-extension guard was untestable until a case existed where it and the
+magic check overlap — a `.c` file whose first line is a shebang. Eight real
+trees run against a real toolchain in a `gcc:13` container behave
+correctly, including the segfaulting one on an already-built tree.
+
+Not addressed: `TEST_FRAMEWORKS` has no C entry, so test generation for C
+falls back to pytest, and `verify_cmd_for_language` returns None for C
+exactly as it already does for Rust and Java — a wrong verify command is
+worse than none.
 
 ### The Code Graph Answers Wiring First (orchestrator/wiring_graph.py)
 
