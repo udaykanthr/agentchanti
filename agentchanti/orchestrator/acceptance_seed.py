@@ -1171,12 +1171,13 @@ def seedable_language(language: str | None) -> bool:
             or lang in _JS_LANGUAGES
             or lang in _GO_LANGUAGES
             or lang in _RUST_LANGUAGES
-            or lang in _JAVA_LANGUAGES)
+            or lang in _JAVA_LANGUAGES
+            or lang in _C_LANGUAGES)
 
 
 def seedable_languages_note() -> str:
     """The supported set, for messages that have to name it."""
-    return "Python, JavaScript/TypeScript, Go, Rust and Java"
+    return "Python, JavaScript/TypeScript, Go, Rust, Java and C/C++"
 
 
 BUILTIN_GO_CONTRACT = os.path.join(
@@ -1196,6 +1197,65 @@ BUILTIN_JAVA_CONTRACT = os.path.join(
     "contracts", "java_build_contract.py")
 
 _JAVA_LANGUAGES = frozenset({"java"})
+
+BUILTIN_C_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "contracts", "c_build_contract.py")
+
+# `detect_language` spells these "c" and "cpp"; the keyword path can also
+# produce "c++". One contract serves both, because the build systems, the
+# absent manifest and the signal-shaped crash are identical.
+_C_LANGUAGES = frozenset({"c", "cpp", "c++", "cxx"})
+
+
+def _seed_c_builtin(identity: str, path: str) -> str | None:
+    """Install the shipped C/C++ contract. Returns the path, or None.
+
+    The sixth instance of one structural gap: evidence seeding is per
+    language, and every new language starts with none. Python, then
+    JavaScript, then Go, then Rust, then Java, now C and C++.
+
+    Shipped rather than generated for the reason `_seed_js_builtin`
+    records. Written in Python rather than C for the strongest version of
+    the reason Rust's and Java's contracts are: a `.c` file in the project
+    is swept into the build by `make`, by a CMake glob, or by `cc *.c`, so
+    a contract written in C would be compiled and linked into the artifact
+    it judges — and a second `main` would break the very build it exists
+    to observe.
+
+    C is the first language here with no manifest at all. Go, Rust and
+    Java all open by asking one what the project is; C's nearest
+    equivalent is a build system, which says how to build and never what
+    the project is. So the floor is weaker and says so, and a project with
+    no build system is skipped with a precise reason rather than judged by
+    a build the contract invented — inventing it is how a missing `-lm`
+    gets reported as a defect in the code.
+
+    Two refusals carried forward, the second in a new form: an absent
+    toolchain skips rather than fails, and a non-zero exit is not a crash.
+    In C a crash prints nothing at all, so it is read from the signal —
+    a negative returncode on POSIX, an NTSTATUS on Windows.
+    """
+    try:
+        with open(BUILTIN_C_CONTRACT, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] built-in C contract unavailable: %s",
+                    exc)
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME, exc)
+        return None
+    _remember_seed_bytes(path, _header(identity, body) + body)
+    log.info("[AcceptanceSeed] installed the built-in C/C++ contract as %s — "
+             "it checks that the project builds and produces a command that "
+             "starts, and nothing about the task itself", SEED_BASENAME)
+    return path
 
 
 def _seed_java_builtin(identity: str, path: str) -> str | None:
@@ -1576,7 +1636,8 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if language and language.lower() in _JS_LANGUAGES:
         return _seed_js(task, root, llm_client,
                         identity_task=identity_task)
-    if language and language.lower() in (_GO_LANGUAGES | _RUST_LANGUAGES | _JAVA_LANGUAGES):
+    if language and language.lower() in (_GO_LANGUAGES | _RUST_LANGUAGES
+                                        | _JAVA_LANGUAGES | _C_LANGUAGES):
         identity = identity_task if (identity_task or "").strip() else task
         path = os.path.join(root, SEED_BASENAME)
         if not _should_seed(identity, root, path):
@@ -1585,6 +1646,8 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
             return _seed_rust_builtin(identity, path)
         if language.lower() in _JAVA_LANGUAGES:
             return _seed_java_builtin(identity, path)
+        if language.lower() in _C_LANGUAGES:
+            return _seed_c_builtin(identity, path)
         return _seed_go_builtin(identity, path)
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)

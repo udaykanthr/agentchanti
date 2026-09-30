@@ -30,15 +30,17 @@ class TestLanguagesTheSeederServes:
         "go", "golang", "Go",
         "rust", "rs", "Rust",
         "java", "Java",
+        "c", "cpp", "c++", "cxx", "C",
     ])
     def test_a_served_language_is_seedable(self, lang):
         assert seedable_language(lang)
 
-    @pytest.mark.parametrize("lang", ["c", "cpp", "ruby",
-                                      "php", "csharp"])
+    @pytest.mark.parametrize("lang", ["ruby", "php", "csharp",
+                                      "kotlin", "swift"])
     def test_an_unserved_language_is_not(self, lang):
-        """Go, Rust and Java each moved to the served list on gaining a
-        contract; move the next one along rather than dropping the case."""
+        """Go, Rust, Java and now C/C++ each moved to the served list on
+        gaining a contract; move the next one along rather than dropping
+        the case."""
         assert not seedable_language(lang)
 
     def test_unknown_language_is_treated_as_seedable(self):
