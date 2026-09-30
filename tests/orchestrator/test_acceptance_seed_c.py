@@ -469,3 +469,91 @@ class TestTheLoopsFallbackVerifyCommand:
         assert verify_cmd_for_language("python", str(tmp_path)) == \
             "python -m pytest -q"
         assert verify_cmd_for_language("rust", str(tmp_path)) is None
+
+
+class TestWhichCommandGetsRun:
+    """The order decides which executable the crash check actually runs,
+    and the first cut sorted by path — which is arbitrary.
+
+    Measured 2026-09-30 on a tree holding `tests.sh` beside `todo`:
+    `tests.sh` sorted first, so the check ran the TEST SUITE rather than
+    the program, and passed because the suite exits 0. A fixture had been
+    green on exactly that basis. A plan declaring `target:
+    tests/test_todo.sh` makes it worse, since that script sorts ahead too.
+    """
+
+    def setup_method(self):
+        self.mod = _contract()
+
+    def _binary(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x7fELF fake")
+
+    def _script(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\necho hi\n")
+
+    def _order(self, project):
+        """Relative POSIX paths, not names.
+
+        Names alone made `test_the_root_outranks_a_subdirectory` vacuous:
+        `build/todo` and `todo` are both named "todo", so the assertion
+        held whichever won. A mutation run caught it — deleting the depth
+        key left every test green.
+        """
+        cls = self.mod.CBuildContract
+        cls.project = project
+        cls._before = {}
+        return [p.relative_to(project).as_posix() for p in
+                cls("test_the_command_starts_without_crashing")._commands()]
+
+    def test_a_test_directory_is_never_the_command(self, tmp_path):
+        self._script(tmp_path / "tests" / "test_todo.sh")
+        self._binary(tmp_path / "todo")
+        assert self._order(tmp_path) == ["todo"]
+
+    @pytest.mark.parametrize("d", ["tests", "test", "spec", "__tests__",
+                                   "testing"])
+    def test_every_test_directory_name(self, tmp_path, d):
+        self._script(tmp_path / d / "run.sh")
+        assert self.mod._executables(tmp_path) == {}
+
+    def test_a_compiled_binary_outranks_a_script(self, tmp_path):
+        """`tests.sh` at the ROOT is not in a test directory, so only the
+        binary-over-script rule saves it."""
+        self._script(tmp_path / "tests.sh")
+        self._binary(tmp_path / "todo")
+        assert self._order(tmp_path) == ["todo", "tests.sh"]
+
+    def test_a_script_is_still_used_when_there_is_no_binary(self, tmp_path):
+        """The launcher-wrapper shape: a build may produce only a script."""
+        self._script(tmp_path / "todo")
+        assert self._order(tmp_path) == ["todo"]
+
+    def test_the_root_outranks_a_subdirectory(self, tmp_path):
+        self._binary(tmp_path / "build" / "todo")
+        self._binary(tmp_path / "todo")
+        assert self._order(tmp_path) == ["todo", "build/todo"]
+
+    def test_a_freshly_built_command_outranks_a_stale_one(self, tmp_path):
+        """Rule 1 still wins over the rest: what this build produced beats
+        whatever was lying there."""
+        import os
+        self._binary(tmp_path / "aaa_old")
+        self._binary(tmp_path / "zzz_new")
+        cls = self.mod.CBuildContract
+        cls.project = tmp_path
+        old = tmp_path / "aaa_old"
+        os.utime(old, (1_000_000, 1_000_000))
+        cls._before = {old: old.stat().st_mtime}
+        names = [p.name for p in
+                 cls("test_the_command_starts_without_crashing")._commands()]
+        assert names == ["zzz_new", "aaa_old"], names
+
+    def test_program_kind_distinguishes_them(self, tmp_path):
+        (tmp_path / "b").write_bytes(b"\x7fELF")
+        (tmp_path / "s").write_text("#!/bin/sh\n")
+        (tmp_path / "t").write_text("hello")
+        assert self.mod._program_kind(tmp_path / "b") == "binary"
+        assert self.mod._program_kind(tmp_path / "s") == "script"
+        assert self.mod._program_kind(tmp_path / "t") is None

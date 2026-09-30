@@ -98,6 +98,13 @@ _NOT_A_COMMAND = {".o", ".obj", ".a", ".lib", ".so", ".dylib", ".dll",
 # and are emphatically not the project's command.
 _BUILD_INTERNALS = {"CMakeFiles", "CMakeTmp", ".cmake", "Testing"}
 
+# A test runner is not the project's command. Measured 2026-09-30 on a
+# plan that declared `target: tests/test_todo.sh`: the script has a
+# shebang, so it counted as a program, and `/work/tests/...` sorts before
+# `/work/todo` — so the crash check ran the SUITE instead of the program.
+# One fixture had been passing that check for exactly this reason.
+_TEST_DIRS = {"tests", "test", "spec", "__tests__", "testing"}
+
 # A build that failed because it could not fetch something is the
 # instrument being unavailable, never the code being wrong. Rarer in C
 # than in Rust, but CMake's FetchContent makes it possible.
@@ -201,7 +208,7 @@ def _build_plan(project):
                   f"this contract's guess rather than the project")
 
 
-def _looks_like_a_program(path):
+def _program_kind(path):
     """Whether the file's own bytes say it is executable.
 
     The execute bit is NOT evidence, which is the whole reason this exists.
@@ -216,18 +223,32 @@ def _looks_like_a_program(path):
     or a script declaring its interpreter. That is decisive and needs no
     cooperation from the filesystem — the same reason this contract reads
     the tree instead of guessing the binary's name.
+
+    Returns "binary", "script", or None — the distinction matters because
+    a C project's command is a COMPILED image in essentially every case,
+    and a script is only the command when the build produced no binary
+    (a launcher wrapping one). See `_commands` for why that ordering is
+    load-bearing.
     """
     try:
         with open(path, "rb") as fh:
             head = fh.read(4)
     except OSError:
-        return False
-    return head[:4] in (b"\x7fELF",                      # ELF
-                        b"\xcf\xfa\xed\xfe",             # Mach-O 64 LE
-                        b"\xce\xfa\xed\xfe",             # Mach-O 32 LE
-                        b"\xca\xfe\xba\xbe",             # Mach-O universal
-                        ) or head[:2] in (b"MZ",         # PE / COFF
-                                          b"#!")         # a script
+        return None
+    if head[:4] in (b"\x7fELF",                          # ELF
+                    b"\xcf\xfa\xed\xfe",                 # Mach-O 64 LE
+                    b"\xce\xfa\xed\xfe",                 # Mach-O 32 LE
+                    b"\xca\xfe\xba\xbe",                 # Mach-O universal
+                    ) or head[:2] == b"MZ":              # PE / COFF
+        return "binary"
+    if head[:2] == b"#!":
+        return "script"
+    return None
+
+
+def _looks_like_a_program(path):
+    """Whether the file is runnable at all. See :func:`_program_kind`."""
+    return _program_kind(path) is not None
 
 
 def _executables(project):
@@ -243,7 +264,7 @@ def _executables(project):
         if not path.is_file():
             continue
         parts = set(path.parts)
-        if parts & SKIP or parts & _BUILD_INTERNALS:
+        if parts & SKIP or parts & _BUILD_INTERNALS or parts & _TEST_DIRS:
             continue
         suffix = path.suffix.lower()
         if suffix in _NOT_A_COMMAND:
@@ -355,14 +376,31 @@ class CBuildContract(unittest.TestCase):
         Existence is sound here because `test_the_project_builds` runs
         first and everything downstream skips when it fails — so by this
         point the build has succeeded, and an executable in the tree is its
-        output. Fresh ones sort first so the just-built command is the one
-        actually run.
+        output.
+
+        The ORDER decides which one gets run, and the first cut sorted by
+        path, which is arbitrary. Measured 2026-09-30 on a tree holding
+        `tests.sh` beside `todo`: `tests.sh` sorted first, so the crash
+        check ran the test suite rather than the program — and passed,
+        because the suite exits 0. A fixture had been green on that basis.
+
+        So the key says what a C project's command actually is:
+
+        1. Something this build produced or refreshed, over something that
+           was already lying there.
+        2. A compiled image over a script. A C build's product is a binary
+           in essentially every case; a script is the command only when
+           there is no binary, which is the launcher-wrapper shape.
+        3. Shallower over deeper, then by name — a program at the project
+           root outranks one buried in a subdirectory.
         """
         after = _executables(self.project)
         before = type(self)._before
-        return sorted(after, key=lambda p: (p in before
-                                            and after[p] <= before[p],
-                                            str(p)))
+        return sorted(after, key=lambda p: (
+            p in before and after[p] <= before[p],
+            _program_kind(p) != "binary",
+            len(p.parts),
+            str(p)))
 
     def test_it_has_a_build_system(self):
         """The closest thing C has to declaring itself.
