@@ -29,15 +29,16 @@ class TestLanguagesTheSeederServes:
         "javascript", "js", "typescript", "ts", "node", "jsx", "tsx",
         "go", "golang", "Go",
         "rust", "rs", "Rust",
+        "java", "Java",
     ])
     def test_a_served_language_is_seedable(self, lang):
         assert seedable_language(lang)
 
-    @pytest.mark.parametrize("lang", ["java", "c", "cpp", "ruby",
+    @pytest.mark.parametrize("lang", ["c", "cpp", "ruby",
                                       "php", "csharp"])
     def test_an_unserved_language_is_not(self, lang):
-        """Rust moved to the served list when it gained a contract; move the
-        next one along rather than dropping the case."""
+        """Go, Rust and Java each moved to the served list on gaining a
+        contract; move the next one along rather than dropping the case."""
         assert not seedable_language(lang)
 
     def test_unknown_language_is_treated_as_seedable(self):
@@ -67,9 +68,14 @@ class TestItMatchesTheSeederItself:
         for lang in _RUST_LANGUAGES:
             assert seedable_language(lang), lang
 
+    def test_every_java_language_in_the_dispatch_set(self):
+        from agentchanti.orchestrator.acceptance_seed import _JAVA_LANGUAGES
+        for lang in _JAVA_LANGUAGES:
+            assert seedable_language(lang), lang
+
     def test_the_note_names_what_is_supported(self):
         note = seedable_languages_note()
-        for word in ("Python", "JavaScript", "Go", "Rust"):
+        for word in ("Python", "JavaScript", "Go", "Rust", "Java"):
             assert word in note
 
 

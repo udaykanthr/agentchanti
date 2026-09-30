@@ -81,13 +81,13 @@ def test_an_unusable_response_writes_nothing(tmp_path):
 def test_a_language_with_no_contract_is_skipped(tmp_path):
     """A language with no seeder writes nothing, which is the honest answer.
 
-    This said "go", then "rust", and each in turn gained a built-in
-    contract. Java is the current example; when Java gains one, move this
-    along rather than deleting the case — the rule it pins is that seeding
+    This said "go", then "rust", then "java", and each in turn gained a
+    built-in contract. C++ is the current example; when C++ gains one, move
+    it along rather than deleting the case — the rule it pins is that seeding
     is per-language and an unsupported one must produce no file at all.
     """
     assert seed_acceptance_tests("Build an app.", str(tmp_path),
-                                 _client(GOOD), language="java") is None
+                                 _client(GOOD), language="cpp") is None
 
 
 def test_javascript_is_no_longer_skipped(tmp_path):
