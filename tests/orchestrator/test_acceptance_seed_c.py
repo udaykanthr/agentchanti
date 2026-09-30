@@ -221,12 +221,50 @@ class TestWhichFilesCountAsCommands:
         self.mod = _contract()
 
     def _make_executable(self, path):
+        """An ELF header, because that is what the check now reads."""
         path.write_bytes(b"\x7fELF fake")
         if os.name != "nt":
             path.chmod(0o755)
 
     def _exe_name(self, stem):
         return f"{stem}.exe" if os.name == "nt" else stem
+
+    def test_the_execute_bit_is_not_evidence(self, tmp_path):
+        """THE defect this check exists for.
+
+        Measured 2026-09-30: on a Windows bind mount every file reports
+        mode 777, so `Makefile`, `main.c` and `store.h` were all
+        "executable". `Makefile` sorts before `todo`, so the crash check
+        ran the MAKEFILE, got an exec-format error, and read that as "did
+        not crash" — a segfaulting program passed the contract. The same
+        holds on any FAT, exFAT or CIFS mount.
+        """
+        for name in ("Makefile", "CMakeLists.txt", "README", "tests.sh.txt"):
+            f = tmp_path / name
+            f.write_text("all:\n\tcc -o todo main.c\n")
+            if os.name != "nt":
+                f.chmod(0o777)
+        self._make_executable(tmp_path / self._exe_name("todo"))
+        found = {p.name for p in self.mod._executables(tmp_path)}
+        assert found == {self._exe_name("todo")}, (
+            f"only the real program is a command, got {found}")
+
+    def test_a_script_with_a_shebang_is_a_command(self, tmp_path):
+        """A Makefile may legitimately build a wrapper script."""
+        f = tmp_path / "todo"
+        f.write_text("#!/bin/sh\nexec ./todo-bin \"$@\"\n")
+        if os.name != "nt":
+            f.chmod(0o755)
+        assert {p.name for p in self.mod._executables(tmp_path)} == {"todo"}
+
+    @pytest.mark.parametrize("magic,name", [
+        (b"MZ\x90\x00", "PE (Windows)"),
+        (b"\xcf\xfa\xed\xfe", "Mach-O 64"),
+        (b"\xca\xfe\xba\xbe", "Mach-O universal"),
+    ])
+    def test_other_platforms_binaries_count(self, tmp_path, magic, name):
+        (tmp_path / self._exe_name("todo")).write_bytes(magic + b"rest")
+        assert self.mod._executables(tmp_path), name
 
     def test_a_built_command_is_found(self, tmp_path):
         self._make_executable(tmp_path / self._exe_name("todo"))
@@ -235,41 +273,38 @@ class TestWhichFilesCountAsCommands:
 
     @pytest.mark.parametrize("name", ["todo.o", "todo.a", "libtodo.so",
                                       "todo.obj", "todo.d", "notes.md"])
-    def test_object_files_and_libraries_are_not_commands(self, tmp_path,
-                                                        monkeypatch, name):
-        """A `.so` has the execute bit set on many distributions and is
-        emphatically not a command.
-
-        Forced onto the POSIX path deliberately. On Windows the `.exe`
-        filter excludes all of these before `_NOT_A_COMMAND` is consulted,
-        so the test would pass over a contract that had lost that check
-        entirely — which a mutation run confirmed: deleting the check was
-        caught on Linux and not here. A guard that is only tested on one
-        platform is half-tested.
-        """
-        monkeypatch.setattr(self.mod.os, "name", "posix")
-        monkeypatch.setattr(self.mod.os, "access", lambda *a, **k: True)
+    def test_object_files_and_libraries_are_not_commands(self, tmp_path, name):
+        """The extension check is what excludes these, and it has to:
+        they are given real ELF headers here because a `.so` genuinely IS
+        an ELF image, so magic bytes alone would admit it."""
         (tmp_path / name).write_bytes(b"\x7fELF fake")
         found = {p.name for p in self.mod._executables(tmp_path)}
         assert name not in found
 
-    def test_a_plain_command_still_counts_on_the_posix_path(self, tmp_path,
-                                                           monkeypatch):
+    def test_a_plain_command_still_counts(self, tmp_path):
         """The other half: the exclusion above must not be so broad that
         nothing is ever a command."""
-        monkeypatch.setattr(self.mod.os, "name", "posix")
-        monkeypatch.setattr(self.mod.os, "access", lambda *a, **k: True)
         (tmp_path / "todo").write_bytes(b"\x7fELF fake")
         found = {p.name for p in self.mod._executables(tmp_path)}
         assert "todo" in found
 
-    def test_sources_and_headers_are_not_commands(self, tmp_path, monkeypatch):
-        """Forced onto the POSIX path for the reason above: on Windows the
-        `.exe` filter would hide the loss of this check."""
-        monkeypatch.setattr(self.mod.os, "name", "posix")
-        monkeypatch.setattr(self.mod.os, "access", lambda *a, **k: True)
+    def test_sources_and_headers_are_not_commands(self, tmp_path):
         for name in ("main.c", "todo.h", "app.cpp", "util.hpp"):
             (tmp_path / name).write_text("int main(void){return 0;}")
+        assert self.mod._executables(tmp_path) == {}
+
+    def test_a_source_file_that_starts_with_a_shebang_is_still_a_source(
+            self, tmp_path):
+        """Where the extension check and the magic check overlap.
+
+        Ordinary sources are excluded by their bytes alone — no `.c` file
+        carries an ELF header — so the extension check only earns its place
+        on the one input that fools the magic check. A mutation run made
+        that concrete: deleting the extension check was NOT caught until
+        this case existed.
+        """
+        (tmp_path / "generated.c").write_text("#!/bin/sh\nint main(){}\n")
+        (tmp_path / "gen.h").write_text("#!/bin/sh\n")
         assert self.mod._executables(tmp_path) == {}
 
     def test_cmake_probe_binaries_are_not_the_project(self, tmp_path):
@@ -324,3 +359,49 @@ class TestWhereTheProjectIs:
         (tmp_path / "README.md").write_text("hello")
         monkeypatch.setattr(self.mod, "ROOT", tmp_path)
         assert self.mod._project_dir() is None
+
+
+class TestTheStubCheck:
+    """The one assertion in the TestCase itself that needs no compiler.
+
+    A mutation run found it had NO unit coverage: replacing the 400
+    character threshold with -1 left all 54 tests green, so the check was
+    validated only by container fixtures. Run here through unittest so the
+    real method executes, rather than by reading the source for a number.
+    """
+
+    def _run_stub_test(self, project):
+        import unittest
+
+        mod = _contract()
+        mod.ROOT = project
+        suite = unittest.TestSuite()
+        suite.addTest(mod.CBuildContract(
+            "test_it_is_a_program_rather_than_a_stub"))
+        result = unittest.TestResult()
+        suite.run(result)
+        return result
+
+    def test_a_stub_is_rejected(self, tmp_path):
+        (tmp_path / "main.c").write_text("int main(void){return 0;}")
+        (tmp_path / "Makefile").write_text("todo: main.c\n\tcc -o todo main.c\n")
+        result = self._run_stub_test(tmp_path)
+        assert len(result.failures) == 1, "a 25-character program must fail"
+        assert "too little to be a program" in result.failures[0][1]
+
+    def test_a_real_program_is_accepted(self, tmp_path):
+        body = "\n".join(f"int helper_{i}(int x) {{ return x * {i} + 1; }}"
+                         for i in range(40))
+        (tmp_path / "main.c").write_text(
+            f"#include <stdio.h>\n{body}\nint main(void){{return 0;}}\n")
+        (tmp_path / "Makefile").write_text("todo: main.c\n\tcc -o todo main.c\n")
+        result = self._run_stub_test(tmp_path)
+        assert result.failures == [], result.failures
+        assert result.errors == [], result.errors
+
+    def test_headers_count_toward_the_total(self, tmp_path):
+        """A project can legitimately put most of its code in headers."""
+        (tmp_path / "main.c").write_text("int main(void){return 0;}")
+        (tmp_path / "big.h").write_text("/* " + "x" * 500 + " */\n")
+        (tmp_path / "Makefile").write_text("todo: main.c\n\tcc -o todo main.c\n")
+        assert self._run_stub_test(tmp_path).failures == []

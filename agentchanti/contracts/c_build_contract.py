@@ -201,6 +201,35 @@ def _build_plan(project):
                   f"this contract's guess rather than the project")
 
 
+def _looks_like_a_program(path):
+    """Whether the file's own bytes say it is executable.
+
+    The execute bit is NOT evidence, which is the whole reason this exists.
+    Measured 2026-09-30: on a Windows bind mount every file reports mode
+    777, so `Makefile`, `main.c` and `store.h` were all "executable" — and
+    `Makefile` sorts before `todo`, so the crash check ran the Makefile,
+    got an exec-format error, and read that as "did not crash". A
+    segfaulting program passed. The same is true of any FAT, exFAT or CIFS
+    mount and of a checkout made with an odd umask.
+
+    So the question becomes what the file IS: an ELF, PE or Mach-O image,
+    or a script declaring its interpreter. That is decisive and needs no
+    cooperation from the filesystem — the same reason this contract reads
+    the tree instead of guessing the binary's name.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    return head[:4] in (b"\x7fELF",                      # ELF
+                        b"\xcf\xfa\xed\xfe",             # Mach-O 64 LE
+                        b"\xce\xfa\xed\xfe",             # Mach-O 32 LE
+                        b"\xca\xfe\xba\xbe",             # Mach-O universal
+                        ) or head[:2] in (b"MZ",         # PE / COFF
+                                          b"#!")         # a script
+
+
 def _executables(project):
     """Every plausible command in the tree, by path -> mtime.
 
@@ -223,10 +252,7 @@ def _executables(project):
             continue
         if path.name.startswith("cmTC_"):
             continue
-        if os.name == "nt":
-            if suffix != ".exe":
-                continue
-        elif not os.access(path, os.X_OK):
+        if not _looks_like_a_program(path):
             continue
         try:
             found[path] = path.stat().st_mtime
@@ -312,12 +338,31 @@ class CBuildContract(unittest.TestCase):
                           f"nothing about the code:\n{out[-500:]}")
         return code, out
 
-    def _fresh_commands(self):
-        """Executables the build added, or rebuilt, in this run."""
+    def _commands(self):
+        """Executables present after a successful build, freshest first.
+
+        NOT "executables new since before the build", which is what this
+        asked at first and is wrong. `make` is incremental: a project whose
+        binary is already up to date rebuilds nothing, so the newness test
+        reported "the build succeeded but left no new executable" over a
+        perfectly good project. That is the normal case rather than an edge
+        one — agentchanti runs the build itself during the run, so the
+        binary almost always exists before the contract looks.
+
+        Caught 2026-09-30 by a fixture that had been built once already;
+        `make-good` passed only because its tree happened to be clean.
+
+        Existence is sound here because `test_the_project_builds` runs
+        first and everything downstream skips when it fails — so by this
+        point the build has succeeded, and an executable in the tree is its
+        output. Fresh ones sort first so the just-built command is the one
+        actually run.
+        """
         after = _executables(self.project)
         before = type(self)._before
-        return sorted(p for p, m in after.items()
-                      if p not in before or m > before[p])
+        return sorted(after, key=lambda p: (p in before
+                                            and after[p] <= before[p],
+                                            str(p)))
 
     def test_it_has_a_build_system(self):
         """The closest thing C has to declaring itself.
@@ -340,8 +385,8 @@ class CBuildContract(unittest.TestCase):
         if code != 0:
             self.skipTest("the project does not build, already reported")
         self.assertTrue(
-            self._fresh_commands(),
-            f"the {self.label} build succeeded but left no new executable "
+            self._commands(),
+            f"the {self.label} build succeeded but there is no executable "
             f"anywhere under {self.project.name} — a C project that builds "
             f"nothing runnable has not been built")
 
@@ -356,7 +401,7 @@ class CBuildContract(unittest.TestCase):
         code, _out = self._build()
         if code != 0:
             self.skipTest("the project does not build, already reported")
-        fresh = self._fresh_commands()
+        fresh = self._commands()
         if not fresh:
             self.skipTest("no runnable command was produced, already "
                           "reported")
