@@ -689,6 +689,34 @@ class IntentAgent(Agent):
                 _logger.info("[IntentAnalysis] Pre-seed returned no results.")
                 if cli_display:
                     cli_display.update_last_intent_event("no results")
+                # An empty KB means the project has no indexed code — and the
+                # very next thing the model does is spend a whole LLM call
+                # asking `RUN_CMD: ls`. Measured 2026-09-30 across five
+                # languages, identical every time:
+                #
+                #   Pre-seed returned no results.
+                #   Iteration 1: RUN_CMD 'ls'
+                #   Successfully generated REQUIREMENTS_SPEC.
+                #
+                # The listing is information the pipeline ALREADY has — the
+                # scan logged `Project scan: 2 files detected` seconds
+                # earlier — so the call buys nothing and its output feeds
+                # the next prompt as evidence. Handing over the listing up
+                # front removes the round trip without removing the loop: on
+                # an existing codebase the KB is not empty and this branch
+                # never runs.
+                listing = self._directory_listing()
+                if listing:
+                    accumulated_context += (
+                        "Initial Project Context (the project's own files, "
+                        "listed automatically — no need to run `ls`):\n"
+                        f"{listing}\n\n")
+                    _logger.info(
+                        "[IntentAnalysis] Pre-seeded the file listing instead "
+                        "(%d entr%s) — the KB is empty, so `ls` would cost a "
+                        "round trip for what the scan already knows",
+                        listing.count("\n") + 1,
+                        "y" if listing.count("\n") == 0 else "ies")
 
             # ── BUG_FIX enhancement: fetch full file content for target ───────
             # Semantic snippets (30 lines) are insufficient for tracing render
@@ -1726,6 +1754,39 @@ class IntentAgent(Agent):
         "Evidence: <file names, function names, or source lines that support the answer>\n"
         "KB topics: none\n"
     )
+
+    _LISTING_SKIP = {
+        ".git", ".agentchanti", "node_modules", "target", "build", "dist",
+        "venv", ".venv", "__pycache__", ".gradle", ".next",
+    }
+
+    def _directory_listing(self, limit: int = 60) -> str:
+        """The project's own top-level files and directories, or "".
+
+        What `RUN_CMD: ls` would have returned, without the round trip.
+        Build output and dependency trees are skipped for the same reason
+        the scanners skip them: they are not the project.
+
+        Deliberately shallow and bounded. This exists to save one call, so
+        it must never become a large block of context that costs more than
+        the call it replaces.
+        """
+        try:
+            entries = sorted(os.listdir("."))
+        except OSError:
+            return ""
+        out = []
+        for name in entries:
+            if name in self._LISTING_SKIP:
+                continue
+            try:
+                out.append(f"{name}/" if os.path.isdir(name) else name)
+            except OSError:
+                continue
+            if len(out) >= limit:
+                out.append(f"... (truncated at {limit} entries)")
+                break
+        return "\n".join(out)
 
     def _build_prompt(self, raw_task: str, accumulated_context: str, conclude: bool = False) -> str:
         """
