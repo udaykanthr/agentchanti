@@ -49,9 +49,15 @@ a missing `-lm` as a defect in the code.
 **The binary's name is unpredictable.** `cargo build` puts it in
 `target/debug/`, `mvn package` writes a jar named from the manifest. A
 Makefile emits whatever its author chose. So this contract does not guess:
-it records the executables present before the build and looks for what
-the build *added or refreshed*. Asking the tree rather than guessing a
-name is the same principle that keeps the other five honest.
+it reads the tree, asks each file what it IS rather than trusting a
+permission bit, and orders the candidates by what a C project's command
+actually looks like — freshly built over already there, a compiled image
+over a script, the root over a subdirectory. Asking the tree rather than
+guessing a name is the same principle that keeps the other five honest.
+
+A project that defines no `main` is a library, and the executable checks
+skip rather than fail — the line the Rust contract draws with
+`src/main.rs`.
 
 **A crash is a signal, not a string.** Rust prints `thread panicked`,
 Java prints `Exception in thread "main"`, Go prints `goroutine 1
