@@ -185,7 +185,7 @@ class TestSeeding:
         """Go, then Rust, were the examples here until each gained one."""
         client = _Client(f"```js\n{GOOD}```")
         assert seed_acceptance_tests("t", str(tmp_path), client,
-                                     language="java") is None
+                                     language="cpp") is None
 
 
 class TestItIsRunnable:

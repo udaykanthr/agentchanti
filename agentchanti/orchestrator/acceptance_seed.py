@@ -1170,12 +1170,13 @@ def seedable_language(language: str | None) -> bool:
     return (lang in ("python", "py")
             or lang in _JS_LANGUAGES
             or lang in _GO_LANGUAGES
-            or lang in _RUST_LANGUAGES)
+            or lang in _RUST_LANGUAGES
+            or lang in _JAVA_LANGUAGES)
 
 
 def seedable_languages_note() -> str:
     """The supported set, for messages that have to name it."""
-    return "Python, JavaScript/TypeScript, Go and Rust"
+    return "Python, JavaScript/TypeScript, Go, Rust and Java"
 
 
 BUILTIN_GO_CONTRACT = os.path.join(
@@ -1189,6 +1190,61 @@ BUILTIN_RUST_CONTRACT = os.path.join(
     "contracts", "rust_build_contract.py")
 
 _RUST_LANGUAGES = frozenset({"rust", "rs"})
+
+BUILTIN_JAVA_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "contracts", "java_build_contract.py")
+
+_JAVA_LANGUAGES = frozenset({"java"})
+
+
+def _seed_java_builtin(identity: str, path: str) -> str | None:
+    """Install the shipped Java contract. Returns the path, or None.
+
+    The fifth instance of one structural gap: evidence seeding is per
+    language, and every new language starts with none. Python, then
+    JavaScript, then Go, then Rust, now Java.
+
+    Shipped rather than generated for the reason `_seed_js_builtin`
+    records. Written in Python rather than Java for a reason stronger than
+    Go's or Rust's: a `.java` file under `src/` is compiled by
+    `mvn package`, one under `src/test/java` is compiled AND executed by
+    Surefire, and a compile error in either fails the build the contract
+    exists to observe.
+
+    Java is the first language where the shape does not transfer cleanly.
+    There is no single build - Maven, Gradle and bare `javac` are not
+    interchangeable - and "a runnable command" is ambiguous, because a jar
+    is only executable if the build was configured to write a `Main-Class`
+    manifest entry. So the floor is "a main method is reachable and the
+    program starts", which is weaker than for Go or Rust and says so.
+
+    Two refusals carried forward: a non-zero exit is not a crash (only an
+    uncaught exception is), and a build that cannot reach Maven Central
+    skips rather than fails. A Gradle project skips with a precise reason
+    when gradle is absent, rather than being judged by a build that never
+    ran.
+    """
+    try:
+        with open(BUILTIN_JAVA_CONTRACT, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] built-in Java contract unavailable: %s",
+                    exc)
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_header(identity, body))
+            fh.write(body)
+    except OSError as exc:
+        log.warning("[AcceptanceSeed] could not write %s: %s",
+                    SEED_BASENAME, exc)
+        return None
+    _remember_seed_bytes(path, _header(identity, body) + body)
+    log.info("[AcceptanceSeed] installed the built-in Java contract as %s — "
+             "it checks that the project compiles and a main method starts, "
+             "and nothing about the task itself", SEED_BASENAME)
+    return path
 
 
 def _seed_rust_builtin(identity: str, path: str) -> str | None:
@@ -1520,13 +1576,15 @@ def seed_acceptance_tests(task: str, root: str, llm_client,
     if language and language.lower() in _JS_LANGUAGES:
         return _seed_js(task, root, llm_client,
                         identity_task=identity_task)
-    if language and language.lower() in (_GO_LANGUAGES | _RUST_LANGUAGES):
+    if language and language.lower() in (_GO_LANGUAGES | _RUST_LANGUAGES | _JAVA_LANGUAGES):
         identity = identity_task if (identity_task or "").strip() else task
         path = os.path.join(root, SEED_BASENAME)
         if not _should_seed(identity, root, path):
             return None
         if language.lower() in _RUST_LANGUAGES:
             return _seed_rust_builtin(identity, path)
+        if language.lower() in _JAVA_LANGUAGES:
+            return _seed_java_builtin(identity, path)
         return _seed_go_builtin(identity, path)
     if language and language.lower() not in ("python", "py"):
         log.debug("[AcceptanceSeed] skipped: language is %s", language)
