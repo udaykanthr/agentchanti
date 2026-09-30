@@ -405,3 +405,67 @@ class TestTheStubCheck:
         (tmp_path / "big.h").write_text("/* " + "x" * 500 + " */\n")
         (tmp_path / "Makefile").write_text("todo: main.c\n\tcc -o todo main.c\n")
         assert self._run_stub_test(tmp_path).failures == []
+
+
+class TestTheLoopsFallbackVerifyCommand:
+    """`verify_cmd_for_language` had no C branch, so a C step whose plan
+    declared no gate fell back to accepting the model's own summary.
+
+    C has no default test command — there is no runner to guess at — so
+    this trusts a declared `test:` rule and nothing else, exactly as the
+    JavaScript branch only trusts `npm test` when package.json defines it.
+    A wrong verify command is worse than none: the loop would chase
+    failures in the verifier instead of the code.
+    """
+
+    def _verify(self, root):
+        from agentchanti.orchestrator.agent_loop import verify_cmd_for_language
+        return verify_cmd_for_language("c", str(root))
+
+    def test_a_declared_test_target_is_used(self, tmp_path):
+        (tmp_path / "Makefile").write_text(
+            "todo: main.c\n\tcc -o todo main.c\n\ntest: todo\n\t./tests.sh\n")
+        assert self._verify(tmp_path) == "make test"
+
+    def test_no_makefile_means_no_command(self, tmp_path):
+        assert self._verify(tmp_path) is None
+
+    def test_a_makefile_without_a_test_target_means_no_command(self, tmp_path):
+        """Guessing `make test` here would fail on every step, for a
+        project that is perfectly fine."""
+        (tmp_path / "Makefile").write_text("todo: main.c\n\tcc -o todo main.c\n")
+        assert self._verify(tmp_path) is None
+
+    def test_phony_alone_is_not_a_target(self, tmp_path):
+        """`.PHONY: test` declares something ABOUT the target, and sits on
+        its own line where a naive scan would match it."""
+        (tmp_path / "Makefile").write_text(
+            "todo: main.c\n\tcc -o todo main.c\n\n.PHONY: test\n")
+        assert self._verify(tmp_path) is None
+
+    def test_a_variable_named_test_is_not_a_target(self, tmp_path):
+        (tmp_path / "Makefile").write_text(
+            "test := ./run.sh\ntodo: main.c\n\tcc -o todo main.c\n")
+        assert self._verify(tmp_path) is None
+
+    def test_test_mentioned_inside_a_recipe_is_not_a_target(self, tmp_path):
+        """Recipe lines are tab-indented, so they never start at column 0."""
+        (tmp_path / "Makefile").write_text(
+            "check: todo\n\ttest -x ./todo && echo ok\n")
+        assert self._verify(tmp_path) is None
+
+    def test_lowercase_makefile_is_found(self, tmp_path):
+        (tmp_path / "makefile").write_text("test:\n\t./tests.sh\n")
+        assert self._verify(tmp_path) == "make test"
+
+    def test_cpp_gets_the_same_treatment(self, tmp_path):
+        from agentchanti.orchestrator.agent_loop import verify_cmd_for_language
+        (tmp_path / "Makefile").write_text("test:\n\t./tests.sh\n")
+        assert verify_cmd_for_language("cpp", str(tmp_path)) == "make test"
+
+    def test_other_languages_are_unaffected(self, tmp_path):
+        from agentchanti.orchestrator.agent_loop import verify_cmd_for_language
+        assert verify_cmd_for_language("go", str(tmp_path)) == "go test ./..."
+        assert verify_cmd_for_language("python", str(tmp_path)) == \
+            "python -m pytest -q"
+        assert verify_cmd_for_language("rust", str(tmp_path)) is None

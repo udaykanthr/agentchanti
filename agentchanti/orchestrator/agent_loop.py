@@ -1649,6 +1649,36 @@ def verify_cmd_for_language(language: str | None,
         return None
     if lang == "go":
         return "go test ./..."
+    if lang in ("c", "cpp", "c++", "cxx"):
+        # Only when the project actually declares the target, exactly as
+        # the JavaScript branch only trusts `npm test` when package.json
+        # defines it. C has no default test command — there is no runner
+        # to guess at — so a declared `test:` rule is the one thing that
+        # says what "the tests pass" means for this project.
+        #
+        # This is a fallback: `_declared_verify_cmd` wins whenever the
+        # plan states a gate, which is the usual case. It matters when the
+        # plan declares none, where the alternative is accepting the
+        # model's own summary that it is done.
+        for name in ("Makefile", "makefile", "GNUmakefile"):
+            path = os.path.join(project_root, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            # A real rule at the start of a line, not `test` appearing in
+            # a variable or a recipe. `.PHONY: test` is a declaration
+            # about the target, not the target, so it is not enough on
+            # its own — but it sits on its own line and would otherwise
+            # match, hence the exclusion.
+            for line in text.splitlines():
+                if line.startswith((".PHONY", ".phony")):
+                    continue
+                if re.match(r"^test\s*:(?!=)", line):
+                    return "make test"
+            return None
+        return None
     return None
 
 
