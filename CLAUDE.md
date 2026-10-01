@@ -1275,7 +1275,24 @@ dict directly — a C project would otherwise get a different answer
 depending on which one asked.
 
 `extract_exports` took three drafts, and each wrong one would have become a
-false finding in the wiring graph. A `static` function has internal
+false finding in the **ghost's `EXPORTS` expectation** and the two export
+verification paths (`cli.py`, `step_handlers.py`) — which are its real
+consumers. It does **not** feed the wiring graph: that reads
+`dependency_check._LANG_PATTERNS`, a separate table, and the first version
+of this paragraph claimed otherwise without checking.
+
+C is deliberately absent from `_LANG_PATTERNS`, so `WiringReport.can_judge`
+stays False for a C project and the caller runs its full check. Adding it
+naively would **manufacture** the false findings this list is about: a C
+function is consumed through its **header**, so a stem-keyed orphan check
+reports `todo.c exports todo_add but nothing imports todo.c` over an
+ordinary project that includes `todo.h` — the `framework_route_reason`
+shape. Doing it properly means resolving a declaration to the header that
+carries it and asking who includes that; until then the refusal is the
+honest answer. It costs nothing observed: measured on both successful C
+runs, wiring verification was skipped outright because bulk tests passed.
+
+A `static` function has internal
 linkage, so listing it makes `find_gaps` report an export nothing imports —
 forever, since nothing outside the file can. `typedef struct { int x; }
 Task;` carries semicolons inside its body, so no single `[^;]` scan reaches
