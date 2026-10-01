@@ -48,7 +48,7 @@ Both paths share the same execution engine in `orchestrator/pipeline.py`.
 
 ### Language Detection (agentchanti/language.py)
 
-Auto-detects project language by scanning file extensions (`detect_language()`) or parsing task keywords (`detect_language_from_task()`). Maps languages to test frameworks via `TEST_FRAMEWORKS` dict. **Known issue**: defaults to Python/pytest when language is `None`, which causes incorrect test generation for non-Python projects (e.g., TypeScript projects get Python tests). The TesterAgent at lines 10-12 and 41-44 hard-defaults to Python when `language` is None.
+Auto-detects project language by scanning file extensions (`detect_language()`) or parsing task keywords (`detect_language_from_task()`). Maps languages to test frameworks via `TEST_FRAMEWORKS` and `language_backend.get_backend()`. Twelve languages have their own backend and command (Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin), so the Python fallback now applies only when the language is `None` or genuinely unlisted — **not** to TypeScript, which the earlier note gave as its example. `get_backend` does still resolve no aliases, so `golang`, `rs`, `js` and `c#` fall through to Python; detection emits canonical keys, so this is only reachable by a caller passing an alias.
 
 ### LLM Client Layer (agentchanti/llm/)
 
@@ -1256,10 +1256,37 @@ magic check overlap — a `.c` file whose first line is a shebang. Eight real
 trees run against a real toolchain in a `gcc:13` container behave
 correctly, including the segfaulting one on an already-built tree.
 
-Not addressed: `TEST_FRAMEWORKS` has no C entry, so test generation for C
-falls back to pytest, and `verify_cmd_for_language` returns None for C
-exactly as it already does for Rust and Java — a wrong verify command is
-worse than none.
+Both gaps this section originally listed as unaddressed are now closed,
+and neither names a framework, because **neither ecosystem has a standard
+one that needs no install** — Unity, CMocka, Criterion, Check, GoogleTest
+and Catch2 all exist and every one of them would have to be fetched. So
+both answer `make test`, the project's own declared target, which is the
+one thing that says what "the tests pass" means here and keeps a generated
+suite runnable with nothing installed.
+
+`verify_cmd_for_language` returns it only when a Makefile actually declares
+the target, as the JavaScript branch only trusts `npm test` when
+package.json defines it — a wrong verify command is worse than none, so a
+Makefile without it still returns None. `CBackend`/`CppBackend` and the
+`TEST_FRAMEWORKS` entries carry the same answer, and a test pins that the
+dict and the backends agree for **every** language, because
+`get_test_framework` prefers the backend while `test_analyzer` reads the
+dict directly — a C project would otherwise get a different answer
+depending on which one asked.
+
+`extract_exports` took three drafts, and each wrong one would have become a
+false finding in the wiring graph. A `static` function has internal
+linkage, so listing it makes `find_gaps` report an export nothing imports —
+forever, since nothing outside the file can. `typedef struct { int x; }
+Task;` carries semicolons inside its body, so no single `[^;]` scan reaches
+the name. And a C++ return type carries `::`, `<>`, `&` and `,`, without
+which the C++ backend returned **no exports at all** for an ordinary
+function.
+
+Still not addressed: `get_backend` resolves no aliases for any language —
+`golang`, `rs`, `js`, `c#` and `c++` all fall through to Python. That is
+pre-existing and repo-wide, and detection only ever emits canonical keys
+(`c`, `cpp`), so widening it belongs in its own change.
 
 ### The Code Graph Answers Wiring First (orchestrator/wiring_graph.py)
 
@@ -1337,7 +1364,13 @@ otherwise.
 
 Defined in `language.py:TEST_FRAMEWORKS`. The TesterAgent (`agents/tester.py`) builds language-specific prompts:
 - `_python_test_rules()` for Python/pytest
-- `_js_test_rules()` for JavaScript/TypeScript (Jest-oriented, no Vitest support yet)
+- `_js_test_rules()` for JavaScript/TypeScript, which dispatches to
+  `_vitest_test_rules()` when the runner is Vitest (`javascript:vitest` and
+  `typescript:vitest` keys select it; `.jsx` is required for test files
+  containing JSX, since Vite will not parse JSX in `.js`)
+- every other language goes through `language_backend.get_backend()`,
+  whose `get_test_rules()` the TesterAgent appends under the backend's own
+  display name
 
 The step handler `_handle_test_step()` in `step_handlers.py` detects JS project environment (ESM vs CJS) and auto-installs test runners.
 
