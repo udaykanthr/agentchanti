@@ -6,6 +6,103 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.12.0 — 2026-10-02
+
+Three more languages can earn an independent verdict, and test generation
+stops handing them Python's. Benchmarked against an external behavioural
+probe across Go, Rust, Java and C — 24 artifacts — with the probe itself
+treated as code under test, because five of its own defects failed correct
+projects before any of them was trusted.
+
+### Added
+
+- **Rust, Java and C/C++ projects can earn independent evidence.**
+  `require_independent_evidence` is satisfiable three ways, and the seeder
+  could write a contract only for Python, JavaScript and Go — so a
+  greenfield build in any other language had none of the three however
+  well it went. Measured on Rust and on Java: a todo manager that passes an
+  external 11-step behavioural probe exited 1 on the last line with
+  "nothing outside this run's own output verified it". Each contract is
+  shipped rather than generated (zero tokens) and written in Python rather
+  than the project's own language on purpose — a `.rs` file lands in the
+  crate and is compiled by `cargo test`, a `.java` under `src/test/java` is
+  compiled and run by Surefire, and a `.c` file is swept into the build by
+  `make` or a CMake glob, so a contract in any of them could break the very
+  compilation it exists to measure. A floor, not a ceiling: the project
+  builds, a runnable command comes out, and it starts without crashing.
+
+- **C is the first supported language with no manifest, and the contract
+  says so rather than guessing.** Go has `go.mod`, Rust `Cargo.toml`, Java
+  `pom.xml`; C's nearest equivalent is a build system, which says *how* to
+  build and never *what* the project is. So a project with no build system
+  is **skipped with a reason** rather than judged by a build the contract
+  invented — inventing it is how a missing `-lm` gets reported as a defect
+  in your code. The binary's name is read from the tree rather than guessed,
+  since a Makefile emits whatever its author chose. And a crash is read
+  from the **signal**: C prints nothing when it dies, so SIGSEGV/SIGABRT
+  (and an NTSTATUS on Windows) is the signal, while a non-zero exit is
+  explicitly not one — a CLI given no arguments is supposed to refuse.
+
+- **C and C++ get their own test generation.** `get_backend("c")` returned
+  the *Python* backend, so the TesterAgent was told to write pytest for a C
+  project and `TEST_FRAMEWORKS` handed it `python -m pytest`. Neither
+  ecosystem has a standard framework that needs no install — Unity, CMocka,
+  Criterion, Check, GoogleTest and Catch2 all exist and every one would
+  have to be fetched — so both answer `make test`, the project's own
+  declared target, which keeps a generated suite runnable with nothing
+  installed. `verify_cmd_for_language` returns it only when a Makefile
+  actually declares the target, as the JavaScript branch only trusts
+  `npm test` when package.json defines it.
+
+- **`benchmarks/verify_todo_cli.py`** — one independent behavioural probe
+  for every language the todo-CLI task supports. Not part of pytest; it
+  spends no API tokens and judges finished artifacts, as
+  `verify_dt_invariance.py` does.
+
+### Fixed
+
+- **A gate proven not to measure the artifact no longer halts the run on
+  either failure path.** The guard that treats such a gate's red verdict as
+  no evidence was wired into one of the two places a failed step is
+  handled; the other went straight to the diagnosis loop, whose own marker
+  branch fails the step. Measured on a C run whose gate carried Makefile
+  escaping into a shell (`d=$$(mktemp -d)`, where `$$` is the PID, so it
+  cannot parse): every layer correctly reported the gate as unmeasurable
+  and skipped recovery, and the run stopped at step 3 of 5 anyway with 37
+  of 43 postconditions never evaluated. Both paths now share one check.
+
+- **A C task is detected as C.** `_TASK_KEYWORDS` had a `cpp` entry and no
+  `c` one, so "Build a todo manager in C" detected nothing — and in an
+  empty directory there are no files to fall back on either, which the
+  seeder treats as "use Python". A C task would have been handed a Python
+  contract. C is matched by phrases, never a bare `c`, which in a survey of
+  fifteen realistic prompts also matched "vitamin c", "plan c" and
+  "option c"; task detection outranks reading the files on disk, so a false
+  positive there picks the wrong language for a project sitting in front
+  of it.
+
+- **An empty KB no longer costs a round trip for `ls`.** On a greenfield
+  task the intent agent's pre-seed returns nothing, and the very next thing
+  it did was spend a whole LLM call whose entire output was `RUN_CMD: ls` —
+  for a listing the project scan had logged seconds earlier, and which then
+  rode into the next prompt as evidence, so the trip cost twice. Observed
+  identically on seven runs across six languages. The listing is handed
+  over directly; on an existing codebase the KB is not empty and the branch
+  never runs.
+
+### Notes
+
+The probe added above was itself the source of five measured false
+verdicts before it was trusted, and each is worth knowing if you write one:
+a build sharing a CLI invocation's 30-second timeout failed two correct
+Maven projects that build in 36 and 38 seconds; `mvn -q` suppressed the
+very `Tests run:` lines the check parses, so a project with **zero tests**
+exited 0 with no output and was graded PASS; and a project's own `todo`
+wrapper has to outrank a guessed invocation, because one build copies its
+dependencies rather than shading them and `java -jar` could never run it.
+The empty-collection rule — a green exit with no evidence that anything ran
+is a verdict in neither direction — now applies in Go and Node too.
+
 ## 0.11.0 — 2026-09-30
 
 Benchmarked against an independent probe across five task shapes and three
