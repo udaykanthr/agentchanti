@@ -129,3 +129,131 @@ class TestTheSeedingConsequence:
         body = open(path, encoding="utf-8").read()
         shipped = open(BUILTIN_C_CONTRACT, encoding="utf-8").read()
         assert shipped in body, "a C task must get the C contract, not Python's"
+
+
+class TestTheCTestRunner:
+    """C and C++ fell through to the PYTHON backend, so the TesterAgent was
+    told to write pytest for a C project and `TEST_FRAMEWORKS` handed it
+    `python -m pytest`.
+
+    Neither ecosystem has a standard test framework — Unity, CMocka,
+    Criterion, Check, GoogleTest and Catch2 all exist and every one needs
+    an install this project cannot assume — so the runner is the project's
+    own `make test` target. That is the same answer
+    `verify_cmd_for_language` gives for C, for the same reason.
+    """
+
+    @pytest.mark.parametrize("lang,ext,name", [("c", ".c", "C"),
+                                               ("cpp", ".cpp", "C++")])
+    def test_there_is_a_backend(self, lang, ext, name):
+        from agentchanti.language_backend import get_backend
+        b = get_backend(lang)
+        assert b.language == lang, f"{lang} fell through to {b.language}"
+        assert b.display_name == name
+        fw = b.get_test_framework()
+        assert fw["command"] == "make test"
+        assert fw["ext"] == ext
+
+    @pytest.mark.parametrize("lang", ["c", "cpp"])
+    def test_the_rules_forbid_adding_a_framework(self, lang):
+        """The one instruction that matters: a generated suite needing an
+        install is a suite that cannot run."""
+        from agentchanti.language_backend import get_backend
+        rules = get_backend(lang).get_test_rules()
+        assert "framework" in rules.lower()
+        assert "make test" in rules
+
+    @pytest.mark.parametrize("lang", ["c", "cpp"])
+    def test_get_test_framework_agrees_with_the_backend(self, lang):
+        from agentchanti.language import get_test_framework
+        assert get_test_framework(lang)["command"] == "make test"
+
+    def test_the_dict_and_the_backends_cannot_drift(self):
+        """`get_test_framework` prefers the backend, but `test_analyzer`
+        reads TEST_FRAMEWORKS directly — so the two must agree or a C
+        project gets a different answer depending on which one asked.
+
+        Checked for EVERY language, not just C: the other seven already
+        satisfied this, which is what makes it an invariant rather than a
+        new rule.
+        """
+        from agentchanti.language import TEST_FRAMEWORKS
+        from agentchanti.language_backend import get_backend
+        for key, entry in TEST_FRAMEWORKS.items():
+            if ":" in key:                      # runner variants (vitest)
+                continue
+            backend = get_backend(key)
+            if backend.language != key:         # no backend of its own
+                continue
+            bf = backend.get_test_framework()
+            assert entry["command"] == bf["command"], key
+            assert entry["ext"] == bf["ext"], key
+
+    def test_a_c_project_no_longer_gets_pytest(self):
+        """The defect, stated as the thing a reader would check."""
+        from agentchanti.language import get_test_framework
+        for lang in ("c", "cpp"):
+            assert "pytest" not in get_test_framework(lang)["command"]
+
+
+class TestTheBackendReadsCAndCpp:
+    """`extract_exports` feeds the wiring and dependency graphs, so a wrong
+    answer here becomes a false finding there. Three drafts were wrong
+    before this was pinned: the first missed `typedef struct {...} Name;`
+    because the body contains its own semicolons, the second listed
+    `static` functions, and the third returned NOTHING for C++ because a
+    `std::` return type has a colon.
+    """
+
+    def _c(self):
+        from agentchanti.language_backend import get_backend
+        return get_backend("c")
+
+    def _cpp(self):
+        from agentchanti.language_backend import get_backend
+        return get_backend("cpp")
+
+    def test_a_definition_is_an_export(self):
+        assert "todo_add" in self._c().extract_exports(
+            "int todo_add(const char *t) { return 0; }\n")
+
+    def test_a_declaration_is_not(self):
+        """A prototype in a header promises nothing about this file."""
+        assert self._c().extract_exports("void declared_only(void);\n") == []
+
+    def test_a_static_function_is_not_an_export(self):
+        """`static` is INTERNAL linkage. Listing one would make find_gaps
+        report an export nothing imports — forever, because nothing outside
+        the file can import it."""
+        out = self._c().extract_exports("static void helper(int n) { (void)n; }\n")
+        assert "helper" not in out
+
+    @pytest.mark.parametrize("src,name", [
+        ("typedef struct { int x; char n[8]; } Task;\n", "Task"),
+        ("typedef enum { A, B } Kind;\n", "Kind"),
+        ("typedef unsigned long handle_t;\n", "handle_t"),
+    ])
+    def test_typedefs_in_every_shape(self, src, name):
+        """The braced form carries semicolons inside it, which is why a
+        single `[^;]` scan could never reach its name."""
+        assert name in self._c().extract_exports(src)
+
+    @pytest.mark.parametrize("src,name", [
+        ('std::string join(const std::vector<int>& v) { return ""; }\n', "join"),
+        ("std::map<int, int> build(int n) { return {}; }\n", "build"),
+        ("int Store::count() const { return 0; }\n", "count"),
+        ("void plain() {}\n", "plain"),
+    ])
+    def test_cpp_return_types_do_not_defeat_it(self, src, name):
+        assert name in self._cpp().extract_exports(src)
+
+    def test_cpp_static_is_still_excluded(self):
+        assert self._cpp().extract_exports("static int hidden() { return 1; }\n") == []
+
+    @pytest.mark.parametrize("src,want", [
+        ('#include <stdio.h>\n', ["stdio.h"]),
+        ('#include "todo.h"\n', ["todo.h"]),
+        ('#  include   <stdint.h>\n', ["stdint.h"]),
+    ])
+    def test_both_include_forms(self, src, want):
+        assert self._c().extract_imports(src) == want

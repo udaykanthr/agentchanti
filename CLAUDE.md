@@ -48,7 +48,7 @@ Both paths share the same execution engine in `orchestrator/pipeline.py`.
 
 ### Language Detection (agentchanti/language.py)
 
-Auto-detects project language by scanning file extensions (`detect_language()`) or parsing task keywords (`detect_language_from_task()`). Maps languages to test frameworks via `TEST_FRAMEWORKS` dict. **Known issue**: defaults to Python/pytest when language is `None`, which causes incorrect test generation for non-Python projects (e.g., TypeScript projects get Python tests). The TesterAgent at lines 10-12 and 41-44 hard-defaults to Python when `language` is None.
+Auto-detects project language by scanning file extensions (`detect_language()`) or parsing task keywords (`detect_language_from_task()`). Maps languages to test frameworks via `TEST_FRAMEWORKS` and `language_backend.get_backend()`. Twelve languages have their own backend and command (Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby, C#, PHP, Swift, Kotlin), so the Python fallback now applies only when the language is `None` or genuinely unlisted — **not** to TypeScript, which the earlier note gave as its example. `get_backend` does still resolve no aliases, so `golang`, `rs`, `js` and `c#` fall through to Python; detection emits canonical keys, so this is only reachable by a caller passing an alias.
 
 ### LLM Client Layer (agentchanti/llm/)
 
@@ -105,6 +105,36 @@ never be recorded as a failure. With the cap raised the task passed ground
 truth for the first time, at 897.2s.
 
 `benchmarks/verify_dt_invariance.py <project-dir>` is an independent ground-truth check for generated tile-maze games: it drives the game at several timestep profiles and asserts no entity ever occupies a wall tile, catching games that only hold together at a fixed 1/60 dt. Exit codes are **0 PASS, 1 FAIL, 2 could-not-verify** — the third is deliberate, because generated projects share no vocabulary and a refusal must never be recorded as a failure.
+
+`benchmarks/verify_todo_cli.py <project-dir>` is the same idea for the
+todo-CLI task, and **one probe for every language** — Python, JavaScript,
+Go, Rust, Java, C/C++. That is the point: a per-language probe confounds
+task with language, so nothing could say whether a difference came from
+the language or the job. It asserts behaviour rather than startup: each of
+eleven steps is a fresh process, so state that does not persist to disk
+fails, and a wrong exit code on an out-of-range index fails. Everything
+runs in a copy, so an existing `todos.json` cannot pre-seed the result.
+Two gates are reported separately and only the first decides the exit
+code — G1 is the contract neither agent wrote, G2 is the project's own
+suite, recorded rather than trusted, the same demotion `evidence.py`
+applies to a seeded contract.
+
+Every refusal in it was a **measured false verdict**, which is why
+`verify_todo_cli_selftest.py` exists and runs first: a probe that has
+never passed a correct program and never failed a broken one is not
+evidence. A build gets its own timeout, because two correct Maven projects
+were reported `FAIL — timed out` against a cap meant for a `todo add milk`
+invocation, and they build in 36s and 38s. A `todo` wrapper the project
+ships outranks the per-language guess, because one artifact's build copies
+its dependencies rather than shading them, so `java -jar` could never run
+it and an entirely correct project failed 11/11. `mvn -q` was suppressing
+the very `Tests run:` lines the check parses, so a project with **zero
+tests** exited 0 with no output and was graded PASS — the
+`empty_suite_reason` mistake, committed by the instrument grading
+agentchanti for it; a green exit now requires evidence that something ran,
+in Go and Node too. And C source with no Makefile is a definite FAIL
+rather than undecidable, because the task states the project MUST build
+with a single `make`.
 
 ### Plan Re-plan Gate Carry-Forward (plan_step.py)
 
@@ -1226,10 +1256,54 @@ magic check overlap — a `.c` file whose first line is a shebang. Eight real
 trees run against a real toolchain in a `gcc:13` container behave
 correctly, including the segfaulting one on an already-built tree.
 
-Not addressed: `TEST_FRAMEWORKS` has no C entry, so test generation for C
-falls back to pytest, and `verify_cmd_for_language` returns None for C
-exactly as it already does for Rust and Java — a wrong verify command is
-worse than none.
+Both gaps this section originally listed as unaddressed are now closed,
+and neither names a framework, because **neither ecosystem has a standard
+one that needs no install** — Unity, CMocka, Criterion, Check, GoogleTest
+and Catch2 all exist and every one of them would have to be fetched. So
+both answer `make test`, the project's own declared target, which is the
+one thing that says what "the tests pass" means here and keeps a generated
+suite runnable with nothing installed.
+
+`verify_cmd_for_language` returns it only when a Makefile actually declares
+the target, as the JavaScript branch only trusts `npm test` when
+package.json defines it — a wrong verify command is worse than none, so a
+Makefile without it still returns None. `CBackend`/`CppBackend` and the
+`TEST_FRAMEWORKS` entries carry the same answer, and a test pins that the
+dict and the backends agree for **every** language, because
+`get_test_framework` prefers the backend while `test_analyzer` reads the
+dict directly — a C project would otherwise get a different answer
+depending on which one asked.
+
+`extract_exports` took three drafts, and each wrong one would have become a
+false finding in the **ghost's `EXPORTS` expectation** and the two export
+verification paths (`cli.py`, `step_handlers.py`) — which are its real
+consumers. It does **not** feed the wiring graph: that reads
+`dependency_check._LANG_PATTERNS`, a separate table, and the first version
+of this paragraph claimed otherwise without checking.
+
+C is deliberately absent from `_LANG_PATTERNS`, so `WiringReport.can_judge`
+stays False for a C project and the caller runs its full check. Adding it
+naively would **manufacture** the false findings this list is about: a C
+function is consumed through its **header**, so a stem-keyed orphan check
+reports `todo.c exports todo_add but nothing imports todo.c` over an
+ordinary project that includes `todo.h` — the `framework_route_reason`
+shape. Doing it properly means resolving a declaration to the header that
+carries it and asking who includes that; until then the refusal is the
+honest answer. It costs nothing observed: measured on both successful C
+runs, wiring verification was skipped outright because bulk tests passed.
+
+A `static` function has internal
+linkage, so listing it makes `find_gaps` report an export nothing imports —
+forever, since nothing outside the file can. `typedef struct { int x; }
+Task;` carries semicolons inside its body, so no single `[^;]` scan reaches
+the name. And a C++ return type carries `::`, `<>`, `&` and `,`, without
+which the C++ backend returned **no exports at all** for an ordinary
+function.
+
+Still not addressed: `get_backend` resolves no aliases for any language —
+`golang`, `rs`, `js`, `c#` and `c++` all fall through to Python. That is
+pre-existing and repo-wide, and detection only ever emits canonical keys
+(`c`, `cpp`), so widening it belongs in its own change.
 
 ### The Code Graph Answers Wiring First (orchestrator/wiring_graph.py)
 
@@ -1307,7 +1381,13 @@ otherwise.
 
 Defined in `language.py:TEST_FRAMEWORKS`. The TesterAgent (`agents/tester.py`) builds language-specific prompts:
 - `_python_test_rules()` for Python/pytest
-- `_js_test_rules()` for JavaScript/TypeScript (Jest-oriented, no Vitest support yet)
+- `_js_test_rules()` for JavaScript/TypeScript, which dispatches to
+  `_vitest_test_rules()` when the runner is Vitest (`javascript:vitest` and
+  `typescript:vitest` keys select it; `.jsx` is required for test files
+  containing JSX, since Vite will not parse JSX in `.js`)
+- every other language goes through `language_backend.get_backend()`,
+  whose `get_test_rules()` the TesterAgent appends under the backend's own
+  display name
 
 The step handler `_handle_test_step()` in `step_handlers.py` detects JS project environment (ESM vs CJS) and auto-installs test runners.
 
