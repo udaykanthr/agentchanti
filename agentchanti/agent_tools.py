@@ -82,10 +82,59 @@ _POSIX_OUTPUT_PIPE_RE = re.compile(
 _NO_TESTS_EXIT = 5
 # Substring match, not a regex: the command only has to LOOK like a test
 # runner for exit 5 to be meaningful.
+#
+# Every supported language family belongs here. Measured 2026-10-02, the
+# list held Python's runners plus `go test` and `npm test`, so a `cargo
+# test`, `mvn test` or `make test` gate was not even considered — and
+# `verify_passed` accepted a zero exit from all three over a suite that
+# had collected nothing.
 _TEST_RUNNER_TOKENS = ("pytest", "unittest", "nose2", "tox",
-                       "manage.py test", "go test", "npm test")
+                       "manage.py test", "npm test", "ctest", "phpunit",
+                       "rspec")
+# Runners whose subcommand can be separated from the program by flags, so a
+# substring cannot express them: `mvn -B test` does not contain "mvn test".
+# Measured 2026-10-02 — that exact command, reporting `[INFO] No tests to
+# run.`, was the one case out of sixteen the substring list still accepted.
+_TEST_RUNNER_RES = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bmvn\b[^|&;]*\btest\b",
+    r"\bgradlew?\b[^|&;]*\btest\b",
+    r"\bcargo\b[^|&;]*\btest\b",
+    r"\bgo\b[^|&;]*\btest\b",
+    r"\bmake\b[^|&;]*\btest\b",
+    r"\bdotnet\b[^|&;]*\btest\b",
+    r"\bswift\b[^|&;]*\btest\b",
+))
+
+
+def _looks_like_a_test_runner(low: str) -> bool:
+    """Whether *low* (a lowercased command) invokes a test runner."""
+    return (any(tok in low for tok in _TEST_RUNNER_TOKENS)
+            or any(r.search(low) for r in _TEST_RUNNER_RES))
+# How each runner says it collected nothing, which is NOT the same question
+# as its exit status: only Python's runners use exit 5, and Go reports an
+# empty package with `[no test files]` and exit 0. `go test` being in the
+# token list above is exactly why this list matters — the token made it
+# look covered while the marker was missing.
 _NO_TESTS_OUTPUT_MARKERS = ("no tests ran", "ran 0 tests",
-                            "collected 0 items")
+                            "collected 0 items", "[no test files]",
+                            "running 0 tests", "no tests to run",
+                            "tests run: 0", "no tests found",
+                            "executed 0 tests", "0 tests executed")
+
+# Runners with no empty-collection marker at all, where a silent zero exit
+# is indistinguishable from success. `make test` runs whatever the Makefile
+# says, so there is no vocabulary to match — and a generated C suite
+# printing nothing is the NORMAL case, measured in 4 of 6 artifacts. For
+# these, proof has to be positive: the output must show that something ran.
+_OPAQUE_RUNNER_RES = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bmake\b[^|&;]*\btest\b", r"\bctest\b"))
+# Deliberately broad, because a false "it ran" costs nothing here (the gate
+# behaves exactly as it did before) while a false "nothing ran" fails a
+# correct step. Any count, any pass/ok token, any assertion word counts.
+_RAN_SOMETHING_RE = re.compile(
+    r"\b(?:pass(?:ed|ing)?|ok|okay|success(?:ful)?|assert\w*|"
+    r"tests?\s+\d+|\d+\s+tests?|\d+\s+(?:checks?|cases?|assertions?))\b"
+    r"|\u2713|\u221a", re.IGNORECASE)
 
 
 def _no_tests_collected(command: str, exit_code, output: str) -> bool:
@@ -96,13 +145,25 @@ def _no_tests_collected(command: str, exit_code, output: str) -> bool:
     must say so outright.
     """
     low = (command or "").lower()
-    if not any(tok in low for tok in _TEST_RUNNER_TOKENS):
+    if not _looks_like_a_test_runner(low):
         return False
     if (isinstance(exit_code, int) and not isinstance(exit_code, bool)
             and exit_code == _NO_TESTS_EXIT):
         return True
     low_out = (output or "").lower()
-    return any(m in low_out for m in _NO_TESTS_OUTPUT_MARKERS)
+    if any(m in low_out for m in _NO_TESTS_OUTPUT_MARKERS):
+        return True
+    # An opaque runner that exited CLEANLY and said nothing has proved
+    # nothing. Scoped to a zero exit on purpose: a non-zero exit is an
+    # ordinary failure the model should debug normally, and calling that
+    # "collected nothing" would send it after the wrong problem — the
+    # mistake this whole function was written to stop.
+    if (any(r.search(low) for r in _OPAQUE_RUNNER_RES)
+            and isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            and exit_code == 0
+            and not _RAN_SOMETHING_RE.search(output or "")):
+        return True
+    return False
 
 
 # Sentinel the agent loop's exit gate greps for: a verify command that
