@@ -175,3 +175,55 @@ class TestTheRegexesSurvivedBeingWritten:
         for r in _TEST_RUNNER_RES + _OPAQUE_RUNNER_RES + (_RAN_SOMETHING_RE,):
             assert "\x08" not in r.pattern, r.pattern
             assert "\\b" in r.pattern, r.pattern
+
+
+class TestTheAdviceMatchesTheRunner:
+    """One hint used to end with "named test_*.py ... __init__.py ...
+    project root" — correct for a Python runner and actively misleading for
+    `make test`, where it would send the model looking for Python test
+    files in a C project.
+
+    A tool misreporting its own situation is the shape `_read_file_range`
+    (a 300-line read headed "full source") and `NO TESTS RAN` were both
+    fixed for.
+    """
+
+    def _hint(self, command):
+        from agentchanti.agent_tools import _no_tests_hint
+        return _no_tests_hint(command)
+
+    @pytest.mark.parametrize("command", ["make test", "make -C build test",
+                                         "ctest"])
+    def test_an_opaque_runner_is_told_to_print_what_passed(self, command):
+        h = self._hint(command)
+        assert "printed nothing" in h
+        assert "tests passed" in h          # the concrete thing to emit
+        assert "test_*.py" not in h, "Python advice leaked into a make hint"
+
+    @pytest.mark.parametrize("command", ["python -m pytest -q",
+                                         "python -m unittest discover",
+                                         "python manage.py test"])
+    def test_a_python_runner_keeps_the_python_advice(self, command):
+        h = self._hint(command)
+        assert "test_*.py" in h
+        assert "printed nothing" not in h
+
+    @pytest.mark.parametrize("command", ["go test ./...", "mvn -B test",
+                                         "cargo test --quiet",
+                                         "./gradlew test"])
+    def test_other_runners_get_runner_neutral_advice(self, command):
+        """Neither Python's filenames nor make's print-a-line, because
+        neither is true for them."""
+        h = self._hint(command)
+        assert "test_*.py" not in h
+        assert "printed nothing" not in h
+        assert "where this runner looks for them" in h
+
+    def test_every_hint_keeps_the_part_that_matters(self):
+        """The shared warning is the load-bearing half: a zero exit is not
+        evidence, and there is no bug in the code to chase."""
+        for command in ("make test", "python -m pytest", "go test ./..."):
+            h = self._hint(command)
+            assert "COLLECTED NO TESTS" in h
+            assert "is NOT evidence that anything passed" in h
+            assert "not a failing assertion" in h

@@ -170,15 +170,47 @@ def _no_tests_collected(command: str, exit_code, output: str) -> bool:
 # collected nothing has proved nothing, whatever it exited with.
 NO_TESTS_MARKER = "COLLECTED NO TESTS"
 
-_NO_TESTS_HINT = (
+_NO_TESTS_PREFIX = (
     f"\n\nNOTE: the runner exited having {NO_TESTS_MARKER}. This is a "
     "discovery problem, not a failing assertion — nothing was executed, so "
     "there is no bug in the code under test to chase here, and a zero exit "
-    "status above is NOT evidence that anything passed. Check that the "
-    "test file exists, is named test_*.py, sits in a directory with an "
-    "__init__.py if you are importing it as a package, and that you are "
-    "running from the project root."
+    "status above is NOT evidence that anything passed. "
 )
+# The advice has to match the runner. The single hint used to end with
+# "named test_*.py ... __init__.py ... project root", which is correct for
+# a Python runner and actively misleading for `make test` — it would send
+# the model looking for Python test files in a C project. Misreporting a
+# tool's own situation is the failure shape `_read_file_range` and
+# `NO TESTS RAN` were both fixed for.
+_NO_TESTS_HINT_PYTHON = (
+    "Check that the test file exists, is named test_*.py, sits in a "
+    "directory with an __init__.py if you are importing it as a package, "
+    "and that you are running from the project root."
+)
+_NO_TESTS_HINT_OPAQUE = (
+    "This target exited 0 and printed nothing that shows a test ran. Either "
+    "it does not actually build and run the suite, or the suite runs "
+    "silently — and a suite that prints nothing cannot be distinguished "
+    "from one that ran no tests. Make it print a line naming what passed "
+    "(for example `3 tests passed`) and make it exit non-zero on the first "
+    "failure."
+)
+_NO_TESTS_HINT_GENERIC = (
+    "Check that test files exist where this runner looks for them, that "
+    "they are named the way it requires, and that you are running from the "
+    "directory that owns the project's manifest."
+)
+
+
+def _no_tests_hint(command: str) -> str:
+    """Advice matched to the runner that collected nothing."""
+    low = (command or "").lower()
+    if any(r.search(low) for r in _OPAQUE_RUNNER_RES):
+        return _NO_TESTS_PREFIX + _NO_TESTS_HINT_OPAQUE
+    if any(tok in low for tok in ("pytest", "unittest", "nose2", "tox",
+                                  "manage.py test")):
+        return _NO_TESTS_PREFIX + _NO_TESTS_HINT_PYTHON
+    return _NO_TESTS_PREFIX + _NO_TESTS_HINT_GENERIC
 
 
 # Distributions named by an install command that FAILED. A model whose
@@ -1298,7 +1330,7 @@ class AgentTools:
         if _no_tests_collected(
                 command, getattr(self._executor, "last_exit_code", None),
                 output):
-            hint = _NO_TESTS_HINT
+            hint = _no_tests_hint(command)
         if stripped_pipe:
             hint += (f"\n[note] Dropped `{stripped_pipe}` — head/tail/more do "
                      f"not exist on Windows and the pipeline would have "
