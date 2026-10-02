@@ -136,6 +136,45 @@ in Go and Node too. And C source with no Makefile is a definite FAIL
 rather than undecidable, because the task states the project MUST build
 with a single `make`.
 
+`benchmarks/replay_fixed_plan.py` replays ONE captured plan through several
+code paths, because the plan a run draws dominates its cost: step execution
+varied 6 -> 13 calls between two rounds of the identical task, a +165%
+swing, which hid a real -20,157 token saving and made totals go UP. Every
+optimisation before it landed in "worked, but unmeasurable".
+
+A checkpoint already carries `plan_steps`, `task`, `language` and
+`project_context`, and `--resume` restores them and skips briefing, the
+global KB and the planner. So `capture` runs until a checkpoint with a plan
+exists and stops — killing the run deliberately, since a full one would
+cost the tokens this exists to save and a successful run clears its
+checkpoint on the way out — and `replay` starts each arm from a byte copy
+of the same template with that plan in place.
+
+    python benchmarks/replay_fixed_plan.py capture <task-file> <template-dir> <out-dir> [--image IMG]
+    python benchmarks/replay_fixed_plan.py replay  <out-dir> <label> [runs] [--image IMG]
+    python benchmarks/replay_fixed_plan.py report  <out-dir>
+
+`--image` runs agentchanti **inside** that container, which is what makes
+it usable for Go, Rust, Java and C — the host has no gcc, make or cmake, so
+without it the harness could only replay a plan whose toolchain the host
+happened to have, and the question it was most recently needed for could
+not be asked at all. `timeout` runs inside the container on purpose: killing
+the docker client leaves the container running, which is how one benchmark
+left a dev server alive for four hours. Both arms must use the same image or
+the comparison measures the image.
+
+**What it does not do is make a small difference significant**, and its
+first real use is the reason `report` now prints the spread rather than the
+delta alone. Measured 2026-10-02 on C's TEST-step change, single-variable
+and same plan: 151,055 vs 123,145 totals, -18.5% — with one arm's own range
+at 111,447, **four times the effect**, and Welch t = 0.84. Pooled CV is
+26%, so detecting that effect at 80% power needs ~27 runs per arm, 54 runs
+and roughly 7.4M tokens. The honest conclusion was that the question is not
+answerable this way at sane cost, because the variance is driven by
+discrete events rather than smooth noise — the one expensive run was
+precisely the one that needed a recovery loop after `verify-failed`. The
+report says so itself now, so nobody reads a direction as a result.
+
 ### Plan Re-plan Gate Carry-Forward (plan_step.py)
 
 A weak `verify:` sends the plan back to the planner, but a re-plan regenerates *every* step — and a planner asked to strengthen step 4's gate has no reason to preserve the strength of step 3's. `repair_verify_commands` exists to avoid the re-plan entirely by rewriting only the offending line; `carry_forward_strong_gates` covers what happens when that repair yields nothing and the re-plan runs anyway.
