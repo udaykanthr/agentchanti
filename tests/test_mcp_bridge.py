@@ -557,3 +557,72 @@ class TestTheDocumentedLimits:
         assert "call_tool" in src
         assert "list_resources" not in src
         assert "list_prompts" not in src
+
+
+class TestEverySdkFieldSpelling:
+    """Three defects of one shape, each found only against a real server.
+
+    The SDK's models are pydantic with snake_case attributes and camelCase
+    wire aliases, and a missing attribute yields a default rather than an
+    error — so reading one spelling fails silently every time. Fixing them
+    one at a time would have left the fourth, so all SDK field access goes
+    through `_sdk_field`.
+    """
+
+    def _f(self):
+        from agentchanti.mcp_bridge import _sdk_field
+        return _sdk_field
+
+    def test_either_spelling_is_read(self):
+        f = self._f()
+
+        class Snake:
+            input_schema = {"type": "object", "properties": {"url": {}}}
+
+        class Camel:
+            inputSchema = {"type": "object", "properties": {"url": {}}}
+
+        for obj in (Snake(), Camel()):
+            got = f(obj, "input_schema", "inputSchema")
+            assert "url" in got["properties"], obj
+
+    def test_dicts_work_too(self):
+        f = self._f()
+        assert f({"isError": True}, "is_error", "isError") is True
+
+    def test_the_default_is_returned_when_absent(self):
+        f = self._f()
+        sentinel = {"type": "object", "properties": {}}
+        assert f(object(), "input_schema", "inputSchema",
+                 default=sentinel) is sentinel
+
+    def test_a_tool_schema_survives_the_snake_case_spelling(self):
+        """THE defect: reading only `inputSchema` advertised every tool as
+        taking no arguments, so the model would call it with `{}` and get
+        "'url' is a required property" forever. Measured against the real
+        mcp-server-fetch, whose schema arrived empty."""
+        from agentchanti.mcp_bridge import MCPServerSpec, tool_defs_for
+
+        class RealWorldTool:
+            name = "fetch"
+            description = "Fetches a URL."
+            input_schema = {"type": "object",
+                            "properties": {"url": {"type": "string"},
+                                           "max_length": {"type": "integer"}},
+                            "required": ["url"]}
+
+        offered, _ = tool_defs_for("fetch", [RealWorldTool()],
+                                   MCPServerSpec("fetch", read_only=True))
+        params = offered[0].parameters
+        assert list(params["properties"]) == ["url", "max_length"]
+        assert params["required"] == ["url"]
+
+    def test_no_direct_getattr_on_sdk_objects_remains(self):
+        """If one creeps back, the class of bug is back with it."""
+        import inspect
+
+        from agentchanti import mcp_bridge
+        src = inspect.getsource(mcp_bridge)
+        for leak in ('getattr(tool,', 'getattr(response,', 'getattr(item,',
+                     'getattr(listed,'):
+            assert leak not in src, leak

@@ -247,6 +247,41 @@ def mcp_available() -> tuple[bool, str]:
     return True, ""
 
 
+def _sdk_field(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read a field from an SDK object under any of its spellings.
+
+    The SDK's models are pydantic with **snake_case attributes and
+    camelCase wire aliases** — `input_schema`/`inputSchema`,
+    `is_error`/`isError`, `structured_content`/`structuredContent` — and in
+    1.x some of those attributes were camelCase outright. Reading one
+    spelling is a silent failure every time, because a missing attribute
+    yields the default rather than an error.
+
+    Three measured instances before this existed, each found only by
+    running against a real server:
+
+    * `is_error` — a FAILED tool call was reported to the model as a
+      success, which is the wrong direction for a verification system.
+    * `input_schema` — every tool was advertised as taking NO arguments, so
+      the model would call it with `{}` and get "'url' is a required
+      property" forever. Tools that appeared to work were unusable.
+    * `structured_content` — a result carrying its whole payload there read
+      as "the tool returned no content".
+
+    Fixing those one at a time would leave the fourth. Dict access is
+    supported too, for a server or a test speaking raw JSON.
+    """
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    if isinstance(obj, dict):
+        for name in names:
+            if obj.get(name) is not None:
+                return obj[name]
+    return default
+
+
 def split_qualified(name: str) -> tuple[str, str] | None:
     """`server__tool` -> ("server", "tool"), or None if not qualified."""
     if NAME_SEPARATOR not in name:
@@ -286,8 +321,7 @@ def tool_defs_for(server: str, tools: list[Any],
     offered: list[ToolDef] = []
     withheld: list[WithheldTool] = []
     for tool in tools:
-        name = getattr(tool, "name", None) or (
-            tool.get("name") if isinstance(tool, dict) else None)
+        name = _sdk_field(tool, "name")
         if not name:
             continue
         if spec.allow and name not in spec.allow:
@@ -295,12 +329,13 @@ def tool_defs_for(server: str, tools: list[Any],
                 server, name,
                 "not in this server's `allow:` list"))
             continue
-        desc = (getattr(tool, "description", None)
-                or (tool.get("description") if isinstance(tool, dict) else None)
+        desc = (_sdk_field(tool, "description")
                 or f"{name} (from MCP server {server})")
-        schema = (getattr(tool, "inputSchema", None)
-                  or (tool.get("inputSchema") if isinstance(tool, dict) else None)
-                  or {"type": "object", "properties": {}})
+        # BOTH spellings: 2.x names the attribute `input_schema` and keeps
+        # `inputSchema` as the wire alias. Reading only the alias advertised
+        # every tool as taking no arguments.
+        schema = _sdk_field(tool, "input_schema", "inputSchema",
+                            default={"type": "object", "properties": {}})
         offered.append(ToolDef(
             name=f"{server}{NAME_SEPARATOR}{name}",
             description=f"[{server}] {desc}",
@@ -425,28 +460,22 @@ def render_result(response: Any) -> str:
     `AgentTools.execute` never raises: the model has to be able to read what
     went wrong and act on it.
     """
-    content = getattr(response, "content", None)
-    if content is None and isinstance(response, dict):
-        content = response.get("content")
+    content = _sdk_field(response, "content")
     # 2.x added a structured payload that may carry the whole result while
     # `content` is empty. Without this the tool would read as having
     # returned nothing.
     if not content:
-        structured = (getattr(response, "structured_content", None)
-                      or (response.get("structuredContent")
-                          if isinstance(response, dict) else None))
+        structured = _sdk_field(response, "structured_content",
+                                "structuredContent")
         if structured:
             return json.dumps(structured, default=str)[:MAX_RESULT_CHARS]
     parts: list[str] = []
     for item in content or ():
-        text = (getattr(item, "text", None)
-                or (item.get("text") if isinstance(item, dict) else None))
+        text = _sdk_field(item, "text")
         if text:
             parts.append(str(text))
             continue
-        kind = (getattr(item, "type", None)
-                or (item.get("type") if isinstance(item, dict) else None)
-                or "content")
+        kind = _sdk_field(item, "type", default="content")
         # Binary and resource blocks are named rather than dumped: a
         # base64 image in the conversation is tokens the model cannot use.
         parts.append(f"[{kind} block, not rendered as text]")
@@ -461,11 +490,7 @@ def render_result(response: Any) -> str:
     # because the fake result object used `isError`, so they validated the
     # assumption rather than the SDK: a fake built from what you believe
     # tests your belief.
-    is_error = bool(
-        getattr(response, "is_error", None)
-        or getattr(response, "isError", None)
-        or (isinstance(response, dict)
-            and (response.get("is_error") or response.get("isError"))))
+    is_error = bool(_sdk_field(response, "is_error", "isError"))
     return f"ERROR from the MCP tool: {body}" if is_error else body
 
 
@@ -602,7 +627,7 @@ def _bridge_start(bridge: "MCPBridge") -> bool:
                 f"MCP server {name!r} did not start: "
                 f"{type(exc).__name__}: {exc}")
             continue
-        tools = getattr(listed, "tools", None) or []
+        tools = _sdk_field(listed, "tools", default=[])
         defs, withheld = tool_defs_for(name, list(tools), spec)
         bridge._sessions[name] = session
         bridge._defs.extend(defs)
