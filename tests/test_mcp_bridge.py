@@ -516,3 +516,44 @@ class TestBothSdkSpellings:
         assert "create_mcp_http_client" in src          # 2.x headers path
         # Arity-tolerant: 1.x yields three streams, 2.x two.
         assert "streams[0], streams[1]" in src
+
+
+class TestTheDocumentedLimits:
+    """`read_only` is the one most likely to be misread, so it is pinned in
+    the module's own documentation as well as in behaviour.
+
+    Verified live against mcp 2.3.0: stdio and streamable HTTP both work,
+    including a configured header reaching the server. What is NOT supported
+    is written down rather than left for someone to discover.
+    """
+
+    def _doc(self):
+        """Whitespace-normalised, because the prose is hard-wrapped and a
+        phrase that happens to straddle a newline is not a missing phrase.
+        The first version of this test asserted on the raw string and failed
+        on "as a\\n   sandbox"."""
+        from agentchanti import mcp_bridge
+        return " ".join((mcp_bridge.__doc__ or "").split())
+
+    def test_read_only_is_documented_as_an_assertion_not_a_sandbox(self):
+        doc = self._doc()
+        assert "ASSERTION, not an enforcement" in doc
+        assert "as a sandbox" in doc
+
+    def test_the_unsupported_surface_is_named(self):
+        doc = self._doc()
+        for unsupported in ("resources", "prompts", "OAuth",
+                            "tools/list_changed"):
+            assert unsupported in doc, unsupported
+
+    def test_only_tools_are_requested_from_a_server(self):
+        """If this grows a `list_resources` call, the limit above is stale
+        and the documentation has to move with it."""
+        import inspect
+
+        from agentchanti import mcp_bridge
+        src = inspect.getsource(mcp_bridge)
+        assert "list_tools" in src
+        assert "call_tool" in src
+        assert "list_resources" not in src
+        assert "list_prompts" not in src

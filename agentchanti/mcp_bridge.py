@@ -48,6 +48,37 @@ absent instrument must not convict the code, which is the rule
 `_INCONCLUSIVE_MARKERS` and the toolchain skips in every shipped contract
 already follow.
 
+WHAT CAN AND CANNOT CONNECT
+
+Verified live against mcp 2.3.0: **stdio** (a child process) and
+**streamable HTTP** (including a configured header reaching the server,
+which is how a gateway carries an agent's bearer token). The SDK renamed the
+HTTP opener and changed how headers are passed between majors, so both
+spellings are handled — `pyproject` declares `mcp>=1.2,<3` and the range
+spans the rename.
+
+Four limits, and the first is the one to read twice:
+
+1. **`read_only` is an operator's ASSERTION, not an enforcement.** It gates
+   whether this bridge *offers* a server's tools; it does not constrain what
+   the server does. Mark a filesystem server `read_only: true` and its write
+   tools are hidden from the model — but nothing here prevents that server
+   writing if some other path reaches it. The fence buys intent, not safety,
+   and the guards still have to move below the tool boundary before a
+   write-capable server is trustworthy. Do not read the config key as a
+   sandbox.
+2. **Tools only.** `tools/list` and `tools/call`. MCP also carries
+   resources, prompts, sampling, roots and elicitation, and a server whose
+   value is in those contributes nothing here.
+3. **Static headers only — no OAuth.** Many hosted servers require OAuth
+   2.1 and cannot connect at all. A gateway that mints its own bearer token
+   works, which is the case the `headers:` key exists for.
+4. **No `tools/list_changed`.** The catalog is read once at startup, so a
+   server that changes its tool list mid-session is not noticed.
+
+A stdio server also needs its command present: `uvx mcp-server-fetch` is
+only connectable on a machine that has `uvx`.
+
 ONE EVENT LOOP, OWNED BY ONE THREAD
 
 The MCP client is async while `AgentTools.execute` is sync, and an MCP
