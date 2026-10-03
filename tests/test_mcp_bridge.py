@@ -305,3 +305,156 @@ class TestABridgeWithAFakeSession:
         b._sessions.clear()
         out = b.execute("fetch__get", {})
         assert "has no live session" in out
+
+
+class _FakeMemory:
+    def summary(self):
+        return ""
+
+
+def _live_bridge(tool="get", result="PAGE BODY"):
+    """A bridge with one offered tool and a fake session."""
+    spec = MCPServerSpec("fetch", command="s", read_only=True)
+    bridge = MCPBridge([spec])
+    offered, _ = tool_defs_for("fetch", [_Tool(tool)], spec)
+    bridge._defs.extend(offered)
+    bridge._sessions["fetch"] = object()
+    bridge._started = True
+    bridge._call = lambda *a, **k: result
+    return bridge
+
+
+class TestItIsActuallyWired:
+    """`protect_acceptance_files` existed, was called only from a test, and
+    the guard it implemented was INERT in production for as long as that
+    was true. These go through `build_step_tools` and `attach_to` rather
+    than setting the attribute by hand, because the wiring is the seam."""
+
+    def test_build_step_tools_transfers_the_bridge(self):
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        bridge = _live_bridge()
+        memory = _FakeMemory()
+        memory._mcp_bridge = bridge
+        tools = build_step_tools(executor=None, memory=memory,
+                                 project_root=".")
+        assert tools._mcp is bridge
+
+    def test_no_bridge_on_memory_leaves_tools_unchanged(self):
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        tools = build_step_tools(executor=None, memory=_FakeMemory(),
+                                 project_root=".")
+        assert tools._mcp is None
+        assert all(NAME_SEPARATOR not in d.name for d in tools.definitions())
+
+    def test_the_tools_appear_in_definitions(self):
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        memory = _FakeMemory()
+        memory._mcp_bridge = _live_bridge()
+        tools = build_step_tools(executor=None, memory=memory,
+                                 project_root=".")
+        names = [d.name for d in tools.definitions()]
+        assert "fetch__get" in names
+        # And the six built-ins are still all there.
+        for builtin in ("list_files", "read_file", "write_file", "edit_file",
+                        "run_command", "search_code"):
+            assert builtin in names
+
+    def test_a_call_reaches_the_server(self):
+        from agentchanti.llm.chat_types import ToolCall
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        memory = _FakeMemory()
+        memory._mcp_bridge = _live_bridge(result="the page")
+        tools = build_step_tools(executor=None, memory=memory,
+                                 project_root=".")
+        out = tools.execute(ToolCall(id="1", name="fetch__get",
+                                     arguments={"url": "x"}))
+        assert out == "the page"
+
+    def test_an_external_tool_obeys_the_per_turn_offer(self):
+        """The loop withholds tools on its final turn and when a model
+        spends turn after turn reading. An MCP tool escaping that would
+        defeat the control for exactly the tools whose behaviour is least
+        known."""
+        from agentchanti.llm.chat_types import ToolCall
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        memory = _FakeMemory()
+        memory._mcp_bridge = _live_bridge()
+        tools = build_step_tools(executor=None, memory=memory,
+                                 project_root=".")
+        out = tools.execute(ToolCall(id="1", name="fetch__get", arguments={}),
+                            allowed={"write_file"})
+        assert "disabled for this turn" in out
+
+    def test_unknown_still_outranks_withheld(self):
+        """A name that never existed is a different mistake from one taken
+        away this turn, and "disabled" would send the model hunting for a
+        way to re-enable it."""
+        from agentchanti.llm.chat_types import ToolCall
+        from agentchanti.orchestrator.agent_loop import build_step_tools
+        memory = _FakeMemory()
+        memory._mcp_bridge = _live_bridge()
+        tools = build_step_tools(executor=None, memory=memory,
+                                 project_root=".")
+        out = tools.execute(ToolCall(id="1", name="fetch__nope", arguments={}),
+                            allowed={"write_file"})
+        assert "unknown tool" in out
+
+
+class TestAttachAndStop:
+
+    def test_nothing_configured_attaches_nothing_and_says_nothing(self, caplog):
+        from agentchanti import mcp_bridge as mb
+
+        class _Cfg:
+            MCP = None
+        memory = _FakeMemory()
+        with caplog.at_level("WARNING"):
+            assert mb.attach_to(memory, _Cfg()) is None
+        assert not hasattr(memory, "_mcp_bridge")
+        assert "[MCP]" not in caplog.text
+
+    def test_a_rejected_server_is_warned_about_not_silently_dropped(self, caplog):
+        """Its tools are missing either way; only one of those outcomes
+        tells the operator which line to fix."""
+        from agentchanti import mcp_bridge as mb
+
+        class _Cfg:
+            MCP = {"servers": [{"name": "w", "command": "s"}]}
+        with caplog.at_level("WARNING"):
+            mb.attach_to(_FakeMemory(), _Cfg())
+        assert "read_only" in caplog.text
+
+    def test_attach_is_idempotent(self):
+        """`cli.py` builds FileMemory on more than one path, and a second
+        set of sessions would double every handshake and orphan the first."""
+        from agentchanti import mcp_bridge as mb
+
+        class _Cfg:
+            MCP = {"servers": [{"name": "f", "command": "s",
+                                "read_only": True}]}
+        mb.stop_active()
+        try:
+            a = mb.attach_to(_FakeMemory(), _Cfg())
+            b = mb.attach_to(_FakeMemory(), _Cfg())
+            # Without mcp installed both are None; with it, the same object.
+            assert a is b
+        finally:
+            mb.stop_active()
+
+    def test_stop_active_is_safe_with_no_bridge(self):
+        from agentchanti import mcp_bridge as mb
+        mb.stop_active()
+        mb.stop_active()
+
+    def test_main_stops_the_bridge_on_every_exit_path(self):
+        """Including the exception and KeyboardInterrupt branches — a stdio
+        server is a child process, and an orphan holding a pipe open is what
+        hung a pipeline for four hours."""
+        import inspect
+
+        from agentchanti.orchestrator import cli
+        src = inspect.getsource(cli.main)
+        assert "finally:" in src
+        assert "stop_active()" in src
+        # In the finally, i.e. after the handlers rather than inside one.
+        assert src.index("KeyboardInterrupt") < src.index("stop_active")

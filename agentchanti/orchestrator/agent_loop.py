@@ -1739,6 +1739,16 @@ def build_step_tools(executor, memory, kb_context_builder=None,
     # it. Retrying until green makes rewriting the contract the cheapest
     # path to green, so this must hold before that loop exists.
     tools.protect_acceptance_files(getattr(memory, "_acceptance_files", None))
+    # The MCP bridge rides on FileMemory for the same reason and by the same
+    # route: one session has to outlive a single step, while this object is
+    # built per step. Attached rather than constructed here because starting
+    # a server per step would pay the handshake every time and drop the
+    # session in between.
+    #
+    # Transferred HERE and not left to the caller, because that is the exact
+    # mistake the comment above records: `protect_acceptance_files` existed,
+    # was called only from a test, and the guard was inert in production.
+    tools._mcp = getattr(memory, "_mcp_bridge", None)
     return tools
 
 

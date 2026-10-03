@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 
 from ..config import Config
+from .. import mcp_bridge as _mcp_bridge
 from ..llm.ollama import OllamaClient
 from ..llm.lm_studio import LMStudioClient
 from ..llm.base import LLMError
@@ -255,6 +256,13 @@ def main():
         # non-zero and the traceback still reaches stderr.
         log.exception("Unhandled exception — pipeline crashed")
         raise
+    finally:
+        # Close MCP sessions on EVERY exit path, including the two above.
+        # A stdio server is a child process, and an orphaned one holding a
+        # pipe open is what hung a pipeline for four hours — so this does
+        # not rely on the bridge's loop thread being a daemon. Safe when no
+        # server was ever configured, which is the ordinary case.
+        _mcp_bridge.stop_active()
     sys.exit(exit_code)
 
 
@@ -1180,6 +1188,10 @@ def _main_impl():
     if resuming and checkpoint_state:
         log.info("Resuming from checkpoint...")
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        # External tools from MCP servers, if any are configured.
+        # Idempotent and silent when none are, so an ordinary run
+        # pays nothing and is never told to install the extra.
+        _mcp_bridge.attach_to(memory, cfg)
         if kb_runtime_watcher is not None:
             memory.watcher_created_files = kb_runtime_watcher.created_files
         memory.update(checkpoint_state.get("file_memory", {}))
@@ -2007,6 +2019,10 @@ def _main_impl():
         log.info(f"Approved {len(steps)} steps.")
 
         memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
+        # External tools from MCP servers, if any are configured.
+        # Idempotent and silent when none are, so an ordinary run
+        # pays nothing and is never told to install the extra.
+        _mcp_bridge.attach_to(memory, cfg)
         if kb_runtime_watcher is not None:
             memory.watcher_created_files = kb_runtime_watcher.created_files
         # Raw-task test-request flag, computed before enrichment (see above).

@@ -554,3 +554,67 @@ def _bridge_stop(bridge: "MCPBridge") -> None:
     bridge._sessions.clear()
     bridge._defs.clear()
     bridge._started = False
+
+
+# --------------------------------------------------------------------------
+# Run-scoped lifecycle. One bridge per run, attached to FileMemory so
+# `build_step_tools` can reach it, and stopped on EVERY exit path.
+# --------------------------------------------------------------------------
+
+_ACTIVE: MCPBridge | None = None
+
+
+def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
+    """Start the configured servers once and hang the bridge on *memory*.
+
+    Idempotent, because `cli.py` builds FileMemory on more than one path and
+    starting a second set of sessions would double every server's handshake
+    and leave the first set orphaned.
+
+    Returns the bridge, or None when nothing is configured — which is the
+    ordinary case and must stay silent. Never raises: every failure here
+    costs the run its external tools and nothing else.
+    """
+    global _ACTIVE
+    try:
+        specs, problems = load_specs(getattr(cfg, "MCP", None))
+    except Exception as exc:                        # pragma: no cover - env
+        log.warning("[MCP] configuration could not be read: %s", exc)
+        return None
+    for problem in problems:
+        # A rejected server is a WARNING, not a silent omission: its tools
+        # are missing either way, and only one of those two outcomes tells
+        # the operator which line to fix.
+        log.warning("[MCP] %s", problem)
+    if not specs:
+        return None
+    if _ACTIVE is not None:
+        memory._mcp_bridge = _ACTIVE
+        return _ACTIVE
+    bridge = MCPBridge(specs)
+    bridge.start()
+    for problem in bridge.problems:
+        log.warning("[MCP] %s", problem)
+    for withheld in bridge.withheld:
+        log.info("[MCP] withheld %s — %s", withheld.qualified, withheld.reason)
+    offered = bridge.definitions()
+    if offered:
+        log.info("[MCP] %d external tool(s) offered to the loop: %s",
+                 len(offered), ", ".join(d.name for d in offered))
+    _ACTIVE = bridge
+    memory._mcp_bridge = bridge
+    return bridge
+
+
+def stop_active() -> None:
+    """Close the run's bridge. Safe to call when there is none.
+
+    Called from `main()`'s finally so it runs on an exception and on
+    KeyboardInterrupt too. A stdio server is a CHILD PROCESS, and the
+    orphaned `next dev` that held a pipe open for four hours is why this
+    does not rely on the loop thread being a daemon.
+    """
+    global _ACTIVE
+    bridge, _ACTIVE = _ACTIVE, None
+    if bridge is not None:
+        bridge.stop()
