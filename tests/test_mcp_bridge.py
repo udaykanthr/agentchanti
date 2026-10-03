@@ -43,9 +43,23 @@ class _Block:
 
 
 class _Result:
-    def __init__(self, content, isError=False):
+    """A tool result, in whichever spelling the SDK major uses.
+
+    `which` exists because a fake built from what you BELIEVE tests your
+    belief: the first version of this class only had `isError`, which is the
+    1.x attribute, so the tests passed while `render_result` could not see a
+    2.x error result at all — and reported a failed call as a success.
+    """
+
+    def __init__(self, content, isError=False, which="both",
+                 structured=None):
         self.content = content
-        self.isError = isError
+        if which in ("both", "1.x"):
+            self.isError = isError
+        if which in ("both", "2.x"):
+            self.is_error = isError
+        if structured is not None:
+            self.structured_content = structured
 
 
 class TestTheReadOnlyFence:
@@ -458,3 +472,47 @@ class TestAttachAndStop:
         assert "stop_active()" in src
         # In the finally, i.e. after the handlers rather than inside one.
         assert src.index("KeyboardInterrupt") < src.index("stop_active")
+
+
+class TestBothSdkSpellings:
+    """`pyproject` declares `mcp>=1.2,<3`, and the SDK renamed things inside
+    that range. Verified against a real mcp 2.3.0 install, which is the only
+    way either of these was found — 52 unit tests passed over both.
+    """
+
+    @pytest.mark.parametrize("which", ["1.x", "2.x", "both"])
+    def test_an_error_result_is_seen_in_either_spelling(self, which):
+        """2.x names the attribute `is_error` and keeps `isError` only as a
+        wire alias. Reading one name reported a FAILED call as a success,
+        which is the wrong direction for a verification system."""
+        out = render_result(_Result([_Block("bad path")], isError=True,
+                                    which=which))
+        assert out.startswith("ERROR from the MCP tool:"), which
+
+    @pytest.mark.parametrize("which", ["1.x", "2.x", "both"])
+    def test_a_success_is_not_mistaken_for_an_error(self, which):
+        out = render_result(_Result([_Block("fine")], isError=False,
+                                    which=which))
+        assert not out.startswith("ERROR"), which
+
+    def test_a_structured_payload_is_not_read_as_empty(self):
+        """2.x may carry the whole result in `structured_content` with
+        `content` empty; without this the tool reads as returning nothing."""
+        out = render_result(_Result([], structured={"rows": [1, 2]}))
+        assert "rows" in out
+        assert "no content" not in out
+
+    def test_the_http_transport_handles_both_apis(self):
+        """1.x: `streamablehttp_client(url, headers=...)`.
+        2.x: `streamable_http_client(url, http_client=...)`.
+        The first cut used the 1.x name AND keyword, so the HTTP transport
+        would have raised ImportError on the version actually released."""
+        import inspect
+
+        from agentchanti import mcp_bridge
+        src = inspect.getsource(mcp_bridge._open_session)
+        assert "streamable_http_client" in src          # 2.x
+        assert "streamablehttp_client" in src           # 1.x
+        assert "create_mcp_http_client" in src          # 2.x headers path
+        # Arity-tolerant: 1.x yields three streams, 2.x two.
+        assert "streams[0], streams[1]" in src

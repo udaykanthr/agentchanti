@@ -59,6 +59,7 @@ bluntly: a dead event loop is a subtle, miserable class of bug.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -396,6 +397,15 @@ def render_result(response: Any) -> str:
     content = getattr(response, "content", None)
     if content is None and isinstance(response, dict):
         content = response.get("content")
+    # 2.x added a structured payload that may carry the whole result while
+    # `content` is empty. Without this the tool would read as having
+    # returned nothing.
+    if not content:
+        structured = (getattr(response, "structured_content", None)
+                      or (response.get("structuredContent")
+                          if isinstance(response, dict) else None))
+        if structured:
+            return json.dumps(structured, default=str)[:MAX_RESULT_CHARS]
     parts: list[str] = []
     for item in content or ():
         text = (getattr(item, "text", None)
@@ -410,8 +420,21 @@ def render_result(response: Any) -> str:
         # base64 image in the conversation is tokens the model cannot use.
         parts.append(f"[{kind} block, not rendered as text]")
     body = "\n".join(parts) if parts else "(the tool returned no content)"
-    is_error = bool(getattr(response, "isError", None)
-                    or (isinstance(response, dict) and response.get("isError")))
+    # BOTH spellings. In mcp 2.x the Python attribute is `is_error` and
+    # `isError` is only the wire alias; in 1.x the attribute itself was
+    # `isError`. Checking one name meant a FAILED tool call was reported to
+    # the model as a success — the wrong direction for a system whose whole
+    # question is whether something actually worked.
+    #
+    # Found by running against a real server. The 52 unit tests missed it
+    # because the fake result object used `isError`, so they validated the
+    # assumption rather than the SDK: a fake built from what you believe
+    # tests your belief.
+    is_error = bool(
+        getattr(response, "is_error", None)
+        or getattr(response, "isError", None)
+        or (isinstance(response, dict)
+            and (response.get("is_error") or response.get("isError"))))
     return f"ERROR from the MCP tool: {body}" if is_error else body
 
 
@@ -460,9 +483,34 @@ async def _open_session(spec: MCPServerSpec, stack: Any) -> Any:
                                        env=dict(spec.env) or None)
         read, write = await stack.enter_async_context(stdio_client(params))
     else:
-        from mcp.client.streamable_http import streamablehttp_client
-        read, write, _ = await stack.enter_async_context(
-            streamablehttp_client(spec.url or "", headers=dict(spec.headers)))
+        # The SDK renamed this between majors and changed how headers are
+        # passed, and `pyproject` declares `mcp>=1.2,<3` — so the range this
+        # package supports spans the rename and both have to work.
+        #
+        #   1.x  streamablehttp_client(url, headers={...})
+        #   2.x  streamable_http_client(url, http_client=AsyncClient(...))
+        #
+        # Found by installing the package: the first cut used the 1.x name
+        # and the 1.x `headers=` keyword, so the HTTP transport would have
+        # raised ImportError on 2.x and TypeError on the version actually
+        # released. 52 unit tests passed throughout, because every one of
+        # them uses a fake session.
+        import mcp.client.streamable_http as _sh
+        opener = getattr(_sh, "streamable_http_client", None)
+        if opener is not None:                      # 2.x
+            http_client = _sh.create_mcp_http_client(
+                headers=dict(spec.headers) or None)
+            await stack.enter_async_context(http_client)
+            streams = await stack.enter_async_context(
+                opener(spec.url or "", http_client=http_client))
+        else:                                       # 1.x
+            streams = await stack.enter_async_context(
+                _sh.streamablehttp_client(spec.url or "",
+                                          headers=dict(spec.headers)))
+        # 1.x yields (read, write, get_session_id); 2.x yields two. Taking
+        # the first two rather than unpacking a fixed arity, so a third
+        # element appearing or vanishing is not a crash.
+        read, write = streams[0], streams[1]
     session = await stack.enter_async_context(ClientSession(read, write))
     await session.initialize()
     return session
