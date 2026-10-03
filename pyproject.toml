@@ -59,6 +59,15 @@ dev = [
     "ruff>=0.5",
     "build>=1.0",
 ]
+# External tools from MCP servers. An extra rather than a dependency: a run
+# that configures no server must not pay for it, and `mcp_bridge` imports
+# the package lazily so agentchanti behaves identically without it.
+#
+# A floor, not a pin. The SDK renamed its server class between majors
+# (FastMCP -> MCPServer), so the upper bound is the one that matters.
+mcp = [
+    "mcp>=1.2,<3",
+]
 
 [project.urls]
 Homepage = "https://github.com/udaykanthr/agentchanti"

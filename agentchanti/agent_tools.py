@@ -734,6 +734,10 @@ class AgentTools:
         self._searcher = searcher
         self._memory = memory
         self._command_timeout = command_timeout
+        # External tools from MCP servers, or None. Run-scoped and supplied
+        # by `build_step_tools`, because one session must outlive a single
+        # step while this object is built per step.
+        self._mcp = None
         # Distributions whose install failed during this step. Scoped to
         # the instance, and build_step_tools() builds one per step, so the
         # window closes when the step ends.
@@ -871,7 +875,7 @@ class AgentTools:
                     "required": ["query"],
                 },
             ),
-        ]
+        ] + (self._mcp.definitions() if self._mcp is not None else [])
 
     # ── Execution ──
 
@@ -896,18 +900,31 @@ class AgentTools:
         contract every other error here uses.
         """
         handler = getattr(self, f"_tool_{call.name}", None)
+        # An external tool from an MCP server is dispatched by the bridge
+        # rather than by method name. A built-in always wins if both
+        # answered, though a collision cannot occur: an MCP name is
+        # qualified `server__tool` and no built-in contains the separator.
+        mcp_owned = (handler is None and self._mcp is not None
+                     and self._mcp.owns(call.name))
         # Unknown outranks withheld: a name this class has never had is a
         # different mistake from one deliberately taken away this turn, and
         # "disabled" would send the model looking for a way to re-enable it.
-        if handler is None:
+        if handler is None and not mcp_owned:
             names = ", ".join(t.name for t in self.definitions())
             return f"ERROR: unknown tool '{call.name}'. Available: {names}"
+        # Checked BEFORE the MCP branch, so an external tool is withheld by
+        # the same rule as a built-in. The loop narrows the offer on its
+        # final turn and when a model spends turn after turn reading, and an
+        # MCP tool escaping that would defeat the control for exactly the
+        # tools whose behaviour we know least about.
         if allowed is not None and call.name not in allowed:
             log.info("[AgentTools] refused withheld tool '%s' "
                      "(offered: %s)", call.name, ", ".join(sorted(allowed)))
             return (f"ERROR: '{call.name}' is disabled for this turn. "
                     f"Available: {', '.join(sorted(allowed))}. "
                     f"Use one of those to change something now.")
+        if mcp_owned:
+            return self._mcp.execute(call.name, call.arguments or {})
         try:
             return handler(**call.arguments)
         except TypeError as e:
