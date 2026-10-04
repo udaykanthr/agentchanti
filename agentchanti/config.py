@@ -493,6 +493,13 @@ class Config:
                 _acc_yaml = [_acc_yaml]
             self.ACCEPTANCE_CMDS = [str(c) for c in _acc_yaml if str(c).strip()]
 
+        # External tools from MCP servers. Kept as the raw section and
+        # parsed by `mcp_bridge.load_specs`, so the shape lives next to the
+        # code that enforces it rather than being validated in two places.
+        # Absent by default; a run that configures nothing pays nothing and
+        # is never told to install the optional package.
+        self.MCP = yd.get("mcp") or {}
+
         # Turn "completed but nothing independent verified it" into a
         # non-zero exit. Off by default so greenfield builds, which
         # legitimately have no pre-existing suite, do not all start
