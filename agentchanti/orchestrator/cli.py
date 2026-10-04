@@ -1441,6 +1441,27 @@ def _main_impl():
             # Re-describe coder agent role with the corrected language
             coder.role = f"Write clean {get_language_name(language)} code for a single step."
 
+        # The planner has never seen a tool definition: `chat(messages,
+        # tools=...)` is called in exactly one place, the agent loop, so the
+        # plan is formed without knowing external tools exist and the loop
+        # then executes a strategy chosen before they were visible. Measured
+        # 2026-10-05 against a live Blender MCP server: five tools offered to
+        # the loop, `execute_blender_code` among them, and the run called
+        # run_command / read_file / write_file / edit_file — never one of the
+        # five, because the plan already said "write a script".
+        #
+        # Appended once, here, rather than at each planner.process call: both
+        # of those sit inside loops (the retry loop and the interactive
+        # approval loop), and `+=` there would repeat the whole summary on
+        # every re-plan. Empty when nothing is configured, so an ordinary
+        # run's planner prompt is byte-identical.
+        _mcp = getattr(memory, "_mcp_bridge", None)
+        _tool_summary = _mcp_bridge.planner_summary(_mcp)
+        if _tool_summary:
+            planner_context += "\n\n" + _tool_summary
+            log.info("[MCP] planner told about %d external tool(s)",
+                     len(_mcp.definitions()))
+
         MAX_PLAN_RETRIES = 3
         plan = None
         raw_steps = None

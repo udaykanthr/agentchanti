@@ -62,6 +62,63 @@ than its effect. Unset keeps the model's own default.
 
 Chat-native entry point: `chat(messages, tools=None) -> ChatResponse` (types in `llm/chat_types.py`: `Message`, `ToolDef`, `ToolCall`, `ChatResponse`). Ollama (`/api/chat`), OpenAI (`/chat/completions`) and Anthropic (Messages API) implement it natively with structured tool calling (`NATIVE_CHAT = True`); other providers fall back to flattening the conversation into a text prompt via `flatten_messages()`. Models that reject tools at runtime raise `ToolsNotSupportedError` and are downgraded to the text path for the session. Check availability with `client.supports_tools()`.
 
+### A Plan Formed Before The Tools Were Visible (mcp_bridge.py `planner_summary`)
+
+`chat(messages, tools=...)` is called in **exactly one place** — the agent
+loop. So every tool definition in the system, built-in and MCP alike, first
+becomes visible to a model *after* the plan that will consume it has been
+written. The planner decides the strategy; the loop is handed tools it was
+never told about and a plan that assumed they did not exist.
+
+Measured 2026-10-05 against a live Blender MCP server. The bridge started
+clean and logged `5 offered, 26 withheld`, `execute_blender_code` among the
+five. The run then called `run_command`, `read_file`, `write_file` and
+`edit_file` — and **not one of the five**, in any step. The plan said "write
+a Python script and run Blender headless", which was settled before the
+tools entered the picture. The model was not declining to use them; it was
+executing a strategy chosen without them. The cube was built, in a headless
+process, in a `.blend` file on disk — not in the Blender window the user had
+open, which was the entire point of connecting the server.
+
+`planner_summary` puts **names and one-liners** in the planner's context.
+Deliberately not schemas: the planner never *calls* these tools, and schemas
+are the expensive part — a real third-party tool measured **1,209
+characters** against 48 for its name and first line, so 25 tools summarised
+this way cost about what one of them costs in full. A description is cut to
+its first line, because later paragraphs are usage detail the planner cannot
+act on.
+
+Three bounds, each of which is the difference between this being free and
+being a tax on every run that configures nothing:
+
+**Silence is byte-identical.** No bridge, or a bridge whose every tool was
+withheld, returns `""` and nothing is appended — so an ordinary run's
+planner prompt is unchanged to the byte, which is also what keeps its cached
+prefix.
+
+**Appended once, before the retry loop.** `planner.process` is called inside
+loops on both paths — the re-plan retry loop and the interactive approval
+loop — so appending at the call site repeats the whole summary on every
+re-plan. The first cut did exactly that, in both files.
+
+**Ordering is the fix.** Appended after the first `planner.process`, the
+first plan — the one that usually ships — is still formed without the tools,
+and a test asserts the call precedes it in the source.
+
+Wired in `api.py` as well as `cli.py`, which `attach_to` itself was not:
+PR #68 reached only the CLI, so the library path offered no external tools
+at all. The tests for the wiring read the **source**, because the defect
+being pinned is a missing call and no behavioural test of the function can
+see one. `attach_to` also registers `atexit.register(stop_active)` on the
+one path that creates a bridge — `cli.py` stops it in `main()`'s finally and
+`api.py` has no such wrapper, and a stdio server is a child process, the
+same hazard as the orphaned `next dev` that held a pipe open for four hours.
+
+What this does **not** do is let a `verify:` gate name a tool call, so a
+step that satisfies its goal through an external tool still has to be
+measured by a shell command — and nothing records that the tool was the
+thing that did the work.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.

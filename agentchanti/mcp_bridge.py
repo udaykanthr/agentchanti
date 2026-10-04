@@ -91,6 +91,7 @@ bluntly: a dead event loop is a subtle, miserable class of bug.
 from __future__ import annotations
 
 import json
+import atexit
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -719,6 +720,13 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
                  len(offered), ", ".join(d.name for d in offered))
     _ACTIVE = bridge
     memory._mcp_bridge = bridge
+    # `cli.py` stops the bridge in `main()`'s finally; `api.py` has no such
+    # wrapper, and a library caller that never stops it would leave every
+    # stdio server running as an orphaned child process. Registered on the
+    # one path that actually creates a bridge, so a run with no servers
+    # configured registers nothing. Double-stopping is safe: `stop_active`
+    # clears `_ACTIVE` first.
+    atexit.register(stop_active)
     return bridge
 
 
@@ -734,3 +742,55 @@ def stop_active() -> None:
     bridge, _ACTIVE = _ACTIVE, None
     if bridge is not None:
         bridge.stop()
+
+
+# Deliberately small. The planner never CALLS these, so it does not need
+# parameter schemas — and schemas are the expensive part: a real
+# third-party tool measured 1,209 characters, against 48 for its name and
+# first line. 25 tools summarised this way cost about what one of them
+# costs in full.
+PLANNER_SUMMARY_MAX_TOOLS = 40
+PLANNER_SUMMARY_DESC_CHARS = 110
+
+
+def planner_summary(bridge: "MCPBridge | None") -> str:
+    """A short description of the external tools, for the PLANNER.
+
+    The planner has never seen tool definitions: `chat(messages, tools=...)`
+    is called in exactly one place, the agent loop. So a plan is formed
+    without any knowledge that external tools exist, and the loop then
+    executes steps that were decided before the tools were visible.
+
+    Measured 2026-10-05 against a live Blender MCP server: five tools were
+    offered to the loop, `execute_blender_code` among them, and the run
+    called `run_command`, `read_file`, `write_file` and `edit_file` — never
+    one of the five. The plan said "write a Python script and run Blender
+    headless", which was settled before the tools entered the picture. The
+    model was not declining to use them; it was executing a strategy chosen
+    without them.
+
+    Returns "" when there is nothing to say, so an ordinary run's planner
+    prompt is byte-for-byte what it was.
+    """
+    if bridge is None:
+        return ""
+    defs = bridge.definitions()
+    if not defs:
+        return ""
+    lines = ["EXTERNAL TOOLS AVAILABLE TO STEPS",
+             "These come from configured MCP servers and can be called "
+             "directly by a step, which is often simpler and more direct "
+             "than writing a script to do the same thing. A step may use "
+             "them instead of, or alongside, shell commands and files.",
+             ""]
+    shown = defs[:PLANNER_SUMMARY_MAX_TOOLS]
+    for d in shown:
+        # First line only: a description's later paragraphs are usage detail
+        # the planner cannot act on.
+        first = (d.description or "").strip().splitlines()[0] if d.description else ""
+        if len(first) > PLANNER_SUMMARY_DESC_CHARS:
+            first = first[:PLANNER_SUMMARY_DESC_CHARS - 1].rstrip() + "…"
+        lines.append(f"  {d.name} — {first}" if first else f"  {d.name}")
+    if len(defs) > len(shown):
+        lines.append(f"  … and {len(defs) - len(shown)} more")
+    return "\n".join(lines)

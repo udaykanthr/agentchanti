@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 _logger = logging.getLogger(__name__)
 
+from . import mcp_bridge as _mcp_bridge
 from .config import Config
 from .llm.ollama import OllamaClient
 from .llm.lm_studio import LMStudioClient
@@ -226,6 +227,11 @@ def _run_task_impl(
     display = CLIDisplay(task)
     memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
 
+    # External tools from configured MCP servers, wired in `api.py` as well as
+    # `cli.py` so the two entry points cannot diverge about what a step can
+    # reach. Silent and free when no server is configured.
+    _mcp_bridge.attach_to(memory, cfg)
+
     # Search agent TODO: should be running only on a condition?
     search_agent = None
     if cfg.SEARCH_ENABLED:
@@ -405,6 +411,18 @@ def _run_task_impl(
     _briefing_text = getattr(planner, '_task_briefing', '')
     if _briefing_text:
         memory._task_briefing = _briefing_text
+
+    # The planner has never seen a tool definition: `chat(messages, tools=...)`
+    # is called in exactly one place, the agent loop, so the plan is formed
+    # without knowing external tools exist. Measured 2026-10-05 against a live
+    # Blender MCP server: five tools offered to the loop, none called, because
+    # the plan already said "write a script". Empty when nothing is configured.
+    _mcp = getattr(memory, "_mcp_bridge", None)
+    _tool_summary = _mcp_bridge.planner_summary(_mcp)
+    if _tool_summary:
+        planner_context += "\n\n" + _tool_summary
+        _logger.info("[MCP] planner told about %d external tool(s)",
+                     len(_mcp.definitions()))
 
     # Plan
     plan = planner.process(task, context=planner_context, language=language,

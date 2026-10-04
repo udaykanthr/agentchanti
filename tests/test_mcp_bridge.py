@@ -667,3 +667,111 @@ class TestTheToolListIsDeterministic:
         first = self._offer(["fetch", "head", "resolve"])
         second = self._offer(["fetch", "head", "resolve"])
         assert first == second
+
+
+class TestThePlannerIsToldTheToolsExist:
+    """Measured 2026-10-05 against a live Blender MCP server: five tools
+    were offered to the loop, `execute_blender_code` among them, and the run
+    called `run_command`, `read_file`, `write_file` and `edit_file` — never
+    one of the five. `chat(messages, tools=...)` is called in exactly one
+    place, the agent loop, so the plan was formed without any knowledge that
+    external tools existed and the loop then executed a strategy chosen
+    before they were visible.
+
+    The silence cases matter as much as the content: an ordinary run must
+    pay nothing and its planner prompt must be byte-identical.
+    """
+
+    def test_no_bridge_says_nothing(self):
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(None) == ""
+
+    def test_a_bridge_with_no_tools_says_nothing(self):
+        """A configured server whose every tool was withheld is the same
+        case as no server at all, as far as the planner is concerned."""
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(MCPBridge([])) == ""
+
+    def test_the_tools_are_named(self):
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(_live_bridge(tool="get"))
+        assert "fetch__get" in out
+        assert "EXTERNAL TOOLS AVAILABLE TO STEPS" in out
+
+    def test_only_the_first_line_of_a_description_is_carried(self):
+        """Schemas and usage paragraphs are the expensive part, and the
+        planner never CALLS these tools, so it cannot act on either."""
+        from agentchanti.mcp_bridge import planner_summary, tool_defs_for
+        spec = MCPServerSpec("fetch", command="s", read_only=True)
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for(
+            "fetch",
+            [_Tool("get", "Fetch a URL.\nPass `raw` to skip conversion.\n"
+                          "Returns markdown.")],
+            spec)
+        bridge._defs.extend(offered)
+        out = planner_summary(bridge)
+        assert "Fetch a URL." in out
+        assert "raw" not in out, "a usage paragraph reached the planner"
+
+    def test_a_long_description_is_truncated(self):
+        from agentchanti.mcp_bridge import (PLANNER_SUMMARY_DESC_CHARS,
+                                            planner_summary, tool_defs_for)
+        spec = MCPServerSpec("fetch", command="s", read_only=True)
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for("fetch", [_Tool("get", "x" * 500)], spec)
+        bridge._defs.extend(offered)
+        line = [ln for ln in planner_summary(bridge).splitlines()
+                if "fetch__get" in ln][0]
+        assert len(line) < PLANNER_SUMMARY_DESC_CHARS + 40
+        assert line.endswith("…")
+
+    def test_a_tool_with_no_description_is_still_named(self):
+        """It is named with no ` — ` separator, which is why the log line
+        counts `bridge.definitions()` rather than counting separators."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(_live_bridge(tool="get"))
+        assert "fetch__get" in out
+
+    def test_the_summary_is_byte_identical_across_calls(self):
+        """It rides in the planner prompt, so a reordering would cost the
+        cached prefix — the same requirement `tool_defs_for` carries."""
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(_live_bridge()) == planner_summary(_live_bridge())
+
+
+class TestBothEntryPointsTellThePlanner:
+    """`cli.py` and `api.py` run the same pipeline, and every fix in this
+    codebase that landed on one of them only has had to be found again on
+    the other. These read the source because the defect being pinned is a
+    missing CALL, which no behavioural test of the function can see.
+    """
+
+    def _source(self, rel):
+        import pathlib
+        import agentchanti
+        return (pathlib.Path(agentchanti.__file__).parent / rel
+                ).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_entry_point_attaches_and_tells_the_planner(self, rel):
+        src = self._source(rel)
+        assert "attach_to(memory, cfg)" in src, f"{rel} starts no servers"
+        assert "planner_summary(" in src, f"{rel} plans without the tools"
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_summary_is_appended_exactly_once(self, rel):
+        """`planner.process` is called inside loops on both paths — the
+        retry loop and the interactive approval loop — so appending at the
+        call site would repeat the whole summary on every re-plan."""
+        src = self._source(rel)
+        assert src.count("planner_summary(") == 1, (
+            f"{rel} appends the summary more than once; a re-plan would "
+            f"carry it twice")
+
+    def test_the_summary_is_appended_before_the_planner_runs(self):
+        """Ordering is the whole fix: appended after the first
+        `planner.process`, the first plan — the one that usually ships — is
+        still formed without the tools."""
+        src = self._source("orchestrator/cli.py")
+        assert src.index("planner_summary(") < src.index("planner.process(")
