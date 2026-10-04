@@ -626,3 +626,44 @@ class TestEverySdkFieldSpelling:
         for leak in ('getattr(tool,', 'getattr(response,', 'getattr(item,',
                      'getattr(listed,'):
             assert leak not in src, leak
+
+
+class TestTheToolListIsDeterministic:
+    """The serialised tool list is part of the provider's CACHED PREFIX.
+
+    Measured 2026-10-04 against gpt-5.6-terra with three calls: two identical
+    ones reported 1,339 of 1,342 prompt tokens cached (99%), and the same
+    messages with a DIFFERENT tool list reported **0**. So a change to the
+    list — including a reordering that means nothing — invalidates the entire
+    prefix, taking the byte-identical system prompt with it.
+
+    `tools/list` order is the server's choice and the protocol does not pin
+    it, so a dict-backed server could reorder between runs and every turn
+    would pay full price for the whole prompt.
+    """
+
+    def _offer(self, names):
+        from agentchanti.mcp_bridge import MCPServerSpec, tool_defs_for
+        offered, _ = tool_defs_for(
+            "s", [_Tool(n) for n in names],
+            MCPServerSpec("s", read_only=True))
+        return [d.name for d in offered]
+
+    def test_order_does_not_depend_on_the_servers_order(self):
+        forward = self._offer(["alpha", "beta", "gamma"])
+        shuffled = self._offer(["gamma", "alpha", "beta"])
+        assert forward == shuffled, "a reordered tools/list changed our list"
+
+    def test_the_order_is_by_name(self):
+        assert self._offer(["zeta", "alpha"]) == ["s__alpha", "s__zeta"]
+
+    def test_a_nameless_tool_does_not_break_sorting(self):
+        """Sorting has to tolerate what the filter later drops."""
+        assert self._offer(["beta", "", "alpha"]) == ["s__alpha", "s__beta"]
+
+    def test_the_same_config_yields_the_same_list_twice(self):
+        """The whole point: byte-identical across startups, or the cache is
+        lost on every run."""
+        first = self._offer(["fetch", "head", "resolve"])
+        second = self._offer(["fetch", "head", "resolve"])
+        assert first == second

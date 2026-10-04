@@ -320,7 +320,19 @@ def tool_defs_for(server: str, tools: list[Any],
     """
     offered: list[ToolDef] = []
     withheld: list[WithheldTool] = []
-    for tool in tools:
+    # Sorted by name, because the serialised tool list is part of the
+    # provider's CACHED PREFIX. Measured 2026-10-04 against gpt-5.6-terra:
+    # two identical calls reported 1,339 of 1,342 prompt tokens cached (99%),
+    # and the same messages with a DIFFERENT tool list reported 0. So any
+    # change to the list — including a reordering that changes nothing
+    # semantically — invalidates the whole prefix, the byte-identical system
+    # prompt with it.
+    #
+    # `tools/list` order is the server's choice and nothing in the protocol
+    # pins it, so a server backed by a dict could reorder between runs and
+    # every turn would pay full price for the entire prompt. Sorting costs
+    # nothing and removes the possibility.
+    for tool in sorted(tools, key=lambda t: str(_sdk_field(t, "name") or "")):
         name = _sdk_field(tool, "name")
         if not name:
             continue
