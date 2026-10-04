@@ -135,7 +135,7 @@ For the reviewer whose question is "why did this cost what it cost".
 4 steps (1 CMD, 2 CODE, 1 TEST)
 3 loop runs, 17 turns (avg 5.7), 0 recovery
 outcomes: verified-early 2, gate-stalled 1
-tokens: 118,205 total — 81,279 sent (38,206 cached, 47%), 36,926 received
+tokens: 212,805 total — 189,206 sent (134,344 cached, 71%), 23,599 received
 ```
 
 ### WHAT THIS REPORT DOES NOT CLAIM
