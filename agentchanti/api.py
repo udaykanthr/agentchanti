@@ -417,7 +417,12 @@ def _run_task_impl(
     # without knowing external tools exist. Measured 2026-10-05 against a live
     # Blender MCP server: five tools offered to the loop, none called, because
     # the plan already said "write a script". Empty when nothing is configured.
-    _mcp = getattr(memory, "_mcp_bridge", None)
+    # `ensure_started` rather than reading it off FileMemory: on the
+    # fresh path that object is not created until AFTER the plan is
+    # made, so the first cut crashed the run with UnboundLocalError
+    # before its first step. The planner needs the list and the plan
+    # comes first, so the start cannot depend on FileMemory.
+    _mcp = _mcp_bridge.ensure_started(cfg)
     _tool_summary = _mcp_bridge.planner_summary(_mcp)
     if _tool_summary:
         planner_context += "\n\n" + _tool_summary

@@ -1455,7 +1455,12 @@ def _main_impl():
         # approval loop), and `+=` there would repeat the whole summary on
         # every re-plan. Empty when nothing is configured, so an ordinary
         # run's planner prompt is byte-identical.
-        _mcp = getattr(memory, "_mcp_bridge", None)
+        # `ensure_started` rather than reading it off FileMemory: on the
+        # fresh path that object is not created until AFTER the plan is
+        # made, so the first cut crashed the run with UnboundLocalError
+        # before its first step. The planner needs the list and the plan
+        # comes first, so the start cannot depend on FileMemory.
+        _mcp = _mcp_bridge.ensure_started(cfg)
         _tool_summary = _mcp_bridge.planner_summary(_mcp)
         if _tool_summary:
             planner_context += "\n\n" + _tool_summary

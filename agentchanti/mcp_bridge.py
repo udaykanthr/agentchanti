@@ -681,18 +681,28 @@ def _bridge_stop(bridge: "MCPBridge") -> None:
 _ACTIVE: MCPBridge | None = None
 
 
-def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
-    """Start the configured servers once and hang the bridge on *memory*.
+def ensure_started(cfg: Any) -> MCPBridge | None:
+    """Start the configured servers once. Returns the bridge, or None.
 
-    Idempotent, because `cli.py` builds FileMemory on more than one path and
-    starting a second set of sessions would double every server's handshake
-    and leave the first set orphaned.
+    Separate from `attach_to` because the servers' lifetime has nothing to do
+    with FileMemory's. `attach_to` was the only way in, and on `cli.py`'s
+    fresh path FileMemory is not created until AFTER the plan has been made —
+    so asking `getattr(memory, "_mcp_bridge")` while planning raised
+    `UnboundLocalError: cannot access local variable 'memory'` and crashed the
+    run before its first step. The planner needs the tool list and the plan
+    comes first, so the start has to be answerable without that object.
 
-    Returns the bridge, or None when nothing is configured — which is the
-    ordinary case and must stay silent. Never raises: every failure here
-    costs the run its external tools and nothing else.
+    Idempotent, because `cli.py` reaches it on more than one path and starting
+    a second set of sessions would double every server's handshake and leave
+    the first set orphaned.
+
+    Returns None when nothing is configured — the ordinary case, which must
+    stay silent. Never raises: every failure here costs the run its external
+    tools and nothing else.
     """
     global _ACTIVE
+    if _ACTIVE is not None:
+        return _ACTIVE
     try:
         specs, problems = load_specs(getattr(cfg, "MCP", None))
     except Exception as exc:                        # pragma: no cover - env
@@ -705,9 +715,6 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
         log.warning("[MCP] %s", problem)
     if not specs:
         return None
-    if _ACTIVE is not None:
-        memory._mcp_bridge = _ACTIVE
-        return _ACTIVE
     bridge = MCPBridge(specs)
     bridge.start()
     for problem in bridge.problems:
@@ -719,7 +726,6 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
         log.info("[MCP] %d external tool(s) offered to the loop: %s",
                  len(offered), ", ".join(d.name for d in offered))
     _ACTIVE = bridge
-    memory._mcp_bridge = bridge
     # `cli.py` stops the bridge in `main()`'s finally; `api.py` has no such
     # wrapper, and a library caller that never stops it would leave every
     # stdio server running as an orphaned child process. Registered on the
@@ -727,6 +733,19 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
     # configured registers nothing. Double-stopping is safe: `stop_active`
     # clears `_ACTIVE` first.
     atexit.register(stop_active)
+    return bridge
+
+
+def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
+    """Start the configured servers and hang the bridge on *memory*.
+
+    The binding half of `ensure_started`: `build_step_tools` reads
+    `memory._mcp_bridge`, which is how a step's `AgentTools` gets the
+    external tools.
+    """
+    bridge = ensure_started(cfg)
+    if bridge is not None:
+        memory._mcp_bridge = bridge
     return bridge
 
 

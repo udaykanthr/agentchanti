@@ -775,3 +775,57 @@ class TestBothEntryPointsTellThePlanner:
         still formed without the tools."""
         src = self._source("orchestrator/cli.py")
         assert src.index("planner_summary(") < src.index("planner.process(")
+
+
+class TestTheStartDoesNotDependOnFileMemory:
+    """Measured live, 2026-10-05. The first cut read the bridge off
+    FileMemory while planning:
+
+        _mcp = getattr(memory, "_mcp_bridge", None)
+        UnboundLocalError: cannot access local variable 'memory'
+
+    On `cli.py`'s fresh path FileMemory is not created until AFTER the plan
+    has been approved, so the run crashed before its first step — a run that
+    configured no MCP server at all would have crashed the same way, because
+    the name is unbound whatever the config says. The servers' lifetime has
+    nothing to do with FileMemory's, so the start is its own function.
+    """
+
+    def test_the_bridge_starts_without_any_memory_object(self):
+        from agentchanti.mcp_bridge import ensure_started
+        class _Cfg:
+            MCP = {}
+        assert ensure_started(_Cfg()) is None      # nothing configured
+
+    def test_a_missing_config_attribute_is_not_an_error(self):
+        from agentchanti.mcp_bridge import ensure_started
+        assert ensure_started(object()) is None
+
+    def test_attach_to_still_binds_for_build_step_tools(self):
+        """`build_step_tools` reads `memory._mcp_bridge`, so the binding half
+        has to survive the split."""
+        import agentchanti.mcp_bridge as mb
+        bridge = _live_bridge()
+        prior, mb._ACTIVE = mb._ACTIVE, bridge
+        try:
+            memory = _FakeMemory()
+            assert mb.attach_to(memory, object()) is bridge
+            assert memory._mcp_bridge is bridge
+        finally:
+            mb._ACTIVE = prior
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_planner_does_not_read_the_bridge_off_memory(self, rel):
+        """The whole defect in one line. Reading it off FileMemory is correct
+        in `build_step_tools`, which runs per step, and wrong before the plan
+        exists."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        i = src.index("planner_summary(")
+        window = src[max(0, i - 400):i + 200]
+        assert "ensure_started(cfg)" in window, (
+            f"{rel} does not start the bridge independently of FileMemory")
+        assert 'getattr(memory, "_mcp_bridge"' not in window, (
+            f"{rel} reads the bridge off FileMemory before the plan exists")
