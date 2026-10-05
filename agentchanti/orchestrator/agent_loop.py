@@ -1032,6 +1032,7 @@ def run_agent_loop(
         # does not start with `exit: success`, so `verify_passed` reads
         # it as a failure and the step cannot exit green on it.
         from .gate_safety import destructive_reason
+        from . import tool_gates
         _cmd = cmd or verify_cmd
         _unsafe = destructive_reason(_cmd or "")
         if _unsafe:
@@ -1041,6 +1042,22 @@ def run_agent_loop(
                     f"{_unsafe}. A verify command must only observe; it is "
                     f"re-run after every later wave, so its side effects "
                     f"happen repeatedly.")
+        # A gate that is an MCP tool call rather than a shell command. There
+        # is no shell command that observes a running external application,
+        # so the planner's `verify: blender__get_scene_info` could not pass
+        # over any artifact — measured 2026-10-06 against a correct one.
+        # `tool_gates.run` answers in `exit: success` / `exit: failure`, so
+        # `verify_passed` and the ledger read it exactly as a shell gate.
+        _tg = tool_gates.parse(_cmd, getattr(tools, "_mcp", None))
+        if _tg is not None:
+            _weak = tool_gates.shallow_tool_gate_reason(_tg)
+            if _weak:
+                # Reported, never silently upgraded to a pass: turning an
+                # impossible gate into a tautological one would trade one
+                # false verdict for another.
+                _logger.warning("[ToolGate] step %d: %s",
+                                step_idx + 1, _weak)
+            return tool_gates.run(_tg, tools)
         return tools.execute_all([_verify_call(_cmd)])[0].content
 
     def _try_platform_variants(result: str) -> str:

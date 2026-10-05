@@ -875,6 +875,20 @@ def planner_summary(bridge: "MCPBridge | None") -> str:
              "place a tool can be called. A CMD step runs one shell "
              "command, and no shell command can invoke a tool — do "
              "not write `echo` to stand in for calling one.",
+             # Measured 2026-10-06: the plan declared `verify:
+             # blender__get_scene_info`, the executor ran it through
+             # cmd.exe, and a correct step failed. A bare tool name is also
+             # a gate that cannot FAIL -- it passes whenever the server is
+             # up, including over the state before the step ran.
+             "A step's `verify:` may call a tool instead of the shell, "
+             "written as `mcp:<tool> {\"arg\": value}` on one line. It "
+             "must be able to FAIL: calling a read-only tool and asserting "
+             "nothing passes whenever the server is reachable, which "
+             "proves nothing about this step. Put the check where it can "
+             "fail — in a tool that executes code, with a real assertion:",
+             "  verify: mcp:<server>__execute_code {\"code\": \"<read the "
+             "live state>; assert <the concrete condition this step "
+             "establishes>\"}",
              ""]
     shown = defs[:PLANNER_SUMMARY_MAX_TOOLS]
     for d in shown:

@@ -167,6 +167,74 @@ at all, and `GateLedger` has nothing to record. The ghost's
 `no-checkable-claim` correctly fired on both measured steps, which is how the
 hollowness was visible at all.
 
+### A `verify:` That Is A Tool Call (orchestrator/tool_gates.py)
+
+Every other gate module reads a `verify:` as a **shell command** and asks
+something about it — can it fail on wrong behaviour (`check_gate_quality`),
+does this platform's shell parse it (`unrunnable_gate_reason`), does it
+destroy anything (`gate_safety`). All of them assume the gate *is* a shell
+command, which was true until a plan could reach an external system through
+MCP.
+
+Measured 2026-10-06, the first run to change a live external application.
+With the ordering fixes above in place the plan was entirely tool-based and
+the model did the work **correctly** — a cube at the origin with Z rotation
+keyed 0° at frame 1 and 360° at frame 60, confirmed by evaluating the scene
+independently of the run. The verdict was `Pipeline failed`, exit 1, because
+the plan's gates were `verify: blender__get_scene_info` and `verify:
+blender__get_object_info`; `_merged_gate` conjoined them and the executor ran
+`blender__get_scene_info && blender__get_object_info` through cmd.exe.
+
+Every verification layer went blank at once, which is the finding worth
+recording: **a tool-only run was unmeasurable by construction**, not badly
+measured. The gate could not pass over any artifact. `target: Blender scene`
+is not a file, so `plan-declares-no-targets` fired and the whole file layer —
+EXISTS, EXPORTS, anchors, content regressions — was never armed: 1
+expectation, 0 hold, 0 violated, **evidence weight 0**. The seeded contract
+is a Python suite about files and errored. `Evidence: self-authored`.
+
+`parse` recognises a gate that is one or more MCP tool calls — the explicit
+`mcp:<tool> {json}` form the planner is now told to write, and a **bare
+qualified tool name**, which is what planners actually wrote both times it
+was measured. `&&` segments must all pass, which is the shell's meaning and
+what `_merged_gate` intends. `run` executes them through the same
+`AgentTools` the loop already uses and answers in `exit: success` /
+`exit: failure`, so `verify_passed`, `GateLedger.record` and
+`observe_gate_verdict` need no knowledge of any of this.
+
+Reading a shell gate as a tool gate would send a real command somewhere that
+cannot run it, so `parse` returns None unless it is certain: **every**
+segment must be a tool call (a gate mixing a tool call and a command has no
+single executor, and honouring one half silently drops the other), the tool
+must be one the bridge actually offers (naming an unconfigured tool is an
+ordinary plan mistake, and the shell's error message is more useful), and a
+payload that is not a JSON object is refused rather than dropped — calling
+the tool bare would measure something the plan never asked for, and passing
+that way is the worse of the two outcomes.
+
+**A tool gate that cannot fail is still shallow**, and saying so is what
+keeps this from trading one false verdict for another — the mistake
+`empty_suite_reason` exists to prevent. `verify: blender__get_scene_info`
+passes whenever the server is reachable, *including over the state that
+existed before the step ran*; making it run without reporting that would
+replace a gate that was always red with one that is always green.
+`shallow_tool_gate_reason` names the fix rather than just the fault: put the
+assertion inside a code-executing tool, where it can actually fail. One
+segment carrying an assertion is enough, since that segment makes the gate a
+measurement.
+
+Verified against the live session rather than reasoned about: a gate
+asserting the real condition returns `exit: success` with
+`{"frame1": 0.0, "frame60": 360.0}`, and the same gate asserting 90° instead
+of 360° returns `exit: failure` carrying the `AssertionError`. It can pass
+and it can fail, which is the whole claim.
+
+Not addressed: the weakness is reported at **run** time, not plan time —
+`check_gate_quality` has no bridge to ask, so a shallow tool gate costs the
+step its turns before anyone says so. And the ghost still has no
+postcondition kind for external-system state, so a tool-only plan's
+`target:` remains unreconcilable and its evidence weight stays zero.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.
