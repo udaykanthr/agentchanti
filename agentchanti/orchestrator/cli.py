@@ -1348,6 +1348,20 @@ def _main_impl():
                 _intent_subproject = _detect_subproject_root(_pre_mem_local)
             except Exception:
                 pass
+        # The bridge starts HERE, before pre_analyze, and not where it used
+        # to: the IntentAgent's REQUIREMENTS_SPEC is what decides the
+        # strategy, and it was written 89 seconds before any tool existed.
+        # Measured 2026-10-05 - the planner was told about 5 Blender tools
+        # and still planned `blender --background --python script.py`,
+        # because the spec beside it already said "Agent directive: Create
+        # create_cube_animation.py ...". `ensure_started` is idempotent, so
+        # the later call is a no-op that returns the same bridge.
+        _mcp = _mcp_bridge.ensure_started(cfg)
+        _tool_summary = _mcp_bridge.planner_summary(_mcp)
+        if _tool_summary:
+            log.info("[MCP] intent analysis and planner told about %d "
+                     "external tool(s)", len(_mcp.definitions()))
+
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -1363,6 +1377,7 @@ def _main_impl():
             intent_agent=intent_agent,
             cli_display=display,
             subproject_cwd=_intent_subproject,
+            external_tools=_tool_summary,
             executor=executor,
         )
         if analysis_context:
@@ -1455,17 +1470,8 @@ def _main_impl():
         # approval loop), and `+=` there would repeat the whole summary on
         # every re-plan. Empty when nothing is configured, so an ordinary
         # run's planner prompt is byte-identical.
-        # `ensure_started` rather than reading it off FileMemory: on the
-        # fresh path that object is not created until AFTER the plan is
-        # made, so the first cut crashed the run with UnboundLocalError
-        # before its first step. The planner needs the list and the plan
-        # comes first, so the start cannot depend on FileMemory.
-        _mcp = _mcp_bridge.ensure_started(cfg)
-        _tool_summary = _mcp_bridge.planner_summary(_mcp)
         if _tool_summary:
             planner_context += "\n\n" + _tool_summary
-            log.info("[MCP] planner told about %d external tool(s)",
-                     len(_mcp.definitions()))
 
         MAX_PLAN_RETRIES = 3
         plan = None

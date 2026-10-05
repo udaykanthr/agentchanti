@@ -627,6 +627,7 @@ class IntentAgent(Agent):
         available_kb_docs: list[str] | None = None,
         subproject_cwd: str | None = None,
         language: str | None = None,
+        external_tools: str = "",
     ) -> str:
         """
         Investigate the task and produce a grounded REQUIREMENTS_SPEC.
@@ -639,6 +640,16 @@ class IntentAgent(Agent):
         _logger.info("[IntentAnalysis] Starting intent analysis for task.")
 
         accumulated_context = ""
+        # External tools come FIRST, because this spec decides the strategy.
+        # Measured 2026-10-05: the planner was told its MCP tools existed and
+        # still planned `blender --background --python script.py`, because
+        # the REQUIREMENTS_SPEC it was handed alongside already read "Agent
+        # directive: Create create_cube_animation.py ..." — written here, 89
+        # seconds before the bridge started. A concrete directive beats
+        # general advice, and rightly so. Whoever decides the strategy has to
+        # know what the run can reach.
+        if external_tools:
+            accumulated_context += f"{external_tools}\n\n"
         if kb_context:
             accumulated_context += f"Project Stack / Knowledge Base Context:\n{kb_context}\n\n"
 

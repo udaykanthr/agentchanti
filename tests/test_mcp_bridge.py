@@ -999,3 +999,76 @@ class TestThePlannerIsToldWhatTheToolsReach:
         from agentchanti.mcp_bridge import planner_summary
         assert planner_summary(None) == ""
         assert planner_summary(MCPBridge([])) == ""
+
+
+class TestWhoeverDecidesTheStrategySeesTheTools:
+    """Measured 2026-10-05, the run after the summary was reframed to say what
+    the tools REACH. The planner was told about five Blender tools and still
+    planned::
+
+        > blender --background --python create_cube_animation.py
+
+    The cause was ordering, not wording. The IntentAgent's REQUIREMENTS_SPEC
+    is what fixes the strategy, and this run's log shows it written at
+    23:04:25 while the bridge started at 23:05:54 — eighty-nine seconds
+    later. So the planner received general advice about tools alongside a
+    concrete directive that already named the script::
+
+        Agent directive: Create `create_cube_animation.py` using Blender bpy
+        Expected output: Running `blender --background --python ...` produces
+                         `cube_rotation_animation.blend`
+
+    A concrete directive beats general advice, and rightly so. This is the
+    original defect one layer up: `chat(messages, tools=...)` is called in one
+    place, and now the summary is injected in one place — but the strategy was
+    decided before either.
+    """
+
+    def test_analyze_intent_accepts_the_tools(self):
+        import inspect
+        from agentchanti.agents.intent import IntentAgent
+        sig = inspect.signature(IntentAgent.analyze_intent)
+        assert "external_tools" in sig.parameters
+
+    def test_pre_analyze_accepts_and_forwards_them(self):
+        import inspect
+        from agentchanti.agents.planner import PlannerAgent
+        assert "external_tools" in inspect.signature(
+            PlannerAgent.pre_analyze).parameters
+        src = inspect.getsource(PlannerAgent.pre_analyze)
+        assert "external_tools=external_tools" in src, (
+            "pre_analyze takes the tools and never passes them on")
+
+    def test_the_tools_lead_the_intent_context(self):
+        """Before the KB block, because the spec it produces decides the
+        strategy and nothing later can unmake that decision."""
+        import inspect
+        from agentchanti.agents.intent import IntentAgent
+        src = inspect.getsource(IntentAgent.analyze_intent)
+        assert "if external_tools:" in src
+        assert src.index("if external_tools:") < src.index("if kb_context:")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_bridge_starts_before_the_strategy_is_decided(self, rel):
+        """The whole fix is an ordering, which no behavioural test of either
+        function can see."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        assert src.index("ensure_started(cfg)") < src.index("pre_analyze("), (
+            f"{rel} decides the strategy before the tools exist")
+        assert "external_tools=_tool_summary" in src, (
+            f"{rel} starts the bridge and does not tell the intent phase")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_bridge_is_started_exactly_once(self, rel):
+        """`ensure_started` is idempotent, but two call sites would mean two
+        places to keep in step — and the planner append must still happen
+        after the summary is in hand."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        assert src.count("ensure_started(cfg)") == 1
+        assert src.count("planner_summary(") == 1

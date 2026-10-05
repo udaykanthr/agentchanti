@@ -352,6 +352,18 @@ def _run_task_impl(
         _api_subproject = _detect_subproject_root(memory)
     except Exception:
         pass
+    # The bridge starts HERE, before pre_analyze, because the IntentAgent's
+    # REQUIREMENTS_SPEC is what decides the strategy and it was written
+    # before any tool existed. Measured 2026-10-05: the planner was told
+    # about 5 Blender tools and still planned `blender --background --python
+    # script.py`, because the spec beside it already named the script.
+    # `ensure_started` is idempotent, so a later call returns this bridge.
+    _mcp = _mcp_bridge.ensure_started(cfg)
+    _tool_summary = _mcp_bridge.planner_summary(_mcp)
+    if _tool_summary:
+        _logger.info("[MCP] intent analysis and planner told about %d "
+                     "external tool(s)", len(_mcp.definitions()))
+
     analysis_context = planner.pre_analyze(
         task,
         source_files=source_files,
@@ -362,6 +374,7 @@ def _run_task_impl(
         intent_agent=intent_agent,
         search_agent=search_agent,
         subproject_cwd=_api_subproject,
+        external_tools=_tool_summary,
         executor=executor,
     )
     if analysis_context:
@@ -412,22 +425,8 @@ def _run_task_impl(
     if _briefing_text:
         memory._task_briefing = _briefing_text
 
-    # The planner has never seen a tool definition: `chat(messages, tools=...)`
-    # is called in exactly one place, the agent loop, so the plan is formed
-    # without knowing external tools exist. Measured 2026-10-05 against a live
-    # Blender MCP server: five tools offered to the loop, none called, because
-    # the plan already said "write a script". Empty when nothing is configured.
-    # `ensure_started` rather than reading it off FileMemory: on the
-    # fresh path that object is not created until AFTER the plan is
-    # made, so the first cut crashed the run with UnboundLocalError
-    # before its first step. The planner needs the list and the plan
-    # comes first, so the start cannot depend on FileMemory.
-    _mcp = _mcp_bridge.ensure_started(cfg)
-    _tool_summary = _mcp_bridge.planner_summary(_mcp)
     if _tool_summary:
         planner_context += "\n\n" + _tool_summary
-        _logger.info("[MCP] planner told about %d external tool(s)",
-                     len(_mcp.definitions()))
 
     # Plan
     plan = planner.process(task, context=planner_context, language=language,
