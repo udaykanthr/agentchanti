@@ -235,6 +235,73 @@ step its turns before anyone says so. And the ghost still has no
 postcondition kind for external-system state, so a tool-only plan's
 `target:` remains unreconcilable and its evidence weight stays zero.
 
+### An Undo For State That Is Not A File (orchestrator/external_state.py)
+
+`snapshot.py` exists because *"neither guard is a guarantee"* — the scan can
+form a wrong premise and the executor can be asked to run something
+destructive, so there has to be a backstop depending on neither. Every net in
+this project is made of **files and git**: `wave_snapshots`,
+`_enforce_monotonic_gates`' rollback, `_best_snapshot`, `agentchanti
+--restore`.
+
+A run that reaches a live external system through MCP has **none of them**,
+and the artifact is not on disk, so there is nothing to copy and nothing to
+restore. Measured 2026-10-06: a tool-only Blender run left the cube carrying
+an action with **zero curves and a constant 360° rotation** partway through,
+and recovered only because it had turns left to iterate with. Had it run out
+there, the user's scene would have been left worse than it was found with
+nothing in the system able to put it back. The run also *failed* while
+finally leaving a correct scene, which matters for the design below.
+
+**It does not guess.** There is no general way to snapshot an arbitrary
+external system — saving a `.blend`, dumping a database, exporting a browser
+profile and committing a repository share no vocabulary, and inventing one is
+how a backstop silently captures the wrong thing. The operator, who knows the
+system, declares the pair on the server, in the same `mcp:` tool-call syntax a
+`verify:` now uses, with `{path}` substituted for a run-specific file under
+`.agentchanti/external/<server>/`::
+
+    snapshot:
+      capture: 'mcp:blender__execute_code {"code": "PATH = r\"{path}\"
+                \nimport bpy\nbpy.ops.wm.save_as_mainfile(filepath=PATH,
+                copy=True)"}'
+      restore: 'mcp:blender__execute_code {"code": "PATH = r\"{path}\"
+                \nimport bpy\nbpy.ops.wm.open_mainfile(filepath=PATH)"}'
+
+**Both halves are required.** A capture with no restore is a file nobody can
+use and a restore with no capture has nothing to read; either alone *looks
+like* an undo, which is worse than plainly having none, so half a pair is a
+warning and is ignored.
+
+**A server that declares nothing is warned about once, before the first
+step** — the `_prompt_for_acceptance_cmds` argument, that the answer is
+already fixed and learning it afterwards costs the run. Silence here is
+indistinguishable from a net being present.
+
+**Nothing is ever restored automatically, and that is the load-bearing
+decision.** The measured run FAILED and left a CORRECT scene; an automatic
+rollback on failure would have destroyed exactly the work the user wanted.
+It is the reasoning `_check_advisory_stage` already records — a rollback has
+to be measured against what it rolls back to — and the smoke-test case where
+restoring a crashing app is the wrong answer. Recovery is offered through
+`agentchanti --restore`, which needed no provider and no API key before and
+still does not: starting a configured MCP server needs neither, and someone
+reaching for an undo must not be asked for credentials. A test pins that
+there is exactly **one** `restore_all` call site, because a second would be
+an automatic rollback.
+
+A capture that fails is a WARNING naming the server, never an exception: a
+backstop that can stop the thing it protects is worse than no backstop — but
+the operator asked for protection and has to learn they did not get it. A
+command that is not a runnable tool call is named rather than skipped
+silently, which is the "reports success and preserves nothing" failure this
+check exists to avoid.
+
+Verified against the live application rather than reasoned about: the cube
+and its full-turn animation captured, the cube then **deleted outright**, and
+`restore_all` put the object, its action and all three sampled rotations back
+unchanged.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.

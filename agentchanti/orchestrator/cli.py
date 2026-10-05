@@ -814,7 +814,34 @@ def _main_impl():
         from ..snapshot import restore_snapshot
         ok, detail = restore_snapshot(".")
         verb = "Restored" if ok else "Could not restore"
-        print("\n  " + verb + ": " + detail + "\n")
+        print("\n  " + verb + ": " + detail)
+        # External state too, for any server that declared how. Still no
+        # provider and no API key: starting a configured MCP server needs
+        # neither, and someone reaching for an undo must not be asked for
+        # credentials. Offered here and NEVER taken automatically — the
+        # measured run failed while leaving a CORRECT scene, so a rollback
+        # on failure would have destroyed the work the user wanted.
+        try:
+            from .. import mcp_bridge as _mb
+            from . import external_state as _ext
+            from .agent_loop import build_step_tools
+            _cfg_for_restore = Config.load(args.config)
+            _bridge = _mb.ensure_started(_cfg_for_restore)
+            if _bridge is not None:
+                rows = _ext.restore_all(
+                    _bridge, build_step_tools(Executor(), FileMemory()),
+                    getattr(_bridge, "_specs", {}))
+                for name, row_ok, row_detail in rows:
+                    print(f"  {'Restored' if row_ok else 'Could not restore'}"
+                          f" {name}: {row_detail.splitlines()[0][:160]}")
+                if not rows:
+                    print("  No external server declared a `snapshot:` pair, "
+                          "so nothing outside the project was preserved.")
+            _mb.stop_active()
+        except Exception as exc:
+            print(f"  External restore unavailable: "
+                  f"{type(exc).__name__}: {exc}")
+        print()
         return
 
     # ── 0. Load config ──
@@ -2148,6 +2175,27 @@ def _main_impl():
     else:
         waves = build_step_waves(steps, dependencies)
     log.info(f"Execution waves: {waves}")
+
+    # ── An undo for state that is not a file ──
+    # Every other rollback here is made of files and git — wave snapshots,
+    # the monotonic-gate rollback, `_best_snapshot`, `agentchanti --restore`.
+    # A run that reaches a live external system through MCP has none of them.
+    # Measured 2026-10-06: a tool-only Blender run left an action with zero
+    # curves and a constant 360° rotation partway through and recovered only
+    # because it had turns left; had it not, nothing in the system could have
+    # put the user's scene back. Taken before the first step, for the reason
+    # `take_snapshot` runs before the project scan.
+    if _mcp is not None:
+        from . import external_state as _ext
+        from .agent_loop import build_step_tools
+        _ext.warn_about_unprotected_servers(_mcp, getattr(_mcp, "_specs", {}))
+        _ext_tools = build_step_tools(executor, memory)
+        _ext_captured = _ext.capture_all(
+            _mcp, _ext_tools, getattr(_mcp, "_specs", {}))
+        if _ext_captured:
+            log.info("[External] %d server(s) can be restored with "
+                     "`agentchanti --restore`: %s", len(_ext_captured),
+                     ", ".join(sorted(_ext_captured)))
 
     # Build step reports for HTML output
     step_reports = [StepReport(index=i, text=steps[i]) for i in range(len(steps))]

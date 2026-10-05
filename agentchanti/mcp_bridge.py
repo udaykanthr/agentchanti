@@ -154,6 +154,12 @@ class MCPServerSpec:
     read_only: bool = False
     allow: tuple[str, ...] = ()
     timeout: float = DEFAULT_CALL_TIMEOUT
+    # How to snapshot and put back this system's state, in `mcp:` tool-call
+    # syntax with `{path}` substituted. Declared by the OPERATOR, never
+    # guessed: saving a .blend, dumping a database and exporting a browser
+    # profile share no vocabulary, and inventing one is how a backstop
+    # silently captures the wrong thing. See orchestrator/external_state.py.
+    snapshot: dict = field(default_factory=dict)
 
     def problem(self) -> str | None:
         """Why this spec cannot be used, or None."""
@@ -222,6 +228,8 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
                 read_only=bool(entry.get("read_only")),
                 allow=tuple(str(a) for a in (entry.get("allow") or ())),
                 timeout=float(entry.get("timeout") or DEFAULT_CALL_TIMEOUT),
+                snapshot={str(k): str(v) for k, v in
+                          (entry.get("snapshot") or {}).items()},
             )
         except (TypeError, ValueError) as exc:
             problems.append(f"mcp server entry {entry!r} is malformed: {exc}")
