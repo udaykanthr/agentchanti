@@ -937,3 +937,65 @@ class TestAStepThatProposesAToolCanRunIt:
             "the routing check runs after the command would have been run")
         window = src[i:i + 2000]
         assert "run_agent_loop_with_escalation" in window
+
+
+class TestThePlannerIsToldWhatTheToolsReach:
+    """Measured 2026-10-05, the run after the step-type guidance landed. The
+    step types were right — 2.1 classified CODE, so the loop ran with 11
+    tools in scope — and the plan went straight back to::
+
+        > blender --background --python create_cube_animation.py
+
+    Correct work, in a fresh process, that could never touch the Blender
+    session the task was about. One MCP call was made (`bpy_api_lookup`,
+    for API reference) and then the model wrote a script.
+
+    A planner has no reason to prefer a tool over a script it already knows
+    how to write, unless it is told what the tool can reach that the script
+    cannot. The first summary explained the MECHANICS of calling one and
+    never said what was on the other end.
+    """
+
+    def _bridge(self):
+        from agentchanti.mcp_bridge import tool_defs_for
+        spec = MCPServerSpec("blender", command="s",
+                             allow=["execute_blender_code"])
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for(
+            "blender", [_Tool("execute_blender_code")], spec)
+        bridge._defs.extend(offered)
+        return bridge
+
+    def test_the_summary_says_the_system_is_live_and_external(self):
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "LIVE EXTERNAL SYSTEM" in out
+
+    def test_it_says_a_script_cannot_reach_it(self):
+        """The decisive fact, and the one the measured plan did not know."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge()).lower()
+        assert "fresh process" in out
+        assert "different result" in out
+
+    def test_it_still_says_which_step_type_can_call_one(self):
+        """The mechanics must survive the reframing — without them the
+        planner emits a CMD step and the hollow-command guard has to catch
+        it, which costs a step."""
+        out = None
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "CODE or TEST step" in out
+
+    def test_it_does_not_tell_the_planner_to_use_tools_for_everything(self):
+        """Over-steering is the opposite failure: most steps are ordinary
+        files and commands, and a plan that routes those through a tool
+        would be worse than the one this fixes."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "ordinary files and commands for everything else" in out
+
+    def test_it_is_still_silent_with_nothing_configured(self):
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(None) == ""
+        assert planner_summary(MCPBridge([])) == ""

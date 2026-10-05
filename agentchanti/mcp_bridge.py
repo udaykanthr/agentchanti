@@ -851,10 +851,25 @@ def planner_summary(bridge: "MCPBridge | None") -> str:
     if not defs:
         return ""
     lines = ["EXTERNAL TOOLS AVAILABLE TO STEPS",
-             "These come from configured MCP servers and can be called "
-             "directly by a step, which is often simpler and more direct "
-             "than writing a script to do the same thing. A step may use "
-             "them instead of, or alongside, shell commands and files.",
+             # What the tools REACH, before how to call them. Measured
+             # 2026-10-05: told only that the tools existed and how to
+             # invoke them, the planner went back to `blender --background
+             # --python script.py` — correct work in a fresh process that
+             # could never touch the session the task was about. A planner
+             # has no reason to prefer a tool over a script it knows how to
+             # write, unless it is told what the tool can reach that the
+             # script cannot.
+             "Each of these acts on a LIVE EXTERNAL SYSTEM that already "
+             "exists and that this run did not create — the application, "
+             "service or session the server is attached to. Nothing else "
+             "in the pipeline can reach it: a script you write runs in a "
+             "fresh process of its own, so it cannot observe or change "
+             "that system's state.",
+             "So when the task concerns that system — what it currently "
+             "holds, or a change someone expects to see IN it — call the "
+             "tool. A script that reproduces the work in a separate "
+             "process is a DIFFERENT RESULT, however correct the script "
+             "is. Use ordinary files and commands for everything else.",
              "A step that uses one must be a CODE or TEST step: those "
              "run as a tool-calling conversation, which is the only "
              "place a tool can be called. A CMD step runs one shell "
