@@ -93,6 +93,7 @@ from __future__ import annotations
 import json
 import atexit
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -772,6 +773,59 @@ PLANNER_SUMMARY_MAX_TOOLS = 40
 PLANNER_SUMMARY_DESC_CHARS = 110
 
 
+
+# A command that only prints. `echo` is the one the planner reaches for,
+# because a CMD step must carry a shell line and there is no shell line that
+# calls a tool. Redirection and chaining are excluded deliberately:
+# `echo x > f` writes a file and `echo x && npm i` installs, so neither is a
+# no-op, and reading them as one would skip real work.
+_NOOP_CMD_RE = re.compile(r"^\s*(?:echo|rem|::|:|true)\b", re.IGNORECASE)
+_HAS_EFFECT_RE = re.compile(r"[>|&;]")
+
+
+def hollow_tool_command(cmd: str, step_text: str,
+                        bridge: "MCPBridge | None") -> str | None:
+    """Why this CMD step cannot do what it says it does.
+
+    Measured 2026-10-05, the run after the planner was first told its tools
+    exist. The planner adopted them — and the plan vocabulary is CMD / CODE /
+    TEST, so a tool call is none of the three. It put the intent in the only
+    slot a CMD step has, a shell line::
+
+        > echo Configure the active Blender scene through
+          blender__execute_blender_code: retain/add a cube at (0,0,0), ...
+
+    `echo` exits 0, so the step reported success having done nothing, and
+    because the step classified CMD the agent loop never ran — which is the
+    only place `chat(messages, tools=...)` is called and therefore the only
+    place a tool can be invoked. Zero tool calls in the whole run.
+
+    Awareness without an execution path is worse than no awareness: a step
+    that proposes a tool and then no-ops is a step that cannot fail.
+
+    Returns None unless the command is **provably** inert and the step names
+    a tool that is actually available, so an ordinary `echo` step and a step
+    naming a tool nobody configured are both left alone.
+    """
+    if bridge is None:
+        return None
+    names = [d.name for d in bridge.definitions()]
+    if not names:
+        return None
+    if not cmd or not _NOOP_CMD_RE.match(cmd) or _HAS_EFFECT_RE.search(cmd):
+        return None
+    # Qualified names only. A bare `export_scene` is an ordinary English
+    # phrase in a plan description; `blender__export_scene` is not.
+    haystack = f"{cmd}\n{step_text or ''}"
+    named = sorted({n for n in names if n in haystack})
+    if not named:
+        return None
+    return (f"the step's command only prints and cannot call "
+            f"{', '.join(named)}, which it names — a shell command cannot "
+            f"invoke an external tool, so this step must run as a "
+            f"tool-calling conversation")
+
+
 def planner_summary(bridge: "MCPBridge | None") -> str:
     """A short description of the external tools, for the PLANNER.
 
@@ -801,6 +855,11 @@ def planner_summary(bridge: "MCPBridge | None") -> str:
              "directly by a step, which is often simpler and more direct "
              "than writing a script to do the same thing. A step may use "
              "them instead of, or alongside, shell commands and files.",
+             "A step that uses one must be a CODE or TEST step: those "
+             "run as a tool-calling conversation, which is the only "
+             "place a tool can be called. A CMD step runs one shell "
+             "command, and no shell command can invoke a tool — do "
+             "not write `echo` to stand in for calling one.",
              ""]
     shown = defs[:PLANNER_SUMMARY_MAX_TOOLS]
     for d in shown:

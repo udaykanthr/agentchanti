@@ -829,3 +829,111 @@ class TestTheStartDoesNotDependOnFileMemory:
             f"{rel} does not start the bridge independently of FileMemory")
         assert 'getattr(memory, "_mcp_bridge"' not in window, (
             f"{rel} reads the bridge off FileMemory before the plan exists")
+
+
+class TestAStepThatProposesAToolCanRunIt:
+    """Measured 2026-10-05, the run after the planner was first told its
+    tools exist. It adopted them — and the plan vocabulary is CMD / CODE /
+    TEST, so a tool call is none of the three. The planner put the intent in
+    the only slot a CMD step has:
+
+        > echo Configure the active Blender scene through
+          blender__execute_blender_code: retain/add a cube at (0,0,0), ...
+
+    `echo` exits 0, so both tool steps reported success having done nothing,
+    and because all three steps classified CMD the agent loop never ran —
+    the only place `chat(messages, tools=...)` is called, and therefore the
+    only place a tool can be invoked. Zero tool calls in the whole run.
+
+    Awareness without an execution path is worse than no awareness: a step
+    that proposes a tool and then no-ops is a step that cannot fail.
+    """
+
+    def _bridge(self, *names):
+        from agentchanti.mcp_bridge import tool_defs_for
+        spec = MCPServerSpec("blender", command="s", allow=list(names))
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for("blender", [_Tool(n) for n in names], spec)
+        bridge._defs.extend(offered)
+        return bridge
+
+    def test_the_measured_command_is_named(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        cmd = ("echo Configure the active Blender scene through "
+               "blender__execute_blender_code: retain/add a cube at (0,0,0), "
+               "set frame_start=1 and frame_end=60")
+        reason = hollow_tool_command(cmd, "Configure the scene",
+                                     self._bridge("execute_blender_code"))
+        assert reason and "blender__execute_blender_code" in reason
+
+    def test_a_tool_named_only_in_the_description_counts(self):
+        """The command and the description are one claim about one step."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        reason = hollow_tool_command(
+            "echo verifying", "Verify through blender__get_scene_info",
+            self._bridge("get_scene_info"))
+        assert reason is not None
+
+    def test_an_ordinary_echo_step_is_untouched(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command("echo hello", "say hello",
+                                   self._bridge("get_scene_info")) is None
+
+    def test_a_command_with_an_effect_is_never_called_hollow(self):
+        """`echo x > f` writes a file and `echo x && npm i` installs — both
+        do real work, and reading either as a no-op would SKIP it."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        b = self._bridge("execute_blender_code")
+        for cmd in ("echo cube > blender__execute_blender_code.txt",
+                    "echo blender__execute_blender_code && npm install",
+                    "echo blender__execute_blender_code | python run.py"):
+            assert hollow_tool_command(cmd, "", b) is None, cmd
+
+    def test_a_real_command_is_never_called_hollow(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "python -m venv venv", "set up for blender__execute_blender_code",
+            self._bridge("execute_blender_code")) is None
+
+    def test_a_tool_nobody_configured_is_not_a_finding(self):
+        """Naming a tool that is not offered is an ordinary plan mistake,
+        and there is nothing to route the step to."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "echo call blender__export_scene", "",
+            self._bridge("get_scene_info")) is None
+
+    def test_no_bridge_is_silent(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command("echo blender__x", "", None) is None
+
+    def test_a_bare_tool_name_is_not_enough(self):
+        """`export_scene` is an ordinary English phrase in a plan
+        description; `blender__export_scene` is not."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "echo now export the scene", "export_scene when done",
+            self._bridge("export_scene")) is None
+
+    def test_the_planner_is_told_which_step_type_can_call_one(self):
+        """The guard above is the backstop. Getting the step type right in
+        the first place costs nothing."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge("execute_blender_code"))
+        assert "CODE or TEST step" in out
+        assert "echo" in out
+
+    def test_the_cmd_handler_routes_instead_of_running_the_noop(self):
+        """Source-level, because the defect is a missing call: the check has
+        to run BEFORE the command is executed, and nothing about the
+        function's return value can show where it sits."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent
+               / "orchestrator" / "step_handlers.py").read_text(encoding="utf-8")
+        assert "hollow_tool_command" in src, "no CMD step is ever routed"
+        i = src.index("hollow_tool_command")
+        assert src.index("# ── Idempotency check ──") > i, (
+            "the routing check runs after the command would have been run")
+        window = src[i:i + 2000]
+        assert "run_agent_loop_with_escalation" in window

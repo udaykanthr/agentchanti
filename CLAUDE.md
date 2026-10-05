@@ -119,6 +119,54 @@ step that satisfies its goal through an external tool still has to be
 measured by a shell command — and nothing records that the tool was the
 thing that did the work.
 
+**A step that proposes a tool must be able to run one.** The section above
+closed the awareness gap and the very next run found the gap behind it. The
+planner, told its tools existed, adopted them — and the plan vocabulary is
+CMD / CODE / TEST, so a tool call is none of the three. It put the intent in
+the only slot a CMD step has, a shell line::
+
+    > echo Configure the active Blender scene through
+      blender__execute_blender_code: retain/add a cube at (0,0,0),
+      set frame_start=1 and frame_end=60, key rotation_euler.z=0 at 1 ...
+
+`echo` exits 0, so both tool steps reported success having done nothing —
+and because all three steps classified CMD, the agent loop **never ran**,
+which is the only place `chat(messages, tools=...)` is called and therefore
+the only place a tool can be invoked. Zero tool calls; the only commands
+executed were `python -m venv venv` and two `echo`s, so nothing reached the
+Blender session the whole exercise was about. Awareness without an execution
+path is worse than no awareness: a step that proposes a tool and then no-ops
+is a step that cannot fail.
+
+Two halves, in this codebase's usual order — get it right up front, and
+guard the case where that fails. The planner summary now states that such a
+step must be **CODE or TEST**, those being the ones that run as a
+tool-calling conversation, and says outright not to write `echo` to stand in
+for a call. `hollow_tool_command` is the backstop at the seam where the
+command arrives: `_handle_cmd_step` routes the step into
+`run_agent_loop_with_escalation` instead of running the no-op.
+
+It is a **proof, not a heuristic**, which is what keeps it off ordinary
+steps. The command must be provably inert — `echo`/`rem`/`:`/`true` with no
+`> | & ;`, because `echo x > f` writes a file and `echo x && npm i` installs,
+and reading either as a no-op would *skip real work*. And the step must name
+a **qualified** tool that is actually offered: `export_scene` is an ordinary
+English phrase in a plan description while `blender__export_scene` is not,
+and a tool nobody configured is an ordinary plan mistake with nothing to
+route to. No bridge, no finding.
+
+No `verify_cmd` is handed to the loop, deliberately: the plan's gate for such
+a step is itself a printed sentence, and a no-op gate would let the loop exit
+green on one. The loop's own refusal to exit on a step that called no tool at
+all is the bar the `echo` could never meet — the same reasoning
+`verify_passed` applies to an empty gate run.
+
+What this still does not do is let a `verify:` **be** a tool call, so a step
+that satisfies its goal through a tool is measured by a shell command or not
+at all, and `GateLedger` has nothing to record. The ghost's
+`no-checkable-claim` correctly fired on both measured steps, which is how the
+hollowness was visible at all.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.
