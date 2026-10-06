@@ -160,6 +160,12 @@ class MCPServerSpec:
     # profile share no vocabulary, and inventing one is how a backstop
     # silently captures the wrong thing. See orchestrator/external_state.py.
     snapshot: dict = field(default_factory=dict)
+    # A read-only tool call whose output fingerprints this system's state,
+    # in the same `mcp:` syntax. `observe_gate_verdict` needs two distinct
+    # artifact digests to fire, and a tool-only step writes no files — so
+    # without this the one check that ends a run stuck on an unsatisfiable
+    # gate is silent by construction. See orchestrator/external_state.py.
+    state_probe: str = ""
 
     def problem(self) -> str | None:
         """Why this spec cannot be used, or None."""
@@ -230,6 +236,7 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
                 timeout=float(entry.get("timeout") or DEFAULT_CALL_TIMEOUT),
                 snapshot={str(k): str(v) for k, v in
                           (entry.get("snapshot") or {}).items()},
+                state_probe=str(entry.get("state_probe") or "").strip(),
             )
         except (TypeError, ValueError) as exc:
             problems.append(f"mcp server entry {entry!r} is malformed: {exc}")

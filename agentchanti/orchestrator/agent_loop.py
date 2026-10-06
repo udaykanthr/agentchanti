@@ -1146,8 +1146,43 @@ def run_agent_loop(
         if _stalled_reason is None and not _missing_required(
                 tools, required_files):
             _stalled_reason = observe_gate_verdict(
-                verify_cmd, result, _artifact_digest())
+                verify_cmd, result, _combined_digest())
         return result
+
+    _warned_unprobed = False
+
+    def _combined_digest() -> str:
+        """The files this attempt wrote, AND any declared external state.
+
+        A tool-only step writes no files, so `_artifact_digest` is constant
+        for it and `observe_gate_verdict`'s two-digest condition can never
+        be met — the one check that ends a run stuck on an unsatisfiable
+        gate is silent by construction. Measured 2026-10-06: two Blender
+        runs each spent 80-90k tokens and an escalation proving a correct
+        artifact wrong.
+
+        Both halves are kept rather than chosen between, because a step may
+        edit files and drive an external system in the same turn.
+        """
+        nonlocal _warned_unprobed
+        files = _artifact_digest()
+        _mcp = getattr(tools, "_mcp", None)
+        if _mcp is None:
+            return files
+        from . import external_state as _ext
+        from . import tool_gates
+        specs = getattr(_mcp, "_specs", {})
+        external = _ext.state_digest(_mcp, tools, specs)
+        if external is None:
+            # Said once, and only for a gate that is actually a tool call:
+            # a detector structurally unable to fire must not read as one
+            # that looked and found nothing.
+            if not _warned_unprobed and tool_gates.is_tool_gate(
+                    verify_cmd, _mcp):
+                _warned_unprobed = True
+                _ext.warn_about_unprobed_servers(_mcp, specs)
+            return files
+        return f"{files}|{external}"
 
     def _gate_result() -> str:
         """The gate's verdict, re-running it only when files have changed.

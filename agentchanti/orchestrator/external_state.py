@@ -60,8 +60,11 @@ __all__ = (
     "EXTERNAL_ROOT",
     "capture_all",
     "declared_snapshot",
+    "declared_state_probe",
     "restore_all",
+    "state_digest",
     "warn_about_unprotected_servers",
+    "warn_about_unprobed_servers",
 )
 
 EXTERNAL_ROOT = os.path.join(".agentchanti", "external")
@@ -195,3 +198,92 @@ def restore_all(bridge, tools, specs, root: str = ".") -> list[tuple[str, bool, 
             ok, detail = False, f"{type(exc).__name__}: {exc}"
         rows.append((name, ok, detail[:400]))
     return rows
+
+
+# --------------------------------------------------------------------------
+# A digest of state that is not a file.
+#
+# `observe_gate_verdict` is the one mechanism designed to stop a run burning
+# its budget on a gate that cannot pass, and it needs two things to fire:
+# repeated byte-identical failing verdicts, AND at least two distinct
+# artifact digests. The second condition is what makes it evidence rather
+# than impatience — without it, a model that edited nothing for three turns
+# looks exactly like a broken gate.
+#
+# `agent_loop._artifact_digest` builds that digest from the FILES the attempt
+# wrote. A tool-only run writes none, so the digest is constant, the
+# two-digest condition can never be met, and the detector is silent by
+# construction. Measured 2026-10-06: two Blender runs each spent 80-90k
+# tokens and an escalation proving a correct artifact wrong, and this is the
+# check that existed to end them at turn three.
+#
+# The fix is a read, and the operator declares it for the same reason they
+# declare the snapshot pair: "what is the state of this system" has no
+# general answer. Undeclared is warned about once rather than left silent,
+# because a detector that cannot fire reads exactly like one that found
+# nothing.
+_PROBE_KEY = "state_probe"
+
+
+def declared_state_probe(spec: object) -> str | None:
+    """The read-only command that fingerprints this server's state."""
+    probe = str(getattr(spec, _PROBE_KEY, None) or "").strip()
+    return probe or None
+
+
+def state_digest(bridge, tools, specs) -> str | None:
+    """A fingerprint of every declared external system, or None.
+
+    None means no server declared a probe — deliberately distinct from an
+    empty string, which would be a digest that never changes and would
+    quietly restore the exact blindness this exists to remove.
+
+    Never raises. A probe that fails contributes its error text, which is
+    itself a state worth distinguishing: a server that has gone away is not
+    the same state as one answering normally.
+    """
+    if bridge is None:
+        return None
+    parts: list[str] = []
+    for name, spec in sorted((specs or {}).items()):
+        probe = declared_state_probe(spec)
+        if probe is None:
+            continue
+        gates = tool_gates.parse(probe, bridge)
+        if gates is None:
+            log.warning("[External] server %r: `state_probe` is not a "
+                        "runnable tool call, so the stall detector stays "
+                        "blind to it: %s", name, probe[:200])
+            continue
+        try:
+            result = tool_gates.run(gates, tools)
+        except Exception as exc:                  # pragma: no cover - env
+            result = f"probe raised {type(exc).__name__}: {exc}"
+        parts.append(f"{name}:{result}")
+    if not parts:
+        return None
+    import hashlib
+    return hashlib.sha1(
+        "\n".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def warn_about_unprobed_servers(bridge, specs) -> list[str]:
+    """Name every server whose state the stall detector cannot see.
+
+    Said once, when a tool gate is first observed. The alternative is a
+    detector that is structurally unable to fire and says nothing about it,
+    which is the `empty_suite_reason` mistake pointed at a safety net.
+    """
+    unprobed = [
+        name for name, spec in (specs or {}).items()
+        if declared_state_probe(spec) is None
+    ]
+    if bridge is None or not unprobed:
+        return unprobed
+    log.warning(
+        "[External] no `state_probe` for %s, so a gate that cannot pass "
+        "cannot be PROVEN not to measure: the stall detector needs two "
+        "distinct artifact digests and a tool-only step writes no files. "
+        "Declare `state_probe: 'mcp:<server>__<read tool> {}'` to get it.",
+        ", ".join(repr(n) for n in unprobed))
+    return unprobed
