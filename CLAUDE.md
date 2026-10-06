@@ -340,6 +340,50 @@ and its full-turn animation captured, the cube then **deleted outright**, and
 `restore_all` put the object, its action and all three sampled rotations back
 unchanged.
 
+**A digest of state that is not a file** (`state_probe`, `state_digest`).
+`observe_gate_verdict` is the one mechanism designed to end a run stuck on a
+gate that cannot pass, and it needs two things: repeated byte-identical
+failing verdicts **and** at least two distinct artifact digests. The second
+is what makes it evidence rather than impatience — without it, a model that
+edited nothing for three turns looks exactly like a broken gate.
+
+`agent_loop._artifact_digest` builds that digest from the **files** the
+attempt wrote. A tool-only step writes none, so the digest is constant, the
+two-digest condition can never be met, and the check is silent **by
+construction**. Measured 2026-10-06: two Blender runs each spent 80–90k
+tokens and an escalation proving a *correct* artifact wrong, and this is the
+check that existed to stop them at turn three.
+
+The fix is a read, declared by the operator for the same reason the snapshot
+pair is: *"what is the state of this system"* has no general answer.
+`state_probe:` is a read-only tool call in the same `mcp:` syntax, its output
+is hashed, and `_combined_digest` keeps **both** halves rather than choosing
+between them — a step may edit files and drive an external system in the same
+turn.
+
+A tool-call count was available for free and is the **wrong signal**: it
+measures effort, not the artifact, and would fire on a model flailing with
+real calls — the false-positive direction `observe_gate_verdict` documents as
+the harmful one.
+
+Undeclared is **said, not silent**, and only for a gate that is actually a
+tool call, so it cannot become noise on an ordinary run. A detector
+structurally unable to fire must not read as one that looked and found
+nothing — the `empty_suite_reason` mistake pointed at a safety net.
+`state_digest` returns `None` rather than `""` for the same reason: a
+constant digest would quietly restore the exact blindness this removes. A
+probe that *fails* contributes its error text rather than aborting, because a
+server that has gone away is not the same state as one answering normally,
+and servers are iterated in sorted order so the digest is deterministic.
+
+Verified by an end-to-end pair against the real `observe_gate_verdict`: three
+identical failing verdicts stay silent on a constant digest and trip once the
+external digest moves. Against the live Blender config the declaration loads,
+no spurious warning fires, and the digest is stable across calls. **Not yet
+measured against the running application** is the "digest moves when the
+scene moves" half — Blender was closed when this landed, so that case rests
+on unit test alone.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.
