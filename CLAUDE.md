@@ -378,11 +378,17 @@ and servers are iterated in sorted order so the digest is deterministic.
 
 Verified by an end-to-end pair against the real `observe_gate_verdict`: three
 identical failing verdicts stay silent on a constant digest and trip once the
-external digest moves. Against the live Blender config the declaration loads,
-no spurious warning fires, and the digest is stable across calls. **Not yet
-measured against the running application** is the "digest moves when the
-scene moves" half — Blender was closed when this landed, so that case rests
-on unit test alone.
+external digest moves. Then against the **running application**, which is the
+measurement that matters, because the digest has to be a function of state
+rather than of time or of how many calls were made::
+
+    digest             ef7c9a54dfd0d2c7
+    digest again       ef7c9a54dfd0d2c7   STABLE
+    + a cube added     27e0d56521131770   MOVED
+    - that cube removed ef7c9a54dfd0d2c7  BACK TO START
+
+Returning to the original value on undo is the half a call-counting signal
+could never produce, and is why this reads the system rather than the run.
 
 ### Agent Tools (agent_tools.py)
 
