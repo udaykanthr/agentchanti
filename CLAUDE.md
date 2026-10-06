@@ -235,6 +235,44 @@ step its turns before anyone says so. And the ghost still has no
 postcondition kind for external-system state, so a tool-only plan's
 `target:` remains unreconcilable and its evidence weight stays zero.
 
+**An assertion that cannot fail does not count.** The first cut of
+`shallow_tool_gate_reason` asked whether the payload *contained* an assertion.
+Measured 2026-10-06 on the terrain/house/tree run, the plan's step 1.1 gate
+was `assert bpy.context.scene is not None; assert isinstance(list(
+bpy.context.scene.objects), list)` — two assertions, neither able to fail over
+any scene, and it passed.
+
+Reusing `seed_strength._substantive_assertions` was the obvious fix and would
+have been a **regression in both directions**. Measured against the real
+gates, it scores that tautology as **2** — passing it, because a bare `assert`
+on any non-literal counts — and scores a correct single
+`assert abs(z - 360.0) < 0.01` as **1**, which fails its two-assertion bar.
+It is calibrated for unittest *suites*; a gate is one focused check, so
+`_falsifiable_assertions` is its own analysis and the threshold is one.
+
+Three shapes cannot fail and all three appeared in real gates: existence
+(`x is not None`, or a bare name/attribute), type (`isinstance`, `hasattr`,
+`callable`), and a comparison between two constants. `and` is falsifiable
+when either side is, `or` only when both are, and a `raise` counts because
+real gates spell the same claim both ways. A payload that is not parseable
+Python returns None and falls back to the text check, since a JavaScript
+payload must not be accused on the strength of a Python parse failing.
+
+**The bound is worth stating plainly: this catches assertions that cannot
+fail, not assertions about the wrong thing.** The same run's terrain gate
+asserted `diffuse_color[1] > diffuse_color[0]` — the *viewport* colour — and
+passed over a terrain whose Principled `Base Color` was left default grey, so
+it renders grey while looking green in solid shading. That gate can fail; it
+simply measures the wrong property, which is the class this codebase already
+records as out of reach of any static check: *"not weak, not grepping, not
+mocking, just semantically wrong and confidently expressed."* It is
+deliberately not accused.
+
+Two of the module's own tests failed when this landed, and both were asserting
+the defect: their fixtures were `assert bpy.data.objects` (truthiness) and
+`assert 1` (a constant), used as examples of a *strong* gate. A check is worth
+having when it catches the tests written against the behaviour it replaced.
+
 ### An Undo For State That Is Not A File (orchestrator/external_state.py)
 
 `snapshot.py` exists because *"neither guard is a guarantee"* — the scan can

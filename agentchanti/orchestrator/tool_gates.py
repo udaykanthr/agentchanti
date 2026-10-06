@@ -50,6 +50,7 @@ patterns.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -84,6 +85,82 @@ _ASSERTION = re.compile(
     r"\bassert\b|\braise\b|\bassertEqual\b|\bexpect\b|!==|===|"
     r"[^=!<>]==[^=]|[<>]=?",
 )
+
+# Existence, type and constant checks hold over anything the system could
+# possibly be, so an assertion built only from them cannot fail. Named here
+# rather than reusing `seed_strength._substantive_assertions`, which is
+# calibrated for unittest SUITES: measured against the real gates, it scores
+# the tautology `assert scene is not None; assert isinstance(objs, list)` as
+# 2 (passing it) and a single correct `assert abs(z - 360.0) < 0.01` as 1
+# (failing it at that module's two-assertion bar). Borrowing it would have
+# been a regression in both directions.
+_EXISTENCE_CALLS = frozenset({"hasattr", "isinstance", "callable", "len"})
+
+
+def _is_constant(node: ast.AST) -> bool:
+    return isinstance(node, (ast.Constant, ast.Tuple, ast.List, ast.Set))
+
+
+def _can_fail(test: ast.AST) -> bool:
+    """Whether this assertion's subject could make it false.
+
+    Three shapes cannot, and all three were observed in real gates:
+    `assert x is not None` (existence), `assert isinstance(x, T)` (type),
+    and `assert <const> == <const>` (tautology). Everything else compares
+    something read from the system against something, which is a claim.
+    """
+    # `assert x` / `assert x.y` — truthiness of a thing that exists.
+    if isinstance(test, (ast.Name, ast.Attribute, ast.Subscript)):
+        return False
+    if _is_constant(test):
+        return False
+    if isinstance(test, ast.Call):
+        func = test.func
+        name = (func.id if isinstance(func, ast.Name)
+                else func.attr if isinstance(func, ast.Attribute) else "")
+        # `assert isinstance(...)` on its own says nothing about behaviour;
+        # `assert len(x) == 3` is a comparison and reaches the branch below.
+        return name not in _EXISTENCE_CALLS
+    if isinstance(test, ast.Compare):
+        left, comparators = test.left, test.comparators
+        # `is None` / `is not None` with nothing else is an existence check.
+        if all(isinstance(op, (ast.Is, ast.IsNot)) for op in test.ops) and all(
+                isinstance(c, ast.Constant) and c.value is None
+                for c in comparators):
+            return False
+        # Two constants compared to each other assert nothing.
+        if _is_constant(left) and all(_is_constant(c) for c in comparators):
+            return False
+        return True
+    if isinstance(test, ast.BoolOp):
+        # `A and B` can fail if either side can; `A or B` needs both.
+        parts = [_can_fail(v) for v in test.values]
+        return any(parts) if isinstance(test.op, ast.And) else all(parts)
+    if isinstance(test, ast.UnaryOp):
+        return _can_fail(test.operand)
+    return True
+
+
+def _falsifiable_assertions(code: str) -> int | None:
+    """How many assertions in this payload could actually fail.
+
+    None when the payload is not parseable Python — a JavaScript or shell
+    payload is a different question and must not be accused on the strength
+    of a Python parse failing.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert) and _can_fail(node.test):
+            count += 1
+        elif isinstance(node, ast.Raise):
+            # `if x != 60: raise AssertionError(...)` is the same claim
+            # spelled differently, and real gates spell it both ways.
+            count += 1
+    return count
 
 
 class ToolGate:
@@ -231,8 +308,22 @@ def shallow_tool_gate_reason(gates: list[ToolGate]) -> str | None:
     if not gates:
         return None
     for g in gates:
+        # Python payloads are parsed, because the shapes that cannot fail are
+        # decidable and were all observed in real gates: `assert scene is not
+        # None`, `assert isinstance(objs, list)`, `assert 1 == 1`. A regex
+        # that only looks for the word `assert` passes every one of them.
+        for value in g.arguments.values():
+            if not isinstance(value, str):
+                continue
+            falsifiable = _falsifiable_assertions(value)
+            if falsifiable is None:
+                continue        # not Python; the text check below decides
+            if falsifiable:
+                return None
         payload = json.dumps(g.arguments, default=str)
-        if _ASSERTION.search(payload):
+        if _ASSERTION.search(payload) and not any(
+                isinstance(v, str) and _falsifiable_assertions(v) == 0
+                for v in g.arguments.values()):
             return None
     names = ", ".join(g.tool for g in gates)
     return (f"the gate calls {names} and asserts nothing about the result, "

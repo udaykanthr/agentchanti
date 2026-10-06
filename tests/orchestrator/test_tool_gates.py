@@ -209,8 +209,12 @@ class TestAToolGateThatCannotFailIsStillShallow:
         assert "execute_code" in reason and "assert" in reason
 
     def test_an_assertion_in_the_payload_clears_it(self):
-        gate = ("mcp:blender__execute_code "
-                + json.dumps({"code": "import bpy; assert bpy.data.objects"}))
+        # A falsifiable assertion, not `assert bpy.data.objects` — that is
+        # truthiness over something that exists, which cannot fail. The
+        # original fixture here encoded the defect the falsifiability
+        # analysis was added to remove.
+        gate = ("mcp:blender__execute_code " + json.dumps(
+            {"code": "import bpy; assert len(bpy.data.objects) == 6"}))
         assert tool_gates.shallow_tool_gate_reason(
             tool_gates.parse(gate, _bridge())) is None
 
@@ -224,7 +228,7 @@ class TestAToolGateThatCannotFailIsStillShallow:
     def test_one_strong_segment_is_enough(self):
         """A gate with any segment that can fail IS a measurement."""
         gate = ("blender__get_scene_info && mcp:blender__execute_code "
-                + json.dumps({"code": "assert 1"}))
+                + json.dumps({"code": "import bpy; assert len(bpy.data.objects) == 6"}))
         gates = tool_gates.parse(gate, _bridge())
         assert gates is not None and len(gates) == 2
         assert tool_gates.shallow_tool_gate_reason(gates) is None
@@ -276,3 +280,102 @@ class TestItIsActuallyWiredIntoTheLoop:
         out = planner_summary(bridge)
         assert "mcp:" in out
         assert "must be able to FAIL" in out
+
+
+class TestAnAssertionThatCannotFailDoesNotCount:
+    """Measured 2026-10-06 on the terrain/house/tree run. The first version
+    of `shallow_tool_gate_reason` asked whether the payload CONTAINED an
+    assertion, and the plan's step 1.1 gate was::
+
+        assert bpy.context.scene is not None
+        assert isinstance(list(bpy.context.scene.objects), list)
+
+    Two assertions, neither able to fail over any scene. It passed.
+
+    Reusing `seed_strength._substantive_assertions` was the obvious fix and
+    would have been a regression in BOTH directions, which is why this is its
+    own analysis: measured, that function scores the tautology above as 2
+    (passing it) because a bare `assert` on any non-literal counts, and
+    scores a correct single `assert abs(z - 360.0) < 0.01` as 1, which fails
+    its two-assertion bar. It is calibrated for unittest suites, not for one
+    focused gate.
+
+    The bound worth stating: this catches assertions that cannot fail. It
+    does NOT catch an assertion that can fail about the WRONG property — the
+    same run's terrain gate asserted `diffuse_color[1] > diffuse_color[0]`,
+    the viewport colour, and passed over a terrain whose Principled Base
+    Color was left default grey so it renders grey. No static check reaches
+    that, which this codebase already records for seeded contracts: "not
+    weak, not grepping, not mocking, just semantically wrong and confidently
+    expressed".
+    """
+
+    def _judge(self, code):
+        gate = "mcp:blender__execute_code " + json.dumps({"code": code})
+        gates = tool_gates.parse(gate, _bridge())
+        assert gates is not None
+        return tool_gates.shallow_tool_gate_reason(gates)
+
+    def test_the_real_tautology_from_the_run_is_flagged(self):
+        assert self._judge(
+            "import bpy; assert bpy.context.scene is not None; "
+            "assert isinstance(list(bpy.context.scene.objects), list)")
+
+    def test_a_single_real_assertion_is_enough(self):
+        """One focused check is what a gate IS. Demanding two would reject
+        the correct cube gate."""
+        assert self._judge(
+            "import bpy, math\nc = bpy.data.objects['Cube']\n"
+            "assert abs(math.degrees(c.rotation_euler.z) - 360.0) < 0.01"
+        ) is None
+
+    @pytest.mark.parametrize("code,why", [
+        ("import bpy; assert bpy.data.objects.get('Cube') is not None",
+         "existence"),
+        ("import bpy; assert bpy.context.scene.objects", "truthiness"),
+        ("import bpy; assert isinstance(bpy.data.objects, object)", "type"),
+        ("assert 1 == 1", "two constants"),
+        ("import bpy; result['n'] = len(bpy.data.objects)", "no assertion"),
+    ])
+    def test_shapes_that_hold_over_any_state(self, code, why):
+        assert self._judge(code), why
+
+    def test_a_raise_is_the_same_claim_spelled_differently(self):
+        """Real gates spell it both ways."""
+        assert self._judge(
+            "import bpy\nif len(bpy.data.objects) != 6:\n"
+            "    raise AssertionError('wrong count')") is None
+
+    def test_an_and_chain_counts_if_either_half_can_fail(self):
+        assert self._judge(
+            "import bpy; assert bpy.context.scene is not None "
+            "and len(bpy.data.objects) == 6") is None
+
+    def test_an_or_chain_needs_both_halves(self):
+        """`A or B` is only falsifiable when both sides can be false."""
+        assert self._judge(
+            "import bpy; assert bpy.context.scene is not None "
+            "or bpy.data.objects")
+
+    def test_the_terrain_gate_is_not_accused(self):
+        """It CAN fail — it just measured the wrong property. Flagging it
+        would be claiming a static check can read intent."""
+        assert self._judge(
+            "import bpy; objs=[o for o in bpy.context.scene.objects "
+            "if o.name.startswith('Terrain_')]; assert len(objs)==1; "
+            "t=objs[0]; assert t.type=='MESH' and "
+            "t.data.materials[0].diffuse_color[1] > "
+            "t.data.materials[0].diffuse_color[0]") is None
+
+    def test_a_non_python_payload_falls_back_to_the_text_check(self):
+        """A JS or shell payload is a different question and must not be
+        accused on the strength of a Python parse failing."""
+        gate = ("mcp:blender__execute_code "
+                + json.dumps({"code": "if (x !== 60) { throw new Error(1) }"}))
+        assert tool_gates.shallow_tool_gate_reason(
+            tool_gates.parse(gate, _bridge())) is None
+
+    def test_a_reader_with_arguments_is_still_shallow(self):
+        gate = 'mcp:blender__get_object_info {"name": "Cube"}'
+        assert tool_gates.shallow_tool_gate_reason(
+            tool_gates.parse(gate, _bridge()))
