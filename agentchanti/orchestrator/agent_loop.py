@@ -1,11 +1,11 @@
-﻿"""
-Bounded agent micro-loop â€” tool-calling step execution.
+"""
+Bounded agent micro-loop — tool-calling step execution.
 
 When ``agent_loop: true`` is configured and the provider supports native
 tool calling, CODE and TEST steps run through this loop instead of the
-generate â†’ review â†’ retry pipeline: the model edits files and runs
+generate → review → retry pipeline: the model edits files and runs
 commands via :class:`~agentchanti.agent_tools.AgentTools`, observes real
-execution output, and self-corrects â€” capped at a fixed number of turns
+execution output, and self-corrects — capped at a fixed number of turns
 so cost stays predictable.
 
 The system prompt below is deliberately byte-identical across all steps
@@ -38,7 +38,7 @@ def verify_passed(result: str) -> bool:
     ``exit: success`` alone is not proof. A test runner that collected
     NOTHING exits 0 on CPython below 3.12 (unittest only gained a non-zero
     status for a zero-test run in 3.12), so a step whose discovery quietly
-    broke would satisfy its own gate having executed no tests at all â€”
+    broke would satisfy its own gate having executed no tests at all —
     the exact false-green this project's verification layers exist to
     prevent, arrived at through the gate rather than around it.
 
@@ -51,8 +51,8 @@ def verify_passed(result: str) -> bool:
 def truncate_middle(text: str, limit: int) -> str:
     """Length-cap *text* while keeping BOTH ends.
 
-    Error output puts the conclusion at the end â€” a Python traceback names
-    the exception on its last line â€” so a plain ``text[:limit]`` slice
+    Error output puts the conclusion at the end — a Python traceback names
+    the exception on its last line — so a plain ``text[:limit]`` slice
     hands the model everything EXCEPT the actual error (observed: a
     recovery loop spent its whole budget on read-only turns hunting for a
     ``NoReverseMatch`` that the head-slice had cut off). Keeps ~1/4 head
@@ -67,7 +67,7 @@ def truncate_middle(text: str, limit: int) -> str:
             + text[-tail:])
 
 
-# â”€â”€ Telemetry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Telemetry ─────────────────────────────────────────────────────────
 # Per-run loop statistics, consumed by the CLI summary and the A/B
 # benchmark harness. Thread-safe: steps in the same wave run in parallel.
 
@@ -96,7 +96,7 @@ def _finish_unstarted(step_idx: int, attempt_label: str, recovery: bool,
     """End a loop that never began, recording it like any other run.
 
     A step refused before turn 1 is still a loop run as far as telemetry
-    is concerned â€” leaving it out would make the session summary claim
+    is concerned — leaving it out would make the session summary claim
     fewer attempts than the pipeline actually made, and the zero turns
     are precisely the number worth seeing.
     """
@@ -116,13 +116,13 @@ def reset_loop_stats() -> None:
         _loop_runs.clear()
 
 
-# â”€â”€ Cross-attempt memory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# The retry ladder (loop â†’ escalation â†’ recovery â†’ recovery escalation)
+# ── Cross-attempt memory ──────────────────────────────────────────────
+# The retry ladder (loop → escalation → recovery → recovery escalation)
 # gave each attempt a blank conversation carrying only the previous
 # attempt's error string. It never learned what the previous attempt
 # actually DID, so every attempt re-derived the same hypotheses and
 # re-edited the same files. Observed on a Pygame run: four attempts,
-# 8 turns each â€” 54 turns and 497k tokens â€” churning src/ghost.py,
+# 8 turns each — 54 turns and 497k tokens — churning src/ghost.py,
 # src/game.py and src/player.py with conflicting fixes, none of them
 # finding the two-line bug. Record each attempt's edits, commands and
 # verdict so the next one starts knowing which doors are already shut.
@@ -157,14 +157,14 @@ def gate_proven_not_measuring(error_info: str) -> bool:
 
     `observe_gate_verdict` trips only on repeated byte-identical failing
     verdicts across distinct artifact digests, where the failure never
-    reached the code â€” a proof that the gate's answer is independent of
+    reached the code — a proof that the gate's answer is independent of
     what the step wrote. A failing measurement from an instrument known
     not to be measuring is not evidence of failure, so it must not be the
     thing that fails a run.
 
     Measured 2026-09-25 on the pre-scaffolded Next.js case: two of three
     runs exited 1 over home pages that build, serve 200 and have had every
-    line of Next's starter copy removed â€” the exact property their gates
+    line of Next's starter copy removed — the exact property their gates
     were written to assert, and could not express (`findstr ... && exit
     /b 1` exits 1 when the text is absent). Both logged `Evidence:
     independent` on the line above `Pipeline failed`.
@@ -224,7 +224,7 @@ def attempt_digest(step_idx: int) -> str:
     shown = attempts[-_JOURNAL_MAX_ATTEMPTS:]
     offset = len(attempts) - len(shown)
     for i, att in enumerate(shown, start=offset + 1):
-        lines.append(f"  attempt {i} â€” {att['label']} â€” {att['outcome']}")
+        lines.append(f"  attempt {i} — {att['label']} — {att['outcome']}")
 
         edited = att["edited"]
         if edited:
@@ -257,7 +257,7 @@ def attempt_digest(step_idx: int) -> str:
         lines.append(
             "  NOTE: " + ", ".join(sorted(repeated)[:6])
             + " have been edited across multiple failed attempts. Re-editing "
-              "them the same way will not work â€” look for the cause "
+              "them the same way will not work — look for the cause "
               "somewhere the previous attempts did not read.")
     return "\n".join(lines)
 
@@ -276,7 +276,7 @@ def loop_stats_summary() -> str | None:
             f"{recoveries} recovery run(s), outcomes: {dict(outcomes)}")
 
 
-# Tools that inspect without changing anything â€” used to detect loops
+# Tools that inspect without changing anything — used to detect loops
 # stuck in analysis mode.
 _READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 
@@ -286,7 +286,7 @@ _READ_ONLY_TOOLS = frozenset({"read_file", "list_files", "search_code"})
 _TOKEN_LIMIT_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 
 # Read-only intervention thresholds (consecutive inspection-only turns).
-# Lowered from 3/4 â†’ 2/3: with the step's target files pre-loaded into the
+# Lowered from 3/4 → 2/3: with the step's target files pre-loaded into the
 # opening message, the model rarely needs several read_file turns, so nudge
 # it to act one turn sooner and stop paying to re-send inspection output on
 # every subsequent turn.
@@ -294,12 +294,12 @@ _ACT_NOW_NUDGE_AT = 2
 _WITHHOLD_READONLY_AT = 3
 
 # Re-running a command that already failed, without having changed anything
-# in between, cannot produce a different answer â€” but models do it anyway,
+# in between, cannot produce a different answer — but models do it anyway,
 # usually by fiddling with the working directory. Observed on a Pygame run:
 # turns 4-7 of an 8-turn budget spent re-running one identical failing gate
 # from four directories (`cd /d %TEMP%\...`, bare, again, `cd .`), ~38k sent
-# tokens, while the actual defect â€” an unreachable pellet its own maze
-# validator was reporting â€” went untouched.
+# tokens, while the actual defect — an unreachable pellet its own maze
+# validator was reporting — went untouched.
 #
 # The system prompt already says "do not retry the same command unchanged".
 # These make it a mechanism rather than a request, on the same escalation
@@ -309,14 +309,14 @@ _WITHHOLD_RUN_COMMAND_AT = 2
 
 # Commands whose failure is an environment or argument problem, never a
 # defect in the project's source. The repeat nudge below used to tell every
-# repeat "the failure is in the code, not in how the command is invoked â€”
+# repeat "the failure is in the code, not in how the command is invoked —
 # edit the source that produced it". For `pip install pygame==2.6.0`
 # failing because that version has no wheel for this Python, that is simply
 # false: no project source existed yet. The model obeyed anyway, and the
 # only source it could invent to satisfy the instruction was a local
 # `pygame/` stub package that shadowed the real library.
 #
-# CODE/TEST wording is unchanged â€” only a repeat of one of these commands
+# CODE/TEST wording is unchanged — only a repeat of one of these commands
 # takes the environment branch.
 _ENV_CMD_RE = re.compile(
     r"\b(?:pip3?|uv|npm|pnpm|yarn|apt|apt-get|brew|choco|winget|"
@@ -390,13 +390,13 @@ def normalize_command(cmd: str) -> str:
 _PRELOAD_MAX_FILES = 6
 _PRELOAD_MAX_CHARS = 12_000
 # Below this much remaining budget a truncated file is more confusing than
-# useful â€” skip it and let the loop read_file if it actually needs it.
+# useful — skip it and let the loop read_file if it actually needs it.
 _PRELOAD_MIN_USEFUL_CHARS = 1_500
 # A file listing longer than this belongs to a tree the model should
 # explore with filtered calls, not carry in full in every turn.
 _PRELOAD_MAX_LISTING_CHARS = 3_000
 
-# Stable prefix â€” keep byte-identical across steps (see module docstring).
+# Stable prefix — keep byte-identical across steps (see module docstring).
 # Step-specific data (task, context, platform quirks) belongs in the user
 # message, never here.
 AGENT_LOOP_SYSTEM_PROMPT = """\
@@ -423,14 +423,14 @@ def _platform_note() -> str:
     Lives in the user message, not the system prompt, so the system
     prompt stays byte-identical across platforms (see module docstring).
     Windows needs it spelled out: an observed loop burned a turn on
-    ``sed -n '1,200p' file`` (exit 1 â€” no sed on Windows) instead of
+    ``sed -n '1,200p' file`` (exit 1 — no sed on Windows) instead of
     calling read_file.
     """
     import os
     if os.name == "nt":
         return ("Environment: Windows (cmd.exe shell). POSIX text tools "
                 "(sed, awk, grep, cat, head, tail, ls) are NOT available "
-                "in run_command â€” use read_file / edit_file / search_code "
+                "in run_command — use read_file / edit_file / search_code "
                 "for file inspection and changes.")
     return ""
 
@@ -457,7 +457,7 @@ def _preload_listing(tools: AgentTools) -> str:
     """The project's file list, up front.
 
     Orientation is the loop's reflex first move: measured on a 7-step run,
-    every single step opened with ``list_files`` â€” a whole turn out of
+    every single step opened with ``list_files`` — a whole turn out of
     eight spent learning a layout the harness can hand over for free. The
     answer also rides along in every later turn once fetched, so paying a
     round trip for it buys nothing.
@@ -474,7 +474,7 @@ def _preload_listing(tools: AgentTools) -> str:
         return ""
     if len(body) > _PRELOAD_MAX_LISTING_CHARS:
         return ""
-    return ("Project files (already listed for you â€” do NOT call "
+    return ("Project files (already listed for you — do NOT call "
             "list_files again unless you have changed the tree):\n" + body)
 
 
@@ -489,7 +489,7 @@ def _py_signature_outline(source: str) -> str | None:
     """API surface of a Python module: declarations, no bodies.
 
     A step importing `map.py` needs to know that `Map.is_walkable(x, y)`
-    exists, not how it is implemented â€” and bodies are ~95% of the bytes.
+    exists, not how it is implemented — and bodies are ~95% of the bytes.
     Measured on a generated game module: 21,364 chars of source reduce to
     1,138 chars of signatures.
 
@@ -555,11 +555,43 @@ def _py_signature_outline(source: str) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+def _is_prose_not_a_path(target: str) -> bool:
+    """True when a declared `target:` is a description, not a filename.
+
+    A step that changes a live external system has no file to name, and a
+    planner asked for one writes what it means. Measured 2026-10-07 on a
+    Blender run::
+
+        target: Blender open scene (live session; no project files)
+
+    That resolves to a path which will never exist, so `_missing_required`
+    reported it missing on every turn and the early exit was declined five
+    times — the gate PASSED on turn 2 and the step ran to turn 7, re-proving
+    a verdict already in hand, with the late turns the dear ones because the
+    whole conversation is resent each time.
+
+    The rule is deliberately narrow: more than two words, no directory
+    separator and no extension. `Makefile` is one word, `src/main.py` has
+    both, and `my notes.txt` has an extension, so none of them is touched.
+    Being wrong here only WEAKENS a guard — the gate itself must still pass
+    — which is the direction `_missing_required` already chooses for a
+    target it cannot resolve.
+    """
+    text = (target or "").strip()
+    if not text:
+        return False
+    if "/" in text or "\\" in text:
+        return False
+    if os.path.splitext(text)[1]:
+        return False
+    return len(text.split()) > 2
+
+
 def _missing_required(tools: AgentTools,
                       required: set[str] | None) -> list[str]:
     """Declared target files that are still absent from disk.
 
-    A pure file-existence check â€” no LLM call, no judgement. Paths that
+    A pure file-existence check — no LLM call, no judgement. Paths that
     escape the project root are ignored rather than raising: a malformed
     `target:` line must not be able to hold a step open forever.
     """
@@ -568,6 +600,12 @@ def _missing_required(tools: AgentTools,
     missing = []
     for path in sorted(required):
         if not path or not path.strip():
+            continue
+        if _is_prose_not_a_path(path):
+            _logger.debug("[AgentLoop] ignoring declared target %r — it is a "
+                          "description, not a filename, so it can never "
+                          "exist and would block the early exit forever",
+                          path.strip())
             continue
         try:
             full = tools._resolve(path.strip())
@@ -582,10 +620,10 @@ def _preload_target_files(tools: AgentTools,
                           paths: list[str] | None,
                           full_paths: set[str] | None = None) -> str:
     """Read the step's context up front so the loop doesn't burn its first
-    turns on read_file round-trips â€” whose output then rides along,
+    turns on read_file round-trips — whose output then rides along,
     re-sent, in every later turn.
 
-    Files in *full_paths* (the step's own targets â€” what it is about to
+    Files in *full_paths* (the step's own targets — what it is about to
     edit) are sent verbatim. Everything else is a DEPENDENCY, and a
     dependency is only consulted for its API: what a step importing
     `map.py` needs is that `Map.is_walkable(x, y)` exists, not how it is
@@ -601,7 +639,7 @@ def _preload_target_files(tools: AgentTools,
     if not paths:
         return ""
     # ``None`` means "no dependency information available", so every
-    # file is sent whole â€” the previous behaviour. Outlining is opt-in
+    # file is sent whole — the previous behaviour. Outlining is opt-in
     # via an explicit set, so a caller that cannot say which file is
     # being edited never gets an outline of the file it must modify.
     outline_ok = full_paths is not None
@@ -617,7 +655,7 @@ def _preload_target_files(tools: AgentTools,
         try:
             full = tools._resolve(path)
         except (ValueError, TypeError):
-            continue  # outside the project root â€” skip
+            continue  # outside the project root — skip
         if not os.path.isfile(full) or os.path.getsize(full) == 0:
             continue
         body = tools._tool_read_file(path)
@@ -633,13 +671,13 @@ def _preload_target_files(tools: AgentTools,
             # An unparseable module falls through to the real text: half an
             # outline is worse than none.
             if outline:
-                body = (f"{rel} (API outline â€” signatures only, bodies "
+                body = (f"{rel} (API outline — signatures only, bodies "
                         f"omitted; read_file it if you need an "
                         f"implementation)\n{outline}")
         room = _PRELOAD_MAX_CHARS - total
         if len(body) > room:
             # This used to `break`, so ONE oversized file emptied the whole
-            # bundle â€” including every smaller file behind it. Generated
+            # bundle — including every smaller file behind it. Generated
             # modules routinely run 20-40 KB, so in practice nothing was
             # ever preloaded: `[PlanStep] Injected 3 plan-context files`
             # would log while the loop's opening message stayed under
@@ -648,7 +686,7 @@ def _preload_target_files(tools: AgentTools,
             # Truncate to the remaining budget instead. read_file itself
             # truncates at _MAX_READ_CHARS, so a head-of-file is exactly
             # what the model would have got from the round-trip we are
-            # replacing â€” with the same explicit truncation notice, so it
+            # replacing — with the same explicit truncation notice, so it
             # knows to read the rest if it needs it.
             if room < _PRELOAD_MIN_USEFUL_CHARS:
                 continue        # no room left worth spending; try the next
@@ -659,7 +697,7 @@ def _preload_target_files(tools: AgentTools,
             break
     if not blocks:
         return ""
-    return ("Relevant existing files (already read for you â€” do NOT call "
+    return ("Relevant existing files (already read for you — do NOT call "
             "read_file on these again):\n\n" + "\n\n".join(blocks))
 
 
@@ -682,7 +720,7 @@ def _venv_python(project_root: str) -> str | None:
 
     Dependency installs must land in the interpreter the gates run under
     (``venv\\Scripts\\python.exe``), not whatever bare ``python`` resolves
-    to on PATH â€” installing into the system interpreter leaves the venv
+    to on PATH — installing into the system interpreter leaves the venv
     (and therefore the verify gate) still missing the package, while the
     test command run under system Python "passes" in the wrong place.
     """
@@ -711,7 +749,7 @@ def commands_equivalent_modulo_flags(candidate: str | None,
                                      original: str | None) -> bool:
     """True when *candidate* is *original* with only flag tokens changed.
 
-    Same executables, same non-flag arguments, in the same order â€”
+    Same executables, same non-flag arguments, in the same order —
     differing only in ``-``/``--`` tokens (e.g. ``pip install pygame``
     vs ``pip install --yes pygame``). Identical strings return False:
     the gate already ran that exact command itself, so an earlier
@@ -731,7 +769,7 @@ def _npm_package_dir(project_root: str,
     step writing ``backend/routes/auth.js`` needs its packages in
     ``backend/``, whatever the repo root happens to contain. Walks up from
     each file to the nearest manifest and requires the answer to be
-    unanimous â€” a step spanning two packages has no single right target,
+    unanimous — a step spanning two packages has no single right target,
     and the caller's existing behaviour is the safer answer there.
 
     Returns ``""`` for the repo root itself, so callers can treat "root"
@@ -772,7 +810,7 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
     """Install a missing third-party dependency named in failing output.
 
     ``No module named X`` / ``Cannot find package 'X'`` are environment
-    problems that editing project files can never fix â€” the loop that hit
+    problems that editing project files can never fix — the loop that hit
     them burned its whole turn budget while the real fix was one pip
     install (mirrors the BulkTest self-heal, which the agent-loop path
     bypasses). *healed* accumulates already-attempted names so a dep that
@@ -792,14 +830,14 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
         install_cmd = "npm install -D " + " ".join(pkgs)
         # Install beside the manifest that owns the failing step, not at
         # the repo root. `_cd_prefix` below can only see a `cd` the GATE
-        # happens to carry, and a correct root-relative backend gate â€”
-        # `node -e "require('./backend/x')"` â€” carries none, so the heal
+        # happens to carry, and a correct root-relative backend gate —
+        # `node -e "require('./backend/x')"` — carries none, so the heal
         # landed at the top level. Measured 2026-08-19: a backend step
         # missing `jsonwebtoken` and `supertest` installed both into a
         # repo-root `node_modules`, leaving a `package.json` belonging to
         # no project; the app only worked because Node walks up, and
         # shipping `backend/` alone would break.
-        # The step's DECLARED TARGETS, not `planned_files` â€” the latter is
+        # The step's DECLARED TARGETS, not `planned_files` — the latter is
         # the loop's reading list (`_loop_preload_paths` adds every file
         # the step imports), so a backend step that reads a frontend
         # module spans two packages, the unanimity rule declines, and the
@@ -821,7 +859,7 @@ def attempt_env_self_heal(tools: AgentTools, verify_output: str,
         # Files the step is about to create count as local too. A TEST step
         # whose gate is `python -m unittest -v test_main` fails with
         # "No module named test_main" before the file exists, and memory
-        # cannot know better â€” so the heal tried `pip install test_main`,
+        # cannot know better — so the heal tried `pip install test_main`,
         # a pointless call and the exact dependency-confusion hazard
         # _missing_third_party_module exists to prevent.
         project_files += [p for p in (planned_files or []) if p]
@@ -860,15 +898,15 @@ def run_agent_loop(
 
     Exit conditions, in order:
     - Model stops calling tools AND ``verify_cmd`` (when given) passes
-      â†’ ``(True, summary)``. A failing ``verify_cmd`` is fed back to the
+      → ``(True, summary)``. A failing ``verify_cmd`` is fed back to the
       model as a new user message and the loop continues.
     - Model stops calling tools without having used any tool at all
-      â†’ ``(False, ...)`` â€” a step that changed nothing cannot have
+      → ``(False, ...)`` — a step that changed nothing cannot have
       succeeded.
-    - ``max_turns`` exhausted â†’ ``(False, ...)``.
+    - ``max_turns`` exhausted → ``(False, ...)``.
 
     *required_files* are the step's plan-declared targets. While any of
-    them is missing the loop declines to exit EARLY on a green gate â€”
+    them is missing the loop declines to exit EARLY on a green gate —
     only that exit, so the guard can spend turns the step already had but
     can never turn a passing step into a failing one.
 
@@ -877,7 +915,7 @@ def run_agent_loop(
     """
     # A gate the shell cannot execute is decidable before a single token
     # is spent, and it is the same conclusion the stall breaker reaches
-    # after three verdicts â€” with the turns already paid for. Measured
+    # after three verdicts — with the turns already paid for. Measured
     # 2026-08-18: the plan-time check named this exact gate as
     # unrunnable at 00:38:48, nothing consumed the warning, and the run
     # then spent 180k tokens and 14 turns proving it right. An advisory
@@ -899,7 +937,7 @@ def run_agent_loop(
             if _runnable:
                 _logger.warning(
                     "[GateIntegrity] step %d: the gate cannot run as "
-                    "written (%s) â€” using the equivalent this platform's "
+                    "written (%s) — using the equivalent this platform's "
                     "shell can execute:\n  original: %s\n  using: %s",
                     step_idx + 1, _unrunnable, verify_cmd, _runnable)
                 # The ledger must learn it too, or the monotonic recheck
@@ -910,7 +948,7 @@ def run_agent_loop(
                 verify_cmd = _runnable
             else:
                 _logger.error(
-                    "[GateIntegrity] step %d: refusing to start â€” the "
+                    "[GateIntegrity] step %d: refusing to start — the "
                     "gate cannot run on this platform in any reading, so "
                     "no work the step does could satisfy it: %s\n  gate: %s",
                     step_idx + 1, _unrunnable, verify_cmd)
@@ -945,7 +983,7 @@ def run_agent_loop(
     # Seeded from earlier attempts at THIS step. The streak used to reset
     # with every attempt, so a command re-run once per attempt across the
     # loop -> escalation -> recovery ladder never tripped the nudge at all
-    # â€” observed on cmd-recovery, where `ruff check messy.py` failed
+    # — observed on cmd-recovery, where `ruff check messy.py` failed
     # identically in all three attempts and the intervention never fired.
     # An edit inside this attempt still clears the seed, so a genuine
     # fix-then-verify sequence is not penalised.
@@ -956,7 +994,7 @@ def run_agent_loop(
     }
     healed: set[str] = set()
 
-    # Last run_command the model executed that exited 0 â€” evidence for
+    # Last run_command the model executed that exited 0 — evidence for
     # the unpassable-gate escape below (recovery loops only).
     last_ok_cmd: str | None = None
 
@@ -966,7 +1004,7 @@ def run_agent_loop(
 
     # Set when an edit lands, cleared when the gate runs. Without it the
     # gate would re-run after every inspection turn and re-prove the same
-    # red result â€” and the final verification would re-run a suite the
+    # red result — and the final verification would re-run a suite the
     # early gate just ran against identical files.
     _dirty_since_gate = False
     _gate_cache: str | None = None
@@ -1013,10 +1051,10 @@ def run_agent_loop(
 
         A failed CMD step's recovery gate is the original command
         verbatim; when that command is malformed (observed:
-        `pip install --yes pygame` â€” pip has no --yes), the gate stays
+        `pip install --yes pygame` — pip has no --yes), the gate stays
         red forever even though the loop already ran the corrected
         command successfully. Accept a same-command-modulo-flags success
-        the loop itself produced. Recovery loops only â€” CODE/TEST gates
+        the loop itself produced. Recovery loops only — CODE/TEST gates
         keep strict semantics.
         """
         return (_recovery and verify_cmd is not None
@@ -1052,7 +1090,7 @@ def run_agent_loop(
         # recovery gate (which is the failed command verbatim), and the
         # platform variants built from either. A gate here runs
         # unattended and repeatedly, so it is refused outright rather
-        # than trimmed â€” trimming belongs to plan time, where the planner
+        # than trimmed — trimming belongs to plan time, where the planner
         # can still be asked for a better command. The refusal string
         # does not start with `exit: success`, so `verify_passed` reads
         # it as a failure and the step cannot exit green on it.
@@ -1063,14 +1101,14 @@ def run_agent_loop(
         if _unsafe:
             _logger.error("[GateSafety] refusing to run this gate: %s",
                           _unsafe)
-            return (f"gate REFUSED â€” it runs a destructive command: "
+            return (f"gate REFUSED — it runs a destructive command: "
                     f"{_unsafe}. A verify command must only observe; it is "
                     f"re-run after every later wave, so its side effects "
                     f"happen repeatedly.")
         # A gate that is an MCP tool call rather than a shell command. There
         # is no shell command that observes a running external application,
         # so the planner's `verify: blender__get_scene_info` could not pass
-        # over any artifact â€” measured 2026-10-06 against a correct one.
+        # over any artifact — measured 2026-10-06 against a correct one.
         # `tool_gates.run` answers in `exit: success` / `exit: failure`, so
         # `verify_passed` and the ledger read it exactly as a shell gate.
         _tg = tool_gates.parse(_cmd, getattr(tools, "_mcp", None))
@@ -1095,13 +1133,14 @@ def run_agent_loop(
         # only `output=116 chars` — enough to misread the failure as the
         # gate's own verdict, which is exactly what happened.
         if _cmd and _cmd.lstrip().lower().startswith(tool_gates.TOOL_GATE_PREFIX):
+            _mcp_for_log = getattr(tools, "_mcp", None)
             _logger.warning(
                 "[ToolGate] step %d: the gate is written as a tool call but "
                 "was NOT recognised as one, so it is going to the shell, "
                 "where it cannot run. Offered tools: %s",
                 step_idx + 1,
-                ", ".join(d.name for d in getattr(tools, "_mcp", None).definitions())
-                if getattr(tools, "_mcp", None) else "none (no MCP bridge)")
+                ", ".join(d.name for d in _mcp_for_log.definitions())
+                if _mcp_for_log else "none (no MCP bridge)")
         return tools.execute_all([_verify_call(_cmd)])[0].content
 
     def _try_platform_variants(result: str) -> str:
@@ -1110,7 +1149,7 @@ def run_agent_loop(
         A gate is an instrument, and an instrument can be broken. When the
         SAME command text means something different on POSIX than it does
         under cmd.exe, a red verdict may be measuring the platform rather
-        than the code â€” observed on a run where the correct edit landed on
+        than the code — observed on a run where the correct edit landed on
         turn 1 and three separate recovery mechanisms then spent 24 turns
         failing against a regex that could not match anything on Windows.
 
@@ -1128,7 +1167,7 @@ def run_agent_loop(
             record_gate_repair(verify_cmd, variant, reason)
             _logger.warning(
                 "[AgentLoop] step %d: the gate FAILED as written but PASSES "
-                "under the %s reading of the identical command â€” treating "
+                "under the %s reading of the identical command — treating "
                 "the gate, not the code, as the defect",
                 step_idx + 1, reason)
             # Adopt the repaired form for the rest of this loop so the
@@ -1141,7 +1180,7 @@ def run_agent_loop(
     def _run_verify() -> str:
         result = _verify_once()
         # A crashed verifier produced no verdict, so failing the step on it
-        # is a category error â€” the same one already guarded in
+        # is a category error — the same one already guarded in
         # GateLedger.recheck and the BulkTest plan gate, and missing here.
         # Observed: three consecutive attempts where `python -m unittest -v`
         # PASSED seconds earlier and then the exit verification
@@ -1154,7 +1193,7 @@ def run_agent_loop(
             if is_abnormal_exit(code):
                 _logger.warning(
                     "[AgentLoop] step %d: verification process terminated "
-                    "abnormally (%s) â€” retrying once before believing it",
+                    "abnormally (%s) — retrying once before believing it",
                     step_idx + 1, describe_abnormal_exit(code) or code)
                 log_crash_diagnostics(code, verify_cmd)
                 result = _verify_once()
@@ -1177,15 +1216,15 @@ def run_agent_loop(
         nonlocal _stalled_reason
         # A step that has not finished writing its declared targets is
         # EXPECTED to fail its gate, identically, while the digest moves
-        # with every file it writes â€” which is the stall signature exactly.
+        # with every file it writes — which is the stall signature exactly.
         # Measured 2026-08-19 run 19: a step declaring five components was
         # cut short at `turns=5, write_file: 3`; its gate reads two of
         # them, so until both existed the failure was a constant ENOENT
         # naming the missing FILE rather than anything about the code. It
         # was declared unmeasurable three times in one run, and a recovery
         # loop then redid the work and passed the same gate. This is the
-        # false positive the check's own bias statement warns about â€” the
-        # kind that suppresses real work â€” so the observation is withheld
+        # false positive the check's own bias statement warns about — the
+        # kind that suppresses real work — so the observation is withheld
         # until the step has produced everything it promised.
         if _stalled_reason is None and not _missing_required(
                 tools, required_files):
@@ -1200,7 +1239,7 @@ def run_agent_loop(
 
         A tool-only step writes no files, so `_artifact_digest` is constant
         for it and `observe_gate_verdict`'s two-digest condition can never
-        be met â€” the one check that ends a run stuck on an unsatisfiable
+        be met — the one check that ends a run stuck on an unsatisfiable
         gate is silent by construction. Measured 2026-10-06: two Blender
         runs each spent 80-90k tokens and an escalation proving a correct
         artifact wrong.
@@ -1249,6 +1288,7 @@ def run_agent_loop(
     # would turn the measured false RED into a false GREEN, which is the
     # worse of the two -- the step would report success having built
     # nothing. Costs one gate run and no tokens.
+    #
     # Only for a TOOL gate. A shell gate already has `_always_fails_error`,
     # which proves inversion from cmd.exe's own operator semantics without
     # running anything -- and an unconditional baseline run would mean a full
@@ -1270,7 +1310,7 @@ def run_agent_loop(
             if _gate_before_work:
                 _logger.info(
                     "[AgentLoop] step %d: the gate already passes before the "
-                    "step has done anything â€” continuing, because that is "
+                    "step has done anything — continuing, because that is "
                     "either a step already satisfied or a precondition, and "
                     "only acting tells them apart", step_idx + 1)
 
@@ -1280,18 +1320,18 @@ def run_agent_loop(
         final_turn = turn == max_turns
         if final_turn and any_tool_used:
             messages.append(Message(role="user", content=(
-                "Turn budget exhausted â€” tools are no longer available. "
+                "Turn budget exhausted — tools are no longer available. "
                 "Reply now with a short summary of what you completed and "
                 "whether it was verified.")))
         if final_turn:
             tools_for_turn = None
         elif read_only_streak >= _WITHHOLD_READONLY_AT:
-            # The act-now nudge was ignored â€” withhold inspection tools so
+            # The act-now nudge was ignored — withhold inspection tools so
             # the only moves left are the ones that change something.
             tools_for_turn = action_definitions
         elif repeat_cmd_streak >= _WITHHOLD_RUN_COMMAND_AT:
             # Stuck re-running a failing command. Take the command away and
-            # the only remaining moves edit the code â€” which is where the
+            # the only remaining moves edit the code — which is where the
             # defect is. The harness runs the gate itself after every turn,
             # so nothing is lost by the model not running it.
             tools_for_turn = editing_definitions
@@ -1316,7 +1356,7 @@ def run_agent_loop(
             #
             # The final turn is deliberately NOT enforced. Tools are absent
             # from that offer to prod a text summary, but a model that edits
-            # anyway may just have fixed the step â€” the gate runs after this
+            # anyway may just have fixed the step — the gate runs after this
             # block, so that late write can still turn the step green.
             # Refusing it would throw away a working fix to enforce a
             # formatting preference.
@@ -1329,7 +1369,7 @@ def run_agent_loop(
             _repeated_out: str = ""
             # A green gate the model ran itself, as the last thing it did
             # this turn. Without this the early gate below re-ran the very
-            # command the model had just run seconds earlier â€” observed as
+            # command the model had just run seconds earlier — observed as
             # back-to-back identical `python -m unittest -v` lines.
             _self_gate: str | None = None
             _last_call = response.tool_calls[-1] if response.tool_calls else None
@@ -1348,7 +1388,7 @@ def run_agent_loop(
                         commands_run.append((_cmd, _ok))
                     if _ok:
                         last_ok_cmd = _cmd
-                    # A command changes the world too â€” it can install a
+                    # A command changes the world too — it can install a
                     # dependency, generate a file or BE the fix. Treating
                     # only edits as invalidating let a stale red verdict
                     # outlive the command that fixed it.
@@ -1366,7 +1406,7 @@ def run_agent_loop(
                     if _path and not _content.lower().startswith("error"):
                         edited_files.append(_path)
                         _dirty_since_gate = True
-                        # The world changed â€” every prior failure is now
+                        # The world changed — every prior failure is now
                         # worth re-testing, so nothing counts as a repeat.
                         failed_since_edit.clear()
                 elif MCP_NAME_SEPARATOR in _tc.name:
@@ -1395,12 +1435,12 @@ def run_agent_loop(
             else:
                 read_only_streak = 0
             if read_only_streak == _ACT_NOW_NUDGE_AT and turn <= max_turns - 2:
-                _logger.info("[AgentLoop] step %d: %d read-only turns â€” "
+                _logger.info("[AgentLoop] step %d: %d read-only turns — "
                              "injecting act-now nudge", step_idx + 1,
                              _ACT_NOW_NUDGE_AT)
                 messages.append(Message(role="user", content=(
                     f"You have spent {_ACT_NOW_NUDGE_AT} consecutive turns "
-                    "only inspecting files. You have enough context â€” ACT "
+                    "only inspecting files. You have enough context — ACT "
                     "now: apply the fix with edit_file or write_file, or run "
                     "the command that completes this step. "
                     f"{max_turns - turn} turn(s) remain.")))
@@ -1408,11 +1448,11 @@ def run_agent_loop(
                 # Nudge ignored (observed twice in one run: the model went
                 # straight back to read_file). Escalate: from the next
                 # turn only acting tools are offered.
-                _logger.info("[AgentLoop] step %d: nudge ignored â€” "
+                _logger.info("[AgentLoop] step %d: nudge ignored — "
                              "withholding read-only tools", step_idx + 1)
                 messages.append(Message(role="user", content=(
                     "Inspection tools are now disabled. Only write_file, "
-                    "edit_file and run_command are available â€” apply the "
+                    "edit_file and run_command are available — apply the "
                     "fix or run the completing command now.")))
 
             # Repeated-command intervention: same ladder, different rut.
@@ -1428,7 +1468,7 @@ def run_agent_loop(
                                    or _ENV_ERROR_RE.search(_repeated_out))
                 _is_silent_failure = NO_OUTPUT_MARKER in _repeated_out
                 _logger.info("[AgentLoop] step %d: re-ran a failing command "
-                             "unchanged â€” injecting fix-the-cause nudge%s",
+                             "unchanged — injecting fix-the-cause nudge%s",
                              step_idx + 1,
                              " (environment variant)" if _is_env_cmd
                              else " (silent-failure variant)"
@@ -1439,11 +1479,11 @@ def run_agent_loop(
                         "this step and it failed the same way. Re-running it "
                         "cannot change the result. This is an environment or "
                         "argument problem, not a defect in the project's "
-                        "source â€” read the error above and change the "
+                        "source — read the error above and change the "
                         "command itself: drop or change a pinned version "
                         "that has no build for this platform or Python, "
-                        "target a different package name, or â€” if the tool "
-                        "is installed but not on PATH â€” invoke it through "
+                        "target a different package name, or — if the tool "
+                        "is installed but not on PATH — invoke it through "
                         "the interpreter instead (`python -m <tool> ...`) "
                         "rather than by its bare name. Do NOT write a local "
                         "module or package that stands in for the "
@@ -1461,7 +1501,7 @@ def run_agent_loop(
                     # already correct and every run printed nothing. The
                     # model burned its turns guessing, then eventually
                     # printed the conditions one by one and found them all
-                    # true â€” the right move, reached far too late.
+                    # true — the right move, reached far too late.
                     #
                     # Ask for that evidence directly. Note this cannot be
                     # used to dodge the step: the acceptance gate is run by
@@ -1470,14 +1510,14 @@ def run_agent_loop(
                     messages.append(Message(role="user", content=(
                         f"You already ran `{_repeated_cmd[:160]}` earlier in "
                         "this step and it failed the same way, producing NO "
-                        "output â€” so it has not told you what is wrong, and "
+                        "output — so it has not told you what is wrong, and "
                         "running it again cannot. Make the failure "
                         "observable before assuming the source is at fault: "
                         "run a version that prints each condition it checks "
                         "separately, so you can see which one is actually "
                         "false. If every condition it asserts turns out to "
                         "be true, then the check itself is malformed rather "
-                        "than the code â€” say so explicitly and quote the "
+                        "than the code — say so explicitly and quote the "
                         "output that shows it. Otherwise fix the source. "
                         f"{max_turns - turn} turn(s) remain.")))
                 else:
@@ -1485,21 +1525,21 @@ def run_agent_loop(
                         f"You already ran `{_repeated_cmd[:160]}` earlier in "
                         "this step and it failed the same way. Re-running it, or "
                         "running it from a different directory, cannot change "
-                        "the result â€” the failure is in the code, not in how the "
+                        "the result — the failure is in the code, not in how the "
                         "command is invoked. Read the error above and edit the "
                         f"source that produced it. {max_turns - turn} turn(s) "
                         "remain.")))
             elif repeat_cmd_streak == _WITHHOLD_RUN_COMMAND_AT:
                 _logger.info("[AgentLoop] step %d: still re-running a failing "
-                             "command â€” withholding run_command",
+                             "command — withholding run_command",
                              step_idx + 1)
                 messages.append(Message(role="user", content=(
                     "run_command is now disabled. Fix the cause with "
-                    "edit_file or write_file â€” the step's command is run for "
+                    "edit_file or write_file — the step's command is run for "
                     "you after every turn, so you do not need to run it.")))
 
             # Early gate: the loop already treats "the gate passes" as the
-            # definition of a completed step â€” when the model claims done
+            # definition of a completed step — when the model claims done
             # AND when the turn budget runs out. It just never asked until
             # one of those happened, so a step that was finished at turn 4
             # kept probing to turn 8. Measured on a Pac-Man run: 53 turns
@@ -1512,7 +1552,7 @@ def run_agent_loop(
                     and (_dirty_since_gate or _self_gate is not None)):
                 _early = _gate_result()
                 # A gate that PASSED before this step acted and fails now is
-                # measuring the absence of the step's work -- a precondition
+                # measuring the absence of the step's work — a precondition
                 # in the `verify:` slot, not a postcondition. Proven from
                 # this step's own two verdicts rather than by reading the
                 # command, which is what lets it catch an assertion inside a
@@ -1522,7 +1562,7 @@ def run_agent_loop(
                     _stalled_reason = (
                         "the gate PASSED before this step did anything and "
                         "FAILS now that it has acted, so it is asserting the "
-                        "absence of the step's own work -- a precondition "
+                        "absence of the step's own work — a precondition "
                         f"written into `verify:`: {truncate_middle(verify_cmd, 300)}")
                     _logger.warning("[GateIntegrity] step %d: %s",
                                     step_idx + 1, _stalled_reason)
@@ -1539,14 +1579,14 @@ def run_agent_loop(
                         # had the first two written; `python -m unittest -v`
                         # passed on those alone, the loop exited at turn 3 of
                         # 8, and the run was reported complete with the
-                        # adversarial test file â€” the whole point of the task
-                        # â€” never created. Declining to stop early is safe:
+                        # adversarial test file — the whole point of the task
+                        # — never created. Declining to stop early is safe:
                         # it can only spend turns the step already had, never
                         # turn a passing step into a failure.
                         _logger.info(
                             "[AgentLoop] step %d: gate %r passes on turn "
                             "%d/%d but %d declared target(s) do not exist "
-                            "yet (%s) â€” not exiting early",
+                            "yet (%s) — not exiting early",
                             step_idx + 1, verify_cmd, turn, max_turns,
                             len(_missing), ", ".join(_missing))
                         messages.append(Message(role="user", content=(
@@ -1554,14 +1594,14 @@ def run_agent_loop(
                             "target file(s) that do not exist yet: "
                             + ", ".join(_missing)
                             + ". A green gate is not the same as a finished "
-                            "step â€” the gate cannot see a file you have not "
+                            "step — the gate cannot see a file you have not "
                             "written. Create them now with the content the "
                             "step describes. "
                             f"{max_turns - turn} turn(s) remain.")))
                         continue
                     _logger.info(
                         "[AgentLoop] step %d verified early on turn %d/%d "
-                        "â€” gate %r passes, ending the loop instead of "
+                        "— gate %r passes, ending the loop instead of "
                         "spending the remaining turn(s)",
                         step_idx + 1, turn, max_turns, verify_cmd)
                     return _finish("verified-early", turn, (True, (
@@ -1570,7 +1610,7 @@ def run_agent_loop(
             continue
 
         # A reply cut at the output cap with no tool call is not a "done"
-        # claim â€” it is a model that ran out of room mid-sentence, usually
+        # claim — it is a model that ran out of room mid-sentence, usually
         # while writing a file's content as prose instead of passing it to
         # write_file. Measured 2026-09-22, glm-5.3-flash rewriting page.tsx:
         #
@@ -1579,7 +1619,7 @@ def run_agent_loop(
         #     prompt=35,077  completion=5,785   tool_calls=1   (write_file)
         #
         # Each truncated reply went back into the conversation whole, so it
-        # was paid for again as prompt on every later turn â€” ~130k tokens,
+        # was paid for again as prompt on every later turn — ~130k tokens,
         # 45% of the run, for one file. Keep a stub, not the reply, and say
         # what to do instead. Not on the final turn, where tools are
         # withheld and the ordinary exit must run.
@@ -1587,7 +1627,7 @@ def run_agent_loop(
                 in _TOKEN_LIMIT_REASONS):
             _logger.warning(
                 "[AgentLoop] step %d turn %d: reply hit the output-token cap "
-                "with no tool call (%d chars) â€” dropping it from the "
+                "with no tool call (%d chars) — dropping it from the "
                 "conversation and asking for the tool call", step_idx + 1,
                 turn, len(response.text or ""))
             messages.append(Message(role="assistant", content=(
@@ -1602,13 +1642,13 @@ def run_agent_loop(
                 f"{max_turns - turn} turn(s) remain.")))
             continue
 
-        # Model stopped calling tools â€” it believes the step is done.
+        # Model stopped calling tools — it believes the step is done.
         summary = response.text.strip()
         if not any_tool_used:
             _logger.warning("[AgentLoop] step %d: model finished without "
                             "using any tool", step_idx + 1)
             return _finish("no-tools", turn, (False, (
-                "Agent loop made no tool calls â€” no files were changed and "
+                "Agent loop made no tool calls — no files were changed and "
                 f"no commands were run. Model said: {summary[:500]}")))
 
         if verify_cmd:
@@ -1623,7 +1663,7 @@ def run_agent_loop(
                 # Tell the LEDGER too, or the step passes and the run
                 # still dies: the monotonic recheck re-runs the declared
                 # command, the malformed original fails exactly as it
-                # always did, and that reads as a regression. Observed â€”
+                # always did, and that reads as a regression. Observed —
                 # a gate with `&& npm run build` written INSIDE the
                 # `node -e "..."` string (a JS syntax error, unpassable by
                 # any code) was correctly recovered via the variant, then
@@ -1632,7 +1672,7 @@ def run_agent_loop(
                 record_gate_repair(verify_cmd, last_ok_cmd, "flag-variant")
                 _logger.info(
                     "[AgentLoop] step %d: gate command fails but the loop "
-                    "ran a flag-variant of it successfully (%r) â€” "
+                    "ran a flag-variant of it successfully (%r) — "
                     "accepting the variant as the gate", step_idx + 1,
                     last_ok_cmd)
                 return _finish("verified-variant", turn, (True, summary))
@@ -1647,10 +1687,10 @@ def run_agent_loop(
                     f"Verification still failing after {max_turns} turns:\n"
                     f"{truncate_middle(result, 1000)}")))
             # A zero-test run may have exited 0, so "failed" would be a
-            # confusing thing to tell the model â€” name the real problem.
+            # confusing thing to tell the model — name the real problem.
             _no_tests = NO_TESTS_MARKER in result
             _logger.info(
-                "[AgentLoop] step %d: %s on turn %d â€” feeding back",
+                "[AgentLoop] step %d: %s on turn %d — feeding back",
                 step_idx + 1,
                 "verify collected no tests" if _no_tests
                 else "verification failed", turn)
@@ -1677,20 +1717,20 @@ def run_agent_loop(
         return _finish("done", turn, (True, summary))
 
     # Exhausted without a final text answer (e.g. text-mode model ignored
-    # the no-tools instruction). The work may still be done â€” let the
+    # the no-tools instruction). The work may still be done — let the
     # deterministic check have the last word.
     if verify_cmd and any_tool_used:
         result = _gate_result()
         if verify_passed(result):
             _logger.info("[AgentLoop] step %d: turns exhausted but "
-                         "verification passes â€” accepting", step_idx + 1)
+                         "verification passes — accepting", step_idx + 1)
             return _finish("exhausted-verified", max_turns, (True, (
                 "Step verified complete (turn budget exhausted "
                 "before the model summarized).")))
         if _variant_gate_ok():
             _logger.info(
                 "[AgentLoop] step %d: turns exhausted, gate command fails "
-                "but a successful flag-variant ran (%r) â€” accepting",
+                "but a successful flag-variant ran (%r) — accepting",
                 step_idx + 1, last_ok_cmd)
             return _finish("exhausted-verified-variant", max_turns, (True, (
                 "Step complete: the gate command is malformed but the loop "
@@ -1711,7 +1751,7 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
     the pipeline must fail on (observed: 8 read-only turns while the
     one-line fix sat in context). When ``models: escalation:`` names a
     stronger model, that client gets one fresh loop with the failed
-    attempt's error in context. No escalation configured â†’ identical to
+    attempt's error in context. No escalation configured → identical to
     :func:`run_agent_loop`.
     """
     success, info = run_agent_loop(llm_client, tools, step_text, task, **kw)
@@ -1726,12 +1766,12 @@ def run_agent_loop_with_escalation(llm_client, tools: AgentTools,
         # escalation spent ten more and 467k tokens total, every verdict
         # byte-identical to the first.
         _logger.warning(
-            "[AgentLoop] step %d: NOT escalating â€” the gate is the defect, "
+            "[AgentLoop] step %d: NOT escalating — the gate is the defect, "
             "not the code; a stronger model cannot satisfy it either",
             kw.get("step_idx", 0) + 1)
         return success, info
     _logger.info(
-        "[AgentLoop] step %d: loop failed â€” escalating to stronger model",
+        "[AgentLoop] step %d: loop failed — escalating to stronger model",
         kw.get("step_idx", 0) + 1)
     kw = dict(kw)
     # Digest = what was tried (narrative, heavily truncated). The full
@@ -1754,7 +1794,7 @@ def escalation_already_failed(step_idx: int) -> bool:
     The ladder used to be loop(weak) -> loop(strong) -> recovery(weak) ->
     recovery(strong): after the stronger model failed, the next attempt
     went back to the weaker one. Observed on a Pac-Man run, step 7 spent
-    32 turns across those four attempts â€” 47% of the whole run's turns â€”
+    32 turns across those four attempts — 47% of the whole run's turns —
     and only the final strong attempt succeeded. Each attempt re-sends the
     conversation, so turns are the dominant driver of prompt tokens.
     """
@@ -1775,7 +1815,7 @@ def verify_cmd_for_language(language: str | None,
                             project_root: str = ".") -> str | None:
     """Deterministic test command for the loop's exit verification.
 
-    Returns None when no trustworthy command exists for the language â€”
+    Returns None when no trustworthy command exists for the language —
     a wrong verify command is worse than none (the loop would chase
     failures in the verifier instead of the code).
     """
@@ -1784,7 +1824,7 @@ def verify_cmd_for_language(language: str | None,
 
     lang = (language or "python").lower()
     if lang == "python":
-        # Django projects test through manage.py â€” pytest is usually not
+        # Django projects test through manage.py — pytest is usually not
         # even installed there, so a pytest verifier fails regardless of
         # the app's real state (mirrors BulkTest's Django detection).
         if os.path.isfile(os.path.join(project_root, "manage.py")):
@@ -1807,8 +1847,8 @@ def verify_cmd_for_language(language: str | None,
     if lang in ("c", "cpp", "c++", "cxx"):
         # Only when the project actually declares the target, exactly as
         # the JavaScript branch only trusts `npm test` when package.json
-        # defines it. C has no default test command â€” there is no runner
-        # to guess at â€” so a declared `test:` rule is the one thing that
+        # defines it. C has no default test command — there is no runner
+        # to guess at — so a declared `test:` rule is the one thing that
         # says what "the tests pass" means for this project.
         #
         # This is a fallback: `_declared_verify_cmd` wins whenever the
@@ -1825,7 +1865,7 @@ def verify_cmd_for_language(language: str | None,
             # A real rule at the start of a line, not `test` appearing in
             # a variable or a recipe. `.PHONY: test` is a declaration
             # about the target, not the target, so it is not enough on
-            # its own â€” but it sits on its own line and would otherwise
+            # its own — but it sits on its own line and would otherwise
             # match, hence the exclusion.
             for line in text.splitlines():
                 if line.startswith((".PHONY", ".phony")):
@@ -1838,12 +1878,12 @@ def verify_cmd_for_language(language: str | None,
 
 
 # One-shot scaffolding commands fail on a SECOND invocation precisely when
-# the first one (or the recovery) succeeded: mkdir â†’ "already exists",
-# django-admin startproject â†’ "conflicts with existing", npm create â†’
-# refuses a non-empty directory, python -m venv â†’ half-usable dir. Any
-# compound command containing one of these is excluded whole â€” planned
+# the first one (or the recovery) succeeded: mkdir → "already exists",
+# django-admin startproject → "conflicts with existing", npm create →
+# refuses a non-empty directory, python -m venv → half-usable dir. Any
+# compound command containing one of these is excluded whole — planned
 # commands routinely chain scaffold + install with `&&`.
-# Venv must match CREATION invocations only â€” a bare `venv` alternative
+# Venv must match CREATION invocations only — a bare `venv` alternative
 # also matched the harmless activation path `venv\Scripts\activate`,
 # which silently disqualified every plan-declared verify: that carried
 # the planner's activation prefix (observed: all 12 CODE gates dropped).
@@ -1861,7 +1901,7 @@ def reverifiable_cmd(cmd: str | None) -> str | None:
     for the recovery loop, else ``None``.
 
     A failed CMD step's own command is the natural ground truth for "did
-    the recovery actually work" â€” without it the loop accepts the model's
+    the recovery actually work" — without it the loop accepts the model's
     final summary on faith (observed: `npm run build:css` exited 1 twice,
     the model summarized what it had attempted, and the step was logged
     as recovered while the CSS was never built). Only commands that are
@@ -1885,7 +1925,7 @@ def build_step_tools(executor, memory, kb_context_builder=None,
     # to be transferred onto every AgentTools built from it. Without this
     # the whole mechanism was INERT in production: cli.py set
     # `memory._acceptance_files`, `_acceptance_refusal` read
-    # `self._acceptance_files`, and nothing connected them â€”
+    # `self._acceptance_files`, and nothing connected them —
     # `protect_acceptance_files` was called only from a test, which is
     # exactly why the test passed while a real run could overwrite its own
     # frozen contract. It matters most now that a failing acceptance
@@ -1933,13 +1973,13 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
                       escalation_client=None) -> tuple[bool, str]:
     """One bounded loop attempt to recover a failed step.
 
-    Replaces the diagnose â†’ fix â†’ re-run machinery: the model gets the
+    Replaces the diagnose → fix → re-run machinery: the model gets the
     real error, inspects the actual project state with tools, fixes the
     cause and completes the step in place.
 
     Without a ``verify_cmd`` the loop's exit rests on the model's final
     summary, so the prompt asks for an explicit verdict line and a
-    summary that admits the blocker is treated as a failure â€” previously
+    summary that admits the blocker is treated as a failure — previously
     an honest "the build still fails" summary was logged as a recovery.
     """
     context = (
@@ -1948,7 +1988,7 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
         "Investigate the actual state of the project, fix the cause, and "
         "complete the step. If the step is a failed shell command, prefer "
         "correcting and re-running that command (fix the path, drop a bad "
-        "`cd`, adjust a flag) over recreating its effects by hand â€” do NOT "
+        "`cd`, adjust a flag) over recreating its effects by hand — do NOT "
         "hand-write the files a scaffolder would have generated. "
         "If the failure is an environment limitation "
         "you cannot fix (e.g. a required tool is not installed and cannot "
@@ -1957,7 +1997,7 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
     if verify_cmd:
         context += (
             f"\n\nThis step is complete ONLY when `{verify_cmd}` exits "
-            "successfully â€” it will be run to verify your work.")
+            "successfully — it will be run to verify your work.")
 
     def _attempt(client, label: str,
                  latest_error: str | None = None) -> tuple[bool, str]:
@@ -1975,20 +2015,20 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
             display=display, step_idx=step_idx, language=language,
             max_turns=max_turns, verify_cmd=verify_cmd, context=ctx,
             _recovery=True, attempt_label=label)
-        # Only meaningful when no verify_cmd gated the exit â€” a passing
+        # Only meaningful when no verify_cmd gated the exit — a passing
         # deterministic check outranks the model's own pessimism.
         if s and not verify_cmd \
                 and RECOVERY_BLOCKED_MARKER.lower() in i.lower():
             _logger.warning(
                 "[AgentLoop] step %d: recovery summary admits the step is "
-                "still blocked â€” not counting it as recovered",
+                "still blocked — not counting it as recovered",
                 step_idx + 1)
             return False, f"Recovery loop reported itself blocked: {i[:800]}"
         return s, i
 
     # Recovery loops are where turn budgets die (observed repeatedly:
     # "mid-fix at turn 8"). Escalation is decided AFTER the blocked-
-    # admission check â€” a "done" summary that admits the blocker is a
+    # admission check — a "done" summary that admits the blocker is a
     # failure the stronger model should get a shot at (observed: a
     # blocked npx-tailwind recovery never escalated because the wrapper
     # saw the self-reported success).
@@ -1999,20 +2039,20 @@ def run_recovery_loop(llm_client, tools: AgentTools, step_text: str,
 
     # Keep the ladder monotonic. If the stronger model already failed this
     # step in the main loop, a recovery run on the WEAKER one is the least
-    # likely rung to succeed and costs a full turn budget to find out â€”
+    # likely rung to succeed and costs a full turn budget to find out —
     # observed step 7 spending 8 turns there between two strong-model
     # attempts, inside a 32-turn step that was 47% of the run's turns.
     if _escalation_usable and escalation_already_failed(step_idx):
         _logger.info(
             "[AgentLoop] step %d: the stronger model already failed this "
-            "step â€” starting recovery there instead of re-trying the "
+            "step — starting recovery there instead of re-trying the "
             "weaker one", step_idx + 1)
         return _attempt(escalation_client, "recovery + escalation")
 
     success, info = _attempt(llm_client, "recovery")
     if not success and _escalation_usable:
         _logger.info(
-            "[AgentLoop] step %d: recovery failed â€” escalating to "
+            "[AgentLoop] step %d: recovery failed — escalating to "
             "stronger model", step_idx + 1)
         success, info = _attempt(escalation_client, "recovery + escalation",
                                  latest_error=info)
