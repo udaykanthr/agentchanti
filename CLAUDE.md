@@ -235,6 +235,40 @@ step its turns before anyone says so. And the ghost still has no
 postcondition kind for external-system state, so a tool-only plan's
 `target:` remains unreconcilable and its evidence weight stays zero.
 
+**A gate the run writes cannot say "this did not change."** Measured
+2026-10-07 on a four-subsystem Blender task — modifier stack, shader node
+graph, object hierarchy, rigid body world — which the model got entirely
+right in six turns. One requirement was *parent the Spinner to the House
+and keep it exactly where it is in world space*, and the gate it wrote for
+that was::
+
+    assert s.matrix_world == s.matrix_parent_inverse.inverted() \
+                             @ h.matrix_world @ s.matrix_basis
+
+The model parented by leaving `matrix_parent_inverse` as identity and
+compensating in the child's local basis, which is a correct route — and
+with that matrix identity the expression collapses to Blender's own
+composition rule. Evaluated against the live session with a simulated
+teleport, it still holds: the gate could not fail on the half of the
+requirement the task was about.
+
+`shallow_tool_gate_reason` is right not to flag it, and the reason is worth
+separating from the `diffuse_color` bound above. That one measures the
+wrong property. This one is **structurally falsifiable and mathematically
+an identity** — a comparison between two non-constant expressions, which is
+exactly what `_falsifiable_assertions` is built to accept, and which no
+static analysis here can know is an invariant of the host application's
+data model.
+
+The deeper limit is not about detection at all: a gate runs against the end
+state, so **no gate the run writes can express a claim about a change**.
+"Unchanged in world space", "the mesh still has its original vertex count",
+"nothing else was touched" are all statements relating two points in time,
+and the run holds only one of them. That is the argument for
+`acceptance_cmds` in its sharpest form — a user instrument may record a
+baseline *before* the first step, which is the one thing the pipeline's own
+machinery structurally cannot do for external state.
+
 **An assertion that cannot fail does not count.** The first cut of
 `shallow_tool_gate_reason` asked whether the payload *contained* an assertion.
 Measured 2026-10-06 on the terrain/house/tree run, the plan's step 1.1 gate
