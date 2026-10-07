@@ -64,6 +64,7 @@ __all__ = (
     "is_tool_gate",
     "parse",
     "run",
+    "run_via_bridge",
     "shallow_tool_gate_reason",
 )
 
@@ -266,31 +267,57 @@ def _failed(result: str) -> bool:
     return any(result.startswith(p) for p in _ERROR_PREFIXES)
 
 
-def run(gates: list[ToolGate], tools: Any) -> str:
-    """Execute the gate and answer in the executor's own vocabulary.
+def _verdict(gates: list[ToolGate], call_one) -> str:
+    """Call each segment through *call_one* and fold the results into one
+    verdict in the executor's own vocabulary.
 
     The return value starts with `exit: success` or `exit: failure` so that
     `verify_passed`, `GateLedger.record` and `observe_gate_verdict` read a
     tool gate exactly as they read a shell gate and need no knowledge of
     this module. Stops at the first failure, as `&&` does.
     """
-    from ..llm.chat_types import ToolCall
-
     bodies: list[str] = []
     for i, g in enumerate(gates):
-        call = ToolCall(name=g.tool, arguments=dict(g.arguments),
-                        id=f"gate{i}")
         try:
-            result = tools.execute_all([call])[0].content
+            result = call_one(g, i)
         except Exception as exc:                 # pragma: no cover - env
-            # `AgentTools.execute` is documented never to raise; if the
-            # dispatch around it does, a gate that could not run must read
-            # as a failure rather than take the step green with it.
+            # `AgentTools.execute` and `MCPBridge.execute` are both
+            # documented never to raise; if the dispatch around either
+            # does, a gate that could not run must read as a failure
+            # rather than take the step green with it.
             result = f"ERROR: the gate could not be run: {type(exc).__name__}: {exc}"
         bodies.append(f"$ {g.raw}\n{result}")
         if _failed(result):
             return "exit: failure\n" + "\n\n".join(bodies)
     return "exit: success\n" + "\n\n".join(bodies)
+
+
+def run(gates: list[ToolGate], tools: Any) -> str:
+    """Execute the gate through the same `AgentTools` the loop uses."""
+    from ..llm.chat_types import ToolCall
+
+    def _one(g: ToolGate, i: int) -> str:
+        call = ToolCall(name=g.tool, arguments=dict(g.arguments),
+                        id=f"gate{i}")
+        return tools.execute_all([call])[0].content
+
+    return _verdict(gates, _one)
+
+
+def run_via_bridge(gates: list[ToolGate], bridge: Any) -> str:
+    """Execute the gate with nothing but the bridge.
+
+    `run` needs an `AgentTools`, which is built per step from a FileMemory
+    and a KB searcher. Most of the pipeline's gate-running routes have
+    neither — `GateLedger.recheck` is handed an `Executor` and nothing
+    else — and that is precisely where a tool gate was going unmeasured.
+    `AgentTools.execute` dispatches an MCP call straight to
+    `self._mcp.execute(name, arguments)`, so this is the same call with the
+    same error prefixes and nothing else skipped: the allow list and the
+    result rendering both live on the bridge.
+    """
+    return _verdict(
+        gates, lambda g, _i: bridge.execute(g.tool, dict(g.arguments)))
 
 
 def shallow_tool_gate_reason(gates: list[ToolGate]) -> str | None:

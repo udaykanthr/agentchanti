@@ -510,16 +510,28 @@ def _green_suites_contradicting(regressions) -> list[tuple[str, str]]:
 
 
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
-                             repair=None, display=None) -> bool:
+                             repair=None, display=None,
+                             authority: str = "") -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
 
     Must be called after **every** stage that can write source files —
     each wave, the bulk-test fix round, wiring verification (through
-    `_check_advisory_stage`), and the smoke-test repair loop.
-    Skipping any of them lets that stage's edits ship unverified: the
-    smoke test repaired a launch crash by changing ``Player.update()``'s
-    signature, the already-green ``python -m unittest discover`` gate went
-    red, nothing rechecked it, and the run reported ``Finished``.
+    `_check_advisory_stage`), the smoke-test repair loop, and the
+    acceptance repair round. Skipping any of them lets that stage's edits
+    ship unverified: the smoke test repaired a launch crash by changing
+    ``Player.update()``'s signature, the already-green ``python -m unittest
+    discover`` gate went red, nothing rechecked it, and the run reported
+    ``Finished``.
+
+    *authority* names an instrument that outranks a plan gate, and is the
+    difference between a rollback and a reported conflict. Supplied for the
+    acceptance repair round: rolling that stage back restores a tree a
+    user-supplied acceptance command has already FAILED, which is strictly
+    worse than keeping a tree it passes and naming the red gate. This is
+    `_green_suites_contradicting`'s reasoning with a stronger witness —
+    `acceptance_cmds` is the one instrument the model neither wrote nor can
+    edit — and like that branch it still returns False, because an
+    unresolved red gate must never be reported as success.
 
     *repair* is an optional zero-arg callable invoked once when a
     regression is found, before deciding to roll back. Use it where the
@@ -589,6 +601,26 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     # the better authority — it is where the task's own invariants live.
     # Keep the work and name both sides. Still returns False: an unresolved
     # red gate must never be reported as success.
+    if authority:
+        set_status(display, "")
+        log.error(
+            "[Monotonic] GATE CONFLICT after %s — %d previously-passing "
+            "gate(s) are red while %s passes. That instrument is outside "
+            "this run and cannot be edited by the model, so it outranks a "
+            "gate the plan wrote. NOT rolling back: the tree before %s is "
+            "one %s has already failed.",
+            stage, len(regressions), authority, stage, authority)
+        for _cmd, _label, _out in regressions:
+            log.error("[Monotonic]   red gate (step %s): %s",
+                      _label or "?", _cmd)
+            log.error("[Monotonic]   output:\n%s",
+                      (_out or "(no output captured)").strip())
+        log.error(
+            "[Monotonic] Both cannot hold. Read the gate above as the "
+            "suspect: a step whose gate asserts the postcondition of its "
+            "own mistake goes red exactly when that mistake is corrected.")
+        return False
+
     _conflict = _green_suites_contradicting(regressions)
     if _conflict:
         set_status(display, "")
@@ -824,16 +856,21 @@ def _main_impl():
         try:
             from .. import mcp_bridge as _mb
             from . import external_state as _ext
-            from .agent_loop import build_step_tools
             _cfg_for_restore = Config.load(args.config)
             _bridge = _mb.ensure_started(_cfg_for_restore)
             if _bridge is not None:
                 rows = _ext.restore_all(
-                    _bridge, build_step_tools(Executor(), FileMemory()),
-                    getattr(_bridge, "_specs", {}))
+                    _bridge, getattr(_bridge, "_specs", {}))
                 for name, row_ok, row_detail in rows:
+                    # The WHOLE detail on a failure. `exit: failure` is the
+                    # verdict header and carries nothing; printing only it
+                    # is how `ERROR: unknown tool 'blender__execute_code'`
+                    # stayed invisible through the one restore that
+                    # mattered. A success stays to one line.
+                    _shown = (row_detail.splitlines()[0][:160] if row_ok
+                              else row_detail.strip()[:600])
                     print(f"  {'Restored' if row_ok else 'Could not restore'}"
-                          f" {name}: {row_detail.splitlines()[0][:160]}")
+                          f" {name}: {_shown}")
                 if not rows:
                     print("  No external server declared a `snapshot:` pair, "
                           "so nothing outside the project was preserved.")
@@ -2187,11 +2224,8 @@ def _main_impl():
     # `take_snapshot` runs before the project scan.
     if _mcp is not None:
         from . import external_state as _ext
-        from .agent_loop import build_step_tools
         _ext.warn_about_unprotected_servers(_mcp, getattr(_mcp, "_specs", {}))
-        _ext_tools = build_step_tools(executor, memory)
-        _ext_captured = _ext.capture_all(
-            _mcp, _ext_tools, getattr(_mcp, "_specs", {}))
+        _ext_captured = _ext.capture_all(_mcp, getattr(_mcp, "_specs", {}))
         if _ext_captured:
             log.info("[External] %d server(s) can be restored with "
                      "`agentchanti --restore`: %s", len(_ext_captured),
@@ -2970,6 +3004,26 @@ def _main_impl():
                                               None),
                     kb_context_builder=kb_context_builder,
                     project_root=os.getcwd()))
+            # The repair round writes source — and, through a tool, live
+            # external state — and it was the one such stage with no gate
+            # check after it. It is also the likeliest of them to break a
+            # plan gate, because it exists to change the artifact until an
+            # independent instrument goes green, which can directly
+            # contradict what a step asserted about its own work.
+            #
+            # Measured 2026-10-07 on a live Blender run: step 2 deleted an
+            # object the task said to leave alone and gated itself on
+            # `assert len(scene.objects)==5`; the acceptance check caught
+            # the deletion; the repair put an object back; and the step's
+            # gate was therefore red at the end of a run that reported
+            # success. Nothing looked. Same shape as the defect
+            # `_check_advisory_stage` was written for, whose own docstring
+            # enumerated every stage that writes source and omitted one.
+            if _acceptance_passed and not _enforce_monotonic_gates(
+                    snapshots, executor, "acceptance repair",
+                    display=display,
+                    authority="the user's acceptance command(s)"):
+                pipeline_success = False
         if _acceptance_passed is False:
             pipeline_success = False
             log.error("Pipeline failed: user acceptance command(s) did not "

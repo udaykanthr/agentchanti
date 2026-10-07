@@ -765,6 +765,22 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
     return bridge
 
 
+def active_bridge() -> "MCPBridge | None":
+    """The run's bridge, for a caller with no FileMemory to read it off.
+
+    `attach_to` hangs the bridge on FileMemory so that `build_step_tools`
+    can reach it, which covers everything built per step. It does not cover
+    the low-level objects a run shares — `Executor` above all, which is
+    handed around on its own and is the one seam every command passes
+    through. Reading `_ACTIVE` directly from another module would make the
+    lifetime invisible at the call site; this says it out loud.
+
+    None is the ordinary case (no servers configured) and must stay cheap
+    and silent.
+    """
+    return _ACTIVE
+
+
 def stop_active() -> None:
     """Close the run's bridge. Safe to call when there is none.
 

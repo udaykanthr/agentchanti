@@ -38,29 +38,26 @@ class _Spec:
 
 
 class _Bridge:
-    def __init__(self, *names):
+    """Records the calls a capture or restore makes.
+
+    The fake is the BRIDGE and not an `AgentTools`, because the bridge is
+    what these functions execute through. The earlier fake answered calls
+    an `AgentTools` built from a bridgeless FileMemory could not make, so
+    the tests passed while `--restore` answered `ERROR: unknown tool`.
+    """
+
+    def __init__(self, *names, fail=False):
         self.names = set(names)
+        self.fail = fail
+        self.calls = []
 
     def owns(self, name):
         return name in self.names
 
-
-class _Tools:
-    """Records the calls a capture or restore makes."""
-
-    def __init__(self, fail=False):
-        self.calls = []
-        self.fail = fail
-
-    def execute_all(self, calls):
-        from agentchanti.llm.chat_types import Message
-        out = []
-        for call in calls:
-            self.calls.append((call.name, call.arguments))
-            body = ("ERROR from the MCP tool: nope" if self.fail
-                    else '{"saved": true}')
-            out.append(Message(role="tool", content=body))
-        return out
+    def execute(self, name, arguments):
+        self.calls.append((name, arguments))
+        return ("ERROR from the MCP tool: nope" if self.fail
+                else '{"saved": true}')
 
 
 def _pair():
@@ -93,12 +90,12 @@ class TestWhatCountsAsADeclaredUndo:
 
 class TestCapture:
     def test_it_calls_the_declared_tool_with_the_path(self, tmp_path):
-        tools = _Tools()
-        captured = ext.capture_all(_Bridge("b__save", "b__open"), tools,
+        bridge = _Bridge("b__save", "b__open")
+        captured = ext.capture_all(bridge,
                                    {"b": _Spec("b", _pair())},
                                    root=str(tmp_path))
         assert list(captured) == ["b"]
-        name, args = tools.calls[0]
+        name, args = bridge.calls[0]
         assert name == "b__save"
         assert captured["b"] in args["filepath"].replace("\\\\", "\\")
 
@@ -107,18 +104,18 @@ class TestCapture:
         backslashes; an unescaped substitution makes the payload unparseable
         and the capture is silently skipped — which would be a backstop that
         reports success and preserves nothing."""
-        tools = _Tools()
-        ext.capture_all(_Bridge("b__save"), tools,
+        bridge = _Bridge("b__save")
+        ext.capture_all(bridge,
                         {"b": _Spec("b", _pair())}, root=str(tmp_path))
-        assert tools.calls, "the capture never reached the tool"
+        assert bridge.calls, "the capture never reached the tool"
         # the payload parsed, which is the whole assertion
-        assert "filepath" in tools.calls[0][1]
+        assert "filepath" in bridge.calls[0][1]
 
     def test_a_server_with_no_pair_is_skipped_not_failed(self, tmp_path):
-        tools = _Tools()
-        assert ext.capture_all(_Bridge("b__save"), tools,
+        bridge = _Bridge("b__save")
+        assert ext.capture_all(bridge,
                                {"b": _Spec("b")}, root=str(tmp_path)) == {}
-        assert tools.calls == []
+        assert bridge.calls == []
 
     def test_a_failing_capture_is_a_warning_not_an_exception(self, tmp_path,
                                                              caplog):
@@ -126,7 +123,7 @@ class TestCapture:
         backstop. But the operator asked for protection and has to learn
         they did not get it."""
         with caplog.at_level("WARNING"):
-            got = ext.capture_all(_Bridge("b__save"), _Tools(fail=True),
+            got = ext.capture_all(_Bridge("b__save", fail=True),
                                   {"b": _Spec("b", _pair())},
                                   root=str(tmp_path))
         assert got == {}
@@ -139,12 +136,12 @@ class TestCapture:
         spec = _Spec("b", {"capture": "cp -r scene /tmp/x",
                            "restore": "cp -r /tmp/x scene"})
         with caplog.at_level("WARNING"):
-            assert ext.capture_all(_Bridge("b__save"), _Tools(),
+            assert ext.capture_all(_Bridge("b__save"),
                                    {"b": spec}, root=str(tmp_path)) == {}
         assert "not a runnable tool call" in caplog.text
 
     def test_no_bridge_captures_nothing(self, tmp_path):
-        assert ext.capture_all(None, _Tools(), {"b": _Spec("b", _pair())},
+        assert ext.capture_all(None, {"b": _Spec("b", _pair())},
                                root=str(tmp_path)) == {}
 
 
@@ -171,28 +168,28 @@ class TestTheWarningWhenThereIsNoUndo:
 
 class TestRestore:
     def test_it_calls_the_restore_tool_when_a_capture_exists(self, tmp_path):
-        bridge, tools = _Bridge("b__save", "b__open"), _Tools()
-        ext.capture_all(bridge, tools, {"b": _Spec("b", _pair())},
+        bridge = _Bridge("b__save", "b__open")
+        ext.capture_all(bridge, {"b": _Spec("b", _pair())},
                         root=str(tmp_path))
         # the fake tool wrote no file, so create it as a real capture would
         path = os.path.join(str(tmp_path), ext.EXTERNAL_ROOT, "b",
                             "pre_run_state")
         open(path, "w").close()
-        tools2 = _Tools()
-        rows = ext.restore_all(bridge, tools2, {"b": _Spec("b", _pair())},
+        bridge.calls.clear()
+        rows = ext.restore_all(bridge, {"b": _Spec("b", _pair())},
                                root=str(tmp_path))
         assert rows and rows[0][0] == "b" and rows[0][1] is True
-        assert tools2.calls[0][0] == "b__open"
+        assert bridge.calls[0][0] == "b__open"
 
     def test_restoring_without_a_capture_says_so(self, tmp_path):
-        rows = ext.restore_all(_Bridge("b__open"), _Tools(),
+        rows = ext.restore_all(_Bridge("b__open"),
                                {"b": _Spec("b", _pair())},
                                root=str(tmp_path))
         assert rows and rows[0][1] is False
         assert "nothing was captured" in rows[0][2]
 
     def test_a_server_with_no_pair_produces_no_row(self, tmp_path):
-        assert ext.restore_all(_Bridge(), _Tools(), {"b": _Spec("b")},
+        assert ext.restore_all(_Bridge(), {"b": _Spec("b")},
                                root=str(tmp_path)) == []
 
 

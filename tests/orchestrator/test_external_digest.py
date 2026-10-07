@@ -39,35 +39,32 @@ class _Spec:
 
 
 class _Bridge:
-    def __init__(self, *names):
+    """Returns a scripted body per call, so a digest can be made to move.
+
+    The fake is the bridge because that is what `state_digest` executes
+    through — an `AgentTools` only forwards to it, and a fake standing in
+    for the forwarder is how `--restore` passed its tests while being
+    unable to reach a tool at all.
+    """
+
+    def __init__(self, *names, bodies=()):
         self.names = set(names)
+        self.bodies = list(bodies)
+        self.calls = []
 
     def owns(self, name):
         return name in self.names
 
-
-class _Tools:
-    """Returns a scripted body per call, so a digest can be made to move."""
-
-    def __init__(self, *bodies):
-        self.bodies = list(bodies)
-        self.calls = []
-
-    def execute_all(self, calls):
-        from agentchanti.llm.chat_types import Message
-        out = []
-        for call in calls:
-            self.calls.append(call.name)
-            body = self.bodies.pop(0) if self.bodies else "same"
-            out.append(Message(role="tool", content=body))
-        return out
+    def execute(self, name, arguments):
+        self.calls.append(name)
+        return self.bodies.pop(0) if self.bodies else "same"
 
 
 PROBE = 'mcp:blender__get_scene_info {}'
 
 
-def _bridge():
-    return _Bridge("blender__get_scene_info")
+def _bridge(*bodies):
+    return _Bridge("blender__get_scene_info", bodies=bodies)
 
 
 class TestWhatCountsAsADeclaredProbe:
@@ -86,9 +83,8 @@ class TestTheDigest:
         """The whole point: two distinct digests are what let
         `observe_gate_verdict` fire at all."""
         specs = {"blender": _Spec("blender", PROBE)}
-        a = ext.state_digest(_bridge(), _Tools('{"objects": ["Cube"]}'), specs)
-        b = ext.state_digest(_bridge(), _Tools('{"objects": ["Cube","Tree"]}'),
-                             specs)
+        a = ext.state_digest(_bridge('{"objects": ["Cube"]}'), specs)
+        b = ext.state_digest(_bridge('{"objects": ["Cube","Tree"]}'), specs)
         assert a and b and a != b
 
     def test_it_is_stable_when_the_state_is(self):
@@ -96,43 +92,42 @@ class TestTheDigest:
         would look like it was measuring something."""
         specs = {"blender": _Spec("blender", PROBE)}
         body = '{"objects": ["Cube"]}'
-        assert (ext.state_digest(_bridge(), _Tools(body), specs)
-                == ext.state_digest(_bridge(), _Tools(body), specs))
+        assert (ext.state_digest(_bridge(body), specs)
+                == ext.state_digest(_bridge(body), specs))
 
     def test_no_probe_declared_returns_none_not_a_constant(self):
         """None, deliberately — an empty string would be a digest that never
         changes, quietly restoring the exact blindness this removes."""
-        assert ext.state_digest(_bridge(), _Tools(),
-                                {"blender": _Spec("blender")}) is None
+        assert ext.state_digest(_bridge(), {"blender": _Spec("blender")}) is None
 
     def test_no_bridge_returns_none(self):
-        assert ext.state_digest(None, _Tools(),
+        assert ext.state_digest(None,
                                 {"blender": _Spec("blender", PROBE)}) is None
 
     def test_a_probe_that_is_not_a_tool_call_is_named(self, caplog):
         specs = {"blender": _Spec("blender", "python -c 'print(1)'")}
         with caplog.at_level("WARNING"):
-            assert ext.state_digest(_bridge(), _Tools(), specs) is None
+            assert ext.state_digest(_bridge(), specs) is None
         assert "not a runnable tool call" in caplog.text
 
     def test_a_failing_probe_is_still_a_state(self):
         """A server that has gone away is not the same state as one
         answering normally, so an error contributes rather than aborting."""
         specs = {"blender": _Spec("blender", PROBE)}
-        ok = ext.state_digest(_bridge(), _Tools('{"objects": []}'), specs)
-        err = ext.state_digest(_bridge(),
-                               _Tools("ERROR from the MCP tool: gone"), specs)
+        ok = ext.state_digest(_bridge('{"objects": []}'), specs)
+        err = ext.state_digest(_bridge("ERROR from the MCP tool: gone"), specs)
         assert ok and err and ok != err
 
     def test_servers_are_ordered_so_the_digest_is_deterministic(self):
-        b = _Bridge("a__read", "z__read")
         specs = {"z": _Spec("z", "mcp:z__read {}"),
                  "a": _Spec("a", "mcp:a__read {}")}
-        first = ext.state_digest(b, _Tools("1", "2"), specs)
+        first = ext.state_digest(
+            _Bridge("a__read", "z__read", bodies=("1", "2")), specs)
         # same bodies, dict built the other way round
         specs2 = {"a": _Spec("a", "mcp:a__read {}"),
                   "z": _Spec("z", "mcp:z__read {}")}
-        second = ext.state_digest(b, _Tools("1", "2"), specs2)
+        second = ext.state_digest(
+            _Bridge("a__read", "z__read", bodies=("1", "2")), specs2)
         assert first == second
 
 

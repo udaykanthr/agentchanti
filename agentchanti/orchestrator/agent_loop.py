@@ -1255,7 +1255,7 @@ def run_agent_loop(
         from . import external_state as _ext
         from . import tool_gates
         specs = getattr(_mcp, "_specs", {})
-        external = _ext.state_digest(_mcp, tools, specs)
+        external = _ext.state_digest(_mcp, specs)
         if external is None:
             # Said once, and only for a gate that is actually a tool call:
             # a detector structurally unable to fire must not read as one

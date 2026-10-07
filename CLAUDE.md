@@ -1468,6 +1468,106 @@ A step refused **before turn 1** carries the same marker and is
 deliberately excluded (`GATE_UNSTARTED_NOTE`): the gate is defective there
 too, but nothing was built, so there is no artifact to stand on.
 
+### A Tool Gate Only Ran Where Someone Remembered It (executor.py `_as_tool_gate`)
+
+`tool_gates` made a `verify:` that names an external tool runnable, and was
+wired into the two callers that knew about it: the agent loop's own
+verification, and `external_state`. **Every other gate-running route in the
+pipeline reaches `Executor.run_command`**, so every other route sent a tool
+gate to cmd.exe.
+
+Measured 2026-10-07 on a live Blender run that renamed an object,
+recoloured it and moved another — all three correct. `GateLedger` re-ran
+the step's gate four times, after the wave and after each of the bulk-test,
+wiring and smoke-test stages, and got the same answer every time::
+
+    'mcp:blender__execute_code' is not recognized as an internal or
+    external command
+
+`_is_harness_error` reads that as "the gate can no longer launch", which is
+right about what it sees and wrong about what happened. The consequence:
+the monotonic-gate protection — the one thing that catches a later stage
+breaking an earlier verified step — is **structurally absent for every
+tool-verified step, and says nothing about it**, which is the
+`empty_suite_reason` mistake aimed at a safety net.
+
+The fix sits where the command arrives, for the reason `run_command`'s own
+docstring already gives about destructive commands: *here is the one seam
+every route passes through*, and a fix applied per route leaves every route
+its author did not think of unprotected. After the destructive screen,
+deliberately — a tool gate's payload is the most capable thing in the
+system and must not round the check that guards it. It cannot misfire: the
+fast path is one `__` test, and `parse` returns None unless **every** `&&`
+segment names a tool the bridge actually offers.
+
+**The stage with no gate check at all.** The monotonic stages were each
+wave, bulk-test fixes, wiring fixes and smoke-test fixes;
+`repair_failed_acceptance` runs after all of them with nothing following
+it. It is also the likeliest of them to break a plan gate, because it
+exists to change the artifact until an instrument outside the run goes
+green — which can directly contradict what a step asserted about its own
+work. Measured in the same run: step 2 deleted an object the task said to
+leave alone and gated itself on `assert len(scene.objects)==5`; the user's
+acceptance check caught the deletion; the repair put an object back; and
+the step's gate was red at the end of a run that reported success. Same
+shape as the defect `_check_advisory_stage` was written for, whose own
+docstring enumerated every stage that writes source and omitted one.
+
+It takes `authority=` rather than the ordinary branch, and that is the
+whole difference between a rollback and a reported conflict: rolling this
+stage back restores a tree a user-supplied acceptance command has already
+FAILED, which is strictly worse than keeping one it passes and naming the
+red gate. `_green_suites_contradicting`'s reasoning with a stronger
+witness — `acceptance_cmds` is the one instrument the model neither wrote
+nor can edit — and like that branch it still returns False, because an
+unresolved red gate must never be reported as success.
+
+**The undo could never reach a tool.** `--restore` built
+`build_step_tools(Executor(), FileMemory())` — a FRESH FileMemory, which no
+bridge had been attached to — so `tools._mcp` was None and the restore
+answered `ERROR: unknown tool 'blender__execute_code'. Available:
+list_files, read_file, ...`. The one mechanism whose entire purpose is to
+put a live external system back could never have done it, on its only code
+path. The tests passed because they hand in a fake `tools` that does
+answer: the defect was in the **wiring**, which is the
+`protect_acceptance_files` lesson verbatim.
+
+So `capture_all`, `restore_all` and `state_digest` ask for the bridge and
+nothing else. An `AgentTools` dispatches an MCP call straight to the bridge
+anyway (`run_via_bridge` is the same call with the same error prefixes), so
+nothing is lost and there is no longer a second object that can be wrong.
+The failure detail is printed whole, too: `exit: failure` is the verdict
+header and carries nothing, which is how the real error stayed invisible
+through the one restore that mattered. Verified against the live
+application — two objects deleted outright, `Restored blender: exit:
+success`, and both back with their geometry and their 6-curve action.
+
+### An Undo That Overwrote Work Done After It (snapshot.py `_preserve_before_restore`)
+
+Measured 2026-10-07, on the second real use of `--restore`. It put the
+Blender scene back correctly, and `shutil.copy2` overwrote an acceptance
+check with the pre-run version, silently discarding edits made to it after
+the snapshot was taken. The log said `restored 8 file(s)`, which reads
+identically whether a restore changed nothing or threw away an afternoon.
+
+The docstring's promise was *"deliberately ADDITIVE"*, and it was true
+about **existence** and never about **content**. Overwriting is the point
+of an undo; doing it irreversibly is not, because this module's whole
+argument is that an undo which destroys work is the behaviour it exists to
+prevent.
+
+Only the files whose bytes actually differ are copied aside, so an ordinary
+restore writes nothing extra — and a targeted copy rather than
+`take_snapshot`, which would re-copy the whole tree and could refuse on its
+own bounds at the one moment refusing is least acceptable. The detail then
+**names** them, since "3 files had changed" sends a reader looking while
+naming them answers the question.
+
+The copy lives in `.agentchanti/pre-restore/`, deliberately not under
+`SNAPSHOT_ROOT`: `latest_snapshot` sorts that directory's names and
+`pre-restore...` sorts after any digit-led timestamp, so keeping it there
+would make a second `--restore` undo the undo instead of repeating it.
+
 ### A Spelling Is Not A Behaviour (plan_step.py `_manifest_script_gate_reason`)
 
 `shallow_gate_reason` asks whether a gate can fail on wrong behaviour.

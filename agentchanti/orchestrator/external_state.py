@@ -100,8 +100,29 @@ def _path_for(server: str, root: str = ".") -> str:
     return os.path.join(directory, "pre_run_state")
 
 
-def _run(command: str, path: str, bridge, tools) -> tuple[bool, str]:
-    """Execute one declared command, with `{path}` substituted."""
+def _run(command: str, path: str, bridge) -> tuple[bool, str]:
+    """Execute one declared command, with `{path}` substituted.
+
+    Executed through the bridge rather than through an `AgentTools`, and
+    that is the whole difference between this module working and being
+    inert. Measured 2026-10-07, the first time an undo was actually needed:
+    `agentchanti --restore` built its tools as
+    `build_step_tools(Executor(), FileMemory())` — a FRESH FileMemory, which
+    no bridge had been attached to — so `tools._mcp` was None and the
+    restore answered::
+
+        ERROR: unknown tool 'blender__execute_code'. Available: list_files,
+        read_file, write_file, edit_file, run_command, search_code
+
+    The one mechanism whose entire purpose is to put a live external system
+    back could never have done it, on its only code path. The tests passed
+    because they hand in a fake `tools` that does answer — the defect was in
+    the WIRING, which is the `protect_acceptance_files` lesson verbatim.
+
+    So this asks for the one object it actually needs. An `AgentTools`
+    dispatches an MCP call straight to the bridge anyway, so nothing is
+    lost, and there is no longer a second object that can be wrong.
+    """
     # Backslashes are doubled because the command is embedded in a JSON
     # payload and a Windows path is full of them; a raw substitution would
     # make the payload unparseable and the capture would be silently skipped.
@@ -111,11 +132,11 @@ def _run(command: str, path: str, bridge, tools) -> tuple[bool, str]:
         return False, (
             "the command is not a runnable tool call — it must be "
             f"`mcp:<server>__<tool> {{json}}` naming an offered tool: {filled[:200]}")
-    result = tool_gates.run(gates, tools)
+    result = tool_gates.run_via_bridge(gates, bridge)
     return result.startswith("exit: success"), result
 
 
-def capture_all(bridge, tools, specs, root: str = ".") -> dict[str, str]:
+def capture_all(bridge, specs, root: str = ".") -> dict[str, str]:
     """Snapshot every server that declares how. Returns {server: path}.
 
     Never raises and never fails a run: a backstop that can stop the thing
@@ -133,7 +154,7 @@ def capture_all(bridge, tools, specs, root: str = ".") -> dict[str, str]:
         capture, _restore = pair
         path = _path_for(name, root)
         try:
-            ok, detail = _run(capture, path, bridge, tools)
+            ok, detail = _run(capture, path, bridge)
         except Exception as exc:                  # pragma: no cover - env
             ok, detail = False, f"{type(exc).__name__}: {exc}"
         if ok:
@@ -171,7 +192,8 @@ def warn_about_unprotected_servers(bridge, specs) -> list[str]:
     return unprotected
 
 
-def restore_all(bridge, tools, specs, root: str = ".") -> list[tuple[str, bool, str]]:
+def restore_all(bridge, specs,
+                root: str = ".") -> list[tuple[str, bool, str]]:
     """Put back what `capture_all` saved. One row per server attempted.
 
     Only ever called from `--restore`, never automatically: the measured run
@@ -193,7 +215,7 @@ def restore_all(bridge, tools, specs, root: str = ".") -> list[tuple[str, bool, 
                          f"({path} does not exist)"))
             continue
         try:
-            ok, detail = _run(restore, path, bridge, tools)
+            ok, detail = _run(restore, path, bridge)
         except Exception as exc:                  # pragma: no cover - env
             ok, detail = False, f"{type(exc).__name__}: {exc}"
         rows.append((name, ok, detail[:400]))
@@ -231,7 +253,7 @@ def declared_state_probe(spec: object) -> str | None:
     return probe or None
 
 
-def state_digest(bridge, tools, specs) -> str | None:
+def state_digest(bridge, specs) -> str | None:
     """A fingerprint of every declared external system, or None.
 
     None means no server declared a probe — deliberately distinct from an
@@ -256,7 +278,7 @@ def state_digest(bridge, tools, specs) -> str | None:
                         "blind to it: %s", name, probe[:200])
             continue
         try:
-            result = tool_gates.run(gates, tools)
+            result = tool_gates.run_via_bridge(gates, bridge)
         except Exception as exc:                  # pragma: no cover - env
             result = f"probe raised {type(exc).__name__}: {exc}"
         parts.append(f"{name}:{result}")
