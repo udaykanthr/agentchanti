@@ -17,8 +17,12 @@ certifies it, while `require_independent_evidence` still said `independent`.
 Until the guards move below the tool boundary, a server must be declared
 read-only or given an explicit allow list.
 """
+import logging
+import sys
+
 import pytest
 
+from agentchanti import mcp_bridge
 from agentchanti.llm.chat_types import ToolDef
 from agentchanti.mcp_bridge import (NAME_SEPARATOR, MAX_RESULT_CHARS,
                                     MCPBridge, MCPServerSpec, WithheldTool,
@@ -1072,3 +1076,104 @@ class TestWhoeverDecidesTheStrategySeesTheTools:
                ).read_text(encoding="utf-8")
         assert src.count("ensure_started(cfg)") == 1
         assert src.count("planner_summary(") == 1
+
+
+# ─── the optional extra, and the journey when it is missing ──────────
+
+
+class TestTheOptionalExtraIsOptional:
+    """`mcp` is an extra, not a dependency, and the promise is twofold.
+
+    A run that configures no server must pay NOTHING — not a slower import,
+    not a warning about a package nobody asked for. And a run that DOES
+    configure one without the extra must get exactly one accurate message.
+
+    Measured 2026-10-08, before the second half held: a config carrying a
+    `snapshot:` pair produced the correct `pip install agentchanti[mcp]`
+    line and then a second warning saying the snapshot command "is not a
+    runnable tool call", which sent the reader to check syntax that was
+    perfectly correct. `ensure_started` returned a bridge that could not
+    reach anything, so every `if bridge is None` guard downstream took the
+    wrong branch and reported a wrong cause.
+    """
+
+    @staticmethod
+    def _without_the_sdk(monkeypatch):
+        import builtins
+        real = builtins.__import__
+
+        def fake(name, *a, **k):
+            if name == "mcp" or name.startswith("mcp."):
+                raise ModuleNotFoundError("No module named 'mcp'")
+            return real(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        for mod in [m for m in sys.modules if m == "mcp" or m.startswith("mcp.")]:
+            monkeypatch.delitem(sys.modules, mod)
+
+    @staticmethod
+    def _cfg(servers):
+        class Cfg:
+            MCP = {"servers": servers} if servers else None
+        return Cfg()
+
+    SERVER = {"name": "blender", "transport": "stdio", "command": "python",
+              "args": ["x.py"], "allow": ["execute_code"]}
+
+    def test_no_servers_configured_says_nothing_at_all(self, monkeypatch, caplog):
+        """A warning about an absent dependency nobody asked for is noise,
+        and noise in the startup output trains a reader to skip it."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.DEBUG):
+            assert mcp_bridge.ensure_started(self._cfg(None)) is None
+        assert "mcp" not in caplog.text.lower()
+
+    def test_a_configured_server_without_the_extra_says_how_to_get_it(
+            self, monkeypatch, caplog):
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            mcp_bridge.ensure_started(self._cfg([self.SERVER]))
+        assert "pip install agentchanti[mcp]" in caplog.text
+
+    def test_and_says_nothing_else(self, monkeypatch, caplog):
+        """One accurate message, not an accurate one plus a misleading one."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            mcp_bridge.ensure_started(self._cfg([self.SERVER]))
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    def test_a_bridge_that_offers_nothing_is_not_handed_out(
+            self, monkeypatch, caplog):
+        """So every `if bridge is None` guard downstream is told the truth."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            assert mcp_bridge.ensure_started(self._cfg([self.SERVER])) is None
+        assert mcp_bridge.active_bridge() is None
+
+    def test_the_capture_is_silent_rather_than_wrong(self, monkeypatch,
+                                                     caplog, tmp_path):
+        """The measured false diagnosis: `snapshot:` syntax was correct."""
+        from agentchanti.orchestrator import external_state as ext
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        server = dict(self.SERVER, snapshot={
+            "capture": 'mcp:blender__execute_code {"code": "save {path}"}',
+            "restore": 'mcp:blender__execute_code {"code": "open {path}"}'})
+        bridge = mcp_bridge.ensure_started(self._cfg([server]))
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            ext.capture_all(bridge, getattr(bridge, "_specs", {}),
+                            root=str(tmp_path))
+        assert "not a runnable tool call" not in caplog.text
+
+    def test_the_sdk_check_names_the_extra(self):
+        """Whatever else changes, the message must carry the command."""
+        ok, why = mcp_bridge.mcp_available()
+        if ok:
+            pytest.skip("the mcp extra is installed in this environment")
+        assert "pip install agentchanti[mcp]" in why

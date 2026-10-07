@@ -741,6 +741,28 @@ def ensure_started(cfg: Any) -> MCPBridge | None:
     if offered:
         log.info("[MCP] %d external tool(s) offered to the loop: %s",
                  len(offered), ", ".join(d.name for d in offered))
+    else:
+        # A bridge offering NOTHING is indistinguishable from no bridge at
+        # all everywhere it matters — except that every `if bridge is None`
+        # guard downstream takes the wrong branch and then reports a wrong
+        # cause. Measured 2026-10-08 against a config with a `snapshot:`
+        # pair and the optional `mcp` extra not installed::
+        #
+        #   [MCP] the `mcp` package is not importable ... pip install
+        #         agentchanti[mcp]                              <- correct
+        #   [External] could NOT capture 'blender' state ... the command is
+        #         not a runnable tool call                      <- WRONG
+        #
+        # The second sends the reader to check `snapshot:` syntax that is
+        # perfectly correct, because `tool_gates.parse` asked a dead bridge
+        # whether it owned the tool and was honestly told no. One accurate
+        # message beats an accurate one followed by a misleading one.
+        #
+        # Stopped rather than merely dropped: a transport may have opened
+        # sessions before the tool listing came back empty, and a bridge
+        # nobody can reach must not keep child processes alive.
+        bridge.stop()
+        return None
     _ACTIVE = bridge
     # `cli.py` stops the bridge in `main()`'s finally; `api.py` has no such
     # wrapper, and a library caller that never stops it would leave every

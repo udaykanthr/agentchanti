@@ -291,6 +291,98 @@ source .venv/bin/activate        # Linux/macOS
 > upgrades — wrapping that in a shell script downloaded over HTTPS
 > would add an attack surface without adding any value.
 
+
+### Optional: external tools over MCP
+
+AgentChanti can reach a **live external application** through a [Model
+Context Protocol](https://modelcontextprotocol.io) server — a running
+Blender session, a FreeCAD document, anything with an MCP server in front
+of it. The agent then edits that application directly, instead of writing
+a script and hoping.
+
+This is **opt-in and costs nothing when unused.** The SDK is an extra, not
+a dependency, so a plain install never downloads it:
+
+```bash
+pipx install agentchanti            # no MCP SDK
+pipx install "agentchanti[mcp]"     # with it
+# already installed? pipx inject agentchanti mcp
+# from a clone:      python -m pip install -e ".[mcp]"
+```
+
+Nothing is installed behind your back, and nothing is fetched on first
+use: a run that configures no server never imports the SDK, and its
+prompts are byte-identical to a build without the extra. If you *do*
+configure a server and the extra is missing, the run says so once and
+carries on without external tools:
+
+```
+[MCP] the `mcp` package is not importable (ModuleNotFoundError);
+      install it with `pip install agentchanti[mcp]`
+```
+
+Servers are declared in `.agentchanti.yaml`:
+
+```yaml
+mcp:
+  servers:
+    - name: blender
+      transport: stdio                  # or: http
+      command: python
+      args: ["path/to/your_mcp_server.py"]
+      timeout: 130
+      # Which tools the agent may call. REQUIRED unless you set
+      # `read_only: true` — a server fronting an app that can execute
+      # arbitrary code is not read-only, and the allow list is you
+      # naming exactly what is permitted.
+      allow: [execute_code, get_scene_info]
+```
+
+Two optional keys are worth setting for anything that holds state you
+care about, because the project's usual safety nets are made of files and
+git, and a live application has neither:
+
+```yaml
+      # A read that fingerprints the application's state. Without it the
+      # stall detector cannot tell "the agent changed nothing" from "the
+      # gate is broken", and stays silent by construction.
+      state_probe: 'mcp:blender__get_scene_info {}'
+
+      # How to snapshot and restore. Declared by you, because there is no
+      # general way to snapshot an arbitrary system -- saving a .blend,
+      # dumping a database and exporting a browser profile share no
+      # vocabulary. `{path}` is substituted with a run-scoped file.
+      # BOTH halves are required: half a pair looks like an undo and is
+      # not one, so it is warned about and ignored.
+      snapshot:
+        capture: 'mcp:blender__execute_code {"code": "import bpy\nbpy.ops.wm.save_as_mainfile(filepath=r\"{path}\", copy=True)"}'
+        restore: 'mcp:blender__execute_code {"code": "import bpy\nbpy.ops.wm.open_mainfile(filepath=r\"{path}\")"}'
+```
+
+Nothing is **ever** restored automatically — a run that fails can still
+leave the application in exactly the state you wanted. Recovery is
+explicit:
+
+```bash
+agentchanti --restore
+```
+
+A plan step may also make a tool call its `verify:` gate, in the same
+syntax, so a step that does its work through an external tool is measured
+by one:
+
+```
+verify: mcp:blender__execute_code {"code": "import bpy\nassert 'Tree' in bpy.data.objects"}
+```
+
+> **Independent evidence for a tool-only task.** The seeded acceptance
+> contract is a *file* check and cannot judge a live application, so a run
+> whose artifact exists only inside another program has nothing outside
+> itself to verify it. Supply `acceptance_cmds` that reads the application
+> and compares against a baseline recorded **before** the run — a gate the
+> run writes sees only the end state and so can never express "this did
+> not change".
+
 ---
 
 ## Usage
