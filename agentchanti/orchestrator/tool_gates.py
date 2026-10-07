@@ -62,6 +62,7 @@ __all__ = (
     "TOOL_GATE_PREFIX",
     "ToolGate",
     "is_tool_gate",
+    "equivalent_variants",
     "parse",
     "run",
     "run_via_bridge",
@@ -318,6 +319,101 @@ def run_via_bridge(gates: list[ToolGate], bridge: Any) -> str:
     """
     return _verdict(
         gates, lambda g, _i: bridge.execute(g.tool, dict(g.arguments)))
+
+
+# Literals an `is` comparison is legitimately written against. `x is None`
+# is the overwhelmingly common correct use and must never be rewritten.
+def _is_sentinel(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant)
+
+
+class _IdentityToEquality(ast.NodeTransformer):
+    """Rewrite `a is b` to `a == b` where neither side is a literal."""
+
+    def __init__(self) -> None:
+        self.changed = 0
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        operands = [node.left, *node.comparators]
+        ops = []
+        for i, op in enumerate(node.ops):
+            left, right = operands[i], operands[i + 1]
+            if (isinstance(op, (ast.Is, ast.IsNot))
+                    and not _is_sentinel(left) and not _is_sentinel(right)):
+                ops.append(ast.Eq() if isinstance(op, ast.Is) else ast.NotEq())
+                self.changed += 1
+            else:
+                ops.append(op)
+        node.ops = ops
+        return node
+
+
+def _equality_reading(code: str) -> str | None:
+    """*code* with wrapper-hostile `is` comparisons read as `==`, or None."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    transformer = _IdentityToEquality()
+    tree = transformer.visit(tree)
+    if not transformer.changed:
+        return None
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree)
+    except Exception:                            # pragma: no cover - py<3.9
+        return None
+
+
+def equivalent_variants(gate: str, bridge: Any) -> list[tuple[str, str]]:
+    """Other readings of the same tool gate, as (reason, command).
+
+    `platform_equivalent_variants` asks whether a SHELL gate means something
+    different under the other dialect. This asks the same question of a tool
+    gate, where the dialect is the host application's Python API.
+
+    Measured 2026-10-07, a four-requirement Blender task. The plan gated the
+    node-material step on::
+
+        any(y.to_node is r ... for y in l) and any(y.from_node is r ...)
+
+    `l.to_node` builds a **fresh Python wrapper** on every attribute access,
+    so `is` against a node fetched separately is False whatever the scene
+    contains, while `bpy_struct.__eq__` compares the underlying RNA pointer
+    and works. No correct material could pass that gate. The step spent 10
+    turns, the recovery loop spent 10 more, and the run failed at 109,609
+    tokens over a material independently confirmed correct — the identical
+    task the previous day drew a planner that wrote `==` and passed in six.
+
+    Wrapper-rebuilding APIs are the norm in the applications an MCP server
+    fronts — Blender, FreeCAD, Maya — so this is not a Blender quirk, and it
+    is the same mistake this project made in its own check hours earlier
+    with `id(socket)`.
+
+    `x is None` is never touched: a comparison with any literal is left
+    exactly as written, which covers the one spelling `is` is genuinely for.
+    And like every dialect variant, the rewrite is **believed only if it
+    passes** — if the original was right, the variant never runs; if both
+    fail, nothing is adopted and the original verdict stands.
+    """
+    parsed = parse(gate, bridge)
+    if parsed is None:
+        return []
+    rewritten: list[str] = []
+    changed = False
+    for one in parsed:
+        args = dict(one.arguments)
+        code = args.get("code")
+        reading = _equality_reading(code) if isinstance(code, str) else None
+        if reading is not None:
+            args["code"] = reading
+            changed = True
+        rewritten.append(
+            f"{TOOL_GATE_PREFIX}{one.tool} {json.dumps(args)}")
+    if not changed:
+        return []
+    return [("bpy-identity-vs-equality", " && ".join(rewritten))]
 
 
 def shallow_tool_gate_reason(gates: list[ToolGate]) -> str | None:

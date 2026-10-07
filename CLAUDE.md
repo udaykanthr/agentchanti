@@ -1602,6 +1602,49 @@ The copy lives in `.agentchanti/pre-restore/`, deliberately not under
 `pre-restore...` sorts after any digit-led timestamp, so keeping it there
 would make a second `--restore` undo the undo instead of repeating it.
 
+### `is` Between Two Wrappers Is Never True (tool_gates.py `equivalent_variants`)
+
+`platform_equivalent_variants` asks whether a SHELL gate means something
+different under the other dialect. A **tool** gate has a dialect too — the
+host application's Python API — and nothing was asking.
+
+Measured 2026-10-07, the second run of a four-requirement Blender task. The
+plan gated the node-material step on::
+
+    any(y.to_node is r ...) and any(y.from_node is r and y.to_node is p ...)
+
+`l.to_node` builds a **fresh Python wrapper** on every attribute access, so
+`is` against a node fetched separately is False whatever the material
+contains, while `bpy_struct.__eq__` compares the underlying RNA pointer and
+works. No correct material could pass it. The step spent 10 turns, the
+recovery loop spent 10 more, and the run failed at **109,609 tokens** over a
+graph confirmed correct afterwards by reading `node_tree.links` directly —
+`TEX_NOISE Fac -> VALTORGB Fac -> BSDF_PRINCIPLED Base Color`. The identical
+task the day before drew a planner that wrote `==` and passed in six turns,
+which is what makes this luck of the draw rather than a property of the task.
+
+Wrapper-rebuilding APIs are the norm in the applications an MCP server
+fronts, so this is not a Blender quirk — and it is the same mistake this
+project made in its own acceptance check hours earlier, keying a node-graph
+traversal on `id(socket)`.
+
+It is a **variant, not a refusal**, which is what keeps a heuristic about
+someone else's API from ever convicting correct code: if the gate as written
+passes, the variant never runs; if both fail, nothing is adopted and the
+original verdict stands. The same believe-only-if-it-passes rule the shell
+dialect transforms use, reached through `_gate_variants`, which dispatches on
+`is_tool_gate` — the shell-dialect question has nothing to say about a tool
+call and was the only thing being asked.
+
+`x is None` is never touched: a comparison against any literal is left
+exactly as written, which covers the one spelling `is` is genuinely for. A
+payload that will not parse as Python offers nothing, so a JavaScript gate is
+not accused on the strength of a Python parse failing.
+
+Verified against the live session rather than reasoned about: the gate
+verbatim from the run's log returns `AssertionError`, and its
+`bpy-identity-vs-equality` reading passes, over the same material.
+
 ### A Spelling Is Not A Behaviour (plan_step.py `_manifest_script_gate_reason`)
 
 `shallow_gate_reason` asks whether a gate can fail on wrong behaviour.

@@ -1143,8 +1143,23 @@ def run_agent_loop(
                 if _mcp_for_log else "none (no MCP bridge)")
         return tools.execute_all([_verify_call(_cmd)])[0].content
 
+    def _gate_variants(cmd: str) -> list:
+        """Other readings of the same gate, whichever kind of gate it is.
+
+        A shell gate's other reading is the other shell's dialect. A TOOL
+        gate's is the host application's Python API — `platform_equivalent_
+        variants` has nothing to say about it, and said nothing while a run
+        spent 20 turns and 109,609 tokens on a gate that compared Blender
+        node wrappers with `is`.
+        """
+        from . import tool_gates
+        bridge = getattr(tools, "_mcp", None)
+        if tool_gates.is_tool_gate(cmd, bridge):
+            return tool_gates.equivalent_variants(cmd, bridge)
+        return platform_equivalent_variants(cmd)
+
     def _try_platform_variants(result: str) -> str:
-        """Re-run the gate under the other shell dialect's reading of it.
+        """Re-run the gate under the other dialect's reading of it.
 
         A gate is an instrument, and an instrument can be broken. When the
         SAME command text means something different on POSIX than it does
@@ -1160,7 +1175,7 @@ def run_agent_loop(
         the original verdict untouched.
         """
         nonlocal verify_cmd
-        for reason, variant in platform_equivalent_variants(verify_cmd):
+        for reason, variant in _gate_variants(verify_cmd):
             variant_result = _verify_once(variant)
             if not verify_passed(variant_result):
                 continue
