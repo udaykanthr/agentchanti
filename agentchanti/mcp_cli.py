@@ -140,6 +140,118 @@ def _insert_server(text: str, entry: dict) -> tuple[str | None, str]:
             "inserted into the existing `mcp.servers` list")
 
 
+def _mcp_block(lines: list[str]) -> tuple[int, int] | None:
+    """(start, end) line indices of the top-level `mcp:` block, or None.
+
+    `end` is the first line at column 0 that is neither blank nor a
+    comment — i.e. the next top-level key.
+    """
+    start = next((i for i, ln in enumerate(lines)
+                  if _TOP_LEVEL_MCP.match(ln.rstrip("\r\n"))), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].rstrip("\r\n")
+        if stripped and not stripped[0].isspace() and not stripped.startswith("#"):
+            end = i
+            break
+    return start, end
+
+
+def _servers_list(lines: list[str]) -> tuple[int, str, list[tuple[int, int]]] | None:
+    """(servers_line, item_indent, [(first, last)]) for each list item.
+
+    None when the shape is not a plain block `servers:` with block items —
+    flow style and the bare-list form of `mcp:` both land here, and both are
+    refused rather than guessed at.
+    """
+    block = _mcp_block(lines)
+    if block is None:
+        return None
+    start, end = block
+    servers_at = servers_indent = None
+    for i in range(start + 1, end):
+        m = _SERVERS_KEY.match(lines[i].rstrip("\r\n"))
+        if m:
+            servers_at, servers_indent = i, m.group(1)
+            break
+    if servers_at is None:
+        return None
+
+    items: list[tuple[int, int]] = []
+    item_indent = None
+    for i in range(servers_at + 1, end):
+        raw = lines[i].rstrip("\r\n")
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        lead = raw[:len(raw) - len(raw.lstrip())]
+        if len(lead) <= len(servers_indent):
+            break
+        if raw.lstrip().startswith("- "):
+            if item_indent is None:
+                item_indent = lead
+            if len(lead) == len(item_indent):
+                items.append((i, i))
+                continue
+        if items:
+            items[-1] = (items[-1][0], i)
+    if item_indent is None:
+        item_indent = servers_indent + "  "
+    return servers_at, item_indent, items
+
+
+def _item_name(lines: list[str], first: int, last: int) -> str | None:
+    """The `name:` of one list item, wherever in the item it sits."""
+    for i in range(first, last + 1):
+        text = lines[i].rstrip("\r\n").lstrip()
+        if text.startswith("- "):
+            text = text[2:]
+        if text.startswith("name:"):
+            value = text[len("name:"):].strip()
+            if "#" in value:
+                value = value.split("#", 1)[0].strip()
+            return value.strip("'\"") or None
+    return None
+
+
+def _remove_server(text: str, name: str) -> tuple[str | None, str]:
+    """(new_text, note). `None` means refused or not found — note says which.
+
+    Deletion only, in the same spirit as insertion: the item's lines go and
+    nothing else is reformatted. Removing the LAST server rewrites
+    `servers:` to `servers: []` rather than leaving the key valueless —
+    `load_specs` reads a bare `servers:` as None and reports
+    `should be a list or mapping of servers, got NoneType`, so tidying the
+    file would otherwise leave it complaining.
+    """
+    lines = text.splitlines(keepends=True)
+    found = _servers_list(lines)
+    if found is None:
+        return None, ("no plain `mcp: servers:` block to edit — it may be "
+                      "inline or a bare list, and editing one blindly could "
+                      "corrupt it")
+    servers_at, _item_indent, items = found
+    matches = [(a, b) for a, b in items if _item_name(lines, a, b) == name]
+    if not matches:
+        return None, f"no server named {name!r} in this file"
+
+    first, last = matches[0]
+    note = "removed"
+    if len(items) == 1:
+        # Keep the section and its comments; empty the list explicitly.
+        raw = lines[servers_at]
+        newline = raw[len(raw.rstrip("\r\n")):] or "\n"
+        indent = _SERVERS_KEY.match(raw.rstrip("\r\n")).group(1)
+        lines[servers_at] = f"{indent}servers: []{newline}"
+        note = "removed — it was the last server, so `servers:` is now empty"
+    del lines[first:last + 1]
+    if len(matches) > 1:
+        note += (f"; {len(matches) - 1} more entr(y/ies) named {name!r} "
+                 f"remain — the file had duplicates")
+    return "".join(lines), note
+
+
 def _load(config_path: str | None):
     """(specs, problems, cfg, path). Never raises; a bad config is a report.
 
@@ -545,6 +657,40 @@ def _cmd_add_json(args) -> int:
     return _write_entry(args, entry, path)
 
 
+def _cmd_remove(args) -> int:
+    if args.scope != "project":
+        print(f"\n  --scope {args.scope} is not supported yet; see "
+              f"`agentchanti mcp add --help`.\n")
+        return 2
+    _specs, _problems, _cfg, path = _load(args.config)
+    if not path or not os.path.isfile(path):
+        print("\n  No .agentchanti.yaml to edit.\n")
+        return 1
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        text = fh.read()
+
+    updated, note = _remove_server(text, args.name)
+    if updated is None:
+        print(f"\n  {note}.\n")
+        return 1
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(updated)
+    print(f"\n  {args.name}: {note} ({path}).")
+
+    # Re-read through the pipeline's own loader, exactly as `add` does: the
+    # question is not whether the text changed but whether what is left is
+    # a config the run will accept.
+    specs, problems, _cfg, _p = _load(path)
+    for p in problems:
+        print(f"  ! {p}")
+    if any(s.name == args.name for s in specs):
+        print(f"  ! it is still being loaded — the removal did not take.\n")
+        return 1
+    remaining = ", ".join(s.name for s in specs) or "none"
+    print(f"  Remaining: {remaining}\n")
+    return 1 if problems else 0
+
+
 def mcp_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agentchanti mcp",
@@ -611,6 +757,11 @@ def mcp_main(argv: list[str] | None = None) -> int:
     p_json.add_argument("json", metavar="JSON")
     p_json.add_argument("-s", "--scope", default="project")
     p_json.set_defaults(func=_cmd_add_json)
+
+    p_rm = sub.add_parser("remove", help="Remove a server from the config")
+    p_rm.add_argument("name")
+    p_rm.add_argument("-s", "--scope", default="project")
+    p_rm.set_defaults(func=_cmd_remove)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not getattr(args, "command", None):

@@ -461,6 +461,9 @@ to find out:
 ```bash
 agentchanti mcp list              # every server: transport, fence, health
 agentchanti mcp get <name>        # one server in full, offered vs withheld
+agentchanti mcp add <name> ...    # add one, with the fence discovered
+agentchanti mcp add-json <name> '{...}'   # incl. snapshot / state_probe
+agentchanti mcp remove <name>     # take one out again
 agentchanti mcp list --no-health  # read the config only, start nothing
 ```
 
@@ -510,11 +513,19 @@ agentchanti mcp add-json blender '{"transport":"stdio","command":"python",
   "snapshot":{"capture":"...","restore":"..."}}'
 ```
 
-Both **only ever insert lines** into an existing `.agentchanti.yaml` —
-comments, key order and formatting are left exactly as they were — and
-refuse rather than guess when the file's shape is ambiguous, printing the
-block for you to paste. The entry is then verified by re-reading the file
-through the same loader the pipeline uses.
+And to take one out again:
+
+```bash
+agentchanti mcp remove blender
+```
+
+`add` **only ever inserts lines** and `remove` **only ever deletes the
+item's own** — comments, key order, quoting and formatting are left exactly
+as they were, so `add` followed by `remove` returns the file byte for byte
+to what it was. Both refuse rather than guess when the file's shape is
+ambiguous (flow-style `servers: [...]`, or `mcp:` written as a bare list),
+printing the block for you to paste instead. The result is then verified by
+re-reading the file through the same loader the pipeline uses.
 
 `--scope` currently accepts `project` only. A home-level server would be
 **silently ignored** in any project with its own `.agentchanti.yaml`,
