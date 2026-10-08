@@ -510,6 +510,7 @@ class PlannerAgent(Agent):
                     intent_agent=None,
                     cli_display=None,
                     subproject_cwd: str | None = None,
+                    external_tools: str = "",
                     executor=None) -> str:
         """Analyze the task and project to build enriched planner context.
 
@@ -713,6 +714,7 @@ class PlannerAgent(Agent):
                 available_kb_docs=_available_kb_titles or None,
                 subproject_cwd=subproject_cwd,
                 language=language,
+                external_tools=external_tools,
             )
             # Relaxed HERE because both readers of the spec — the planner
             # and the acceptance-contract seeder — take it from this one

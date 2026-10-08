@@ -62,6 +62,368 @@ than its effect. Unset keeps the model's own default.
 
 Chat-native entry point: `chat(messages, tools=None) -> ChatResponse` (types in `llm/chat_types.py`: `Message`, `ToolDef`, `ToolCall`, `ChatResponse`). Ollama (`/api/chat`), OpenAI (`/chat/completions`) and Anthropic (Messages API) implement it natively with structured tool calling (`NATIVE_CHAT = True`); other providers fall back to flattening the conversation into a text prompt via `flatten_messages()`. Models that reject tools at runtime raise `ToolsNotSupportedError` and are downgraded to the text path for the session. Check availability with `client.supports_tools()`.
 
+### A Plan Formed Before The Tools Were Visible (mcp_bridge.py `planner_summary`)
+
+`chat(messages, tools=...)` is called in **exactly one place** — the agent
+loop. So every tool definition in the system, built-in and MCP alike, first
+becomes visible to a model *after* the plan that will consume it has been
+written. The planner decides the strategy; the loop is handed tools it was
+never told about and a plan that assumed they did not exist.
+
+Measured 2026-10-05 against a live Blender MCP server. The bridge started
+clean and logged `5 offered, 26 withheld`, `execute_blender_code` among the
+five. The run then called `run_command`, `read_file`, `write_file` and
+`edit_file` — and **not one of the five**, in any step. The plan said "write
+a Python script and run Blender headless", which was settled before the
+tools entered the picture. The model was not declining to use them; it was
+executing a strategy chosen without them. The cube was built, in a headless
+process, in a `.blend` file on disk — not in the Blender window the user had
+open, which was the entire point of connecting the server.
+
+`planner_summary` puts **names and one-liners** in the planner's context.
+Deliberately not schemas: the planner never *calls* these tools, and schemas
+are the expensive part — a real third-party tool measured **1,209
+characters** against 48 for its name and first line, so 25 tools summarised
+this way cost about what one of them costs in full. A description is cut to
+its first line, because later paragraphs are usage detail the planner cannot
+act on.
+
+Three bounds, each of which is the difference between this being free and
+being a tax on every run that configures nothing:
+
+**Silence is byte-identical.** No bridge, or a bridge whose every tool was
+withheld, returns `""` and nothing is appended — so an ordinary run's
+planner prompt is unchanged to the byte, which is also what keeps its cached
+prefix.
+
+**Appended once, before the retry loop.** `planner.process` is called inside
+loops on both paths — the re-plan retry loop and the interactive approval
+loop — so appending at the call site repeats the whole summary on every
+re-plan. The first cut did exactly that, in both files.
+
+**Ordering is the fix.** Appended after the first `planner.process`, the
+first plan — the one that usually ships — is still formed without the tools,
+and a test asserts the call precedes it in the source.
+
+Wired in `api.py` as well as `cli.py`, which `attach_to` itself was not:
+PR #68 reached only the CLI, so the library path offered no external tools
+at all. The tests for the wiring read the **source**, because the defect
+being pinned is a missing call and no behavioural test of the function can
+see one. `attach_to` also registers `atexit.register(stop_active)` on the
+one path that creates a bridge — `cli.py` stops it in `main()`'s finally and
+`api.py` has no such wrapper, and a stdio server is a child process, the
+same hazard as the orphaned `next dev` that held a pipe open for four hours.
+
+What this does **not** do is let a `verify:` gate name a tool call, so a
+step that satisfies its goal through an external tool still has to be
+measured by a shell command — and nothing records that the tool was the
+thing that did the work.
+
+**A step that proposes a tool must be able to run one.** The section above
+closed the awareness gap and the very next run found the gap behind it. The
+planner, told its tools existed, adopted them — and the plan vocabulary is
+CMD / CODE / TEST, so a tool call is none of the three. It put the intent in
+the only slot a CMD step has, a shell line::
+
+    > echo Configure the active Blender scene through
+      blender__execute_blender_code: retain/add a cube at (0,0,0),
+      set frame_start=1 and frame_end=60, key rotation_euler.z=0 at 1 ...
+
+`echo` exits 0, so both tool steps reported success having done nothing —
+and because all three steps classified CMD, the agent loop **never ran**,
+which is the only place `chat(messages, tools=...)` is called and therefore
+the only place a tool can be invoked. Zero tool calls; the only commands
+executed were `python -m venv venv` and two `echo`s, so nothing reached the
+Blender session the whole exercise was about. Awareness without an execution
+path is worse than no awareness: a step that proposes a tool and then no-ops
+is a step that cannot fail.
+
+Two halves, in this codebase's usual order — get it right up front, and
+guard the case where that fails. The planner summary now states that such a
+step must be **CODE or TEST**, those being the ones that run as a
+tool-calling conversation, and says outright not to write `echo` to stand in
+for a call. `hollow_tool_command` is the backstop at the seam where the
+command arrives: `_handle_cmd_step` routes the step into
+`run_agent_loop_with_escalation` instead of running the no-op.
+
+It is a **proof, not a heuristic**, which is what keeps it off ordinary
+steps. The command must be provably inert — `echo`/`rem`/`:`/`true` with no
+`> | & ;`, because `echo x > f` writes a file and `echo x && npm i` installs,
+and reading either as a no-op would *skip real work*. And the step must name
+a **qualified** tool that is actually offered: `export_scene` is an ordinary
+English phrase in a plan description while `blender__export_scene` is not,
+and a tool nobody configured is an ordinary plan mistake with nothing to
+route to. No bridge, no finding.
+
+No `verify_cmd` is handed to the loop, deliberately: the plan's gate for such
+a step is itself a printed sentence, and a no-op gate would let the loop exit
+green on one. The loop's own refusal to exit on a step that called no tool at
+all is the bar the `echo` could never meet — the same reasoning
+`verify_passed` applies to an empty gate run.
+
+What this still does not do is let a `verify:` **be** a tool call, so a step
+that satisfies its goal through a tool is measured by a shell command or not
+at all, and `GateLedger` has nothing to record. The ghost's
+`no-checkable-claim` correctly fired on both measured steps, which is how the
+hollowness was visible at all.
+
+### A `verify:` That Is A Tool Call (orchestrator/tool_gates.py)
+
+Every other gate module reads a `verify:` as a **shell command** and asks
+something about it — can it fail on wrong behaviour (`check_gate_quality`),
+does this platform's shell parse it (`unrunnable_gate_reason`), does it
+destroy anything (`gate_safety`). All of them assume the gate *is* a shell
+command, which was true until a plan could reach an external system through
+MCP.
+
+Measured 2026-10-06, the first run to change a live external application.
+With the ordering fixes above in place the plan was entirely tool-based and
+the model did the work **correctly** — a cube at the origin with Z rotation
+keyed 0° at frame 1 and 360° at frame 60, confirmed by evaluating the scene
+independently of the run. The verdict was `Pipeline failed`, exit 1, because
+the plan's gates were `verify: blender__get_scene_info` and `verify:
+blender__get_object_info`; `_merged_gate` conjoined them and the executor ran
+`blender__get_scene_info && blender__get_object_info` through cmd.exe.
+
+Every verification layer went blank at once, which is the finding worth
+recording: **a tool-only run was unmeasurable by construction**, not badly
+measured. The gate could not pass over any artifact. `target: Blender scene`
+is not a file, so `plan-declares-no-targets` fired and the whole file layer —
+EXISTS, EXPORTS, anchors, content regressions — was never armed: 1
+expectation, 0 hold, 0 violated, **evidence weight 0**. The seeded contract
+is a Python suite about files and errored. `Evidence: self-authored`.
+
+`parse` recognises a gate that is one or more MCP tool calls — the explicit
+`mcp:<tool> {json}` form the planner is now told to write, and a **bare
+qualified tool name**, which is what planners actually wrote both times it
+was measured. `&&` segments must all pass, which is the shell's meaning and
+what `_merged_gate` intends. `run` executes them through the same
+`AgentTools` the loop already uses and answers in `exit: success` /
+`exit: failure`, so `verify_passed`, `GateLedger.record` and
+`observe_gate_verdict` need no knowledge of any of this.
+
+Reading a shell gate as a tool gate would send a real command somewhere that
+cannot run it, so `parse` returns None unless it is certain: **every**
+segment must be a tool call (a gate mixing a tool call and a command has no
+single executor, and honouring one half silently drops the other), the tool
+must be one the bridge actually offers (naming an unconfigured tool is an
+ordinary plan mistake, and the shell's error message is more useful), and a
+payload that is not a JSON object is refused rather than dropped — calling
+the tool bare would measure something the plan never asked for, and passing
+that way is the worse of the two outcomes.
+
+**A tool gate that cannot fail is still shallow**, and saying so is what
+keeps this from trading one false verdict for another — the mistake
+`empty_suite_reason` exists to prevent. `verify: blender__get_scene_info`
+passes whenever the server is reachable, *including over the state that
+existed before the step ran*; making it run without reporting that would
+replace a gate that was always red with one that is always green.
+`shallow_tool_gate_reason` names the fix rather than just the fault: put the
+assertion inside a code-executing tool, where it can actually fail. One
+segment carrying an assertion is enough, since that segment makes the gate a
+measurement.
+
+Verified against the live session rather than reasoned about: a gate
+asserting the real condition returns `exit: success` with
+`{"frame1": 0.0, "frame60": 360.0}`, and the same gate asserting 90° instead
+of 360° returns `exit: failure` carrying the `AssertionError`. It can pass
+and it can fail, which is the whole claim.
+
+Not addressed: the weakness is reported at **run** time, not plan time —
+`check_gate_quality` has no bridge to ask, so a shallow tool gate costs the
+step its turns before anyone says so. And the ghost still has no
+postcondition kind for external-system state, so a tool-only plan's
+`target:` remains unreconcilable and its evidence weight stays zero.
+
+**A gate the run writes cannot say "this did not change."** Measured
+2026-10-07 on a four-subsystem Blender task — modifier stack, shader node
+graph, object hierarchy, rigid body world — which the model got entirely
+right in six turns. One requirement was *parent the Spinner to the House
+and keep it exactly where it is in world space*, and the gate it wrote for
+that was::
+
+    assert s.matrix_world == s.matrix_parent_inverse.inverted() \
+                             @ h.matrix_world @ s.matrix_basis
+
+The model parented by leaving `matrix_parent_inverse` as identity and
+compensating in the child's local basis, which is a correct route — and
+with that matrix identity the expression collapses to Blender's own
+composition rule. Evaluated against the live session with a simulated
+teleport, it still holds: the gate could not fail on the half of the
+requirement the task was about.
+
+`shallow_tool_gate_reason` is right not to flag it, and the reason is worth
+separating from the `diffuse_color` bound above. That one measures the
+wrong property. This one is **structurally falsifiable and mathematically
+an identity** — a comparison between two non-constant expressions, which is
+exactly what `_falsifiable_assertions` is built to accept, and which no
+static analysis here can know is an invariant of the host application's
+data model.
+
+The deeper limit is not about detection at all: a gate runs against the end
+state, so **no gate the run writes can express a claim about a change**.
+"Unchanged in world space", "the mesh still has its original vertex count",
+"nothing else was touched" are all statements relating two points in time,
+and the run holds only one of them. That is the argument for
+`acceptance_cmds` in its sharpest form — a user instrument may record a
+baseline *before* the first step, which is the one thing the pipeline's own
+machinery structurally cannot do for external state.
+
+**An assertion that cannot fail does not count.** The first cut of
+`shallow_tool_gate_reason` asked whether the payload *contained* an assertion.
+Measured 2026-10-06 on the terrain/house/tree run, the plan's step 1.1 gate
+was `assert bpy.context.scene is not None; assert isinstance(list(
+bpy.context.scene.objects), list)` — two assertions, neither able to fail over
+any scene, and it passed.
+
+Reusing `seed_strength._substantive_assertions` was the obvious fix and would
+have been a **regression in both directions**. Measured against the real
+gates, it scores that tautology as **2** — passing it, because a bare `assert`
+on any non-literal counts — and scores a correct single
+`assert abs(z - 360.0) < 0.01` as **1**, which fails its two-assertion bar.
+It is calibrated for unittest *suites*; a gate is one focused check, so
+`_falsifiable_assertions` is its own analysis and the threshold is one.
+
+Three shapes cannot fail and all three appeared in real gates: existence
+(`x is not None`, or a bare name/attribute), type (`isinstance`, `hasattr`,
+`callable`), and a comparison between two constants. `and` is falsifiable
+when either side is, `or` only when both are, and a `raise` counts because
+real gates spell the same claim both ways. A payload that is not parseable
+Python returns None and falls back to the text check, since a JavaScript
+payload must not be accused on the strength of a Python parse failing.
+
+**The bound is worth stating plainly: this catches assertions that cannot
+fail, not assertions about the wrong thing.** The same run's terrain gate
+asserted `diffuse_color[1] > diffuse_color[0]` — the *viewport* colour — and
+passed over a terrain whose Principled `Base Color` was left default grey, so
+it renders grey while looking green in solid shading. That gate can fail; it
+simply measures the wrong property, which is the class this codebase already
+records as out of reach of any static check: *"not weak, not grepping, not
+mocking, just semantically wrong and confidently expressed."* It is
+deliberately not accused.
+
+Two of the module's own tests failed when this landed, and both were asserting
+the defect: their fixtures were `assert bpy.data.objects` (truthiness) and
+`assert 1` (a constant), used as examples of a *strong* gate. A check is worth
+having when it catches the tests written against the behaviour it replaced.
+
+### An Undo For State That Is Not A File (orchestrator/external_state.py)
+
+`snapshot.py` exists because *"neither guard is a guarantee"* — the scan can
+form a wrong premise and the executor can be asked to run something
+destructive, so there has to be a backstop depending on neither. Every net in
+this project is made of **files and git**: `wave_snapshots`,
+`_enforce_monotonic_gates`' rollback, `_best_snapshot`, `agentchanti
+--restore`.
+
+A run that reaches a live external system through MCP has **none of them**,
+and the artifact is not on disk, so there is nothing to copy and nothing to
+restore. Measured 2026-10-06: a tool-only Blender run left the cube carrying
+an action with **zero curves and a constant 360° rotation** partway through,
+and recovered only because it had turns left to iterate with. Had it run out
+there, the user's scene would have been left worse than it was found with
+nothing in the system able to put it back. The run also *failed* while
+finally leaving a correct scene, which matters for the design below.
+
+**It does not guess.** There is no general way to snapshot an arbitrary
+external system — saving a `.blend`, dumping a database, exporting a browser
+profile and committing a repository share no vocabulary, and inventing one is
+how a backstop silently captures the wrong thing. The operator, who knows the
+system, declares the pair on the server, in the same `mcp:` tool-call syntax a
+`verify:` now uses, with `{path}` substituted for a run-specific file under
+`.agentchanti/external/<server>/`::
+
+    snapshot:
+      capture: 'mcp:blender__execute_code {"code": "PATH = r\"{path}\"
+                \nimport bpy\nbpy.ops.wm.save_as_mainfile(filepath=PATH,
+                copy=True)"}'
+      restore: 'mcp:blender__execute_code {"code": "PATH = r\"{path}\"
+                \nimport bpy\nbpy.ops.wm.open_mainfile(filepath=PATH)"}'
+
+**Both halves are required.** A capture with no restore is a file nobody can
+use and a restore with no capture has nothing to read; either alone *looks
+like* an undo, which is worse than plainly having none, so half a pair is a
+warning and is ignored.
+
+**A server that declares nothing is warned about once, before the first
+step** — the `_prompt_for_acceptance_cmds` argument, that the answer is
+already fixed and learning it afterwards costs the run. Silence here is
+indistinguishable from a net being present.
+
+**Nothing is ever restored automatically, and that is the load-bearing
+decision.** The measured run FAILED and left a CORRECT scene; an automatic
+rollback on failure would have destroyed exactly the work the user wanted.
+It is the reasoning `_check_advisory_stage` already records — a rollback has
+to be measured against what it rolls back to — and the smoke-test case where
+restoring a crashing app is the wrong answer. Recovery is offered through
+`agentchanti --restore`, which needed no provider and no API key before and
+still does not: starting a configured MCP server needs neither, and someone
+reaching for an undo must not be asked for credentials. A test pins that
+there is exactly **one** `restore_all` call site, because a second would be
+an automatic rollback.
+
+A capture that fails is a WARNING naming the server, never an exception: a
+backstop that can stop the thing it protects is worse than no backstop — but
+the operator asked for protection and has to learn they did not get it. A
+command that is not a runnable tool call is named rather than skipped
+silently, which is the "reports success and preserves nothing" failure this
+check exists to avoid.
+
+Verified against the live application rather than reasoned about: the cube
+and its full-turn animation captured, the cube then **deleted outright**, and
+`restore_all` put the object, its action and all three sampled rotations back
+unchanged.
+
+**A digest of state that is not a file** (`state_probe`, `state_digest`).
+`observe_gate_verdict` is the one mechanism designed to end a run stuck on a
+gate that cannot pass, and it needs two things: repeated byte-identical
+failing verdicts **and** at least two distinct artifact digests. The second
+is what makes it evidence rather than impatience — without it, a model that
+edited nothing for three turns looks exactly like a broken gate.
+
+`agent_loop._artifact_digest` builds that digest from the **files** the
+attempt wrote. A tool-only step writes none, so the digest is constant, the
+two-digest condition can never be met, and the check is silent **by
+construction**. Measured 2026-10-06: two Blender runs each spent 80–90k
+tokens and an escalation proving a *correct* artifact wrong, and this is the
+check that existed to stop them at turn three.
+
+The fix is a read, declared by the operator for the same reason the snapshot
+pair is: *"what is the state of this system"* has no general answer.
+`state_probe:` is a read-only tool call in the same `mcp:` syntax, its output
+is hashed, and `_combined_digest` keeps **both** halves rather than choosing
+between them — a step may edit files and drive an external system in the same
+turn.
+
+A tool-call count was available for free and is the **wrong signal**: it
+measures effort, not the artifact, and would fire on a model flailing with
+real calls — the false-positive direction `observe_gate_verdict` documents as
+the harmful one.
+
+Undeclared is **said, not silent**, and only for a gate that is actually a
+tool call, so it cannot become noise on an ordinary run. A detector
+structurally unable to fire must not read as one that looked and found
+nothing — the `empty_suite_reason` mistake pointed at a safety net.
+`state_digest` returns `None` rather than `""` for the same reason: a
+constant digest would quietly restore the exact blindness this removes. A
+probe that *fails* contributes its error text rather than aborting, because a
+server that has gone away is not the same state as one answering normally,
+and servers are iterated in sorted order so the digest is deterministic.
+
+Verified by an end-to-end pair against the real `observe_gate_verdict`: three
+identical failing verdicts stay silent on a constant digest and trip once the
+external digest moves. Then against the **running application**, which is the
+measurement that matters, because the digest has to be a function of state
+rather than of time or of how many calls were made::
+
+    digest             ef7c9a54dfd0d2c7
+    digest again       ef7c9a54dfd0d2c7   STABLE
+    + a cube added     27e0d56521131770   MOVED
+    - that cube removed ef7c9a54dfd0d2c7  BACK TO START
+
+Returning to the original value on undo is the half a call-counting signal
+could never produce, and is why this reads the system rather than the run.
+
 ### Agent Tools (agent_tools.py)
 
 `AgentTools` is the agent-computer interface for tool-calling loops: six `ToolDef`s (`list_files`, `read_file`, `write_file`, `edit_file`, `run_command`, `search_code`) scoped to a project root, backed by `Executor`, the KB `Searcher`, and `FileMemory`. `execute(ToolCall) -> str` never raises (errors return as strings for the model); `execute_all()` wraps results as `role="tool"` messages. `edit_file` is exact-match single-occurrence replace with `ast.parse` validation for Python; paths escaping the project root are rejected.
@@ -1139,6 +1501,149 @@ immediately above `Pipeline failed`.
 A step refused **before turn 1** carries the same marker and is
 deliberately excluded (`GATE_UNSTARTED_NOTE`): the gate is defective there
 too, but nothing was built, so there is no artifact to stand on.
+
+### A Tool Gate Only Ran Where Someone Remembered It (executor.py `_as_tool_gate`)
+
+`tool_gates` made a `verify:` that names an external tool runnable, and was
+wired into the two callers that knew about it: the agent loop's own
+verification, and `external_state`. **Every other gate-running route in the
+pipeline reaches `Executor.run_command`**, so every other route sent a tool
+gate to cmd.exe.
+
+Measured 2026-10-07 on a live Blender run that renamed an object,
+recoloured it and moved another — all three correct. `GateLedger` re-ran
+the step's gate four times, after the wave and after each of the bulk-test,
+wiring and smoke-test stages, and got the same answer every time::
+
+    'mcp:blender__execute_code' is not recognized as an internal or
+    external command
+
+`_is_harness_error` reads that as "the gate can no longer launch", which is
+right about what it sees and wrong about what happened. The consequence:
+the monotonic-gate protection — the one thing that catches a later stage
+breaking an earlier verified step — is **structurally absent for every
+tool-verified step, and says nothing about it**, which is the
+`empty_suite_reason` mistake aimed at a safety net.
+
+The fix sits where the command arrives, for the reason `run_command`'s own
+docstring already gives about destructive commands: *here is the one seam
+every route passes through*, and a fix applied per route leaves every route
+its author did not think of unprotected. After the destructive screen,
+deliberately — a tool gate's payload is the most capable thing in the
+system and must not round the check that guards it. It cannot misfire: the
+fast path is one `__` test, and `parse` returns None unless **every** `&&`
+segment names a tool the bridge actually offers.
+
+**The stage with no gate check at all.** The monotonic stages were each
+wave, bulk-test fixes, wiring fixes and smoke-test fixes;
+`repair_failed_acceptance` runs after all of them with nothing following
+it. It is also the likeliest of them to break a plan gate, because it
+exists to change the artifact until an instrument outside the run goes
+green — which can directly contradict what a step asserted about its own
+work. Measured in the same run: step 2 deleted an object the task said to
+leave alone and gated itself on `assert len(scene.objects)==5`; the user's
+acceptance check caught the deletion; the repair put an object back; and
+the step's gate was red at the end of a run that reported success. Same
+shape as the defect `_check_advisory_stage` was written for, whose own
+docstring enumerated every stage that writes source and omitted one.
+
+It takes `authority=` rather than the ordinary branch, and that is the
+whole difference between a rollback and a reported conflict: rolling this
+stage back restores a tree a user-supplied acceptance command has already
+FAILED, which is strictly worse than keeping one it passes and naming the
+red gate. `_green_suites_contradicting`'s reasoning with a stronger
+witness — `acceptance_cmds` is the one instrument the model neither wrote
+nor can edit — and like that branch it still returns False, because an
+unresolved red gate must never be reported as success.
+
+**The undo could never reach a tool.** `--restore` built
+`build_step_tools(Executor(), FileMemory())` — a FRESH FileMemory, which no
+bridge had been attached to — so `tools._mcp` was None and the restore
+answered `ERROR: unknown tool 'blender__execute_code'. Available:
+list_files, read_file, ...`. The one mechanism whose entire purpose is to
+put a live external system back could never have done it, on its only code
+path. The tests passed because they hand in a fake `tools` that does
+answer: the defect was in the **wiring**, which is the
+`protect_acceptance_files` lesson verbatim.
+
+So `capture_all`, `restore_all` and `state_digest` ask for the bridge and
+nothing else. An `AgentTools` dispatches an MCP call straight to the bridge
+anyway (`run_via_bridge` is the same call with the same error prefixes), so
+nothing is lost and there is no longer a second object that can be wrong.
+The failure detail is printed whole, too: `exit: failure` is the verdict
+header and carries nothing, which is how the real error stayed invisible
+through the one restore that mattered. Verified against the live
+application — two objects deleted outright, `Restored blender: exit:
+success`, and both back with their geometry and their 6-curve action.
+
+### An Undo That Overwrote Work Done After It (snapshot.py `_preserve_before_restore`)
+
+Measured 2026-10-07, on the second real use of `--restore`. It put the
+Blender scene back correctly, and `shutil.copy2` overwrote an acceptance
+check with the pre-run version, silently discarding edits made to it after
+the snapshot was taken. The log said `restored 8 file(s)`, which reads
+identically whether a restore changed nothing or threw away an afternoon.
+
+The docstring's promise was *"deliberately ADDITIVE"*, and it was true
+about **existence** and never about **content**. Overwriting is the point
+of an undo; doing it irreversibly is not, because this module's whole
+argument is that an undo which destroys work is the behaviour it exists to
+prevent.
+
+Only the files whose bytes actually differ are copied aside, so an ordinary
+restore writes nothing extra — and a targeted copy rather than
+`take_snapshot`, which would re-copy the whole tree and could refuse on its
+own bounds at the one moment refusing is least acceptable. The detail then
+**names** them, since "3 files had changed" sends a reader looking while
+naming them answers the question.
+
+The copy lives in `.agentchanti/pre-restore/`, deliberately not under
+`SNAPSHOT_ROOT`: `latest_snapshot` sorts that directory's names and
+`pre-restore...` sorts after any digit-led timestamp, so keeping it there
+would make a second `--restore` undo the undo instead of repeating it.
+
+### `is` Between Two Wrappers Is Never True (tool_gates.py `equivalent_variants`)
+
+`platform_equivalent_variants` asks whether a SHELL gate means something
+different under the other dialect. A **tool** gate has a dialect too — the
+host application's Python API — and nothing was asking.
+
+Measured 2026-10-07, the second run of a four-requirement Blender task. The
+plan gated the node-material step on::
+
+    any(y.to_node is r ...) and any(y.from_node is r and y.to_node is p ...)
+
+`l.to_node` builds a **fresh Python wrapper** on every attribute access, so
+`is` against a node fetched separately is False whatever the material
+contains, while `bpy_struct.__eq__` compares the underlying RNA pointer and
+works. No correct material could pass it. The step spent 10 turns, the
+recovery loop spent 10 more, and the run failed at **109,609 tokens** over a
+graph confirmed correct afterwards by reading `node_tree.links` directly —
+`TEX_NOISE Fac -> VALTORGB Fac -> BSDF_PRINCIPLED Base Color`. The identical
+task the day before drew a planner that wrote `==` and passed in six turns,
+which is what makes this luck of the draw rather than a property of the task.
+
+Wrapper-rebuilding APIs are the norm in the applications an MCP server
+fronts, so this is not a Blender quirk — and it is the same mistake this
+project made in its own acceptance check hours earlier, keying a node-graph
+traversal on `id(socket)`.
+
+It is a **variant, not a refusal**, which is what keeps a heuristic about
+someone else's API from ever convicting correct code: if the gate as written
+passes, the variant never runs; if both fail, nothing is adopted and the
+original verdict stands. The same believe-only-if-it-passes rule the shell
+dialect transforms use, reached through `_gate_variants`, which dispatches on
+`is_tool_gate` — the shell-dialect question has nothing to say about a tool
+call and was the only thing being asked.
+
+`x is None` is never touched: a comparison against any literal is left
+exactly as written, which covers the one spelling `is` is genuinely for. A
+payload that will not parse as Python offers nothing, so a JavaScript gate is
+not accused on the strength of a Python parse failing.
+
+Verified against the live session rather than reasoned about: the gate
+verbatim from the run's log returns `AssertionError`, and its
+`bpy-identity-vs-equality` reading passes, over the same material.
 
 ### A Spelling Is Not A Behaviour (plan_step.py `_manifest_script_gate_reason`)
 

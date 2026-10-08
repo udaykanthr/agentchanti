@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 _logger = logging.getLogger(__name__)
 
+from . import mcp_bridge as _mcp_bridge
 from .config import Config
 from .llm.ollama import OllamaClient
 from .llm.lm_studio import LMStudioClient
@@ -226,6 +227,11 @@ def _run_task_impl(
     display = CLIDisplay(task)
     memory = FileMemory(embedding_store=embed_store, top_k=cfg.EMBEDDING_TOP_K)
 
+    # External tools from configured MCP servers, wired in `api.py` as well as
+    # `cli.py` so the two entry points cannot diverge about what a step can
+    # reach. Silent and free when no server is configured.
+    _mcp_bridge.attach_to(memory, cfg)
+
     # Search agent TODO: should be running only on a condition?
     search_agent = None
     if cfg.SEARCH_ENABLED:
@@ -346,6 +352,18 @@ def _run_task_impl(
         _api_subproject = _detect_subproject_root(memory)
     except Exception:
         pass
+    # The bridge starts HERE, before pre_analyze, because the IntentAgent's
+    # REQUIREMENTS_SPEC is what decides the strategy and it was written
+    # before any tool existed. Measured 2026-10-05: the planner was told
+    # about 5 Blender tools and still planned `blender --background --python
+    # script.py`, because the spec beside it already named the script.
+    # `ensure_started` is idempotent, so a later call returns this bridge.
+    _mcp = _mcp_bridge.ensure_started(cfg)
+    _tool_summary = _mcp_bridge.planner_summary(_mcp)
+    if _tool_summary:
+        _logger.info("[MCP] intent analysis and planner told about %d "
+                     "external tool(s)", len(_mcp.definitions()))
+
     analysis_context = planner.pre_analyze(
         task,
         source_files=source_files,
@@ -356,6 +374,7 @@ def _run_task_impl(
         intent_agent=intent_agent,
         search_agent=search_agent,
         subproject_cwd=_api_subproject,
+        external_tools=_tool_summary,
         executor=executor,
     )
     if analysis_context:
@@ -405,6 +424,9 @@ def _run_task_impl(
     _briefing_text = getattr(planner, '_task_briefing', '')
     if _briefing_text:
         memory._task_briefing = _briefing_text
+
+    if _tool_summary:
+        planner_context += "\n\n" + _tool_summary
 
     # Plan
     plan = planner.process(task, context=planner_context, language=language,

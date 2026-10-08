@@ -91,7 +91,9 @@ bluntly: a dead event loop is a subtle, miserable class of bug.
 from __future__ import annotations
 
 import json
+import atexit
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -152,6 +154,18 @@ class MCPServerSpec:
     read_only: bool = False
     allow: tuple[str, ...] = ()
     timeout: float = DEFAULT_CALL_TIMEOUT
+    # How to snapshot and put back this system's state, in `mcp:` tool-call
+    # syntax with `{path}` substituted. Declared by the OPERATOR, never
+    # guessed: saving a .blend, dumping a database and exporting a browser
+    # profile share no vocabulary, and inventing one is how a backstop
+    # silently captures the wrong thing. See orchestrator/external_state.py.
+    snapshot: dict = field(default_factory=dict)
+    # A read-only tool call whose output fingerprints this system's state,
+    # in the same `mcp:` syntax. `observe_gate_verdict` needs two distinct
+    # artifact digests to fire, and a tool-only step writes no files — so
+    # without this the one check that ends a run stuck on an unsatisfiable
+    # gate is silent by construction. See orchestrator/external_state.py.
+    state_probe: str = ""
 
     def problem(self) -> str | None:
         """Why this spec cannot be used, or None."""
@@ -220,6 +234,9 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
                 read_only=bool(entry.get("read_only")),
                 allow=tuple(str(a) for a in (entry.get("allow") or ())),
                 timeout=float(entry.get("timeout") or DEFAULT_CALL_TIMEOUT),
+                snapshot={str(k): str(v) for k, v in
+                          (entry.get("snapshot") or {}).items()},
+                state_probe=str(entry.get("state_probe") or "").strip(),
             )
         except (TypeError, ValueError) as exc:
             problems.append(f"mcp server entry {entry!r} is malformed: {exc}")
@@ -680,18 +697,28 @@ def _bridge_stop(bridge: "MCPBridge") -> None:
 _ACTIVE: MCPBridge | None = None
 
 
-def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
-    """Start the configured servers once and hang the bridge on *memory*.
+def ensure_started(cfg: Any) -> MCPBridge | None:
+    """Start the configured servers once. Returns the bridge, or None.
 
-    Idempotent, because `cli.py` builds FileMemory on more than one path and
-    starting a second set of sessions would double every server's handshake
-    and leave the first set orphaned.
+    Separate from `attach_to` because the servers' lifetime has nothing to do
+    with FileMemory's. `attach_to` was the only way in, and on `cli.py`'s
+    fresh path FileMemory is not created until AFTER the plan has been made —
+    so asking `getattr(memory, "_mcp_bridge")` while planning raised
+    `UnboundLocalError: cannot access local variable 'memory'` and crashed the
+    run before its first step. The planner needs the tool list and the plan
+    comes first, so the start has to be answerable without that object.
 
-    Returns the bridge, or None when nothing is configured — which is the
-    ordinary case and must stay silent. Never raises: every failure here
-    costs the run its external tools and nothing else.
+    Idempotent, because `cli.py` reaches it on more than one path and starting
+    a second set of sessions would double every server's handshake and leave
+    the first set orphaned.
+
+    Returns None when nothing is configured — the ordinary case, which must
+    stay silent. Never raises: every failure here costs the run its external
+    tools and nothing else.
     """
     global _ACTIVE
+    if _ACTIVE is not None:
+        return _ACTIVE
     try:
         specs, problems = load_specs(getattr(cfg, "MCP", None))
     except Exception as exc:                        # pragma: no cover - env
@@ -704,9 +731,6 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
         log.warning("[MCP] %s", problem)
     if not specs:
         return None
-    if _ACTIVE is not None:
-        memory._mcp_bridge = _ACTIVE
-        return _ACTIVE
     bridge = MCPBridge(specs)
     bridge.start()
     for problem in bridge.problems:
@@ -717,9 +741,66 @@ def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
     if offered:
         log.info("[MCP] %d external tool(s) offered to the loop: %s",
                  len(offered), ", ".join(d.name for d in offered))
+    else:
+        # A bridge offering NOTHING is indistinguishable from no bridge at
+        # all everywhere it matters — except that every `if bridge is None`
+        # guard downstream takes the wrong branch and then reports a wrong
+        # cause. Measured 2026-10-08 against a config with a `snapshot:`
+        # pair and the optional `mcp` extra not installed::
+        #
+        #   [MCP] the `mcp` package is not importable ... pip install
+        #         agentchanti[mcp]                              <- correct
+        #   [External] could NOT capture 'blender' state ... the command is
+        #         not a runnable tool call                      <- WRONG
+        #
+        # The second sends the reader to check `snapshot:` syntax that is
+        # perfectly correct, because `tool_gates.parse` asked a dead bridge
+        # whether it owned the tool and was honestly told no. One accurate
+        # message beats an accurate one followed by a misleading one.
+        #
+        # Stopped rather than merely dropped: a transport may have opened
+        # sessions before the tool listing came back empty, and a bridge
+        # nobody can reach must not keep child processes alive.
+        bridge.stop()
+        return None
     _ACTIVE = bridge
-    memory._mcp_bridge = bridge
+    # `cli.py` stops the bridge in `main()`'s finally; `api.py` has no such
+    # wrapper, and a library caller that never stops it would leave every
+    # stdio server running as an orphaned child process. Registered on the
+    # one path that actually creates a bridge, so a run with no servers
+    # configured registers nothing. Double-stopping is safe: `stop_active`
+    # clears `_ACTIVE` first.
+    atexit.register(stop_active)
     return bridge
+
+
+def attach_to(memory: Any, cfg: Any) -> MCPBridge | None:
+    """Start the configured servers and hang the bridge on *memory*.
+
+    The binding half of `ensure_started`: `build_step_tools` reads
+    `memory._mcp_bridge`, which is how a step's `AgentTools` gets the
+    external tools.
+    """
+    bridge = ensure_started(cfg)
+    if bridge is not None:
+        memory._mcp_bridge = bridge
+    return bridge
+
+
+def active_bridge() -> "MCPBridge | None":
+    """The run's bridge, for a caller with no FileMemory to read it off.
+
+    `attach_to` hangs the bridge on FileMemory so that `build_step_tools`
+    can reach it, which covers everything built per step. It does not cover
+    the low-level objects a run shares — `Executor` above all, which is
+    handed around on its own and is the one seam every command passes
+    through. Reading `_ACTIVE` directly from another module would make the
+    lifetime invisible at the call site; this says it out loud.
+
+    None is the ordinary case (no servers configured) and must stay cheap
+    and silent.
+    """
+    return _ACTIVE
 
 
 def stop_active() -> None:
@@ -734,3 +815,142 @@ def stop_active() -> None:
     bridge, _ACTIVE = _ACTIVE, None
     if bridge is not None:
         bridge.stop()
+
+
+# Deliberately small. The planner never CALLS these, so it does not need
+# parameter schemas — and schemas are the expensive part: a real
+# third-party tool measured 1,209 characters, against 48 for its name and
+# first line. 25 tools summarised this way cost about what one of them
+# costs in full.
+PLANNER_SUMMARY_MAX_TOOLS = 40
+PLANNER_SUMMARY_DESC_CHARS = 110
+
+
+
+# A command that only prints. `echo` is the one the planner reaches for,
+# because a CMD step must carry a shell line and there is no shell line that
+# calls a tool. Redirection and chaining are excluded deliberately:
+# `echo x > f` writes a file and `echo x && npm i` installs, so neither is a
+# no-op, and reading them as one would skip real work.
+_NOOP_CMD_RE = re.compile(r"^\s*(?:echo|rem|::|:|true)\b", re.IGNORECASE)
+_HAS_EFFECT_RE = re.compile(r"[>|&;]")
+
+
+def hollow_tool_command(cmd: str, step_text: str,
+                        bridge: "MCPBridge | None") -> str | None:
+    """Why this CMD step cannot do what it says it does.
+
+    Measured 2026-10-05, the run after the planner was first told its tools
+    exist. The planner adopted them — and the plan vocabulary is CMD / CODE /
+    TEST, so a tool call is none of the three. It put the intent in the only
+    slot a CMD step has, a shell line::
+
+        > echo Configure the active Blender scene through
+          blender__execute_blender_code: retain/add a cube at (0,0,0), ...
+
+    `echo` exits 0, so the step reported success having done nothing, and
+    because the step classified CMD the agent loop never ran — which is the
+    only place `chat(messages, tools=...)` is called and therefore the only
+    place a tool can be invoked. Zero tool calls in the whole run.
+
+    Awareness without an execution path is worse than no awareness: a step
+    that proposes a tool and then no-ops is a step that cannot fail.
+
+    Returns None unless the command is **provably** inert and the step names
+    a tool that is actually available, so an ordinary `echo` step and a step
+    naming a tool nobody configured are both left alone.
+    """
+    if bridge is None:
+        return None
+    names = [d.name for d in bridge.definitions()]
+    if not names:
+        return None
+    if not cmd or not _NOOP_CMD_RE.match(cmd) or _HAS_EFFECT_RE.search(cmd):
+        return None
+    # Qualified names only. A bare `export_scene` is an ordinary English
+    # phrase in a plan description; `blender__export_scene` is not.
+    haystack = f"{cmd}\n{step_text or ''}"
+    named = sorted({n for n in names if n in haystack})
+    if not named:
+        return None
+    return (f"the step's command only prints and cannot call "
+            f"{', '.join(named)}, which it names — a shell command cannot "
+            f"invoke an external tool, so this step must run as a "
+            f"tool-calling conversation")
+
+
+def planner_summary(bridge: "MCPBridge | None") -> str:
+    """A short description of the external tools, for the PLANNER.
+
+    The planner has never seen tool definitions: `chat(messages, tools=...)`
+    is called in exactly one place, the agent loop. So a plan is formed
+    without any knowledge that external tools exist, and the loop then
+    executes steps that were decided before the tools were visible.
+
+    Measured 2026-10-05 against a live Blender MCP server: five tools were
+    offered to the loop, `execute_blender_code` among them, and the run
+    called `run_command`, `read_file`, `write_file` and `edit_file` — never
+    one of the five. The plan said "write a Python script and run Blender
+    headless", which was settled before the tools entered the picture. The
+    model was not declining to use them; it was executing a strategy chosen
+    without them.
+
+    Returns "" when there is nothing to say, so an ordinary run's planner
+    prompt is byte-for-byte what it was.
+    """
+    if bridge is None:
+        return ""
+    defs = bridge.definitions()
+    if not defs:
+        return ""
+    lines = ["EXTERNAL TOOLS AVAILABLE TO STEPS",
+             # What the tools REACH, before how to call them. Measured
+             # 2026-10-05: told only that the tools existed and how to
+             # invoke them, the planner went back to `blender --background
+             # --python script.py` — correct work in a fresh process that
+             # could never touch the session the task was about. A planner
+             # has no reason to prefer a tool over a script it knows how to
+             # write, unless it is told what the tool can reach that the
+             # script cannot.
+             "Each of these acts on a LIVE EXTERNAL SYSTEM that already "
+             "exists and that this run did not create — the application, "
+             "service or session the server is attached to. Nothing else "
+             "in the pipeline can reach it: a script you write runs in a "
+             "fresh process of its own, so it cannot observe or change "
+             "that system's state.",
+             "So when the task concerns that system — what it currently "
+             "holds, or a change someone expects to see IN it — call the "
+             "tool. A script that reproduces the work in a separate "
+             "process is a DIFFERENT RESULT, however correct the script "
+             "is. Use ordinary files and commands for everything else.",
+             "A step that uses one must be a CODE or TEST step: those "
+             "run as a tool-calling conversation, which is the only "
+             "place a tool can be called. A CMD step runs one shell "
+             "command, and no shell command can invoke a tool — do "
+             "not write `echo` to stand in for calling one.",
+             # Measured 2026-10-06: the plan declared `verify:
+             # blender__get_scene_info`, the executor ran it through
+             # cmd.exe, and a correct step failed. A bare tool name is also
+             # a gate that cannot FAIL -- it passes whenever the server is
+             # up, including over the state before the step ran.
+             "A step's `verify:` may call a tool instead of the shell, "
+             "written as `mcp:<tool> {\"arg\": value}` on one line. It "
+             "must be able to FAIL: calling a read-only tool and asserting "
+             "nothing passes whenever the server is reachable, which "
+             "proves nothing about this step. Put the check where it can "
+             "fail — in a tool that executes code, with a real assertion:",
+             "  verify: mcp:<server>__execute_code {\"code\": \"<read the "
+             "live state>; assert <the concrete condition this step "
+             "establishes>\"}",
+             ""]
+    shown = defs[:PLANNER_SUMMARY_MAX_TOOLS]
+    for d in shown:
+        # First line only: a description's later paragraphs are usage detail
+        # the planner cannot act on.
+        first = (d.description or "").strip().splitlines()[0] if d.description else ""
+        if len(first) > PLANNER_SUMMARY_DESC_CHARS:
+            first = first[:PLANNER_SUMMARY_DESC_CHARS - 1].rstrip() + "…"
+        lines.append(f"  {d.name} — {first}" if first else f"  {d.name}")
+    if len(defs) > len(shown):
+        lines.append(f"  … and {len(defs) - len(shown)} more")
+    return "\n".join(lines)
