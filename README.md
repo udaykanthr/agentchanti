@@ -451,6 +451,40 @@ agentchanti kb update                # Pull global KB updates
 
 See [documentation.md](documentation.md) for the full list of KB commands.
 
+### MCP Commands
+
+Inspect and health-check the servers declared under `mcp:` — without
+spending a run, and **without a provider or an API key**, since someone
+asking why their server is not working should not be asked for credentials
+to find out:
+
+```bash
+agentchanti mcp list              # every server: transport, fence, health
+agentchanti mcp get <name>        # one server in full, offered vs withheld
+agentchanti mcp list --no-health  # read the config only, start nothing
+```
+
+Both connect briefly, list the server's tools, and stop. They exit non-zero
+when a server fails its check, so they are usable from CI. `list` names the
+config file it read, which matters because `.agentchanti.yaml` is found
+CWD-first and **never merged** — a project file shadows a home one entirely.
+
+What they are built to answer, each of which otherwise costs a whole run to
+discover:
+
+```
+  thing  [FAILED — offers nothing; see the warnings]
+      stdio: python server.py
+      allow: do_it
+      no snapshot — no undo — `agentchanti --restore` cannot put this
+        system back, because there is no general way to snapshot one
+      no state_probe — the stall detector is blind to it ...
+```
+
+A server given neither `allow:` nor `read_only: true` is **rejected at
+load** rather than merely limited, so it is reported as unusable and the
+exit is non-zero.
+
 ---
 
 ## Documentation

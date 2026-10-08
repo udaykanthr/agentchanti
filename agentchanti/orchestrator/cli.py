@@ -786,6 +786,15 @@ def _main_impl():
         kb_main(sys.argv[2:])
         return
 
+    # `agentchanti mcp ...` likewise, and deliberately before any config,
+    # provider or API key is resolved: someone asking why their MCP server
+    # is not working must not be told to supply credentials to find out —
+    # the same argument `--restore` makes. Starting a configured server
+    # needs neither.
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp":
+        from ..mcp_cli import mcp_main
+        sys.exit(mcp_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="AgentChanti — Multi-Agent Local Coder")
     from .. import __version__ as _agentchanti_version
     parser.add_argument("--version", action="version",
