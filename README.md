@@ -485,6 +485,42 @@ A server given neither `allow:` nor `read_only: true` is **rejected at
 load** rather than merely limited, so it is reported as unusable and the
 exit is non-zero.
 
+To add one:
+
+```bash
+agentchanti mcp add blender -- python blender_server.py
+agentchanti mcp add thing --allow read_x read_y -- npx my-mcp-server
+agentchanti mcp add api --transport http https://x.test/mcp \
+    -H 'Authorization: Bearer ...' --read-only
+```
+
+With neither `--allow` nor `--read-only`, `add` **starts the server once and
+lists its tools**, so the fence is chosen from what the server actually
+offers rather than guessed — and nothing is written until you choose. With
+no terminal to ask at, it prints the ready-made flag and writes nothing.
+
+`snapshot:` and `state_probe:` take a JSON document rather than three more
+flags, because their values are `mcp:` tool calls carrying JSON payloads
+that no shell quotes comfortably:
+
+```bash
+agentchanti mcp add-json blender '{"transport":"stdio","command":"python",
+  "args":["blender_server.py"],"allow":["execute_code","get_scene_info"],
+  "state_probe":"mcp:blender__get_scene_info {}",
+  "snapshot":{"capture":"...","restore":"..."}}'
+```
+
+Both **only ever insert lines** into an existing `.agentchanti.yaml` —
+comments, key order and formatting are left exactly as they were — and
+refuse rather than guess when the file's shape is ambiguous, printing the
+block for you to paste. The entry is then verified by re-reading the file
+through the same loader the pipeline uses.
+
+`--scope` currently accepts `project` only. A home-level server would be
+**silently ignored** in any project with its own `.agentchanti.yaml`,
+because the config is found CWD-first and never merged; the flag says so
+rather than failing quietly.
+
 ---
 
 ## Documentation

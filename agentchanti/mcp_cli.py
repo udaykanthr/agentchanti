@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from typing import Any
 
@@ -44,6 +45,99 @@ _MISSING_COSTS = {
                     "writes no files, so without a probe it cannot tell a "
                     "broken gate from a model that changed nothing"),
 }
+
+
+# ── writing the config back ──────────────────────────────────────────
+#
+# `--generate-config` rewrites `.agentchanti.yaml` wholesale from
+# `cfg.to_yaml()`. Doing that here would be destructive in a way nobody
+# asked for: a real MCP config is heavily commented — the one this feature
+# was developed against carries the reasoning for `allow:`, `env:` and the
+# snapshot pair inline — and a PyYAML round-trip drops every comment, every
+# blank line and the key order with them.
+#
+# So the only operation performed on an existing file is INSERTION of new
+# lines. Nothing already in it is reformatted, reordered or re-quoted. When
+# the shape cannot be determined with certainty the edit is REFUSED and the
+# block is printed for the reader to paste — the `unrunnable_gate_reason`
+# temperament, where declining beats half-doing it.
+
+_TOP_LEVEL_MCP = re.compile(r"^mcp:\s*(?:#.*)?$")
+_SERVERS_KEY = re.compile(r"^(\s+)servers:\s*(?:#.*)?$")
+
+
+def _server_block(entry: dict, indent: str) -> str:
+    """*entry* as a YAML list item, indented to *indent*.
+
+    Dumped by PyYAML rather than formatted by hand so that quoting is the
+    library's problem: a Windows command path, a header value and a
+    `mcp:`-syntax snapshot payload are all full of characters that decide
+    whether YAML reads a string or something else.
+    """
+    import yaml
+    body = yaml.safe_dump([entry], default_flow_style=False, sort_keys=False,
+                          allow_unicode=True)
+    return "".join(indent + line if line.strip() else line
+                   for line in body.splitlines(keepends=True))
+
+
+def _insert_server(text: str, entry: dict) -> tuple[str | None, str]:
+    """(new_text, note). `None` means refused — the note says why."""
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if text.count("\r\n") > len(lines) / 2 else "\n"
+
+    mcp_at = next((i for i, ln in enumerate(lines)
+                   if _TOP_LEVEL_MCP.match(ln.rstrip("\r\n"))), None)
+    if mcp_at is None:
+        # No `mcp:` at all: appending a whole section touches nothing.
+        block = _server_block(entry, "    ")
+        tail = "" if not text or text.endswith(("\n", "\r")) else newline
+        section = (f"{tail}{newline}# External tools from MCP servers."
+                   f"{newline}mcp:{newline}  servers:{newline}")
+        return text + section + block, "appended a new `mcp:` section"
+
+    # Find `servers:` inside the mcp block — i.e. before the next line that
+    # starts at column 0 and is neither blank nor a comment.
+    end = len(lines)
+    for i in range(mcp_at + 1, len(lines)):
+        stripped = lines[i].rstrip("\r\n")
+        if stripped and not stripped[0].isspace() and not stripped.startswith("#"):
+            end = i
+            break
+
+    servers_at = servers_indent = None
+    for i in range(mcp_at + 1, end):
+        m = _SERVERS_KEY.match(lines[i].rstrip("\r\n"))
+        if m:
+            servers_at, servers_indent = i, m.group(1)
+            break
+    if servers_at is None:
+        return None, ("`mcp:` exists but has no plain `servers:` key — it may "
+                      "be a list or inline mapping, and inserting into one "
+                      "blindly could corrupt it")
+
+    # The list items, and where the list stops.
+    item_indent = None
+    last_item_line = servers_at
+    for i in range(servers_at + 1, end):
+        raw = lines[i].rstrip("\r\n")
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        lead = raw[:len(raw) - len(raw.lstrip())]
+        if len(lead) <= len(servers_indent):
+            break                      # back out to a sibling key of servers
+        if raw.lstrip().startswith("- ") and item_indent is None:
+            item_indent = lead
+        last_item_line = i
+    if item_indent is None:
+        item_indent = servers_indent + "  "
+
+    block = _server_block(entry, item_indent)
+    if not lines[last_item_line].endswith(("\n", "\r")):
+        lines[last_item_line] = lines[last_item_line] + newline
+    return ("".join(lines[:last_item_line + 1]) + block
+            + "".join(lines[last_item_line + 1:]),
+            "inserted into the existing `mcp.servers` list")
 
 
 def _load(config_path: str | None):
@@ -255,6 +349,202 @@ def _cmd_get(args) -> int:
         mcp_bridge.stop_active()
 
 
+# ── add ──────────────────────────────────────────────────────────────
+
+def _kv(pairs, sep, what):
+    """`KEY=value` / `Header: value` pairs into a dict, or raise."""
+    out = {}
+    for item in pairs or ():
+        key, found, value = item.partition(sep)
+        if not found or not key.strip():
+            raise ValueError(f"{what} must be `KEY{sep}value`, got {item!r}")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _discover(entry: dict) -> tuple[list[str], str]:
+    """Every tool the server offers, by connecting once. ([], why) on failure.
+
+    Discovery uses an in-memory spec with `read_only=True` and NO allow
+    list, which is the one combination `tool_defs_for` passes through
+    unfiltered — the point is to see everything so the operator can choose.
+    It is never written: what lands in the file is the fence they picked.
+    """
+    from . import mcp_bridge
+    ok, why = mcp_bridge.mcp_available()
+    if not ok:
+        return [], why
+    probe = dict(entry)
+    probe.pop("allow", None)
+    probe["read_only"] = True
+
+    class _Cfg:
+        MCP = {"servers": [probe]}
+
+    sys.stdout.flush()
+    bridge = mcp_bridge.ensure_started(_Cfg())
+    if bridge is None:
+        return [], "the server offered no tools — see the warnings above"
+    try:
+        return sorted(d.name.partition("__")[2]
+                      for d in bridge.definitions()), ""
+    finally:
+        mcp_bridge.stop_active()
+
+
+def _write_entry(args, entry: dict, path: str | None) -> int:
+    """Insert *entry*, verify it parses, and report. Returns an exit code."""
+    specs, _problems, _cfg, _p = _load(args.config)
+    if any(s.name == entry["name"] for s in specs):
+        print(f"\n  A server named {entry['name']!r} is already configured in "
+              f"{path}.\n  Edit it there, or choose another name — names "
+              f"qualify tool names and must be unique.\n")
+        return 1
+
+    target = path or os.path.join(os.getcwd(), ".agentchanti.yaml")
+    text = ""
+    if os.path.isfile(target):
+        with open(target, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+
+    updated, note = _insert_server(text, entry)
+    if updated is None:
+        print(f"\n  Not editing {target} automatically: {note}.\n"
+              f"  Add this under `mcp: servers:` yourself:\n")
+        print(_server_block(entry, "    "))
+        return 1
+
+    with open(target, "w", encoding="utf-8", newline="") as fh:
+        fh.write(updated)
+    print(f"\n  Added {entry['name']!r} to {target} ({note}).")
+
+    # Verified by re-reading the file rather than trusting the dict we
+    # wrote: the question is whether the PIPELINE will accept it, and the
+    # only thing that answers that is the loader the pipeline uses.
+    specs, problems, _cfg, _p = _load(target)
+    for p in problems:
+        print(f"  ! {p}")
+    if not any(s.name == entry["name"] for s in specs):
+        print(f"  ! it did not load back — the entry is in the file but the "
+              f"loader rejected it.\n")
+        return 1
+    print(f"  Check it any time with `agentchanti mcp get "
+          f"{entry['name']}`.\n")
+    return 0
+
+
+def _cmd_add(args) -> int:
+    if args.scope != "project":
+        print(f"\n  --scope {args.scope} is not supported yet. "
+              f"`.agentchanti.yaml` is found CWD-first and NEVER merged, so "
+              f"a server written to a home config is silently ignored in "
+              f"every project that has its own file — which is every project "
+              f"that sets a provider. Use --scope project (the default).\n")
+        return 2
+    try:
+        env = _kv(args.env, "=", "--env")
+        headers = _kv(args.header, ":", "--header")
+    except ValueError as exc:
+        print(f"\n  {exc}\n")
+        return 2
+
+    entry: dict = {"name": args.name, "transport": args.transport}
+    if args.transport == "stdio":
+        entry["command"] = args.command_or_url
+        if args.args:
+            entry["args"] = list(args.args)
+    else:
+        entry["url"] = args.command_or_url
+        if args.args:
+            print("\n  Positional arguments are only meaningful for a stdio "
+                  "server; ignoring them for an http one.\n")
+    if env:
+        entry["env"] = env
+    if headers:
+        entry["headers"] = headers
+    if args.timeout:
+        entry["timeout"] = args.timeout
+
+    _specs, _problems, _cfg, path = _load(args.config)
+
+    # The fence. A server with neither is REJECTED by `load_specs`, so
+    # writing one would produce a file that parses and a run with no
+    # external tools — the failure this whole command exists to prevent.
+    allow = list(args.allow or ())
+    if args.read_only:
+        entry["read_only"] = True
+    elif allow:
+        entry["allow"] = allow
+    else:
+        found, why = ([], "discovery skipped") if args.no_discover else \
+            _discover(entry)
+        if not found:
+            print(f"\n  Need a fence before this can be written: pass "
+                  f"--allow <tool...> or --read-only.\n"
+                  f"  Could not list the server's tools to help "
+                  f"({why}).\n")
+            return 1
+        print(f"\n  {args.name} offers {len(found)} tool(s): "
+              f"{', '.join(found)}")
+        # `isatty()` is not the question, and on Windows it is not even an
+        # answer: the CRT reports every CHARACTER DEVICE as a tty, so a
+        # process whose stdin is NUL — which is what a CI runner and
+        # `subprocess.DEVNULL` both give — reports True and then raises
+        # EOFError on the first read. Measured here before it shipped.
+        # Asking and handling the EOF is the only reliable test, and
+        # `_prompt_for_acceptance_cmds` already draws the same conclusion:
+        # a closed stdin is DECLINING, not an error.
+        try:
+            reply = input("  Allow which? (blank = all, or space-separated "
+                          "names, or `q`): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n\n  Nothing to read from, so nothing is assumed and "
+                  f"nothing was written. Re-run with one of:\n"
+                  f"    --allow {' '.join(found)}\n"
+                  f"    --read-only\n")
+            return 1
+        if reply.lower() == "q":
+            print("  Nothing written.\n")
+            return 1
+        chosen = reply.split() if reply else list(found)
+        unknown = [t for t in chosen if t not in found]
+        if unknown:
+            print(f"\n  This server does not offer: {', '.join(unknown)}\n")
+            return 1
+        entry["allow"] = chosen
+
+    return _write_entry(args, entry, path)
+
+
+def _cmd_add_json(args) -> int:
+    """The escape hatch, and the only sane home for `snapshot:`.
+
+    A snapshot command is a `mcp:`-syntax tool call carrying a JSON payload
+    full of quotes and backslashes. Putting that on a command line is how
+    this project has repeatedly been burned — cmd.exe losing quote tracking
+    on `\\"`, reading `<3` as a redirect — so those fields get a JSON
+    document instead of three more flags.
+    """
+    import json
+    if args.scope != "project":
+        print(f"\n  --scope {args.scope} is not supported yet; see "
+              f"`agentchanti mcp add --help`.\n")
+        return 2
+    try:
+        entry = json.loads(args.json)
+    except ValueError as exc:
+        print(f"\n  That is not valid JSON: {exc}\n")
+        return 2
+    if not isinstance(entry, dict):
+        print(f"\n  Expected a JSON object describing one server, got "
+              f"{type(entry).__name__}.\n")
+        return 2
+    entry = {"name": args.name, **{k: v for k, v in entry.items()
+                                   if k != "name"}}
+    _specs, _problems, _cfg, path = _load(args.config)
+    return _write_entry(args, entry, path)
+
+
 def mcp_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agentchanti mcp",
@@ -273,6 +563,54 @@ def mcp_main(argv: list[str] | None = None) -> int:
     p_get.add_argument("--no-health", action="store_true",
                        help="Read the config only; do not start the server")
     p_get.set_defaults(func=_cmd_get)
+
+    p_add = sub.add_parser(
+        "add", help="Add an MCP server to .agentchanti.yaml",
+        description=(
+            "Add an MCP server.\n\n"
+            "Examples:\n"
+            "  agentchanti mcp add blender -- python blender_server.py\n"
+            "  agentchanti mcp add thing --allow read_x,read_y -- npx my-mcp\n"
+            "  agentchanti mcp add api --transport http https://x.test/mcp \\\n"
+            "      -H 'Authorization: Bearer ...' --read-only\n\n"
+            "With neither --allow nor --read-only the server is started once "
+            "and its tools listed, so the fence can be chosen from what it "
+            "actually offers."),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_add.add_argument("name")
+    p_add.add_argument("command_or_url", metavar="commandOrUrl")
+    p_add.add_argument("args", nargs="*",
+                       help="Arguments for a stdio command (after `--`)")
+    p_add.add_argument("--transport", choices=["stdio", "http"],
+                       default="stdio")
+    p_add.add_argument("-e", "--env", action="append", metavar="KEY=value",
+                       help="Environment variable for a stdio server")
+    p_add.add_argument("-H", "--header", action="append",
+                       metavar="'Name: value'",
+                       help="Header for an http server")
+    p_add.add_argument("-s", "--scope", default="project",
+                       help="Config scope (project only, for now)")
+    p_add.add_argument("--allow", nargs="+", metavar="TOOL",
+                       help="Tools the agent may call")
+    p_add.add_argument("--read-only", action="store_true",
+                       help="Assert the whole server is read-only")
+    p_add.add_argument("--timeout", type=float, default=None,
+                       help="Per-call timeout in seconds")
+    p_add.add_argument("--no-discover", action="store_true",
+                       help="Do not start the server to list its tools")
+    p_add.set_defaults(func=_cmd_add)
+
+    p_json = sub.add_parser(
+        "add-json", help="Add a server from a JSON object",
+        description=("Add a server from a JSON object — the home for "
+                     "`snapshot:` and `state_probe:`, whose values are "
+                     "tool calls carrying JSON payloads that no shell "
+                     "quotes comfortably."),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_json.add_argument("name")
+    p_json.add_argument("json", metavar="JSON")
+    p_json.add_argument("-s", "--scope", default="project")
+    p_json.set_defaults(func=_cmd_add_json)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if not getattr(args, "command", None):
