@@ -2276,6 +2276,46 @@ def _handle_cmd_step(step_text: str, executor: Executor,
         cmd = cmd[_m.start(1):]
         log.info(f"Step {step_idx+1}: Stripped dead `cd` prefix from scaffold command")
 
+    # ── A CMD step that names an external tool and does nothing ──
+    # The plan vocabulary is CMD / CODE / TEST and a tool call is none of
+    # the three, so a planner that adopts an MCP tool has only a shell line
+    # to put it in and writes `echo <instruction>`. That exits 0, so the
+    # step reports success having done nothing — and classified CMD, it
+    # never reaches the agent loop, the only place a tool can be called.
+    # Route it there instead of running the no-op.
+    from .. import mcp_bridge as _mcp_bridge
+    _hollow = _mcp_bridge.hollow_tool_command(
+        cmd, step_text, getattr(memory, "_mcp_bridge", None))
+    if _hollow:
+        from .agent_loop import (
+            agent_loop_enabled, build_step_tools,
+            run_agent_loop_with_escalation,
+        )
+        if agent_loop_enabled(cfg, llm_client):
+            log.info("Step %d: %s — running it as a tool-calling step",
+                     step_idx + 1, _hollow)
+            display.step_info(step_idx, "External tool step — agent loop")
+            _tool_goal = (getattr(project_context, "goal_summary", "")
+                          if project_context else "") or step_text
+            _ok, _info = run_agent_loop_with_escalation(
+                llm_client, build_step_tools(executor, memory),
+                step_text, _tool_goal,
+                display=display, step_idx=step_idx, language=language,
+                max_turns=getattr(cfg, "AGENT_LOOP_MAX_TURNS", 8),
+                # No verify_cmd: the plan's gate for such a step is itself a
+                # printed sentence, and handing the loop a no-op gate would
+                # let it exit green on one. The loop still refuses to exit
+                # on a step that called no tool at all, which is the bar
+                # the `echo` could never meet.
+                context=(f"This step was planned as a shell command, but "
+                         f"{_hollow}. Use the external tool(s) it names."),
+                escalation_client=getattr(llm_client, "escalation_client",
+                                          None))
+            return _ok, ("" if _ok else _info)
+        log.warning("Step %d: %s — but the agent loop is disabled, so "
+                    "nothing can call it; running the command as planned",
+                    step_idx + 1, _hollow)
+
     # ── Idempotency check ──
     # Detect the subproject root early so idempotency checks resolve
     # paths relative to the correct directory. It must be the SAME

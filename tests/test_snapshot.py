@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 
+from agentchanti import snapshot
 from agentchanti.snapshot import (
     MANIFEST_NAME,
     SNAPSHOT_ROOT,
@@ -175,3 +176,89 @@ class TestLatest:
 
         assert latest_snapshot(root) == second
         assert first != second
+
+
+# ─── an undo that overwrote work done after the snapshot ─────────────
+
+
+class TestRestoreKeepsWhatItOverwrites:
+    """Measured 2026-10-07, on the second real use of this module.
+
+    The undo had just put a live Blender scene back correctly — and
+    `shutil.copy2` overwrote `acceptance_check_caseC.py` with the pre-run
+    version, silently discarding edits made to it AFTER the snapshot. The
+    log said `restored 8 file(s)`, which reads identically whether a
+    restore changed nothing or threw away an afternoon.
+
+    The module's promise was "additive", and it was true about EXISTENCE
+    and never about CONTENT. Overwriting is the point of an undo; doing it
+    irreversibly is not, because this module's whole argument is that an
+    undo which destroys work is the behaviour it exists to prevent.
+    """
+
+    def _project(self, tmp_path):
+        (tmp_path / "check.py").write_text("original\n", encoding="utf-8")
+        (tmp_path / "keep.py").write_text("untouched\n", encoding="utf-8")
+        assert snapshot.take_snapshot(str(tmp_path))
+        return tmp_path
+
+    def test_the_newer_content_is_kept(self, tmp_path):
+        root = self._project(tmp_path)
+        (root / "check.py").write_text("an afternoon of work\n",
+                                       encoding="utf-8")
+
+        ok, detail = snapshot.restore_snapshot(str(root))
+        assert ok
+        assert (root / "check.py").read_text(encoding="utf-8") == "original\n"
+
+        kept = root / snapshot.PRE_RESTORE_ROOT
+        copies = [p for p in kept.rglob("check.py")]
+        assert len(copies) == 1
+        assert copies[0].read_text(encoding="utf-8") == "an afternoon of work\n"
+
+    def test_the_detail_names_what_it_overwrote(self, tmp_path):
+        root = self._project(tmp_path)
+        (root / "check.py").write_text("newer\n", encoding="utf-8")
+        ok, detail = snapshot.restore_snapshot(str(root))
+        assert ok
+        assert "check.py" in detail
+        assert "had changed" in detail
+        assert snapshot.PRE_RESTORE_ROOT.replace("\\", "/") in detail.replace(
+            "\\", "/")
+
+    def test_only_the_files_that_differ_are_copied(self, tmp_path):
+        """An ordinary restore must write nothing extra."""
+        root = self._project(tmp_path)
+        (root / "check.py").write_text("newer\n", encoding="utf-8")
+        snapshot.restore_snapshot(str(root))
+        kept = root / snapshot.PRE_RESTORE_ROOT
+        names = sorted(p.name for p in kept.rglob("*") if p.is_file())
+        assert names == ["check.py", snapshot.MANIFEST_NAME]
+
+    def test_an_unchanged_project_leaves_no_copy_at_all(self, tmp_path):
+        root = self._project(tmp_path)
+        ok, detail = snapshot.restore_snapshot(str(root))
+        assert ok
+        assert "had changed" not in detail
+        assert not (root / snapshot.PRE_RESTORE_ROOT).exists()
+
+    def test_the_copy_does_not_become_the_latest_snapshot(self, tmp_path):
+        """Otherwise the next `--restore` would undo the undo.
+
+        `latest_snapshot` sorts the snapshot directory's names, and
+        `pre-restore...` sorts after any digit-led timestamp — so keeping
+        the copy there would make a second restore return the state from
+        just before the first one.
+        """
+        root = self._project(tmp_path)
+        before = snapshot.latest_snapshot(str(root))
+        (root / "check.py").write_text("newer\n", encoding="utf-8")
+        snapshot.restore_snapshot(str(root))
+        assert snapshot.latest_snapshot(str(root)) == before
+
+    def test_a_file_the_run_added_is_still_never_deleted(self, tmp_path):
+        """The original promise, unchanged."""
+        root = self._project(tmp_path)
+        (root / "added_by_the_run.py").write_text("new\n", encoding="utf-8")
+        snapshot.restore_snapshot(str(root))
+        assert (root / "added_by_the_run.py").is_file()

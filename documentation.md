@@ -49,6 +49,7 @@ Complete reference for the AgentChanti multi-agent AI coding system.
 8. [Plugin System](#plugin-system)
 9. [Supported Languages](#supported-languages)
 10. [Troubleshooting](#troubleshooting)
+11. [External Tools over MCP](mcp.md) — separate guide
 
 ---
 

@@ -17,8 +17,12 @@ certifies it, while `require_independent_evidence` still said `independent`.
 Until the guards move below the tool boundary, a server must be declared
 read-only or given an explicit allow list.
 """
+import logging
+import sys
+
 import pytest
 
+from agentchanti import mcp_bridge
 from agentchanti.llm.chat_types import ToolDef
 from agentchanti.mcp_bridge import (NAME_SEPARATOR, MAX_RESULT_CHARS,
                                     MCPBridge, MCPServerSpec, WithheldTool,
@@ -667,3 +671,509 @@ class TestTheToolListIsDeterministic:
         first = self._offer(["fetch", "head", "resolve"])
         second = self._offer(["fetch", "head", "resolve"])
         assert first == second
+
+
+class TestThePlannerIsToldTheToolsExist:
+    """Measured 2026-10-05 against a live Blender MCP server: five tools
+    were offered to the loop, `execute_blender_code` among them, and the run
+    called `run_command`, `read_file`, `write_file` and `edit_file` — never
+    one of the five. `chat(messages, tools=...)` is called in exactly one
+    place, the agent loop, so the plan was formed without any knowledge that
+    external tools existed and the loop then executed a strategy chosen
+    before they were visible.
+
+    The silence cases matter as much as the content: an ordinary run must
+    pay nothing and its planner prompt must be byte-identical.
+    """
+
+    def test_no_bridge_says_nothing(self):
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(None) == ""
+
+    def test_a_bridge_with_no_tools_says_nothing(self):
+        """A configured server whose every tool was withheld is the same
+        case as no server at all, as far as the planner is concerned."""
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(MCPBridge([])) == ""
+
+    def test_the_tools_are_named(self):
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(_live_bridge(tool="get"))
+        assert "fetch__get" in out
+        assert "EXTERNAL TOOLS AVAILABLE TO STEPS" in out
+
+    def test_only_the_first_line_of_a_description_is_carried(self):
+        """Schemas and usage paragraphs are the expensive part, and the
+        planner never CALLS these tools, so it cannot act on either."""
+        from agentchanti.mcp_bridge import planner_summary, tool_defs_for
+        spec = MCPServerSpec("fetch", command="s", read_only=True)
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for(
+            "fetch",
+            [_Tool("get", "Fetch a URL.\nPass `raw` to skip conversion.\n"
+                          "Returns markdown.")],
+            spec)
+        bridge._defs.extend(offered)
+        out = planner_summary(bridge)
+        assert "Fetch a URL." in out
+        assert "raw" not in out, "a usage paragraph reached the planner"
+
+    def test_a_long_description_is_truncated(self):
+        from agentchanti.mcp_bridge import (PLANNER_SUMMARY_DESC_CHARS,
+                                            planner_summary, tool_defs_for)
+        spec = MCPServerSpec("fetch", command="s", read_only=True)
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for("fetch", [_Tool("get", "x" * 500)], spec)
+        bridge._defs.extend(offered)
+        line = [ln for ln in planner_summary(bridge).splitlines()
+                if "fetch__get" in ln][0]
+        assert len(line) < PLANNER_SUMMARY_DESC_CHARS + 40
+        assert line.endswith("…")
+
+    def test_a_tool_with_no_description_is_still_named(self):
+        """It is named with no ` — ` separator, which is why the log line
+        counts `bridge.definitions()` rather than counting separators."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(_live_bridge(tool="get"))
+        assert "fetch__get" in out
+
+    def test_the_summary_is_byte_identical_across_calls(self):
+        """It rides in the planner prompt, so a reordering would cost the
+        cached prefix — the same requirement `tool_defs_for` carries."""
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(_live_bridge()) == planner_summary(_live_bridge())
+
+
+class TestBothEntryPointsTellThePlanner:
+    """`cli.py` and `api.py` run the same pipeline, and every fix in this
+    codebase that landed on one of them only has had to be found again on
+    the other. These read the source because the defect being pinned is a
+    missing CALL, which no behavioural test of the function can see.
+    """
+
+    def _source(self, rel):
+        import pathlib
+        import agentchanti
+        return (pathlib.Path(agentchanti.__file__).parent / rel
+                ).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_entry_point_attaches_and_tells_the_planner(self, rel):
+        src = self._source(rel)
+        assert "attach_to(memory, cfg)" in src, f"{rel} starts no servers"
+        assert "planner_summary(" in src, f"{rel} plans without the tools"
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_summary_is_appended_exactly_once(self, rel):
+        """`planner.process` is called inside loops on both paths — the
+        retry loop and the interactive approval loop — so appending at the
+        call site would repeat the whole summary on every re-plan."""
+        src = self._source(rel)
+        assert src.count("planner_summary(") == 1, (
+            f"{rel} appends the summary more than once; a re-plan would "
+            f"carry it twice")
+
+    def test_the_summary_is_appended_before_the_planner_runs(self):
+        """Ordering is the whole fix: appended after the first
+        `planner.process`, the first plan — the one that usually ships — is
+        still formed without the tools."""
+        src = self._source("orchestrator/cli.py")
+        assert src.index("planner_summary(") < src.index("planner.process(")
+
+
+class TestTheStartDoesNotDependOnFileMemory:
+    """Measured live, 2026-10-05. The first cut read the bridge off
+    FileMemory while planning:
+
+        _mcp = getattr(memory, "_mcp_bridge", None)
+        UnboundLocalError: cannot access local variable 'memory'
+
+    On `cli.py`'s fresh path FileMemory is not created until AFTER the plan
+    has been approved, so the run crashed before its first step — a run that
+    configured no MCP server at all would have crashed the same way, because
+    the name is unbound whatever the config says. The servers' lifetime has
+    nothing to do with FileMemory's, so the start is its own function.
+    """
+
+    def test_the_bridge_starts_without_any_memory_object(self):
+        from agentchanti.mcp_bridge import ensure_started
+        class _Cfg:
+            MCP = {}
+        assert ensure_started(_Cfg()) is None      # nothing configured
+
+    def test_a_missing_config_attribute_is_not_an_error(self):
+        from agentchanti.mcp_bridge import ensure_started
+        assert ensure_started(object()) is None
+
+    def test_attach_to_still_binds_for_build_step_tools(self):
+        """`build_step_tools` reads `memory._mcp_bridge`, so the binding half
+        has to survive the split."""
+        import agentchanti.mcp_bridge as mb
+        bridge = _live_bridge()
+        prior, mb._ACTIVE = mb._ACTIVE, bridge
+        try:
+            memory = _FakeMemory()
+            assert mb.attach_to(memory, object()) is bridge
+            assert memory._mcp_bridge is bridge
+        finally:
+            mb._ACTIVE = prior
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_planner_does_not_read_the_bridge_off_memory(self, rel):
+        """The whole defect in one line. Reading it off FileMemory is correct
+        in `build_step_tools`, which runs per step, and wrong before the plan
+        exists."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        i = src.index("planner_summary(")
+        window = src[max(0, i - 400):i + 200]
+        assert "ensure_started(cfg)" in window, (
+            f"{rel} does not start the bridge independently of FileMemory")
+        assert 'getattr(memory, "_mcp_bridge"' not in window, (
+            f"{rel} reads the bridge off FileMemory before the plan exists")
+
+
+class TestAStepThatProposesAToolCanRunIt:
+    """Measured 2026-10-05, the run after the planner was first told its
+    tools exist. It adopted them — and the plan vocabulary is CMD / CODE /
+    TEST, so a tool call is none of the three. The planner put the intent in
+    the only slot a CMD step has:
+
+        > echo Configure the active Blender scene through
+          blender__execute_blender_code: retain/add a cube at (0,0,0), ...
+
+    `echo` exits 0, so both tool steps reported success having done nothing,
+    and because all three steps classified CMD the agent loop never ran —
+    the only place `chat(messages, tools=...)` is called, and therefore the
+    only place a tool can be invoked. Zero tool calls in the whole run.
+
+    Awareness without an execution path is worse than no awareness: a step
+    that proposes a tool and then no-ops is a step that cannot fail.
+    """
+
+    def _bridge(self, *names):
+        from agentchanti.mcp_bridge import tool_defs_for
+        spec = MCPServerSpec("blender", command="s", allow=list(names))
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for("blender", [_Tool(n) for n in names], spec)
+        bridge._defs.extend(offered)
+        return bridge
+
+    def test_the_measured_command_is_named(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        cmd = ("echo Configure the active Blender scene through "
+               "blender__execute_blender_code: retain/add a cube at (0,0,0), "
+               "set frame_start=1 and frame_end=60")
+        reason = hollow_tool_command(cmd, "Configure the scene",
+                                     self._bridge("execute_blender_code"))
+        assert reason and "blender__execute_blender_code" in reason
+
+    def test_a_tool_named_only_in_the_description_counts(self):
+        """The command and the description are one claim about one step."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        reason = hollow_tool_command(
+            "echo verifying", "Verify through blender__get_scene_info",
+            self._bridge("get_scene_info"))
+        assert reason is not None
+
+    def test_an_ordinary_echo_step_is_untouched(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command("echo hello", "say hello",
+                                   self._bridge("get_scene_info")) is None
+
+    def test_a_command_with_an_effect_is_never_called_hollow(self):
+        """`echo x > f` writes a file and `echo x && npm i` installs — both
+        do real work, and reading either as a no-op would SKIP it."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        b = self._bridge("execute_blender_code")
+        for cmd in ("echo cube > blender__execute_blender_code.txt",
+                    "echo blender__execute_blender_code && npm install",
+                    "echo blender__execute_blender_code | python run.py"):
+            assert hollow_tool_command(cmd, "", b) is None, cmd
+
+    def test_a_real_command_is_never_called_hollow(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "python -m venv venv", "set up for blender__execute_blender_code",
+            self._bridge("execute_blender_code")) is None
+
+    def test_a_tool_nobody_configured_is_not_a_finding(self):
+        """Naming a tool that is not offered is an ordinary plan mistake,
+        and there is nothing to route the step to."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "echo call blender__export_scene", "",
+            self._bridge("get_scene_info")) is None
+
+    def test_no_bridge_is_silent(self):
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command("echo blender__x", "", None) is None
+
+    def test_a_bare_tool_name_is_not_enough(self):
+        """`export_scene` is an ordinary English phrase in a plan
+        description; `blender__export_scene` is not."""
+        from agentchanti.mcp_bridge import hollow_tool_command
+        assert hollow_tool_command(
+            "echo now export the scene", "export_scene when done",
+            self._bridge("export_scene")) is None
+
+    def test_the_planner_is_told_which_step_type_can_call_one(self):
+        """The guard above is the backstop. Getting the step type right in
+        the first place costs nothing."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge("execute_blender_code"))
+        assert "CODE or TEST step" in out
+        assert "echo" in out
+
+    def test_the_cmd_handler_routes_instead_of_running_the_noop(self):
+        """Source-level, because the defect is a missing call: the check has
+        to run BEFORE the command is executed, and nothing about the
+        function's return value can show where it sits."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent
+               / "orchestrator" / "step_handlers.py").read_text(encoding="utf-8")
+        assert "hollow_tool_command" in src, "no CMD step is ever routed"
+        i = src.index("hollow_tool_command")
+        assert src.index("# ── Idempotency check ──") > i, (
+            "the routing check runs after the command would have been run")
+        window = src[i:i + 2000]
+        assert "run_agent_loop_with_escalation" in window
+
+
+class TestThePlannerIsToldWhatTheToolsReach:
+    """Measured 2026-10-05, the run after the step-type guidance landed. The
+    step types were right — 2.1 classified CODE, so the loop ran with 11
+    tools in scope — and the plan went straight back to::
+
+        > blender --background --python create_cube_animation.py
+
+    Correct work, in a fresh process, that could never touch the Blender
+    session the task was about. One MCP call was made (`bpy_api_lookup`,
+    for API reference) and then the model wrote a script.
+
+    A planner has no reason to prefer a tool over a script it already knows
+    how to write, unless it is told what the tool can reach that the script
+    cannot. The first summary explained the MECHANICS of calling one and
+    never said what was on the other end.
+    """
+
+    def _bridge(self):
+        from agentchanti.mcp_bridge import tool_defs_for
+        spec = MCPServerSpec("blender", command="s",
+                             allow=["execute_blender_code"])
+        bridge = MCPBridge([spec])
+        offered, _ = tool_defs_for(
+            "blender", [_Tool("execute_blender_code")], spec)
+        bridge._defs.extend(offered)
+        return bridge
+
+    def test_the_summary_says_the_system_is_live_and_external(self):
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "LIVE EXTERNAL SYSTEM" in out
+
+    def test_it_says_a_script_cannot_reach_it(self):
+        """The decisive fact, and the one the measured plan did not know."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge()).lower()
+        assert "fresh process" in out
+        assert "different result" in out
+
+    def test_it_still_says_which_step_type_can_call_one(self):
+        """The mechanics must survive the reframing — without them the
+        planner emits a CMD step and the hollow-command guard has to catch
+        it, which costs a step."""
+        out = None
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "CODE or TEST step" in out
+
+    def test_it_does_not_tell_the_planner_to_use_tools_for_everything(self):
+        """Over-steering is the opposite failure: most steps are ordinary
+        files and commands, and a plan that routes those through a tool
+        would be worse than the one this fixes."""
+        from agentchanti.mcp_bridge import planner_summary
+        out = planner_summary(self._bridge())
+        assert "ordinary files and commands for everything else" in out
+
+    def test_it_is_still_silent_with_nothing_configured(self):
+        from agentchanti.mcp_bridge import planner_summary
+        assert planner_summary(None) == ""
+        assert planner_summary(MCPBridge([])) == ""
+
+
+class TestWhoeverDecidesTheStrategySeesTheTools:
+    """Measured 2026-10-05, the run after the summary was reframed to say what
+    the tools REACH. The planner was told about five Blender tools and still
+    planned::
+
+        > blender --background --python create_cube_animation.py
+
+    The cause was ordering, not wording. The IntentAgent's REQUIREMENTS_SPEC
+    is what fixes the strategy, and this run's log shows it written at
+    23:04:25 while the bridge started at 23:05:54 — eighty-nine seconds
+    later. So the planner received general advice about tools alongside a
+    concrete directive that already named the script::
+
+        Agent directive: Create `create_cube_animation.py` using Blender bpy
+        Expected output: Running `blender --background --python ...` produces
+                         `cube_rotation_animation.blend`
+
+    A concrete directive beats general advice, and rightly so. This is the
+    original defect one layer up: `chat(messages, tools=...)` is called in one
+    place, and now the summary is injected in one place — but the strategy was
+    decided before either.
+    """
+
+    def test_analyze_intent_accepts_the_tools(self):
+        import inspect
+        from agentchanti.agents.intent import IntentAgent
+        sig = inspect.signature(IntentAgent.analyze_intent)
+        assert "external_tools" in sig.parameters
+
+    def test_pre_analyze_accepts_and_forwards_them(self):
+        import inspect
+        from agentchanti.agents.planner import PlannerAgent
+        assert "external_tools" in inspect.signature(
+            PlannerAgent.pre_analyze).parameters
+        src = inspect.getsource(PlannerAgent.pre_analyze)
+        assert "external_tools=external_tools" in src, (
+            "pre_analyze takes the tools and never passes them on")
+
+    def test_the_tools_lead_the_intent_context(self):
+        """Before the KB block, because the spec it produces decides the
+        strategy and nothing later can unmake that decision."""
+        import inspect
+        from agentchanti.agents.intent import IntentAgent
+        src = inspect.getsource(IntentAgent.analyze_intent)
+        assert "if external_tools:" in src
+        assert src.index("if external_tools:") < src.index("if kb_context:")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_bridge_starts_before_the_strategy_is_decided(self, rel):
+        """The whole fix is an ordering, which no behavioural test of either
+        function can see."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        assert src.index("ensure_started(cfg)") < src.index("pre_analyze("), (
+            f"{rel} decides the strategy before the tools exist")
+        assert "external_tools=_tool_summary" in src, (
+            f"{rel} starts the bridge and does not tell the intent phase")
+
+    @pytest.mark.parametrize("rel", ["orchestrator/cli.py", "api.py"])
+    def test_the_bridge_is_started_exactly_once(self, rel):
+        """`ensure_started` is idempotent, but two call sites would mean two
+        places to keep in step — and the planner append must still happen
+        after the summary is in hand."""
+        import pathlib
+        import agentchanti
+        src = (pathlib.Path(agentchanti.__file__).parent / rel
+               ).read_text(encoding="utf-8")
+        assert src.count("ensure_started(cfg)") == 1
+        assert src.count("planner_summary(") == 1
+
+
+# ─── the optional extra, and the journey when it is missing ──────────
+
+
+class TestTheOptionalExtraIsOptional:
+    """`mcp` is an extra, not a dependency, and the promise is twofold.
+
+    A run that configures no server must pay NOTHING — not a slower import,
+    not a warning about a package nobody asked for. And a run that DOES
+    configure one without the extra must get exactly one accurate message.
+
+    Measured 2026-10-08, before the second half held: a config carrying a
+    `snapshot:` pair produced the correct `pip install agentchanti[mcp]`
+    line and then a second warning saying the snapshot command "is not a
+    runnable tool call", which sent the reader to check syntax that was
+    perfectly correct. `ensure_started` returned a bridge that could not
+    reach anything, so every `if bridge is None` guard downstream took the
+    wrong branch and reported a wrong cause.
+    """
+
+    @staticmethod
+    def _without_the_sdk(monkeypatch):
+        import builtins
+        real = builtins.__import__
+
+        def fake(name, *a, **k):
+            if name == "mcp" or name.startswith("mcp."):
+                raise ModuleNotFoundError("No module named 'mcp'")
+            return real(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake)
+        for mod in [m for m in sys.modules if m == "mcp" or m.startswith("mcp.")]:
+            monkeypatch.delitem(sys.modules, mod)
+
+    @staticmethod
+    def _cfg(servers):
+        class Cfg:
+            MCP = {"servers": servers} if servers else None
+        return Cfg()
+
+    SERVER = {"name": "blender", "transport": "stdio", "command": "python",
+              "args": ["x.py"], "allow": ["execute_code"]}
+
+    def test_no_servers_configured_says_nothing_at_all(self, monkeypatch, caplog):
+        """A warning about an absent dependency nobody asked for is noise,
+        and noise in the startup output trains a reader to skip it."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.DEBUG):
+            assert mcp_bridge.ensure_started(self._cfg(None)) is None
+        assert "mcp" not in caplog.text.lower()
+
+    def test_a_configured_server_without_the_extra_says_how_to_get_it(
+            self, monkeypatch, caplog):
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            mcp_bridge.ensure_started(self._cfg([self.SERVER]))
+        assert "pip install agentchanti[mcp]" in caplog.text
+
+    def test_and_says_nothing_else(self, monkeypatch, caplog):
+        """One accurate message, not an accurate one plus a misleading one."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            mcp_bridge.ensure_started(self._cfg([self.SERVER]))
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    def test_a_bridge_that_offers_nothing_is_not_handed_out(
+            self, monkeypatch, caplog):
+        """So every `if bridge is None` guard downstream is told the truth."""
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        with caplog.at_level(logging.WARNING):
+            assert mcp_bridge.ensure_started(self._cfg([self.SERVER])) is None
+        assert mcp_bridge.active_bridge() is None
+
+    def test_the_capture_is_silent_rather_than_wrong(self, monkeypatch,
+                                                     caplog, tmp_path):
+        """The measured false diagnosis: `snapshot:` syntax was correct."""
+        from agentchanti.orchestrator import external_state as ext
+        self._without_the_sdk(monkeypatch)
+        monkeypatch.setattr(mcp_bridge, "_ACTIVE", None)
+        server = dict(self.SERVER, snapshot={
+            "capture": 'mcp:blender__execute_code {"code": "save {path}"}',
+            "restore": 'mcp:blender__execute_code {"code": "open {path}"}'})
+        bridge = mcp_bridge.ensure_started(self._cfg([server]))
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            ext.capture_all(bridge, getattr(bridge, "_specs", {}),
+                            root=str(tmp_path))
+        assert "not a runnable tool call" not in caplog.text
+
+    def test_the_sdk_check_names_the_extra(self):
+        """Whatever else changes, the message must carry the command."""
+        ok, why = mcp_bridge.mcp_available()
+        if ok:
+            pytest.skip("the mcp extra is installed in this environment")
+        assert "pip install agentchanti[mcp]" in why

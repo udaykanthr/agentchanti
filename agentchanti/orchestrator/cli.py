@@ -510,16 +510,28 @@ def _green_suites_contradicting(regressions) -> list[tuple[str, str]]:
 
 
 def _enforce_monotonic_gates(snapshots, executor, stage: str,
-                             repair=None, display=None) -> bool:
+                             repair=None, display=None,
+                             authority: str = "") -> bool:
     """Snapshot *stage*, then re-run every acceptance gate recorded so far.
 
     Must be called after **every** stage that can write source files —
     each wave, the bulk-test fix round, wiring verification (through
-    `_check_advisory_stage`), and the smoke-test repair loop.
-    Skipping any of them lets that stage's edits ship unverified: the
-    smoke test repaired a launch crash by changing ``Player.update()``'s
-    signature, the already-green ``python -m unittest discover`` gate went
-    red, nothing rechecked it, and the run reported ``Finished``.
+    `_check_advisory_stage`), the smoke-test repair loop, and the
+    acceptance repair round. Skipping any of them lets that stage's edits
+    ship unverified: the smoke test repaired a launch crash by changing
+    ``Player.update()``'s signature, the already-green ``python -m unittest
+    discover`` gate went red, nothing rechecked it, and the run reported
+    ``Finished``.
+
+    *authority* names an instrument that outranks a plan gate, and is the
+    difference between a rollback and a reported conflict. Supplied for the
+    acceptance repair round: rolling that stage back restores a tree a
+    user-supplied acceptance command has already FAILED, which is strictly
+    worse than keeping a tree it passes and naming the red gate. This is
+    `_green_suites_contradicting`'s reasoning with a stronger witness —
+    `acceptance_cmds` is the one instrument the model neither wrote nor can
+    edit — and like that branch it still returns False, because an
+    unresolved red gate must never be reported as success.
 
     *repair* is an optional zero-arg callable invoked once when a
     regression is found, before deciding to roll back. Use it where the
@@ -589,6 +601,26 @@ def _enforce_monotonic_gates(snapshots, executor, stage: str,
     # the better authority — it is where the task's own invariants live.
     # Keep the work and name both sides. Still returns False: an unresolved
     # red gate must never be reported as success.
+    if authority:
+        set_status(display, "")
+        log.error(
+            "[Monotonic] GATE CONFLICT after %s — %d previously-passing "
+            "gate(s) are red while %s passes. That instrument is outside "
+            "this run and cannot be edited by the model, so it outranks a "
+            "gate the plan wrote. NOT rolling back: the tree before %s is "
+            "one %s has already failed.",
+            stage, len(regressions), authority, stage, authority)
+        for _cmd, _label, _out in regressions:
+            log.error("[Monotonic]   red gate (step %s): %s",
+                      _label or "?", _cmd)
+            log.error("[Monotonic]   output:\n%s",
+                      (_out or "(no output captured)").strip())
+        log.error(
+            "[Monotonic] Both cannot hold. Read the gate above as the "
+            "suspect: a step whose gate asserts the postcondition of its "
+            "own mistake goes red exactly when that mistake is corrected.")
+        return False
+
     _conflict = _green_suites_contradicting(regressions)
     if _conflict:
         set_status(display, "")
@@ -754,6 +786,15 @@ def _main_impl():
         kb_main(sys.argv[2:])
         return
 
+    # `agentchanti mcp ...` likewise, and deliberately before any config,
+    # provider or API key is resolved: someone asking why their MCP server
+    # is not working must not be told to supply credentials to find out —
+    # the same argument `--restore` makes. Starting a configured server
+    # needs neither.
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp":
+        from ..mcp_cli import mcp_main
+        sys.exit(mcp_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="AgentChanti — Multi-Agent Local Coder")
     from .. import __version__ as _agentchanti_version
     parser.add_argument("--version", action="version",
@@ -814,7 +855,39 @@ def _main_impl():
         from ..snapshot import restore_snapshot
         ok, detail = restore_snapshot(".")
         verb = "Restored" if ok else "Could not restore"
-        print("\n  " + verb + ": " + detail + "\n")
+        print("\n  " + verb + ": " + detail)
+        # External state too, for any server that declared how. Still no
+        # provider and no API key: starting a configured MCP server needs
+        # neither, and someone reaching for an undo must not be asked for
+        # credentials. Offered here and NEVER taken automatically — the
+        # measured run failed while leaving a CORRECT scene, so a rollback
+        # on failure would have destroyed the work the user wanted.
+        try:
+            from .. import mcp_bridge as _mb
+            from . import external_state as _ext
+            _cfg_for_restore = Config.load(args.config)
+            _bridge = _mb.ensure_started(_cfg_for_restore)
+            if _bridge is not None:
+                rows = _ext.restore_all(
+                    _bridge, getattr(_bridge, "_specs", {}))
+                for name, row_ok, row_detail in rows:
+                    # The WHOLE detail on a failure. `exit: failure` is the
+                    # verdict header and carries nothing; printing only it
+                    # is how `ERROR: unknown tool 'blender__execute_code'`
+                    # stayed invisible through the one restore that
+                    # mattered. A success stays to one line.
+                    _shown = (row_detail.splitlines()[0][:160] if row_ok
+                              else row_detail.strip()[:600])
+                    print(f"  {'Restored' if row_ok else 'Could not restore'}"
+                          f" {name}: {_shown}")
+                if not rows:
+                    print("  No external server declared a `snapshot:` pair, "
+                          "so nothing outside the project was preserved.")
+            _mb.stop_active()
+        except Exception as exc:
+            print(f"  External restore unavailable: "
+                  f"{type(exc).__name__}: {exc}")
+        print()
         return
 
     # ── 0. Load config ──
@@ -1348,6 +1421,20 @@ def _main_impl():
                 _intent_subproject = _detect_subproject_root(_pre_mem_local)
             except Exception:
                 pass
+        # The bridge starts HERE, before pre_analyze, and not where it used
+        # to: the IntentAgent's REQUIREMENTS_SPEC is what decides the
+        # strategy, and it was written 89 seconds before any tool existed.
+        # Measured 2026-10-05 - the planner was told about 5 Blender tools
+        # and still planned `blender --background --python script.py`,
+        # because the spec beside it already said "Agent directive: Create
+        # create_cube_animation.py ...". `ensure_started` is idempotent, so
+        # the later call is a no-op that returns the same bridge.
+        _mcp = _mcp_bridge.ensure_started(cfg)
+        _tool_summary = _mcp_bridge.planner_summary(_mcp)
+        if _tool_summary:
+            log.info("[MCP] intent analysis and planner told about %d "
+                     "external tool(s)", len(_mcp.definitions()))
+
         analysis_context = planner.pre_analyze(
             args.task,
             source_files=source_files,
@@ -1363,6 +1450,7 @@ def _main_impl():
             intent_agent=intent_agent,
             cli_display=display,
             subproject_cwd=_intent_subproject,
+            external_tools=_tool_summary,
             executor=executor,
         )
         if analysis_context:
@@ -1440,6 +1528,23 @@ def _main_impl():
             language = _llm_detected
             # Re-describe coder agent role with the corrected language
             coder.role = f"Write clean {get_language_name(language)} code for a single step."
+
+        # The planner has never seen a tool definition: `chat(messages,
+        # tools=...)` is called in exactly one place, the agent loop, so the
+        # plan is formed without knowing external tools exist and the loop
+        # then executes a strategy chosen before they were visible. Measured
+        # 2026-10-05 against a live Blender MCP server: five tools offered to
+        # the loop, `execute_blender_code` among them, and the run called
+        # run_command / read_file / write_file / edit_file — never one of the
+        # five, because the plan already said "write a script".
+        #
+        # Appended once, here, rather than at each planner.process call: both
+        # of those sit inside loops (the retry loop and the interactive
+        # approval loop), and `+=` there would repeat the whole summary on
+        # every re-plan. Empty when nothing is configured, so an ordinary
+        # run's planner prompt is byte-identical.
+        if _tool_summary:
+            planner_context += "\n\n" + _tool_summary
 
         MAX_PLAN_RETRIES = 3
         plan = None
@@ -2116,6 +2221,24 @@ def _main_impl():
     else:
         waves = build_step_waves(steps, dependencies)
     log.info(f"Execution waves: {waves}")
+
+    # ── An undo for state that is not a file ──
+    # Every other rollback here is made of files and git — wave snapshots,
+    # the monotonic-gate rollback, `_best_snapshot`, `agentchanti --restore`.
+    # A run that reaches a live external system through MCP has none of them.
+    # Measured 2026-10-06: a tool-only Blender run left an action with zero
+    # curves and a constant 360° rotation partway through and recovered only
+    # because it had turns left; had it not, nothing in the system could have
+    # put the user's scene back. Taken before the first step, for the reason
+    # `take_snapshot` runs before the project scan.
+    if _mcp is not None:
+        from . import external_state as _ext
+        _ext.warn_about_unprotected_servers(_mcp, getattr(_mcp, "_specs", {}))
+        _ext_captured = _ext.capture_all(_mcp, getattr(_mcp, "_specs", {}))
+        if _ext_captured:
+            log.info("[External] %d server(s) can be restored with "
+                     "`agentchanti --restore`: %s", len(_ext_captured),
+                     ", ".join(sorted(_ext_captured)))
 
     # Build step reports for HTML output
     step_reports = [StepReport(index=i, text=steps[i]) for i in range(len(steps))]
@@ -2890,6 +3013,26 @@ def _main_impl():
                                               None),
                     kb_context_builder=kb_context_builder,
                     project_root=os.getcwd()))
+            # The repair round writes source — and, through a tool, live
+            # external state — and it was the one such stage with no gate
+            # check after it. It is also the likeliest of them to break a
+            # plan gate, because it exists to change the artifact until an
+            # independent instrument goes green, which can directly
+            # contradict what a step asserted about its own work.
+            #
+            # Measured 2026-10-07 on a live Blender run: step 2 deleted an
+            # object the task said to leave alone and gated itself on
+            # `assert len(scene.objects)==5`; the acceptance check caught
+            # the deletion; the repair put an object back; and the step's
+            # gate was therefore red at the end of a run that reported
+            # success. Nothing looked. Same shape as the defect
+            # `_check_advisory_stage` was written for, whose own docstring
+            # enumerated every stage that writes source and omitted one.
+            if _acceptance_passed and not _enforce_monotonic_gates(
+                    snapshots, executor, "acceptance repair",
+                    display=display,
+                    authority="the user's acceptance command(s)"):
+                pipeline_success = False
         if _acceptance_passed is False:
             pipeline_success = False
             log.error("Pipeline failed: user acceptance command(s) did not "

@@ -6,6 +6,11 @@ import subprocess
 from typing import Dict, List, Tuple
 from . import winjob
 from .cli_display import log
+# Safe at module level: `mcp_bridge` imports nothing but stdlib and
+# `llm.chat_types`. `orchestrator.tool_gates` is NOT, because importing it
+# runs `orchestrator/__init__.py`, which imports `cli`, which imports this
+# module — so that one stays lazy, as `gate_safety` already does.
+from .mcp_bridge import NAME_SEPARATOR as MCP_NAME_SEPARATOR, active_bridge
 
 # Substituted for a failing command's empty output. A silent failure says
 # nothing the caller can act on, so consumers key off this to react to
@@ -1709,6 +1714,61 @@ class Executor:
             run_env[path_key] = venv_bin + os.pathsep + current if current else venv_bin
         run_env.setdefault("VIRTUAL_ENV", os.path.dirname(venv_bin))
 
+    def _as_tool_gate(self, cmd: str) -> Tuple[bool, str] | None:
+        """Run *cmd* as MCP tool calls, or None if it is not tool calls.
+
+        `tool_gates` turned a `verify:` that names an external tool into
+        something runnable, and wired it into the two places that knew
+        about it: the agent loop's own verification, and `external_state`.
+        Every OTHER gate-running route in the pipeline reaches
+        `run_command`, so every other route sent a tool gate to cmd.exe.
+
+        Measured 2026-10-07 on a live Blender run. `GateLedger` re-ran the
+        step's gate four times — after the wave, after bulk-test fixes,
+        after wiring fixes, after smoke-test fixes — and got, every time::
+
+            'mcp:blender__execute_code' is not recognized as an internal
+            or external command
+
+        `_is_harness_error` reads that as "the gate can no longer launch",
+        which is correct about what it sees and means the monotonic-gate
+        protection is **structurally absent for every tool-verified step,
+        while saying nothing about it** — the `empty_suite_reason` mistake
+        pointed at a safety net. It mattered in that run: the acceptance
+        repair re-added an object the step had deleted, which makes the
+        step's own `assert len(scene.objects)==5` red. Nothing could see it.
+
+        Here rather than at each caller for the reason `run_command`'s own
+        docstring gives about destructive commands: this is the one seam
+        every route passes through, and a fix applied per route leaves
+        every route its author did not think of unprotected.
+
+        Cannot misfire on an ordinary command: `parse` returns None unless
+        EVERY `&&` segment is a qualified name the bridge actually offers,
+        and the fast path below means a run with no servers configured pays
+        one attribute read.
+        """
+        # A qualified tool name always carries the separator, with or
+        # without the `mcp:` prefix, so this one test is the whole fast path.
+        if MCP_NAME_SEPARATOR not in cmd:
+            return None
+        bridge = active_bridge()
+        if bridge is None:
+            return None
+        from .orchestrator import tool_gates
+        gates = tool_gates.parse(cmd, bridge)
+        if gates is None:
+            return None
+        log.info("[ToolGate] running %d tool call(s) through the bridge: %s",
+                 len(gates), ", ".join(g.tool for g in gates))
+        out = tool_gates.run_via_bridge(gates, bridge)
+        ok = out.startswith("exit: success")
+        # Set so `is_abnormal_exit` and the ledger's crash retry read an
+        # ordinary verdict here. A tool call is not a process and can never
+        # die abnormally, so 0/1 is the whole range.
+        self.last_exit_code = 0 if ok else 1
+        return ok, out
+
     def run_command(self, cmd: str, env: dict | None = None,
                     timeout: int = 120, background: bool = False,
                     cwd: str | None = None,
@@ -1765,6 +1825,13 @@ class Executor:
                 f"is actually in it before replacing it, and prefer editing "
                 f"the project that is there to re-creating it. Clearing "
                 f"build output (node_modules, dist, build) is still allowed.")
+
+        # After the destructive screen, deliberately: a tool gate's payload
+        # is the most capable thing in the system, and routing it before
+        # that check would let it round the one seam the check sits on.
+        _tool = self._as_tool_gate(cmd)
+        if _tool is not None:
+            return _tool
 
         ok, out = self._run_command_once(
             cmd, env=env, timeout=timeout, background=background, cwd=cwd)

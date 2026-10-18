@@ -113,6 +113,14 @@ _DEFAULTS = {
 _CONFIG_FILENAMES = [".agentchanti.yaml", ".agentchanti.yml"]
 
 
+def _config_file_in(directory: str) -> str | None:
+    for name in _CONFIG_FILENAMES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def _find_config_file(explicit_path: str | None = None) -> str | None:
     """Find the config file. Checks explicit path, CWD, then user home."""
     if explicit_path:
@@ -121,13 +129,72 @@ def _find_config_file(explicit_path: str | None = None) -> str | None:
         return None
 
     # Search CWD first, then home directory
-    search_dirs = [os.getcwd(), os.path.expanduser("~")]
-    for d in search_dirs:
-        for name in _CONFIG_FILENAMES:
-            path = os.path.join(d, name)
-            if os.path.isfile(path):
-                return path
+    for d in (os.getcwd(), os.path.expanduser("~")):
+        path = _config_file_in(d)
+        if path:
+            return path
     return None
+
+
+def home_config_file() -> str | None:
+    """The user-level config, if there is one. Never the project's."""
+    home = os.path.expanduser("~")
+    if os.path.abspath(home) == os.path.abspath(os.getcwd()):
+        return None
+    return _config_file_in(home)
+
+
+def _merged_mcp_servers(path: str | None, explicit: bool) -> dict | None:
+    """The `mcp:` section, merged across the user and project configs.
+
+    Everything else in `.agentchanti.yaml` keeps its first-file-wins
+    resolution: `_find_config_file` returns the project file when there is
+    one, and a home file is ignored entirely. That is right for a provider
+    and an API key, where two half-applied sources would be worse than one,
+    and it is WRONG for MCP servers — "a server I want in every project" is
+    exactly what a user-level entry means, and under first-file-wins it was
+    silently dead in every project that sets a provider, which is every
+    project. `agentchanti mcp add --scope user` had to refuse for that
+    reason alone.
+
+    So this one section merges, and only this one. Project entries come
+    first, which gives them precedence: `load_specs` keeps the first of a
+    duplicated name and reports the rest, so a project server shadowing a
+    user one is both honoured and said out loud.
+
+    An EXPLICIT `--config` path means "use this file", and merging a home
+    file into it would make that false. Returns None to leave the caller's
+    own reading alone.
+    """
+    if explicit or not path:
+        return None
+    home = home_config_file()
+    if not home or os.path.abspath(home) == os.path.abspath(path):
+        return None
+    project_raw = (_load_yaml(path) or {}).get("mcp") or {}
+    home_raw = (_load_yaml(home) or {}).get("mcp") or {}
+
+    def _servers(raw):
+        entries = raw.get("servers") if isinstance(raw, dict) else raw
+        if isinstance(entries, dict):
+            entries = [{**v, "name": k} for k, v in entries.items()
+                       if isinstance(v, dict)]
+        return list(entries) if isinstance(entries, list) else []
+
+    home_servers = _servers(home_raw)
+    if not home_servers:
+        return None
+    # Tagged with where each came from, so `mcp list` can say which file is
+    # responsible for a server — without it a merged view is a mystery, and
+    # the mystery is the thing this whole command set exists to remove.
+    for entry in home_servers:
+        if isinstance(entry, dict):
+            entry.setdefault("_source", home)
+    project_servers = _servers(project_raw)
+    for entry in project_servers:
+        if isinstance(entry, dict):
+            entry.setdefault("_source", path)
+    return {"servers": project_servers + home_servers}
 
 
 def _load_yaml(path: str) -> dict:
@@ -688,9 +755,17 @@ class Config:
 
     @classmethod
     def load(cls, config_path: str | None = None) -> "Config":
-        """Load config from YAML file (if found) + env vars + defaults."""
+        """Load config from YAML file (if found) + env vars + defaults.
+
+        One section is resolved differently from the rest: see
+        `_merged_mcp_servers` for why MCP servers merge across the user and
+        project files while everything else is first-file-wins.
+        """
         path = _find_config_file(config_path)
         yaml_data = _load_yaml(path) if path else {}
+        merged = _merged_mcp_servers(path, explicit=bool(config_path))
+        if merged is not None:
+            yaml_data = {**yaml_data, "mcp": merged}
         return cls(yaml_data)
 
     # Safety: Critical files that require extra care when editing

@@ -25,6 +25,7 @@ from threading import Lock
 from ..agent_tools import NO_TESTS_MARKER, AgentTools, _truncate
 from ..executor import NO_OUTPUT_MARKER
 from ..llm.chat_types import Message, ToolCall
+from ..mcp_bridge import NAME_SEPARATOR as MCP_NAME_SEPARATOR
 from .gate_integrity import (observe_gate_verdict, platform_equivalent_variants,
                              record_gate_repair)
 
@@ -554,6 +555,38 @@ def _py_signature_outline(source: str) -> str | None:
     return "\n".join(lines) if lines else None
 
 
+def _is_prose_not_a_path(target: str) -> bool:
+    """True when a declared `target:` is a description, not a filename.
+
+    A step that changes a live external system has no file to name, and a
+    planner asked for one writes what it means. Measured 2026-10-07 on a
+    Blender run::
+
+        target: Blender open scene (live session; no project files)
+
+    That resolves to a path which will never exist, so `_missing_required`
+    reported it missing on every turn and the early exit was declined five
+    times — the gate PASSED on turn 2 and the step ran to turn 7, re-proving
+    a verdict already in hand, with the late turns the dear ones because the
+    whole conversation is resent each time.
+
+    The rule is deliberately narrow: more than two words, no directory
+    separator and no extension. `Makefile` is one word, `src/main.py` has
+    both, and `my notes.txt` has an extension, so none of them is touched.
+    Being wrong here only WEAKENS a guard — the gate itself must still pass
+    — which is the direction `_missing_required` already chooses for a
+    target it cannot resolve.
+    """
+    text = (target or "").strip()
+    if not text:
+        return False
+    if "/" in text or "\\" in text:
+        return False
+    if os.path.splitext(text)[1]:
+        return False
+    return len(text.split()) > 2
+
+
 def _missing_required(tools: AgentTools,
                       required: set[str] | None) -> list[str]:
     """Declared target files that are still absent from disk.
@@ -567,6 +600,12 @@ def _missing_required(tools: AgentTools,
     missing = []
     for path in sorted(required):
         if not path or not path.strip():
+            continue
+        if _is_prose_not_a_path(path):
+            _logger.debug("[AgentLoop] ignoring declared target %r — it is a "
+                          "description, not a filename, so it can never "
+                          "exist and would block the early exit forever",
+                          path.strip())
             continue
         try:
             full = tools._resolve(path.strip())
@@ -970,6 +1009,30 @@ def run_agent_loop(
     _dirty_since_gate = False
     _gate_cache: str | None = None
 
+    # Did this step DO anything yet? `edited_files` was standing in for that
+    # question and answers it only for steps that write files: a tool-only
+    # step edits none, so the early gate (guarded on `edited_files`) never
+    # ran, and an MCP tool call never marked the gate dirty either. Measured
+    # 2026-10-07 on a live Blender run: three gate runs, all after the work,
+    # none at turn zero, and a cached green verdict could have outlived the
+    # tool call that invalidated it.
+    _tool_acted = False
+
+    # The gate's verdict BEFORE this step did anything. A gate that passes
+    # here and fails once the step has acted is measuring the ABSENCE of the
+    # step's work -- a precondition written into the `verify:` slot. Measured
+    # on the same run, where the planner wrote
+    #     assert bpy.data.objects.get('Spinner') is None
+    # for a step whose whole job was to create `Spinner`. The artifact was
+    # correct and the run failed; `_always_fails_error` could not see it,
+    # because it reasons about cmd.exe operators and this is a Python
+    # assertion inside a tool payload.
+    _gate_before_work: bool | None = None
+
+    def _is_tool_gate(cmd: str | None) -> bool:
+        from . import tool_gates
+        return tool_gates.is_tool_gate(cmd, getattr(tools, "_mcp", None))
+
     # Set once the gate is proven to be measuring something other than
     # the artifact (see gate_integrity.observe_gate_verdict). Ends the
     # loop and suppresses the escalation, which would otherwise spend a
@@ -1032,6 +1095,7 @@ def run_agent_loop(
         # does not start with `exit: success`, so `verify_passed` reads
         # it as a failure and the step cannot exit green on it.
         from .gate_safety import destructive_reason
+        from . import tool_gates
         _cmd = cmd or verify_cmd
         _unsafe = destructive_reason(_cmd or "")
         if _unsafe:
@@ -1041,10 +1105,61 @@ def run_agent_loop(
                     f"{_unsafe}. A verify command must only observe; it is "
                     f"re-run after every later wave, so its side effects "
                     f"happen repeatedly.")
+        # A gate that is an MCP tool call rather than a shell command. There
+        # is no shell command that observes a running external application,
+        # so the planner's `verify: blender__get_scene_info` could not pass
+        # over any artifact — measured 2026-10-06 against a correct one.
+        # `tool_gates.run` answers in `exit: success` / `exit: failure`, so
+        # `verify_passed` and the ledger read it exactly as a shell gate.
+        _tg = tool_gates.parse(_cmd, getattr(tools, "_mcp", None))
+        if _tg is not None:
+            _weak = tool_gates.shallow_tool_gate_reason(_tg)
+            if _weak:
+                # Reported, never silently upgraded to a pass: turning an
+                # impossible gate into a tautological one would trade one
+                # false verdict for another.
+                _logger.warning("[ToolGate] step %d: %s",
+                                step_idx + 1, _weak)
+            _logger.info("[ToolGate] step %d: running the gate as %d tool "
+                         "call(s): %s", step_idx + 1, len(_tg),
+                         ", ".join(g.tool for g in _tg))
+            return tool_gates.run(_tg, tools)
+        # Which path a gate took is not recoverable from the log afterwards,
+        # and the two are easy to confuse: a gate that reads `mcp:server__tool
+        # {...}` fails in cmd.exe with a 114-character "is not recognized",
+        # which looks nothing like the assertion it was meant to make.
+        # Measured 2026-10-07: a run took the shell path for a gate that
+        # parses cleanly as a tool call when replayed, and the log recorded
+        # only `output=116 chars` — enough to misread the failure as the
+        # gate's own verdict, which is exactly what happened.
+        if _cmd and _cmd.lstrip().lower().startswith(tool_gates.TOOL_GATE_PREFIX):
+            _mcp_for_log = getattr(tools, "_mcp", None)
+            _logger.warning(
+                "[ToolGate] step %d: the gate is written as a tool call but "
+                "was NOT recognised as one, so it is going to the shell, "
+                "where it cannot run. Offered tools: %s",
+                step_idx + 1,
+                ", ".join(d.name for d in _mcp_for_log.definitions())
+                if _mcp_for_log else "none (no MCP bridge)")
         return tools.execute_all([_verify_call(_cmd)])[0].content
 
+    def _gate_variants(cmd: str) -> list:
+        """Other readings of the same gate, whichever kind of gate it is.
+
+        A shell gate's other reading is the other shell's dialect. A TOOL
+        gate's is the host application's Python API — `platform_equivalent_
+        variants` has nothing to say about it, and said nothing while a run
+        spent 20 turns and 109,609 tokens on a gate that compared Blender
+        node wrappers with `is`.
+        """
+        from . import tool_gates
+        bridge = getattr(tools, "_mcp", None)
+        if tool_gates.is_tool_gate(cmd, bridge):
+            return tool_gates.equivalent_variants(cmd, bridge)
+        return platform_equivalent_variants(cmd)
+
     def _try_platform_variants(result: str) -> str:
-        """Re-run the gate under the other shell dialect's reading of it.
+        """Re-run the gate under the other dialect's reading of it.
 
         A gate is an instrument, and an instrument can be broken. When the
         SAME command text means something different on POSIX than it does
@@ -1060,7 +1175,7 @@ def run_agent_loop(
         the original verdict untouched.
         """
         nonlocal verify_cmd
-        for reason, variant in platform_equivalent_variants(verify_cmd):
+        for reason, variant in _gate_variants(verify_cmd):
             variant_result = _verify_once(variant)
             if not verify_passed(variant_result):
                 continue
@@ -1129,8 +1244,43 @@ def run_agent_loop(
         if _stalled_reason is None and not _missing_required(
                 tools, required_files):
             _stalled_reason = observe_gate_verdict(
-                verify_cmd, result, _artifact_digest())
+                verify_cmd, result, _combined_digest())
         return result
+
+    _warned_unprobed = False
+
+    def _combined_digest() -> str:
+        """The files this attempt wrote, AND any declared external state.
+
+        A tool-only step writes no files, so `_artifact_digest` is constant
+        for it and `observe_gate_verdict`'s two-digest condition can never
+        be met — the one check that ends a run stuck on an unsatisfiable
+        gate is silent by construction. Measured 2026-10-06: two Blender
+        runs each spent 80-90k tokens and an escalation proving a correct
+        artifact wrong.
+
+        Both halves are kept rather than chosen between, because a step may
+        edit files and drive an external system in the same turn.
+        """
+        nonlocal _warned_unprobed
+        files = _artifact_digest()
+        _mcp = getattr(tools, "_mcp", None)
+        if _mcp is None:
+            return files
+        from . import external_state as _ext
+        from . import tool_gates
+        specs = getattr(_mcp, "_specs", {})
+        external = _ext.state_digest(_mcp, specs)
+        if external is None:
+            # Said once, and only for a gate that is actually a tool call:
+            # a detector structurally unable to fire must not read as one
+            # that looked and found nothing.
+            if not _warned_unprobed and tool_gates.is_tool_gate(
+                    verify_cmd, _mcp):
+                _warned_unprobed = True
+                _ext.warn_about_unprobed_servers(_mcp, specs)
+            return files
+        return f"{files}|{external}"
 
     def _gate_result() -> str:
         """The gate's verdict, re-running it only when files have changed.
@@ -1145,6 +1295,39 @@ def run_agent_loop(
         _gate_cache = _run_verify()
         _dirty_since_gate = False
         return _gate_cache
+
+    # The gate's verdict before this step does anything, which is the only
+    # moment it can be taken. Deliberately NOT an early exit: a gate that
+    # passes here is either a step already satisfied or a precondition, and
+    # the two are indistinguishable until the step acts. Exiting green on it
+    # would turn the measured false RED into a false GREEN, which is the
+    # worse of the two -- the step would report success having built
+    # nothing. Costs one gate run and no tokens.
+    #
+    # Only for a TOOL gate. A shell gate already has `_always_fails_error`,
+    # which proves inversion from cmd.exe's own operator semantics without
+    # running anything -- and an unconditional baseline run would mean a full
+    # pytest suite at the start of every CODE step, changing the cost profile
+    # of every ordinary run to fix a defect only ever observed here.
+    if verify_cmd and _is_tool_gate(verify_cmd):
+        try:
+            _gate_before_work = verify_passed(_verify_once())
+        except Exception as exc:                  # pragma: no cover - env
+            _logger.debug("[AgentLoop] step %d: baseline gate run failed "
+                          "(%s); inversion cannot be proven for this step",
+                          step_idx + 1, type(exc).__name__)
+            _gate_before_work = None
+        else:
+            # The cache now holds a verdict for the pre-work state, which is
+            # not the state any later question is about.
+            _gate_cache = None
+            _dirty_since_gate = True
+            if _gate_before_work:
+                _logger.info(
+                    "[AgentLoop] step %d: the gate already passes before the "
+                    "step has done anything — continuing, because that is "
+                    "either a step already satisfied or a precondition, and "
+                    "only acting tells them apart", step_idx + 1)
 
     for turn in range(1, max_turns + 1):
         # Final turn: withhold tools so the model must produce a text
@@ -1241,6 +1424,18 @@ def run_agent_loop(
                         # The world changed — every prior failure is now
                         # worth re-testing, so nothing counts as a repeat.
                         failed_since_edit.clear()
+                elif MCP_NAME_SEPARATOR in _tc.name:
+                    # An MCP tool call changes the world too, and nothing
+                    # here said so: `_dirty_since_gate` was set by
+                    # run_command and the file writers only, so a cached
+                    # GREEN verdict could outlive the tool call that
+                    # invalidated it. Every MCP call counts, including a
+                    # read: we cannot know which are mutating, and the only
+                    # cost of being wrong is one extra gate run, while the
+                    # cost the other way is a stale pass.
+                    _dirty_since_gate = True
+                    _tool_acted = True
+                    failed_since_edit.clear()
             if _self_gate is not None:
                 _gate_cache = _self_gate
                 _dirty_since_gate = False
@@ -1368,9 +1563,24 @@ def run_agent_loop(
             # start) because the whole conversation is resent every turn.
             #
             # Asking early costs one subprocess and no tokens at all.
-            if (verify_cmd and edited_files and not final_turn
+            if (verify_cmd and (edited_files or _tool_acted) and not final_turn
                     and (_dirty_since_gate or _self_gate is not None)):
                 _early = _gate_result()
+                # A gate that PASSED before this step acted and fails now is
+                # measuring the absence of the step's work — a precondition
+                # in the `verify:` slot, not a postcondition. Proven from
+                # this step's own two verdicts rather than by reading the
+                # command, which is what lets it catch an assertion inside a
+                # tool payload that no shell-operator analysis can see.
+                if (_gate_before_work is True and not verify_passed(_early)
+                        and _stalled_reason is None):
+                    _stalled_reason = (
+                        "the gate PASSED before this step did anything and "
+                        "FAILS now that it has acted, so it is asserting the "
+                        "absence of the step's own work — a precondition "
+                        f"written into `verify:`: {truncate_middle(verify_cmd, 300)}")
+                    _logger.warning("[GateIntegrity] step %d: %s",
+                                    step_idx + 1, _stalled_reason)
                 if not verify_passed(_early) and _stalled_reason:
                     return _finish("gate-stalled", turn, (False, (
                         f"{GATE_STALLED_MARKER} {_stalled_reason}\n\n"
