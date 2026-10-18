@@ -6,6 +6,133 @@ changes bump the minor (until 1.0), bugfixes bump the patch.
 
 ## Unreleased
 
+## 0.13.0 — 2026-10-18
+
+A run can reach a **live external application** through an MCP server — a
+Blender session, a FreeCAD document — and be measured while it does.
+Making the tools reachable was the small half; every layer that was
+supposed to verify such a run turned out to be blind to it, because every
+net in this project is made of files and git and a tool-only run writes no
+files. Developed against a live Blender server, with each finding measured
+on a real run rather than reasoned about.
+
+### Added
+
+- **External tools from MCP servers.** Declare a server under `mcp:` in
+  `.agentchanti.yaml` and its tools become available to the agent loop
+  alongside the built-in ones. The SDK is an **optional extra** — `pip
+  install "agentchanti[mcp]"` — not a dependency: it pulls roughly thirty
+  packages including a web-server stack, and a run that configures nothing
+  never imports it, never mentions it, and sends a byte-identical planner
+  prompt. Both stdio and HTTP transports, across `mcp>=1.2,<3`.
+
+- **`agentchanti mcp list | get | add | add-json | remove`.** Configuring a
+  server used to be write-and-hope: the only way to learn whether the entry
+  worked was to spend a whole run and read the log. `list` and `get`
+  connect briefly, report what each server offers versus withholds, and
+  exit non-zero when one fails — needing **no provider and no API key**,
+  because you should not have to supply credentials to find out why a
+  server is not working. `add` starts the server once and builds the
+  `allow:` list from the tools it really offers, since a server with no
+  fence is rejected at load and hand-writing one means guessing names.
+  Config edits **insert lines only**: comments, key order and formatting
+  survive, an ambiguous file shape is refused rather than guessed, and
+  add-then-remove is a byte-for-byte round trip. Documented in
+  [docs/mcp.md](docs/mcp.md).
+
+- **A `verify:` can be a tool call.** `mcp:<server>__<tool> {json}`, chained
+  with `&&`. Before this a tool-only run was unmeasurable by construction:
+  the gate was sent to cmd.exe, `target:` was not a file, and the evidence
+  weight was 0. Gates that call only a reader are reported — they pass
+  whenever the server is reachable, including over the state that existed
+  before the step ran.
+
+- **An undo for state that is not a file.** A server may declare a
+  `snapshot:` capture/restore pair and a read-only `state_probe:`, in the
+  same `mcp:` syntax with `{path}` substituted. Declared by the operator
+  because there is no general way to snapshot an arbitrary system — saving
+  a `.blend`, dumping a database and exporting a browser profile share no
+  vocabulary. **Nothing is ever restored automatically**: the measured run
+  FAILED while leaving a CORRECT scene, so a rollback on failure would have
+  destroyed exactly the work that was wanted. Recovery stays explicit,
+  through `agentchanti --restore`.
+
+- **`--scope user` for servers you want in every project.** The `mcp:`
+  section is the one part of the config that merges across
+  `~/.agentchanti.yaml` and the project's; everything else stays
+  first-file-wins, because a provider resolved half from one file and half
+  from another would be worse than one source. The project wins a name
+  collision and the shadowed entry is reported rather than dropped.
+
+### Fixed
+
+- **A tool gate only ran where someone had remembered to wire it.**
+  `GateLedger` re-runs every recorded gate after each later stage through
+  `Executor.run_command`, which sent a tool gate to cmd.exe and got `'mcp:…'
+  is not recognized` — read, correctly for what it saw, as "the gate can no
+  longer launch". So the monotonic-gate protection, the one thing that
+  catches a later stage breaking an earlier verified step, was
+  **structurally absent for every tool-verified step and said nothing about
+  it**. Now handled at the one seam every route passes through.
+
+- **The acceptance repair round had no gate check at all**, while being the
+  stage most likely to contradict a plan gate — it exists to change the
+  artifact until an instrument outside the run goes green. Measured: a step
+  deleted an object the task said to leave alone and gated itself on the
+  resulting object count; the acceptance check caught the deletion; the
+  repair put an object back; and the step's own gate was red at the end of
+  a run that reported success.
+
+- **`agentchanti --restore` could never restore external state.** It built
+  its tools from a fresh `FileMemory` that no bridge had been attached to,
+  so the one mechanism whose whole purpose is putting a live system back
+  answered `ERROR: unknown tool` on its only code path. The tests passed
+  because they handed in a fake that did answer.
+
+- **An undo that overwrote work done after it.** `--restore` was
+  "deliberately additive", which was true about existence and never about
+  content: it silently replaced files edited since the snapshot. Anything
+  whose bytes differ is now copied to `.agentchanti/pre-restore/` first and
+  named in the output.
+
+- **`is` between two wrapper objects is never true.** Host APIs rebuild a
+  Python wrapper on every attribute access, so a gate comparing two
+  separately-fetched objects with `is` cannot pass over any state. One run
+  spent 10 turns, 10 more of recovery and 109,609 tokens failing a node
+  graph that was correct; the same task a day earlier drew `==` and passed
+  in six turns. The `==` reading is now offered and adopted only if it
+  passes.
+
+- **One accurate message when the MCP extra is missing**, instead of the
+  right one followed by a misleading one. A bridge that can reach nothing
+  is no longer handed to the rest of the run, where every `if bridge is
+  None` guard took the wrong branch and reported a wrong cause — a
+  `snapshot:` line that was perfectly correct being named as "not a
+  runnable tool call".
+
+- **The empty-collection gate covered Python only.** `verify_cmd` could
+  report a pass over a suite that collected nothing in every other
+  language (#67).
+
+- **A unit test could read, and then write, the developer's real home
+  directory.** `_find_config_file` searches `~`, so any test calling
+  `Config.load()` could pick up the machine's own provider or servers and
+  change its own outcome; `--scope user` turned that into a write. `~` is
+  now redirected per test.
+
+### Notes
+
+- A **seeded contract cannot judge a live application** — it is a file
+  check. A task whose artifact exists only inside another program needs
+  `acceptance_cmds` comparing against a baseline recorded *before* the run,
+  which is also the one thing a gate structurally cannot do: a gate sees
+  only the end state, so it can never express "this did not change".
+
+- Still open: the ghost has no postcondition kind for external-system
+  state, so a tool-only plan's `target:` stays unreconcilable; and
+  `check_gate_quality` has no bridge to ask, so a shallow tool gate costs
+  the step its turns before anyone says so.
+
 ## 0.12.0 — 2026-10-02
 
 Three more languages can earn an independent verdict, and test generation
